@@ -304,3 +304,124 @@ fn rejects_what_does_not_fit() {
     assert!(Vtx::parse(&broken).is_err());
     assert!(Vtx::parse(&broken[..40]).is_err());
 }
+
+const PHY_TEXT: &str = "solid {\n\"index\" \"0\"\n\"name\" \"static_prop\"\n\"mass\" \"25.000000\"\n\"surfaceprop\" \"metal\"\n\"damping\" \"0.000000\"\n\"volume\" \"4096.0\"\n}\nsolid {\n\"index\" \"1\"\n\"name\" \"arm\"\n\"mass\" \"5\"\n}\nragdollconstraint {\n\"parent\" \"0\"\n\"child\" \"1\"\n\"xmin\" \"-30\"\n\"xmax\" \"45\"\n\"xfriction\" \"2\"\n\"ymin\" \"-10\"\n\"ymax\" \"10\"\n\"zmin\" \"0\"\n\"zmax\" \"90\"\n}\neditparams {\n\"rootname\" \"\"\n\"totalmass\" \"30\"\n\"concave\" \"1\"\n}\n";
+
+fn tetrahedron(at: [f32; 3]) -> testmodel::TestConvex {
+    let points = [[0.0, 0.0, 0.0], [16.0, 0.0, 0.0], [0.0, 16.0, 0.0], [0.0, 0.0, 16.0]];
+    testmodel::TestConvex {
+        points: points.map(|p| [p[0] + at[0], p[1] + at[1], p[2] + at[2]]).to_vec(),
+        triangles: vec![[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]],
+    }
+}
+
+/// A box of 16 × 16 × 16 on the floor, and an arm of three pieces.
+fn phy_bytes(legacy: bool) -> Vec<u8> {
+    let solids = vec![
+        vec![testmodel::TestConvex::cuboid([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0])],
+        vec![tetrahedron([0.0; 3]), testmodel::TestConvex::cuboid([20.0, 0.0, 0.0], [30.0, 4.0, 4.0]), tetrahedron([0.0, 0.0, 40.0])],
+    ];
+    testmodel::phy(CHECKSUM, &solids, legacy, PHY_TEXT)
+}
+
+fn near(a: [f32; 3], b: [f32; 3]) -> bool {
+    (0..3).all(|i| (a[i] - b[i]).abs() < 1e-3)
+}
+
+#[test]
+fn reads_physics_models() {
+    for legacy in [false, true] {
+        let phy = Phy::parse(&phy_bytes(legacy)).unwrap();
+        assert_eq!((phy.checksum, phy.solids.len()), (CHECKSUM, 2));
+        // the box, back from IVP's metres and axes
+        let cube = &phy.solids[0].convexes;
+        assert_eq!(cube.len(), 1);
+        assert_eq!((cube[0].points.len(), cube[0].triangles.len()), (8, 12));
+        for corner in [[-8.0, -8.0, 0.0], [8.0, 8.0, 16.0], [8.0, -8.0, 16.0]] {
+            assert!(cube[0].points.iter().any(|&p| near(p, corner)), "{corner:?} in {:?}", cube[0].points);
+        }
+        // every triangle faces out
+        for convex in phy.solids.iter().flat_map(|s| &s.convexes) {
+            let n = convex.points.len() as f32;
+            let middle = convex.points.iter().fold([0.0; 3], |m, p| [m[0] + p[0] / n, m[1] + p[1] / n, m[2] + p[2] / n]);
+            for tri in &convex.triangles {
+                let [a, b, c] = tri.map(|i| convex.points[i as usize]);
+                let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+                let normal = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                let out = [a[0] - middle[0], a[1] - middle[1], a[2] - middle[2]];
+                assert!(normal[0] * out[0] + normal[1] * out[1] + normal[2] * out[2] > 0.0, "{tri:?} of {convex:?}");
+            }
+        }
+        // the arm's three pieces, in order, without the hull its tree's inner nodes point to
+        let arm = &phy.solids[1].convexes;
+        assert_eq!(arm.iter().map(|c| c.points.len()).collect::<Vec<_>>(), [4, 8, 4]);
+        assert!(arm[2].points.iter().any(|&p| near(p, [0.0, 0.0, 56.0])));
+        // the text
+        let solid = &phy.solids[0];
+        assert_eq!((solid.name(), solid.mass(), solid.surface_prop()), ("static_prop", Some(25.0), Some("metal")));
+        assert_eq!(solid.keys.number("volume"), Some(4096.0));
+        assert_eq!((phy.solids[1].name(), phy.solids[1].surface_prop()), ("arm", None));
+        assert_eq!(phy.block("editparams").and_then(|b| b.number("totalmass")), Some(30.0));
+        assert_eq!(
+            phy.ragdoll_constraints(),
+            [RagdollConstraint { parent: 0, child: 1, limits: [[-30.0, 45.0], [-10.0, 10.0], [0.0, 90.0]], friction: [2.0, 0.0, 0.0] }]
+        );
+    }
+}
+
+#[test]
+fn the_text_of_physics_models_is_read_leniently() {
+    let text = "garbage solid { \"index\" \"0\" \"name\" \"a\" nested { \"x\" \"1\" } \"mass\" \"3\" } { stray } break { \"model\" \"gibs/a.mdl\" }";
+    let solids = vec![vec![testmodel::TestConvex::cuboid([0.0; 3], [1.0; 3])]];
+    let phy = Phy::parse(&testmodel::phy(CHECKSUM, &solids, false, text)).unwrap();
+    assert_eq!((phy.solids[0].name(), phy.solids[0].mass()), ("a", Some(3.0)));
+    assert_eq!(phy.block("break").and_then(|b| b.get("model")), Some("gibs/a.mdl"));
+    assert!(phy.ragdoll_constraints().is_empty());
+}
+
+#[test]
+fn rejects_physics_that_does_not_fit() {
+    let good = phy_bytes(false);
+    assert!(Phy::parse(&good[..good.len() / 3]).is_err());
+    assert!(Phy::parse(&[0; 8]).is_err());
+    // the first solid: its data at 20, the surface after the 28-byte header
+    let surface = 20 + 28;
+    let error = |change: &dyn Fn(&mut Vec<u8>)| {
+        let mut bytes = good.clone();
+        change(&mut bytes);
+        Phy::parse(&bytes).unwrap_err().to_string()
+    };
+    // without "VPHY" the header is read as an old model's surface, which does not fit
+    assert!(!error(&|b| b[20] = b'X').is_empty());
+    assert!(error(&|b| b[26] = 1).contains("type 1"));
+    // the root of the tree pointing back
+    let root = surface + i32::from_le_bytes(good[surface + 32..surface + 36].try_into().unwrap()) as usize;
+    assert!(error(&|b| b[root..root + 4].copy_from_slice(&(-28i32).to_le_bytes())).contains("points back"));
+    // a triangle using a point past the end
+    let first_edge = surface + 48 + 16 + 4;
+    assert!(error(&|b| b[first_edge..first_edge + 2].copy_from_slice(&60000u16.to_le_bytes())).contains("past the end"));
+}
+
+/// A game folder in the temporary directory, removed when dropped.
+struct Game(std::path::PathBuf);
+
+impl Drop for Game {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn physics_belongs_to_its_model() {
+    let game = Game(std::env::temp_dir().join(format!("gmod-model-{}", std::process::id())));
+    let file = game.0.join("models/test/box.phy");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, phy_bytes(false)).unwrap();
+    let mut vfs = Vfs::new();
+    vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(&game.0))));
+    let phy = load_physics(&vfs, "models/test/box.mdl", CHECKSUM).unwrap().unwrap();
+    assert_eq!(phy.solids.len(), 2);
+    let other = load_physics(&vfs, "models/test/box.mdl", CHECKSUM + 1).unwrap_err().to_string();
+    assert!(other.contains("models/test/box.phy") && other.contains("another build"), "{other}");
+    assert!(load_physics(&vfs, "models/test/none.mdl", CHECKSUM).unwrap().is_none());
+}

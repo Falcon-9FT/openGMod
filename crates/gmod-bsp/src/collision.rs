@@ -15,7 +15,11 @@
 //! * Brush entities stand where the map puts them, turned by their angles. A turned one is
 //!   swept with a box grown to hold the box turned the other way. Those nothing collides with
 //!   (triggers, `func_illusionary`, clips for physics objects ...) are left out.
-//! * Static props and other models collide by their physics models, which are not read yet.
+//! * Models that do not move - static props - collide by convex hulls ([`Hull`]): those of their
+//!   physics models, which the caller reads ([`Collision::add_shape`],
+//!   [`Collision::add_static`]). A box keeps the world's axes against a turned prop: the hull is
+//!   grown by it along the hull's faces, the box's faces and every crossing of an edge of one
+//!   with an edge of the other, which is exact.
 
 use crate::lumps::contents;
 use crate::math::{Vec3, abs, add, cross, dot, length, lerp3, normalize, scale, sub};
@@ -111,22 +115,17 @@ fn axes(angles: Vec3) -> [Vec3; 3] {
     ]
 }
 
-/// A brush model where it stands.
+/// Where something stands: moved to an origin, and turned.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Placement {
-    pub model: usize,
-    /// Its entity, in [`Bsp::entities`]; `None` for the world.
-    pub entity: Option<usize>,
-    pub origin: Vec3,
-    /// Pitch, yaw and roll, in degrees.
-    pub angles: Vec3,
-    /// The model's axes in the world; `None` when it is not turned.
+struct Frame {
+    origin: Vec3,
+    /// Its axes in the world; `None` when it is not turned.
     axes: Option<[Vec3; 3]>,
 }
 
-impl Placement {
-    pub fn new(model: usize, entity: Option<usize>, origin: Vec3, angles: Vec3) -> Placement {
-        Placement { model, entity, origin, angles, axes: (angles != [0.0; 3]).then(|| axes(angles)) }
+impl Frame {
+    fn new(origin: Vec3, angles: Vec3) -> Frame {
+        Frame { origin, axes: (angles != [0.0; 3]).then(|| axes(angles)) }
     }
 
     fn local_point(&self, p: Vec3) -> Vec3 {
@@ -144,14 +143,150 @@ impl Placement {
         }
     }
 
-    /// The half size, in the model's space, of a box that holds a box of half size `e` in the
-    /// world.
+    fn world_point(&self, p: Vec3) -> Vec3 {
+        add(self.origin, self.world_direction(p))
+    }
+
+    /// The half size, in its space, of a box that holds a box of half size `e` in the world.
     fn local_extents(&self, e: Vec3) -> Vec3 {
         match self.axes {
             Some([f, l, u]) => [dot(abs(f), e), dot(abs(l), e), dot(abs(u), e)],
             None => e,
         }
     }
+
+    /// The world's axes in its space: how a box of the world lies there.
+    fn world_axes(&self) -> Option<[Vec3; 3]> {
+        self.axes.map(|[f, l, u]| [[f[0], l[0], u[0]], [f[1], l[1], u[1]], [f[2], l[2], u[2]]])
+    }
+}
+
+/// A brush model where it stands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    pub model: usize,
+    /// Its entity, in [`Bsp::entities`]; `None` for the world.
+    pub entity: Option<usize>,
+    pub origin: Vec3,
+    /// Pitch, yaw and roll, in degrees.
+    pub angles: Vec3,
+    frame: Frame,
+}
+
+impl Placement {
+    pub fn new(model: usize, entity: Option<usize>, origin: Vec3, angles: Vec3) -> Placement {
+        Placement { model, entity, origin, angles, frame: Frame::new(origin, angles) }
+    }
+}
+
+/// A convex solid of a model, in the model's space: its corners, the planes of its faces and
+/// the directions of its edges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hull {
+    points: Vec<Vec3>,
+    /// Normals facing out, and distances.
+    faces: Vec<(Vec3, f32)>,
+    edges: Vec<Vec3>,
+    mins: Vec3,
+    maxs: Vec3,
+}
+
+impl Hull {
+    /// The hull with the corners `points` and the faces `triangles`, wound either way; `None`
+    /// when it has no volume.
+    pub fn new(points: &[Vec3], triangles: &[[usize; 3]]) -> Option<Hull> {
+        if points.len() < 4 || points.iter().flatten().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let middle = scale(points.iter().fold([0.0; 3], |m, &p| add(m, p)), 1.0 / points.len() as f32);
+        let (mut faces, mut edges): (Vec<(Vec3, f32)>, Vec<Vec3>) = (Vec::new(), Vec::new());
+        for tri in triangles {
+            let [Some(&a), Some(&b), Some(&c)] = tri.map(|i| points.get(i)) else { continue };
+            let n = cross(sub(b, a), sub(c, a));
+            if length(n) < 1e-6 {
+                continue;
+            }
+            // facing away from the middle
+            let n = scale(n, if dot(n, sub(middle, a)) > 0.0 { -1.0 } else { 1.0 } / length(n));
+            let dist = dot(n, a);
+            if !faces.iter().any(|&(m, d)| dot(m, n) > 1.0 - 1e-5 && (d - dist).abs() < 1e-3) {
+                faces.push((n, dist));
+            }
+            for (p, q) in [(a, b), (b, c), (c, a)] {
+                let e = sub(q, p);
+                if length(e) > 1e-6 {
+                    let e = normalize(e);
+                    if !edges.iter().any(|&f| dot(f, e).abs() > 1.0 - 1e-5) {
+                        edges.push(e);
+                    }
+                }
+            }
+        }
+        // a solid has four faces at least, and its middle inside all of them
+        if faces.len() < 4 || faces.iter().any(|&(n, d)| dot(n, middle) >= d) {
+            return None;
+        }
+        let mins = std::array::from_fn(|i| points.iter().map(|p| p[i]).fold(f32::MAX, f32::min));
+        let maxs = std::array::from_fn(|i| points.iter().map(|p| p[i]).fold(f32::MIN, f32::max));
+        Some(Hull { points: points.to_vec(), faces, edges, mins, maxs })
+    }
+
+    /// A box.
+    pub fn cuboid(mins: Vec3, maxs: Vec3) -> Hull {
+        let points: Vec<Vec3> =
+            (0..8).map(|i| std::array::from_fn(|axis| if i & (1 << axis) == 0 { mins[axis] } else { maxs[axis] })).collect();
+        let faces = (0..3)
+            .flat_map(|axis| {
+                let mut n = [0.0; 3];
+                n[axis] = 1.0;
+                [(n, maxs[axis]), (scale(n, -1.0), -mins[axis])]
+            })
+            .collect();
+        Hull { points, faces, edges: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], mins, maxs }
+    }
+
+    /// How far it reaches along `n`.
+    fn support(&self, n: Vec3) -> f32 {
+        self.points.iter().map(|&p| dot(n, p)).fold(f32::MIN, f32::max)
+    }
+
+    /// The planes that bound it grown by the sweep's box: its faces, and for a box also the
+    /// box's faces and every crossing of one of its edges with one of the box's - each axis
+    /// that can keep the two apart.
+    fn bounds(&self, sweep: &Sweep) -> Vec<Bound> {
+        let mut out: Vec<Bound> = self.faces.iter().map(|&(normal, dist)| Bound { normal, dist, ..Bound::default() }).collect();
+        if sweep.point {
+            return out;
+        }
+        let axes = sweep.axes.unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let mut both_ways = |n: Vec3| {
+            for normal in [n, scale(n, -1.0)] {
+                out.push(Bound { normal, dist: self.support(normal), bevel: true, surface: Surface::default() });
+            }
+        };
+        for axis in axes {
+            both_ways(axis);
+            for &edge in &self.edges {
+                let c = cross(edge, axis);
+                if length(c) > 1e-6 {
+                    both_ways(normalize(c));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A model that does not move.
+#[derive(Debug, Clone)]
+struct Static {
+    shape: usize,
+    /// Its number among the map's static props.
+    prop: usize,
+    frame: Frame,
+    /// Its bounds in the world.
+    mins: Vec3,
+    maxs: Vec3,
 }
 
 /// What a sweep found.
@@ -178,6 +313,8 @@ pub struct Trace {
     pub displacement: bool,
     /// The brush model it hit, 0 being the world.
     pub model: Option<usize>,
+    /// The static prop it hit, by its number in the map.
+    pub static_prop: Option<usize>,
 }
 
 impl Trace {
@@ -201,8 +338,10 @@ struct Sweep {
     /// The box's middle.
     start: Vec3,
     end: Vec3,
-    /// Its half size.
+    /// Its half size along its axes.
     extents: Vec3,
+    /// Its axes, when they are not the model's: a box of the world in a turned model's space.
+    axes: Option<[Vec3; 3]>,
     point: bool,
     mask: u32,
     /// The nearest hit so far, through any model.
@@ -215,6 +354,15 @@ struct Sweep {
 }
 
 impl Sweep {
+    /// How far the box reaches along `normal`.
+    fn reach(&self, normal: Vec3) -> f32 {
+        match (self.point, self.axes) {
+            (true, _) => 0.0,
+            (false, None) => dot(abs(normal), self.extents),
+            (false, Some(axes)) => (0..3).map(|i| self.extents[i] * dot(normal, axes[i]).abs()).sum(),
+        }
+    }
+
     /// Sweeps against a convex solid bounded by `bounds`. A thin solid - a triangle swept by a
     /// ray - is hit even where going in and coming out are the same moment.
     fn clip(&mut self, bounds: impl Iterator<Item = Bound>, contents: u32, displacement: bool, thin: bool) {
@@ -225,7 +373,7 @@ impl Sweep {
             if bound.bevel && self.point {
                 continue;
             }
-            let reach = if self.point { 0.0 } else { dot(abs(bound.normal), self.extents) };
+            let reach = self.reach(bound.normal);
             let d1 = dot(bound.normal, self.start) - bound.dist - reach;
             let d2 = dot(bound.normal, self.end) - bound.dist - reach;
             starts_out |= d1 > 0.0;
@@ -274,7 +422,7 @@ impl Sweep {
 
     /// The space the sweep passes through, grown by `margin`.
     fn bounds(&self, margin: f32) -> (Vec3, Vec3) {
-        let grow = self.extents.map(|e| e + margin);
+        let grow = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].map(|axis| self.reach(axis) + margin);
         let lo = std::array::from_fn(|i| self.start[i].min(self.end[i]) - grow[i]);
         let hi = std::array::from_fn(|i| self.start[i].max(self.end[i]) + grow[i]);
         (lo, hi)
@@ -374,6 +522,9 @@ pub struct Collision {
     model_bounds: Vec<Option<(Vec3, Vec3)>>,
     /// The world and the brush entities that are solid where the map puts them.
     pub placements: Vec<Placement>,
+    /// The convex hulls of models, in their own space.
+    shapes: Vec<Vec<Hull>>,
+    statics: Vec<Static>,
     /// The world's bounds.
     pub mins: Vec3,
     pub maxs: Vec3,
@@ -425,6 +576,8 @@ impl Collision {
             heads,
             model_bounds: Vec::new(),
             placements: placements(bsp),
+            shapes: Vec::new(),
+            statics: Vec::new(),
             mins,
             maxs,
         };
@@ -432,9 +585,31 @@ impl Collision {
         collision
     }
 
-    /// The map has nothing solid to sweep through: no trees (a map cut down to be drawn only).
+    /// The map has no world to sweep through: no trees (a map cut down to be drawn only).
     pub fn is_empty(&self) -> bool {
         self.heads.is_empty()
+    }
+
+    /// Adds the convex hulls of a model - a shape for [`Collision::add_static`] - and returns
+    /// its number.
+    pub fn add_shape(&mut self, hulls: Vec<Hull>) -> usize {
+        self.shapes.push(hulls);
+        self.shapes.len() - 1
+    }
+
+    /// Adds a model that does not move: the map's static prop number `prop`, of the shape
+    /// numbered `shape`, at `origin` and turned by `angles`. A shape that was not added is
+    /// nothing.
+    pub fn add_static(&mut self, prop: usize, shape: usize, origin: Vec3, angles: Vec3) {
+        let Some(hulls) = self.shapes.get(shape) else { return };
+        let frame = Frame::new(origin, angles);
+        let (mut mins, mut maxs) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in hulls.iter().flat_map(|h| &h.points) {
+            let p = frame.world_point(*p);
+            mins = std::array::from_fn(|i| mins[i].min(p[i]));
+            maxs = std::array::from_fn(|i| maxs[i].max(p[i]));
+        }
+        self.statics.push(Static { shape, prop, frame, mins, maxs });
     }
 
     /// Sweeps a box - `mins` to `maxs` around the point that moves - from `start` to `end`
@@ -444,6 +619,9 @@ impl Collision {
         let mut found = Found::default();
         for placement in &self.placements {
             self.sweep_placed(placement, start, end, mins, maxs, mask, &mut found);
+        }
+        for s in &self.statics {
+            self.sweep_static(s, start, end, mins, maxs, mask, &mut found);
         }
         found.trace(start, end)
     }
@@ -462,14 +640,14 @@ impl Collision {
     }
 
     /// What is at a point: the [`contents`] of all the brushes there, of the world and of the
-    /// solid brush entities.
+    /// solid brush entities. Static props are left out, as the engine does.
     pub fn point_contents(&self, point: Vec3) -> u32 {
         self.placements.iter().fold(contents::EMPTY, |c, placement| c | self.model_contents(placement, point))
     }
 
     fn model_contents(&self, placement: &Placement, point: Vec3) -> u32 {
         let Some(&head) = self.heads.get(placement.model) else { return contents::EMPTY };
-        let p = placement.local_point(point);
+        let p = placement.frame.local_point(point);
         let mut node = head;
         while let Ok(i) = usize::try_from(node) {
             let n = self.nodes[i];
@@ -496,9 +674,10 @@ impl Collision {
         let offset = scale(add(mins, maxs), 0.5);
         let extents = abs(scale(sub(maxs, mins), 0.5));
         let mut sweep = Sweep {
-            start: placement.local_point(add(start, offset)),
-            end: placement.local_point(add(end, offset)),
-            extents: placement.local_extents(extents),
+            start: placement.frame.local_point(add(start, offset)),
+            end: placement.frame.local_point(add(end, offset)),
+            extents: placement.frame.local_extents(extents),
+            axes: None,
             point: extents == [0.0; 3],
             mask,
             fraction: found.fraction,
@@ -519,17 +698,43 @@ impl Collision {
         if placement.model == 0 {
             self.sweep_displacements(&mut sweep);
         }
-        found.start_solid |= sweep.start_solid;
-        found.all_solid |= sweep.all_solid;
-        found.left_solid = found.left_solid.max(sweep.left_solid);
-        if let Some(hit) = sweep.hit {
-            found.fraction = sweep.fraction;
-            found.normal = placement.world_direction(hit.normal);
-            found.contents = hit.contents;
-            found.surface = hit.surface;
-            found.displacement = hit.displacement;
-            found.model = Some(placement.model);
+        found.take(&sweep, &placement.frame, Some(placement.model), None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_static(&self, s: &Static, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, mask: u32, found: &mut Found) {
+        if mask & contents::SOLID == 0 {
+            return;
         }
+        let offset = scale(add(mins, maxs), 0.5);
+        let extents = abs(scale(sub(maxs, mins), 0.5));
+        let (from, to) = (add(start, offset), add(end, offset));
+        let lo = std::array::from_fn(|i| from[i].min(to[i]) - extents[i] - 1.0);
+        let hi = std::array::from_fn(|i| from[i].max(to[i]) + extents[i] + 1.0);
+        if !overlap(lo, hi, s.mins, s.maxs) {
+            return;
+        }
+        // in the prop's space, the box keeps the world's axes
+        let mut sweep = Sweep {
+            start: s.frame.local_point(from),
+            end: s.frame.local_point(to),
+            extents,
+            axes: s.frame.world_axes(),
+            point: extents == [0.0; 3],
+            mask,
+            fraction: found.fraction,
+            hit: None,
+            start_solid: false,
+            all_solid: false,
+            left_solid: 0.0,
+        };
+        let (lo, hi) = sweep.bounds(1.0);
+        for hull in &self.shapes[s.shape] {
+            if overlap(lo, hi, hull.mins, hull.maxs) {
+                sweep.clip(hull.bounds(&sweep).into_iter(), contents::SOLID, false, false);
+            }
+        }
+        found.take(&sweep, &s.frame, None, Some(s.prop));
     }
 
     /// Walks the tree from `head` down the leaves the sweep passes through, the near ones
@@ -547,7 +752,7 @@ impl Collision {
                 continue;
             };
             let n = self.nodes[index];
-            let reach = if sweep.point { 0.0 } else { dot(abs(n.normal), sweep.extents) } + EPSILON;
+            let reach = sweep.reach(n.normal) + EPSILON;
             let d1 = dot(n.normal, p1) - n.dist;
             let d2 = dot(n.normal, p2) - n.dist;
             let [front, back] = n.children;
@@ -647,6 +852,7 @@ struct Found {
     surface: Surface,
     displacement: bool,
     model: Option<usize>,
+    static_prop: Option<usize>,
 }
 
 impl Default for Found {
@@ -661,11 +867,27 @@ impl Default for Found {
             surface: Surface::default(),
             displacement: false,
             model: None,
+            static_prop: None,
         }
     }
 }
 
 impl Found {
+    /// What a sweep through one model found, from the space it stands in: kept when nearer.
+    fn take(&mut self, sweep: &Sweep, frame: &Frame, model: Option<usize>, static_prop: Option<usize>) {
+        self.start_solid |= sweep.start_solid;
+        self.all_solid |= sweep.all_solid;
+        self.left_solid = self.left_solid.max(sweep.left_solid);
+        if let Some(hit) = sweep.hit {
+            self.fraction = sweep.fraction;
+            self.normal = frame.world_direction(hit.normal);
+            self.contents = hit.contents;
+            self.surface = hit.surface;
+            self.displacement = hit.displacement;
+            (self.model, self.static_prop) = (model, static_prop);
+        }
+    }
+
     fn trace(self, start: Vec3, end: Vec3) -> Trace {
         Trace {
             fraction: self.fraction,
@@ -679,6 +901,7 @@ impl Found {
             surface_flags: self.surface.flags,
             displacement: self.displacement,
             model: self.model,
+            static_prop: self.static_prop,
         }
     }
 }

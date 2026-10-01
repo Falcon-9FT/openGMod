@@ -280,13 +280,25 @@ pub struct TestDisplacement {
     pub heights: Vec<f32>,
 }
 
+/// A static prop of a [`TestMap`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestStaticProp {
+    pub model: String,
+    pub origin: [f32; 3],
+    pub angles: [f32; 3],
+    /// How it collides ([`crate::props::solid`]).
+    pub solid: u8,
+}
+
 /// A map of brushes for tests, lump by lump: the world and brush entities, each with a BSP
-/// tree split along its brushes' bounds, displacements in the world, and entities.
+/// tree split along its brushes' bounds, displacements in the world, static props, and
+/// entities.
 #[derive(Debug, Clone, Default)]
 pub struct TestMap {
     /// The brushes of each brush model; the first are the world's.
     pub models: Vec<Vec<TestBrush>>,
     pub displacements: Vec<TestDisplacement>,
+    pub static_props: Vec<TestStaticProp>,
     /// The entities after `worldspawn`, as the entity lump writes them.
     pub entities: String,
     /// The leaves as maps of version 19 write them, with an ambient light cube each.
@@ -528,14 +540,56 @@ impl TestMap {
         let mut out = vec![0u8; 8 + 64 * 16 + 4];
         out[0..4].copy_from_slice(b"VBSP");
         out[4..8].copy_from_slice(&20i32.to_le_bytes());
+        let set_entry = |out: &mut Vec<u8>, index: usize, offset: usize, length: usize, version: u32| {
+            let at = 8 + index * 16;
+            out[at..at + 16].copy_from_slice(&i32s(&[offset as i32, length as i32, version as i32, 0]));
+        };
         for (index, data, version) in lumps {
             while !out.len().is_multiple_of(4) {
                 out.push(0);
             }
-            let at = 8 + index * 16;
-            let entry = i32s(&[out.len() as i32, data.len() as i32, version as i32, 0]);
-            out[at..at + 16].copy_from_slice(&entry);
+            let at = out.len();
+            set_entry(&mut out, index, at, data.len(), version);
             out.extend(data);
+        }
+
+        // the static props: a game lump of one sprp of version 6
+        if !self.static_props.is_empty() {
+            let mut models: Vec<&str> = Vec::new();
+            for prop in &self.static_props {
+                if !models.contains(&prop.model.as_str()) {
+                    models.push(&prop.model);
+                }
+            }
+            let mut sprp = i32s(&[models.len() as i32]);
+            for model in &models {
+                let mut name = model.as_bytes().to_vec();
+                name.resize(128, 0);
+                sprp.extend(name);
+            }
+            sprp.extend(i32s(&[0, self.static_props.len() as i32]));
+            for prop in &self.static_props {
+                sprp.extend(f32s(&[prop.origin, prop.angles].concat()));
+                let model = models.iter().position(|m| *m == prop.model).unwrap_or(0) as u16;
+                sprp.extend(model.to_le_bytes());
+                sprp.extend([0, 0, 0, 0, prop.solid, 0]);
+                sprp.extend(i32s(&[0]));
+                sprp.extend(f32s(&[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]));
+                sprp.extend([0; 4]);
+            }
+            while !out.len().is_multiple_of(4) {
+                out.push(0);
+            }
+            let directory_at = out.len();
+            let data_at = directory_at + 4 + 16;
+            let mut game = i32s(&[1]);
+            game.extend(u32::from_be_bytes(*b"sprp").to_le_bytes());
+            game.extend(0u16.to_le_bytes());
+            game.extend(6u16.to_le_bytes());
+            game.extend(i32s(&[data_at as i32, sprp.len() as i32]));
+            game.extend(sprp);
+            set_entry(&mut out, index::GAME_LUMP, directory_at, game.len(), 0);
+            out.extend(game);
         }
         out
     }

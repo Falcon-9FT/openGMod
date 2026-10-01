@@ -283,6 +283,7 @@ fn the_tree_finds_what_every_brush_would() {
             start: add(start, offset),
             end: add(end, offset),
             extents,
+            axes: None,
             point: extents == [0.0; 3],
             mask: mask::SOLID,
             fraction: 1.0,
@@ -310,4 +311,79 @@ fn a_map_without_trees_has_nothing_solid() {
     assert!(collision.is_empty());
     assert_eq!(collision.trace_line([0.0; 3], [0.0, 0.0, -100.0], mask::ALL).fraction, 1.0);
     assert_eq!(collision.point_contents([0.0; 3]), contents::EMPTY);
+}
+
+#[test]
+fn hulls_are_solids() {
+    let tetrahedron = [[0.0, 0.0, 0.0], [16.0, 0.0, 0.0], [0.0, 16.0, 0.0], [0.0, 0.0, 16.0]];
+    let triangles = [[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2], [0, 1, 99]];
+    let hull = Hull::new(&tetrahedron, &triangles).unwrap();
+    assert_eq!(hull.faces.len(), 4, "the triangle with a corner that is not there is passed over");
+    assert!(hull.faces.iter().all(|&(n, d)| dot(n, [4.0, 4.0, 4.0]) < d), "facing out");
+    assert_eq!((hull.mins, hull.maxs), ([0.0; 3], [16.0; 3]));
+    let flat = [[0.0, 0.0, 0.0], [16.0, 0.0, 0.0], [0.0, 16.0, 0.0], [16.0, 16.0, 0.0]];
+    assert!(Hull::new(&flat, &[[0, 1, 2], [1, 3, 2]]).is_none());
+    assert!(Hull::new(&tetrahedron[..3], &[[0, 1, 2]]).is_none());
+}
+
+#[test]
+fn static_props_collide_by_their_hulls() {
+    let floor = TestMap { models: vec![vec![TestBrush::cuboid([-1024.0, -1024.0, -32.0], [1024.0, 1024.0, 0.0])]], ..TestMap::default() };
+    let (_, mut collision) = load(&floor);
+    let crate_shape = collision.add_shape(vec![Hull::cuboid([-16.0, -16.0, 0.0], [16.0, 16.0, 32.0])]);
+    collision.add_static(7, crate_shape, [200.0, 0.0, 0.0], [0.0; 3]);
+    collision.add_static(8, crate_shape, [400.0, 0.0, 0.0], [0.0, 45.0, 0.0]);
+    collision.add_static(9, crate_shape + 1, [600.0, 0.0, 0.0], [0.0; 3]);
+
+    let top = collision.trace_line([200.0, 0.0, 100.0], [200.0, 0.0, -100.0], mask::SOLID);
+    assert!(near(top.end, [200.0, 0.0, 32.0 + EPSILON]) && top.normal == [0.0, 0.0, 1.0], "{top:?}");
+    assert_eq!((top.static_prop, top.model, top.contents, top.texinfo), (Some(7), None, contents::SOLID, None));
+    let side = collision.trace([100.0, 0.0, 1.0], [300.0, 0.0, 1.0], MINS, MAXS, mask::PLAYERSOLID);
+    assert!(near(side.end, [200.0 - 32.0 - EPSILON, 0.0, 1.0]), "{side:?}");
+
+    // turned a quarter of a right angle, a corner points at the box: the box's own face meets
+    // it, and the box is not grown by being turned
+    let corner = 400.0 - 16.0 * 2f32.sqrt();
+    let turned = collision.trace([300.0, 0.0, 1.0], [500.0, 0.0, 1.0], MINS, MAXS, mask::PLAYERSOLID);
+    assert!(near(turned.end, [corner - 16.0 - EPSILON, 0.0, 1.0]) && near(turned.normal, [-1.0, 0.0, 0.0]), "{turned:?}");
+    assert_eq!(turned.static_prop, Some(8));
+    let beside = collision.trace([300.0, 40.0, 1.0], [500.0, 40.0, 1.0], MINS, MAXS, mask::PLAYERSOLID);
+    assert_eq!(beside.fraction, 1.0, "{beside:?}");
+    // a ray meets the corner, stopping short of one of the faces there
+    let ray = collision.trace_line([300.0, 0.0, 10.0], [500.0, 0.0, 10.0], mask::SOLID);
+    assert!(near(ray.end, [corner - EPSILON * 2f32.sqrt(), 0.0, 10.0]), "{ray:?}");
+    assert!((ray.normal[0] + 0.5f32.sqrt()).abs() < 1e-4 && (ray.normal[1].abs() - 0.5f32.sqrt()).abs() < 1e-4, "{ray:?}");
+
+    // not water, and a shape that was not added is nothing
+    assert_eq!(collision.trace_line([200.0, 0.0, 100.0], [200.0, 0.0, 10.0], mask::WATER).fraction, 1.0);
+    assert_eq!(collision.trace_line([600.0, 0.0, 100.0], [600.0, 0.0, 10.0], mask::SOLID).fraction, 1.0);
+    assert_eq!(collision.point_contents([200.0, 0.0, 10.0]), contents::EMPTY);
+}
+
+#[test]
+fn a_hull_stops_what_the_same_brush_stops() {
+    let mut random = Random(11);
+    let boxes: Vec<(Vec3, Vec3)> = (0..30)
+        .map(|_| {
+            let mins = [random.range(-400.0, 300.0), random.range(-400.0, 300.0), random.range(-400.0, 300.0)];
+            (mins, mins.map(|m| m + 8.0 + 100.0 * random.next()))
+        })
+        .collect();
+    let brushes = boxes.iter().map(|&(mins, maxs)| TestBrush::cuboid(mins, maxs)).collect();
+    let (_, as_brushes) = load(&TestMap { models: vec![brushes], ..TestMap::default() });
+    let (_, mut as_hulls) = load(&TestMap { models: vec![Vec::new()], ..TestMap::default() });
+    for (i, &(mins, maxs)) in boxes.iter().enumerate() {
+        // the hull in its own space, moved back by its prop's origin
+        let middle = scale(add(mins, maxs), 0.5);
+        let shape = as_hulls.add_shape(vec![Hull::cuboid(sub(mins, middle), sub(maxs, middle))]);
+        as_hulls.add_static(i, shape, middle, [0.0; 3]);
+    }
+    for i in 0..2000 {
+        let start = [random.range(-500.0, 500.0), random.range(-500.0, 500.0), random.range(-500.0, 500.0)];
+        let end = [random.range(-500.0, 500.0), random.range(-500.0, 500.0), random.range(-500.0, 500.0)];
+        let (mins, maxs) = if i % 2 == 0 { ([0.0; 3], [0.0; 3]) } else { (MINS, MAXS) };
+        let (a, b) = (as_brushes.trace(start, end, mins, maxs, mask::SOLID), as_hulls.trace(start, end, mins, maxs, mask::SOLID));
+        assert!((a.fraction - b.fraction).abs() < 1e-5, "sweep {i}: {a:?} {b:?}");
+        assert_eq!((a.start_solid, a.all_solid), (b.start_solid, b.all_solid), "sweep {i}");
+    }
 }

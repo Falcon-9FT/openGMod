@@ -1,6 +1,8 @@
 //! `trace`: a sweep through a map, as `util.TraceLine` and `util.TraceHull` make it in the game,
 //! printed under the names of GMod's `TraceResult`, so that the same sweep here and in the game
 //! can be compared line by line. And the check that a player put at a map's start stands there.
+//! Both go through what [`gmod_world::collision`] makes solid: brushes, displacements and the
+//! static props.
 
 use gmod_bsp::{Bsp, Collision, contents, surf};
 use gmod_movement::{Command, Player, Settings};
@@ -29,23 +31,28 @@ fn vector(v: [f32; 3]) -> String {
 
 /// The sweep of the box `mins`..`maxs` - a ray when it has no size - from `from` to `to`
 /// through what `mask` names, as lines.
-pub fn report(bsp: &Bsp, from: [f32; 3], to: [f32; 3], mins: [f32; 3], maxs: [f32; 3], mask: u32) -> Vec<String> {
-    let collision = Collision::new(bsp);
+pub fn report(bsp: &Bsp, collision: &Collision, from: [f32; 3], to: [f32; 3], mins: [f32; 3], maxs: [f32; 3], mask: u32) -> Vec<String> {
     let trace = collision.trace(from, to, mins, maxs, mask);
     let swept =
         if mins == [0.0; 3] && maxs == [0.0; 3] { "a ray".to_string() } else { format!("the box {} to {}", vector(mins), vector(maxs)) };
     let material = trace.texinfo.and_then(|t| bsp.texinfo.get(t)).and_then(|info| bsp.materials.get(usize::try_from(info.texdata).ok()?));
     let texture = match (trace.displacement, material) {
+        _ if trace.static_prop.is_some() => "**studio**".to_string(),
         (true, Some(material)) => format!("**displacement** ({material})"),
         (_, Some(material)) => material.clone(),
         (_, None) => String::new(),
     };
     let named: Vec<&str> = NAMES.iter().filter(|(flag, _)| trace.contents & flag != 0).map(|(_, name)| *name).collect();
     let contents = if named.is_empty() { trace.contents.to_string() } else { format!("{} ({})", trace.contents, named.join(" | ")) };
-    let entity = match trace.model {
-        None => String::new(),
-        Some(0) => "worldspawn".into(),
-        Some(model) => {
+    let prop_model = |prop: usize| {
+        let model = bsp.static_props.props.get(prop).and_then(|p| bsp.static_props.models.get(usize::from(p.model)));
+        model.map_or("", String::as_str)
+    };
+    let entity = match (trace.model, trace.static_prop) {
+        (_, Some(prop)) => format!("worldspawn (static prop {prop}, {})", prop_model(prop)),
+        (None, _) => String::new(),
+        (Some(0), _) => "worldspawn".into(),
+        (Some(model), _) => {
             let placed = collision.placements.iter().find(|p| p.model == model).and_then(|p| p.entity);
             let class = placed.and_then(|i| bsp.entities.get(i)).map_or("", |e| e.class_name());
             format!("{class} (model *{model})")
@@ -65,26 +72,25 @@ pub fn report(bsp: &Bsp, from: [f32; 3], to: [f32; 3], mins: [f32; 3], maxs: [f3
         format!("  SurfaceFlags       {}", trace.surface_flags),
         format!("  HitSky             {}", trace.surface_flags & surf::SKY != 0),
         format!("  HitNoDraw          {}", trace.surface_flags & surf::NODRAW != 0),
-        format!("  HitWorld           {}", trace.model == Some(0)),
+        format!("  HitWorld           {}", trace.model == Some(0) || trace.static_prop.is_some()),
         format!("  Entity             {entity}"),
     ]
 }
 
-/// Puts a player at the map's start and lets two seconds pass: they should stand there, on
-/// the map's brushes or displacements, or swim. `None` for a map without a player start or
-/// without brushes.
-pub fn stand_at_start(bsp: &Bsp) -> Option<Result<(), String>> {
+/// Puts a player at the map's start and lets two seconds pass: they should stand there - on
+/// the map's brushes, displacements or props - or swim. `None` for a map without a player
+/// start or without brushes.
+pub fn stand_at_start(bsp: &Bsp, collision: &Collision) -> Option<Result<(), String>> {
     let (origin, _) = gmod_world::spawn_point(bsp)?;
-    let collision = Collision::new(bsp);
     if collision.is_empty() {
         return None;
     }
     let settings = Settings::default();
-    let Some(mut player) = Player::spawn(&collision, &settings, origin) else {
+    let Some(mut player) = Player::spawn(collision, &settings, origin) else {
         return Some(Err(format!("no room for a player at the player start ({})", vector(origin))));
     };
     for _ in 0..133 {
-        player.tick(&collision, &settings, &Command::default(), 0.015);
+        player.tick(collision, &settings, &Command::default(), 0.015);
     }
     Some(if player.on_ground || player.water_level >= 2 {
         Ok(())
@@ -97,8 +103,9 @@ pub fn stand_at_start(bsp: &Bsp) -> Option<Result<(), String>> {
 mod tests {
     use std::sync::Arc;
 
+    use gmod_bsp::collision::Hull;
     use gmod_bsp::mask;
-    use gmod_bsp::testmap::{TestBrush, TestMap};
+    use gmod_bsp::testmap::{TestBrush, TestMap, TestStaticProp};
 
     use super::*;
 
@@ -112,35 +119,65 @@ mod tests {
         if let Some([x, y, z]) = start {
             entities += &format!("{{\n\"classname\" \"info_player_start\"\n\"origin\" \"{x} {y} {z}\"\n}}\n");
         }
-        let bytes = TestMap { models: vec![world, door], entities, ..TestMap::default() }.bytes();
+        let crate_prop = TestStaticProp { model: "models/props/crate.mdl".into(), origin: [-400.0, 0.0, 0.0], angles: [0.0; 3], solid: 6 };
+        let bytes = TestMap { models: vec![world, door], static_props: vec![crate_prop], entities, ..TestMap::default() }.bytes();
         Bsp::parse("maps/test.bsp".into(), Arc::from(bytes)).unwrap()
+    }
+
+    /// What is solid in the map, the crate at -400 as a 32-unit box.
+    fn solid(bsp: &Bsp) -> Collision {
+        let mut collision = Collision::new(bsp);
+        let shape = collision.add_shape(vec![Hull::cuboid([-16.0, -16.0, 0.0], [16.0, 16.0, 32.0])]);
+        collision.add_static(0, shape, [-400.0, 0.0, 0.0], [0.0; 3]);
+        collision
     }
 
     #[test]
     fn traces_read_as_in_the_game() {
         let bsp = map(None);
-        let lines = report(&bsp, [0.0, 0.0, 64.0], [400.0, 0.0, 64.0], [0.0; 3], [0.0; 3], mask::SOLID);
+        let collision = solid(&bsp);
+        let lines = report(&bsp, &collision, [0.0, 0.0, 64.0], [400.0, 0.0, 64.0], [0.0; 3], [0.0; 3], mask::SOLID);
         assert_eq!(lines[0], "maps/test.bsp: a ray from 0 0 64 to 400 0 64, mask 33570827");
         assert!(lines.contains(&"  HitPos             99.96875 0 64".to_string()), "{lines:#?}");
         assert!(lines.contains(&"  HitNormal          -1 0 0".to_string()));
         assert!(lines.contains(&"  Contents           1 (SOLID)".to_string()));
         assert!(lines.contains(&"  HitTexture         BRICK/BRICKWALL001A".to_string()));
         assert!(lines.contains(&"  Entity             worldspawn".to_string()));
-        let door = report(&bsp, [-200.0, 0.0, 100.0], [-200.0, 0.0, -100.0], [-16.0, -16.0, 0.0], [16.0, 16.0, 72.0], mask::PLAYERSOLID);
+        let door = report(
+            &bsp,
+            &collision,
+            [-200.0, 0.0, 100.0],
+            [-200.0, 0.0, -100.0],
+            [-16.0, -16.0, 0.0],
+            [16.0, 16.0, 72.0],
+            mask::PLAYERSOLID,
+        );
         assert!(door[0].contains("the box -16 -16 0 to 16 16 72"));
         assert!(door.contains(&"  Entity             func_door (model *1)".to_string()), "{door:#?}");
         assert!(door.contains(&"  HitWorld           false".to_string()));
+        // a static prop is part of the world, as in the game
+        let prop = report(&bsp, &collision, [-400.0, 0.0, 100.0], [-400.0, 0.0, -100.0], [0.0; 3], [0.0; 3], mask::SOLID);
+        assert!(prop.contains(&"  HitPos             -400 0 32.03125".to_string()), "{prop:#?}");
+        assert!(prop.contains(&"  HitTexture         **studio**".to_string()));
+        assert!(prop.contains(&"  HitWorld           true".to_string()));
+        assert!(prop.contains(&"  Entity             worldspawn (static prop 0, models/props/crate.mdl)".to_string()), "{prop:#?}");
     }
 
     #[test]
     fn players_stand_at_the_start() {
-        assert_eq!(stand_at_start(&map(Some([0.0, 0.0, 0.0]))), Some(Ok(())));
-        assert_eq!(stand_at_start(&map(Some([0.0, 0.0, 40.0]))), Some(Ok(())));
-        let walled = stand_at_start(&map(Some([116.0, 0.0, 0.0])));
+        let stand = |start: Option<[f32; 3]>| {
+            let bsp = map(start);
+            stand_at_start(&bsp, &solid(&bsp))
+        };
+        assert_eq!(stand(Some([0.0, 0.0, 0.0])), Some(Ok(())));
+        assert_eq!(stand(Some([0.0, 0.0, 40.0])), Some(Ok(())));
+        // on the crate
+        assert_eq!(stand(Some([-400.0, 0.0, 40.0])), Some(Ok(())));
+        let walled = stand(Some([116.0, 0.0, 0.0]));
         assert!(walled.as_ref().is_some_and(|r| r.as_ref().is_err_and(|e| e.contains("no room"))), "{walled:?}");
         // off the edge of the floor: falling
-        let falling = stand_at_start(&map(Some([2000.0, 0.0, 0.0])));
+        let falling = stand(Some([2000.0, 0.0, 0.0]));
         assert!(falling.as_ref().is_some_and(|r| r.as_ref().is_err_and(|e| e.contains("still falls"))), "{falling:?}");
-        assert_eq!(stand_at_start(&map(None)), None);
+        assert_eq!(stand(None), None);
     }
 }

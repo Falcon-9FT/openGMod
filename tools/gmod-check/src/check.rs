@@ -60,6 +60,8 @@ pub struct Report {
     pub textures: Tally,
     pub materials: Tally,
     pub models: Tally,
+    /// Physics models (`.phy`) of the models that read.
+    pub physics: Tally,
     pub maps: Tally,
     /// Maps where a player put at the start stands: what is solid there is read right.
     pub collision: Tally,
@@ -75,7 +77,7 @@ pub struct Report {
 
 impl Report {
     pub fn failures(&self) -> usize {
-        [&self.keyvalues, &self.lua, &self.textures, &self.materials, &self.models, &self.maps, &self.collision]
+        [&self.keyvalues, &self.lua, &self.textures, &self.materials, &self.models, &self.physics, &self.maps, &self.collision]
             .iter()
             .map(|t| t.failed.len())
             .sum::<usize>()
@@ -112,6 +114,11 @@ impl Report {
             self.models.failed.len()
         ));
         out.line(format!(
+            "  Physics    {:>8} read   {:>6} failed   (PHY of those models: convex pieces, masses, ragdoll joints)",
+            self.physics.ok,
+            self.physics.failed.len()
+        ));
+        out.line(format!(
             "  Maps       {:>8} read   {:>6} failed   (BSP: world, lightmaps, displacements, static props, brushes)",
             self.maps.ok,
             self.maps.failed.len()
@@ -143,6 +150,7 @@ impl Report {
             ("Texture failures", &self.textures.failed),
             ("Material failures", &self.materials.failed),
             ("Model failures", &self.models.failed),
+            ("Physics failures", &self.physics.failed),
             ("Map failures", &self.maps.failed),
             ("Collision failures", &self.collision.failed),
             ("Unreadable", &self.unreadable),
@@ -289,7 +297,7 @@ fn check_material(vfs: &Vfs, path: &str, where_: &str, report: &mut Report) {
 }
 
 /// A model reads when its three files do and fit together into triangles; its materials should
-/// be there.
+/// be there. Its physics model, if it has one, should read and belong to it.
 fn check_model(vfs: &Vfs, path: &str, where_: &str, report: &mut Report) {
     let model = match gmod_model::load(vfs, path).and_then(|model| model.mesh(0, 0).map(|_| model)) {
         Ok(model) => model,
@@ -300,6 +308,11 @@ fn check_model(vfs: &Vfs, path: &str, where_: &str, report: &mut Report) {
         }
     };
     report.models.ok += 1;
+    match gmod_model::load_physics(vfs, path, model.mdl.checksum) {
+        Ok(Some(_)) => report.physics.ok += 1,
+        Ok(None) => {}
+        Err(e) => report.physics.failed.push(format!("{where_}: {e}")),
+    }
     for texture in 0..model.mdl.textures.len() {
         let candidates = model.mdl.material_candidates(texture);
         if !candidates.iter().any(|name| material_path(name).is_some_and(|file| vfs.exists(&file, "GAME")))
@@ -327,9 +340,6 @@ fn check_map(vfs: &mut Vfs, path: &str, where_: &str, bytes: Vec<u8>, report: &m
         Err(e) => return report.maps.failed.push(format!("{where_}: pakfile: {e}")),
     };
     report.maps.ok += 1;
-    if let Some(stands) = crate::trace::stand_at_start(&bsp) {
-        count(&mut report.collision, where_, stands);
-    }
     let mounted = pak.is_some();
     if let Some(pak) = pak {
         let entries: Vec<String> = pak.entries().iter().map(|e| e.path.clone()).collect();
@@ -355,6 +365,11 @@ fn check_map(vfs: &mut Vfs, path: &str, where_: &str, bytes: Vec<u8>, report: &m
         if !vfs.exists(model, "GAME") {
             report.missing_models.push(format!("{where_}: {model}"));
         }
+    }
+    // what is solid, the props of the pakfile's models among it
+    let (collision, _) = gmod_world::collision(vfs, &bsp);
+    if let Some(stands) = crate::trace::stand_at_start(&bsp, &collision) {
+        count(&mut report.collision, where_, stands);
     }
     if mounted {
         vfs.remove(0);

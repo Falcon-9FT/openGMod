@@ -274,7 +274,7 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
             return render_map(&mut Vfs::new(), args.operand.as_deref().unwrap_or_default(), args);
         }
         Err(_) if args.command == "trace" && args.operand.as_deref().is_some_and(|map| Path::new(map).is_file()) => {
-            return trace_map(&Vfs::new(), args.operand.as_deref().unwrap_or_default(), args);
+            return trace_map(&mut Vfs::new(), args.operand.as_deref().unwrap_or_default(), args);
         }
         Err(e) => {
             out.line(e.to_string());
@@ -334,7 +334,7 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
         },
         "lua" => lua::run(std::mem::take(&mut vfs), operand, args.all, out),
         "render" => render_map(&mut vfs, operand, args),
-        "trace" => trace_map(&vfs, operand, args),
+        "trace" => trace_map(&mut vfs, operand, args),
         _ => unreachable!("commands are checked when parsing"),
     }
 }
@@ -353,16 +353,28 @@ fn read_map(vfs: &Vfs, map: &str) -> Result<gmod_bsp::Bsp, String> {
     gmod_bsp::Bsp::parse(PathBuf::from(&path), Arc::from(bytes)).map_err(|e| e.to_string())
 }
 
-/// `trace`: a sweep through the map, printed.
-fn trace_map(vfs: &Vfs, map: &str, args: &Args) -> ExitCode {
+/// `trace`: a sweep through the map, printed. The map's pakfile is mounted in front while
+/// the physics models of its props are read.
+fn trace_map(vfs: &mut Vfs, map: &str, args: &Args) -> ExitCode {
     let bsp = match read_map(vfs, map) {
         Ok(bsp) => bsp,
         Err(e) => return fail(&e),
     };
     let (Some(from), Some(to)) = (args.view.eye, args.view.target) else { return fail("trace needs --from and --to") };
+    let mounted = match gmod_world::mount_pakfile(vfs, &bsp) {
+        Ok(mounted) => mounted,
+        Err(e) => return fail(&format!("{}: pakfile: {e}", bsp.label.display())),
+    };
+    let (collision, failed) = gmod_world::collision(vfs, &bsp);
+    if mounted {
+        vfs.remove(0);
+    }
     let mask = args.mask.unwrap_or(gmod_bsp::mask::SOLID);
-    for line in trace::report(&bsp, from, to, args.mins.unwrap_or_default(), args.maxs.unwrap_or_default(), mask) {
+    for line in trace::report(&bsp, &collision, from, to, args.mins.unwrap_or_default(), args.maxs.unwrap_or_default(), mask) {
         say!("{line}");
+    }
+    for physics in failed {
+        say!("Not solid, its physics model could not be read: {physics}");
     }
     ExitCode::SUCCESS
 }
