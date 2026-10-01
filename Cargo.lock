@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "gmod-bsp"
+version = "0.1.0"
+dependencies = [
+ "gmod-fs",
+]
+
+[[package]]
 name = "gmod-check"
 version = "0.1.0"
 dependencies = [

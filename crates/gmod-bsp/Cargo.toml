@@ -1,0 +1,10 @@
+[package]
+name = "gmod-bsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Source engine maps (.bsp v19-21): lumps, entities, static props, pakfile, and world meshes with lightmaps"
+
+[dependencies]
+gmod-fs.workspace = true

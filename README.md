@@ -2,8 +2,9 @@
 
 **openGMOD** — реимплементация движка Garry's Mod с нуля на Rust, по примеру
 [OpenMW](https://openmw.org) и [openOMSI](https://github.com/turbo-devv/openOMSI). Цель — 64-битный
-многопоточный движок с современным рендером (wgpu: Vulkan / DirectX 12), на котором
-работают контент, Lua-аддоны, геймоды и воркшоп Garry's Mod без изменений.
+многопоточный движок с современным рендером (wgpu: DirectX 12, запасной — Vulkan), на котором
+работают контент, Lua-аддоны, геймоды и воркшоп Garry's Mod без изменений. Сейчас — под Windows;
+Linux и macOS — позже.
 
 > [!IMPORTANT]
 > **Нужна лицензионная Garry's Mod.** В openGMOD нет игрового контента: он работает на файлах
@@ -67,9 +68,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 openGMod/
 ├── crates/
-│   ├── gmod-fs/     установка, VPK, GMA, LZMA, воркшоп, файловая система, папка пользователя
+│   ├── gmod-fs/     установка, VPK, GMA, zip, LZMA, воркшоп, файловая система, папка пользователя
 │   ├── gmod-kv/     KeyValues
-│   └── gmod-glua/   диалект Lua из GMod → LuaJIT
+│   ├── gmod-glua/   диалект Lua из GMod → LuaJIT
+│   └── gmod-bsp/    карты BSP и сетка мира из них
 ├── tools/
 │   └── gmod-check/  проверка установки и просмотр игровой файловой системы
 ├── docs/            архитектура, физика, дорожная карта, форматы

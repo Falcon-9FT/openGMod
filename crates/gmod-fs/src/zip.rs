@@ -5,12 +5,14 @@
 //! its local header. Entries stored (method 0), deflated (8) or LZMA-compressed (14, what
 //! Valve's `bspzip -repack` writes) can be read. Offsets are taken relative to where the
 //! directory really is, so an archive embedded in another file (a pakfile lump) reads the same
-//! whether its offsets count from the archive or from the file.
+//! whether its offsets count from the archive or from the file. The bytes may be a file or
+//! memory: a map from a workshop addon is read into memory, its pakfile with it.
 
 use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::crc32::crc32;
 use crate::index;
@@ -34,10 +36,38 @@ pub struct ZipEntry {
     header: u64,
 }
 
-/// An open zip archive, or a zip inside a file (a map's pakfile).
+/// Where an archive's bytes are.
+enum Data {
+    File(File),
+    Memory(Arc<[u8]>),
+}
+
+impl Data {
+    fn len(&self) -> io::Result<u64> {
+        match self {
+            Data::File(file) => Ok(file.metadata()?.len()),
+            Data::Memory(bytes) => Ok(bytes.len() as u64),
+        }
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        match self {
+            Data::File(file) => read_exact_at(file, buf, offset),
+            Data::Memory(bytes) => {
+                let start = usize::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+                let source = start.checked_add(buf.len()).and_then(|end| bytes.get(start..end));
+                buf.copy_from_slice(source.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// An open zip archive, or a zip inside a file or in memory (a map's pakfile).
 pub struct ZipArchive {
+    /// The file, or what the bytes in memory came from.
     path: PathBuf,
-    file: File,
+    data: Data,
     /// Where the archive starts in the file, and its length.
     base: u64,
     len: u64,
@@ -68,14 +98,24 @@ impl ZipArchive {
 
     /// Opens the zip that occupies `len` bytes from `offset` in the file at `path`.
     pub fn open_range(path: &Path, offset: u64, len: u64) -> io::Result<ZipArchive> {
+        let file = File::open(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        ZipArchive::new(path.to_path_buf(), Data::File(file), offset, len)
+    }
+
+    /// The zip that occupies `len` bytes from `offset` in `bytes`; `label` names where the bytes
+    /// came from (a map inside an addon) in messages.
+    pub fn from_memory(label: PathBuf, bytes: Arc<[u8]>, offset: u64, len: u64) -> io::Result<ZipArchive> {
+        ZipArchive::new(label, Data::Memory(bytes), offset, len)
+    }
+
+    fn new(path: PathBuf, data: Data, offset: u64, len: u64) -> io::Result<ZipArchive> {
         let context = |e: io::Error| io::Error::new(e.kind(), format!("{} (zip at {offset}): {e}", path.display()));
-        let file = File::open(path).map_err(context)?;
-        let file_len = file.metadata().map_err(context)?.len();
-        if offset.checked_add(len).is_none_or(|end| end > file_len) {
+        let total = data.len().map_err(context)?;
+        if offset.checked_add(len).is_none_or(|end| end > total) {
             return Err(context(invalid("the archive runs past the end of the file")));
         }
-        let entries = read_directory(&file, offset, len).map_err(context)?;
-        Ok(ZipArchive { path: path.to_path_buf(), file, base: offset, len, entries })
+        let entries = read_directory(&data, offset, len).map_err(context)?;
+        Ok(ZipArchive { path, data, base: offset, len, entries })
     }
 
     /// The file the archive is in.
@@ -128,7 +168,7 @@ impl ZipArchive {
         if entry.header + 30 > self.len {
             return Err(context(invalid("local header past the end of the archive")));
         }
-        read_exact_at(&self.file, &mut header, self.base + entry.header).map_err(context)?;
+        self.data.read_at(&mut header, self.base + entry.header).map_err(context)?;
         if u32_at(&header, 0) != LOCAL_HEADER {
             return Err(context(invalid("no local header where the directory says")));
         }
@@ -137,7 +177,7 @@ impl ZipArchive {
             return Err(context(invalid("data past the end of the archive")));
         }
         let mut data = vec![0u8; entry.compressed as usize];
-        read_exact_at(&self.file, &mut data, self.base + start).map_err(context)?;
+        self.data.read_at(&mut data, self.base + start).map_err(context)?;
         let out = match entry.method {
             0 => data,
             8 => inflate::inflate(&data, entry.size as usize, entry.size).map_err(context)?,
@@ -166,14 +206,14 @@ impl ZipArchive {
     }
 }
 
-fn read_directory(file: &File, base: u64, len: u64) -> io::Result<Vec<ZipEntry>> {
+fn read_directory(data: &Data, base: u64, len: u64) -> io::Result<Vec<ZipEntry>> {
     // the end-of-directory record: 22 bytes and a comment of up to 65 535
     let tail_len = len.min(22 + 65_535);
     if tail_len < 22 {
         return Err(invalid("too short to be a zip archive"));
     }
     let mut tail = vec![0u8; tail_len as usize];
-    read_exact_at(file, &mut tail, base + len - tail_len)?;
+    data.read_at(&mut tail, base + len - tail_len)?;
     let at = (0..=tail.len() - 22).rev().find(|&i| u32_at(&tail, i) == END_OF_DIRECTORY).ok_or_else(|| invalid("not a zip archive"))?;
     let record = &tail[at..];
     let count = u16_at(record, 10) as usize;
@@ -187,7 +227,7 @@ fn read_directory(file: &File, base: u64, len: u64) -> io::Result<Vec<ZipEntry>>
     let directory_start = record_position.checked_sub(directory_size).ok_or_else(|| invalid("the directory is larger than the archive"))?;
     let shift = directory_start as i64 - directory_offset as i64;
     let mut directory = vec![0u8; directory_size as usize];
-    read_exact_at(file, &mut directory, base + directory_start)?;
+    data.read_at(&mut directory, base + directory_start)?;
 
     let mut entries = Vec::with_capacity(count);
     let mut pos = 0usize;
@@ -260,6 +300,10 @@ mod tests {
         let embedded = tmp.path().join("map.bsp");
         std::fs::write(&embedded, &map).unwrap();
         check(&ZipArchive::open_range(&embedded, offset, sample().len() as u64).unwrap());
+
+        // and in memory
+        let bytes: Arc<[u8]> = map.into();
+        check(&ZipArchive::from_memory("map.bsp".into(), bytes, offset, sample().len() as u64).unwrap());
 
         // the same bytes opened as a whole file: offsets are off by the prefix, which is noticed
         let mut prefixed = b"prefix".repeat(10);

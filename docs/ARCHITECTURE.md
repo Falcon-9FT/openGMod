@@ -36,7 +36,8 @@
   чужих файлов на C++ — главный источник уязвимостей в Source. В Rust эти ошибки исключены
   языком: в crate'ах openGMOD стоит `#![forbid(unsafe_code)]`, а размеры из файлов проверяются,
   прежде чем по ним что-то выделяется.
-* **Сборка одной командой** на Windows и Linux (Cargo), CI на каждый коммит.
+* **Сборка одной командой** (Cargo), CI на каждый коммит. Сейчас платформа одна — Windows; код к ней
+  не привязан, Linux и macOS добавятся позже.
 * **Экосистема:** wgpu и winit (рендер и окна), mlua (LuaJIT), cpal (звук). Производительность
   на уровне C++.
 
@@ -49,10 +50,11 @@
 
 ### Рендер: wgpu + winit
 
-Как в openOMSI, но только Vulkan и DirectX 12. Платформы — Windows (DirectX 12 или Vulkan) и Linux
-(Vulkan). Бэкенды wgpu включаются по отдельности: Metal и OpenGL в сборку не входят. Шейдеры Source
-(`LightmappedGeneric`, `VertexLitGeneric`, `UnlitGeneric`, `WorldVertexTransition`, `Water`,
-`Refract`...) переписываются на WGSL по их наблюдаемому результату.
+Как в openOMSI. Сейчас — Windows: DirectX 12, запасной — Vulkan. Linux (Vulkan) и macOS (Metal)
+позже. Бэкенды wgpu включаются по отдельности: OpenGL в сборку не входит, Metal появится вместе с
+macOS. Шейдеры Source (`LightmappedGeneric`, `VertexLitGeneric`, `UnlitGeneric`,
+`WorldVertexTransition`, `Water`, `Refract`...) переписываются на WGSL по их наблюдаемому
+результату.
 
 ### Lua: LuaJIT через mlua + перевод диалекта
 
@@ -106,7 +108,8 @@ cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, з
 | KeyValues | `gmod-kv` | готово; `#base`/`#include` пока только распознаются |
 | диалект Lua | `gmod-glua` | готово |
 | Lua-рантайм: LuaJIT, `include`, `AddCSLuaFile`, `hook`, `timer`, реалмы | `gmod-lua` | этап 3 |
-| карты BSP v19–21: LZMA-лампы, дисплейсменты, статические пропы, pakfile, PVS | `gmod-bsp` | этап 2 |
+| zip (pakfile карт): без сжатия, DEFLATE, LZMA | `gmod-fs::zip` | готово |
+| карты BSP v19–21: LZMA-лампы, дисплейсменты, статические пропы, pakfile, PVS | `gmod-bsp` | чтение и сетка мира готовы; PVS — этап 2 |
 | материалы VMT, текстуры VTF | `gmod-material` | этап 2 |
 | модели MDL / VVD / VTX / PHY | `gmod-model` | этапы 2 и 4 |
 | рендер | `gmod-render` | этап 2 |
