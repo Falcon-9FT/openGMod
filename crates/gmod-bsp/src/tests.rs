@@ -23,7 +23,7 @@ fn reads_every_lump() {
     assert_eq!(bsp.face_material(&bsp.faces[1]), Some("BRICK/BRICKWALL001A"));
     assert_eq!(
         bsp.face_vertices(&bsp.faces[2]).collect::<Vec<_>>(),
-        [[256.0, 0.0, 0.0], [384.0, 0.0, 0.0], [384.0, 128.0, 0.0], [256.0, 128.0, 0.0]]
+        [[256.0, 0.0, 0.0], [256.0, 128.0, 0.0], [384.0, 128.0, 0.0], [384.0, 0.0, 0.0]]
     );
     assert_eq!(bsp.displacements.len(), 1);
     assert_eq!(bsp.displacements[0].side(), 5);
@@ -50,6 +50,10 @@ fn rejects_what_is_not_a_map() {
     broken[faces + 4..faces + 8].copy_from_slice(&1000i32.to_le_bytes());
     let err = Bsp::parse("x".into(), Arc::from(broken)).unwrap_err();
     assert!(err.to_string().contains("edges out of range"), "{err}");
+}
+
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
 fn lightmap_at(mesh: &mesh::Mesh, uv: [f32; 2]) -> [f32; 3] {
@@ -85,19 +89,26 @@ fn world_mesh() {
     assert_eq!(floor[2].uv, [128.0 / 512.0, 128.0 / 256.0]);
     assert!(floor.iter().all(|v| v.normal == [0.0, 0.0, 1.0]));
 
-    // displacement: rows run from the start corner (256, 0, 0) along x, columns along y; each
-    // column is raised 4 units more, and alpha grows by row
+    // displacement: rows run from the start corner (256, 0, 0) to the next corner (along y),
+    // columns across (along x); each column is raised 4 units more, and alpha grows by row
     let disp = &mesh.vertices[8..];
     let at = |row: usize, column: usize| disp[row * 5 + column];
     assert_eq!(at(0, 0).position, [256.0, 0.0, 0.0]);
-    assert_eq!(at(4, 0).position, [384.0, 0.0, 0.0]);
-    assert_eq!(at(0, 4).position, [256.0, 128.0, 16.0]);
+    assert_eq!(at(4, 0).position, [256.0, 128.0, 0.0]);
+    assert_eq!(at(0, 4).position, [384.0, 0.0, 16.0]);
     assert_eq!(at(4, 4).position, [384.0, 128.0, 16.0]);
-    assert_eq!(at(2, 1).position, [320.0, 32.0, 4.0]);
+    assert_eq!(at(2, 1).position, [288.0, 64.0, 4.0]);
     assert!((at(4, 2).alpha - 1.0).abs() < 1e-6 && at(0, 2).alpha == 0.0);
     assert_eq!(at(4, 4).uv, [384.0 / 512.0, 128.0 / 256.0]);
-    // a slope rising toward +y: normals lean toward -y and still point up
-    assert!(disp.iter().all(|v| v.normal[2] > 0.9 && v.normal[1] < 0.0), "{:?}", at(2, 2).normal);
+    // a slope rising toward +x: normals lean toward -x and still point up
+    assert!(disp.iter().all(|v| v.normal[2] > 0.9 && v.normal[0] < 0.0), "{:?}", at(2, 2).normal);
+    // triangles turn clockwise seen from the front, as the game's do
+    for tri in mesh.indices.chunks(3) {
+        let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[tri[k] as usize]);
+        let (u, v) = (sub(b.position, a.position), sub(c.position, a.position));
+        let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        assert!(n[0] * a.normal[0] + n[1] * a.normal[1] + n[2] * a.normal[2] < 0.0, "{tri:?}");
+    }
 }
 
 #[test]

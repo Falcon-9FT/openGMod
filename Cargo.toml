@@ -8,6 +8,8 @@ members = [
     "crates/gmod-material",
     "crates/gmod-model",
     "crates/gmod-world",
+    "crates/gmod-render",
+    "crates/gmod-app",
     "tools/gmod-check",
 ]
 
@@ -26,6 +28,10 @@ gmod-bsp = { path = "crates/gmod-bsp" }
 gmod-material = { path = "crates/gmod-material" }
 gmod-model = { path = "crates/gmod-model" }
 gmod-world = { path = "crates/gmod-world" }
+gmod-render = { path = "crates/gmod-render" }
+# the GPU: Direct3D 12 and Vulkan only - no OpenGL, no Metal until macOS
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 
 [profile.release]
 opt-level = 3

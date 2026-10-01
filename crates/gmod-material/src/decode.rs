@@ -100,6 +100,36 @@ pub fn half(bits: u16) -> f32 {
     }
 }
 
+/// The IEEE 754 half float nearest to `value` (ties to even); beyond the largest half,
+/// infinity.
+pub fn to_half(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x7F_FFFF;
+    if exponent == 0xFF {
+        return sign | 0x7C00 | if mantissa != 0 { 0x200 } else { 0 };
+    }
+    // the exponent biased for a half
+    let e = exponent - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    let round = |kept: u32, rest: u32, halfway: u32| if rest > halfway || (rest == halfway && kept & 1 == 1) { kept + 1 } else { kept };
+    if e <= 0 {
+        // a subnormal half: k times 2^-24
+        if e < -10 {
+            return sign;
+        }
+        let m = mantissa | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let kept = round(m >> shift, m & ((1 << shift) - 1), 1 << (shift - 1));
+        return sign | kept as u16;
+    }
+    // a carry out of the mantissa moves on into the exponent, as it should
+    sign | round((e as u32) << 10 | (mantissa >> 13), mantissa & 0x1FFF, 0x1000) as u16
+}
+
 fn unit_float(v: f32) -> u8 {
     // NaN turns into 0
     (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8

@@ -1,0 +1,17 @@
+[package]
+name = "gmod-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Draws a map on the GPU with wgpu: Direct3D 12, Vulkan as the fallback"
+
+[dependencies]
+gmod-world.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+gmod-bsp = { workspace = true, features = ["testmap"] }
+gmod-fs.workspace = true
+# checks the shaders without a GPU
+naga = { version = "30.0.0", features = ["wgsl-in"] }

@@ -8,7 +8,8 @@
 //! sky box.
 //!
 //! The map's pakfile holds materials, models and the props' light: mount it in front first
-//! ([`mount_pakfile`]), as the engine does while the map is played.
+//! ([`mount_pakfile`]), as the engine does while the map is played. [`gpu`] lays the world out
+//! for a GPU.
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +21,10 @@ use gmod_bsp::{Bsp, mesh};
 use gmod_fs::{Backing, Mount, Vfs};
 use gmod_material::{Library, Material, Vtf};
 use gmod_model::{Model, Vhv};
+
+pub mod gpu;
+
+pub use gmod_bsp::mesh::Lightmap;
 
 pub type Vec3 = [f32; 3];
 
@@ -37,6 +42,10 @@ fn scale(a: Vec3, s: f32) -> Vec3 {
 
 fn dot(a: Vec3, b: Vec3) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
 fn normalize(a: Vec3) -> Vec3 {

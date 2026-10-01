@@ -287,6 +287,31 @@ fn half_floats() {
 }
 
 #[test]
+fn halves_from_floats() {
+    use crate::decode::to_half;
+    assert_eq!(to_half(1.0), 0x3C00);
+    assert_eq!(to_half(-2.0), 0xC000);
+    assert_eq!(to_half(65504.0), 0x7BFF);
+    assert_eq!(to_half(65520.0), 0x7C00, "halfway to infinity rounds to even: infinity");
+    assert_eq!(to_half(1e9), 0x7C00);
+    assert_eq!(to_half(f32::NEG_INFINITY), 0xFC00);
+    assert!(half(to_half(f32::NAN)).is_nan());
+    assert_eq!(to_half(2f32.powi(-24)), 1);
+    assert_eq!(to_half(1e-8), 0);
+    assert_eq!(to_half(0.1), 0x2E66);
+    // every half there is comes back as itself
+    for bits in 0..=u16::MAX {
+        let value = half(bits);
+        if !value.is_nan() {
+            assert_eq!(to_half(value), bits, "{bits:#x}");
+        }
+    }
+    // a value between two halves goes to the nearer one
+    assert_eq!(to_half(1.0 + 0.75 / 1024.0), 0x3C01);
+    assert_eq!(to_half(1.0 + 0.25 / 1024.0), 0x3C00);
+}
+
+#[test]
 fn format_numbers_and_sizes() {
     for raw in 0..30 {
         assert_eq!(Format::from_raw(raw).unwrap().raw(), raw);

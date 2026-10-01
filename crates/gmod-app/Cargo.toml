@@ -1,0 +1,19 @@
+[package]
+name = "gmod-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "opengmod: opens a Garry's Mod map from your installation and lets you fly around it"
+
+[[bin]]
+name = "opengmod"
+path = "src/main.rs"
+
+[dependencies]
+gmod-fs.workspace = true
+gmod-bsp.workspace = true
+gmod-world.workspace = true
+gmod-render.workspace = true
+wgpu.workspace = true
+winit.workspace = true
