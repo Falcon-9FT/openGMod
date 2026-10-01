@@ -48,6 +48,8 @@ cargo run --release -p gmod-check -- ls lua/autorun   # папка игрово�
 cargo run --release -p gmod-check -- find "maps/*.bsp"
 cargo run --release -p gmod-check -- glua lua/includes/init.lua   # Lua так, как его увидит LuaJIT
 cargo run --release -p gmod-check -- --crc            # плюс проверка CRC каждого файла архивов
+cargo run --release -p gmod-check -- render gm_construct          # картинка карты в gm_construct.png
+cargo run --release -p gmod-check -- render gm_flatgrass --from 0,0,200 --to 800,0,100 --size 1920x1080
 ```
 
 `gmod-check` читает каждый файл, для которого в openGMOD уже есть читатель (архивы,
@@ -57,6 +59,11 @@ KeyValues, весь Lua, текстуры, материалы и карты, в�
 материалы и модели, на которые ссылаются карты (обычно — из игр, которые не подключены). Старые сжатые загрузки воркшопа
 (`.bin`) распаковываются в `~/.opengmod/cache/workshop`, а не в папку игры (`--no-unpack`
 отключает распаковку).
+
+`render` рисует карту на процессоре и сохраняет PNG: мир и брашевые энтити с текстурами и
+световыми картами, дисплейсменты со смешиванием текстур, прозрачность, воду и небо. Это превью,
+пока не готов рендер на видеокарте; модели (пропы) на нём ещё не видны. Без `--from` камера
+встаёт на точку появления игрока.
 
 ## Сборка и тесты
 

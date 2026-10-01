@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod crc32;
+pub mod deflate;
 mod dir;
 pub mod gameinfo;
 pub mod gma;

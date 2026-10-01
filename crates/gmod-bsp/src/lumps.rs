@@ -170,8 +170,10 @@ impl Plane {
 /// A face: a convex polygon of the world or of a brush model, or the base of a displacement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Face {
+    /// The plane, already facing the way the face does: front faces are wound clockwise.
     pub plane: u16,
-    /// 1 when the face looks the other way from its plane.
+    /// 1 when the plane is the flipped one of its pair (the plane index is odd). Nothing to
+    /// turn around: [`Face::plane`] faces the right way either way.
     pub side: u8,
     pub on_node: u8,
     pub first_edge: i32,

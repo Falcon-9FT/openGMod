@@ -11,6 +11,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 use gmod_fs::install::Install;
@@ -27,10 +28,11 @@ macro_rules! say {
 
 mod check;
 mod out;
+mod render;
 
 use out::Out;
 
-const COMMANDS: [&str; 6] = ["check", "info", "ls", "find", "cat", "glua"];
+const COMMANDS: [&str; 7] = ["check", "info", "ls", "find", "cat", "glua", "render"];
 
 const USAGE: &str = "\
 gmod-check - what openGMOD can read of a Garry's Mod installation
@@ -47,6 +49,8 @@ COMMANDS:
     cat <FILE>       a file, to standard output
     glua <FILE>      a Lua file as openGMOD hands it to LuaJIT (a file of the game, or
                      one on disk - that needs no installation)
+    render <MAP>     a picture of a map (gm_construct, or a .bsp file) drawn on the CPU:
+                     the world with textures and light maps, saved as PNG
 
 OPTIONS:
     --gmod <DIR>         the Garry's Mod folder (default: GMOD_ROOT, then Steam's libraries)
@@ -56,6 +60,11 @@ OPTIONS:
     --no-unpack          do not unpack old compressed workshop downloads (.bin)
     --crc                check: also verify the CRC-32 of every archive entry (reads everything)
     --all                check: list every failure, not only the first 20 of each kind
+    --out <FILE>         render: the PNG to write (default: <MAP>.png here)
+    --from <X,Y,Z>       render: the eye (default: a player start)
+    --to <X,Y,Z>         render: the point looked at
+    --size <WxH>         render: pixels (default: 1280x720)
+    --fov <DEGREES>      render: horizontal field of view (default: 90)
     -V, --version        the version
     -h, --help           this text";
 
@@ -73,6 +82,19 @@ pub struct Args {
     pub all: bool,
     pub help: bool,
     pub version: bool,
+    pub out: Option<PathBuf>,
+    pub view: render::View,
+}
+
+/// `X,Y,Z` as three numbers.
+fn point(text: &str) -> Result<[f32; 3], String> {
+    let numbers: Vec<f32> = text
+        .split([',', ' '])
+        .filter(|p| !p.is_empty())
+        .map(|p| p.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("{text:?} is not X,Y,Z"))?;
+    numbers.try_into().map_err(|_| format!("{text:?} is not X,Y,Z"))
 }
 
 impl Args {
@@ -89,6 +111,8 @@ impl Args {
             all: false,
             help: false,
             version: false,
+            out: None,
+            view: render::View::default(),
         };
         let mut positional = Vec::new();
         while let Some(arg) = raw.next() {
@@ -100,6 +124,16 @@ impl Args {
                 "--no-unpack" => args.unpack = false,
                 "--crc" => args.crc = true,
                 "--all" => args.all = true,
+                "--out" => args.out = Some(raw.next().ok_or("--out needs a file")?.into()),
+                "--from" => args.view.eye = Some(point(&raw.next().ok_or("--from needs X,Y,Z")?)?),
+                "--to" => args.view.target = Some(point(&raw.next().ok_or("--to needs X,Y,Z")?)?),
+                "--size" => {
+                    let size = raw.next().ok_or("--size needs WxH")?;
+                    let (w, h) = size.split_once(['x', 'X']).ok_or(format!("{size:?} is not WxH"))?;
+                    args.view.width = w.parse().map_err(|_| format!("{size:?} is not WxH"))?;
+                    args.view.height = h.parse().map_err(|_| format!("{size:?} is not WxH"))?;
+                }
+                "--fov" => args.view.fov = raw.next().and_then(|f| f.parse().ok()).ok_or("--fov needs degrees")?,
                 "-h" | "--help" => args.help = true,
                 "-V" | "--version" => args.version = true,
                 flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
@@ -117,7 +151,7 @@ impl Args {
         if let Some(extra) = positional.next() {
             return Err(format!("unexpected argument {extra:?}"));
         }
-        let needs_operand = ["ls", "find", "cat", "glua"].contains(&args.command.as_str());
+        let needs_operand = ["ls", "find", "cat", "glua", "render"].contains(&args.command.as_str());
         if !COMMANDS.contains(&args.command.as_str()) {
             return Err(format!("unknown command {:?}", args.command));
         }
@@ -199,6 +233,11 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
     let started = Instant::now();
     let install = match Install::locate(args.gmod.as_deref()) {
         Ok(install) => install,
+        // a map on disk can be drawn without the game, only not with its materials
+        Err(e) if args.command == "render" && args.operand.as_deref().is_some_and(|map| Path::new(map).is_file()) => {
+            say!("{e}\nDrawing without the game's materials.");
+            return render_map(&mut Vfs::new(), args.operand.as_deref().unwrap_or_default(), args);
+        }
         Err(e) => {
             out.line(e.to_string());
             if cfg!(windows) {
@@ -255,8 +294,50 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
             Ok(bytes) => print_glua(&bytes, operand),
             Err(e) => fail(&e.to_string()),
         },
+        "render" => render_map(&mut vfs, operand, args),
         _ => unreachable!("commands are checked when parsing"),
     }
+}
+
+/// `render`: the map is a file on disk, or a name in the game (`gm_construct`).
+fn render_map(vfs: &mut Vfs, map: &str, args: &Args) -> ExitCode {
+    let on_disk = Path::new(map).is_file();
+    let path = if on_disk {
+        map.to_string()
+    } else {
+        let name = map.trim_end_matches(".bsp");
+        if name.contains('/') || name.contains('\\') { format!("{name}.bsp") } else { format!("maps/{name}.bsp") }
+    };
+    let bytes = if on_disk { std::fs::read(&path) } else { vfs.read(&path, "GAME") };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(e) => return fail(&format!("{path}: {e}")),
+    };
+    let bsp = match gmod_bsp::Bsp::parse(PathBuf::from(&path), Arc::from(bytes)) {
+        Ok(bsp) => bsp,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let picture = match render::render(vfs, &bsp, &args.view) {
+        Ok(picture) => picture,
+        Err(e) => return fail(&format!("{path}: {e}")),
+    };
+    let stem = Path::new(&path).file_stem().map_or("map".into(), |s| s.to_string_lossy().into_owned());
+    let file = args.out.clone().unwrap_or_else(|| PathBuf::from(format!("{stem}.png")));
+    if let Err(e) = std::fs::write(&file, &picture.png) {
+        return fail(&format!("{}: {e}", file.display()));
+    }
+    let [ex, ey, ez] = picture.eye;
+    let [tx, ty, tz] = picture.target;
+    say!("{path}: {} triangles from {ex},{ey},{ez} to {tx},{ty},{tz} in {:.1} s", picture.triangles, picture.seconds);
+    for (what, names) in [("materials", &picture.missing_materials), ("textures", &picture.missing_textures)] {
+        if !names.is_empty() {
+            let shown: Vec<&str> = names.iter().take(5).map(String::as_str).collect();
+            let more = if names.len() > 5 { format!(" and {} more", names.len() - 5) } else { String::new() };
+            say!("Missing {what} ({}), drawn as purple squares: {}{more}", names.len(), shown.join(", "));
+        }
+    }
+    say!("Saved {}", file.display());
+    ExitCode::SUCCESS
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -394,5 +475,12 @@ mod tests {
         assert!(parse(&["cat"]).is_err(), "cat needs a file");
         assert!(parse(&["--unknown"]).is_err());
         assert!(parse(&["ls", "a", "b"]).is_err());
+
+        let args = parse(&["render", "gm_construct", "--from", "1,2,3", "--to", "4, 5, 6", "--size", "640x480", "--fov", "75"]).unwrap();
+        assert_eq!((args.view.eye, args.view.target), (Some([1.0, 2.0, 3.0]), Some([4.0, 5.0, 6.0])));
+        assert_eq!((args.view.width, args.view.height, args.view.fov), (640, 480, 75.0));
+        assert!(parse(&["render"]).is_err(), "render needs a map");
+        assert!(parse(&["render", "x", "--from", "1,2"]).is_err());
+        assert!(parse(&["render", "x", "--size", "big"]).is_err());
     }
 }

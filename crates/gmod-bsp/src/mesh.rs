@@ -259,8 +259,7 @@ pub fn build(bsp: &Bsp, options: Options) -> Mesh {
 }
 
 fn polygon(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placement: Option<Placement>, mesh: &mut Mesh) {
-    let plane = &bsp.planes[face.plane as usize];
-    let normal = if face.side != 0 { plane.normal.map(|c| -c) } else { plane.normal };
+    let normal = bsp.planes[face.plane as usize].normal;
     let base = mesh.vertices.len() as u32;
     let mut count = 0;
     for p in bsp.face_vertices(face) {
@@ -332,8 +331,7 @@ fn displacement(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placemen
         }
     }
     // smooth normals from the triangles, turned to face the way the base face does
-    let plane = &bsp.planes[face.plane as usize];
-    let facing = if face.side != 0 { plane.normal.map(|c| -c) } else { plane.normal };
+    let facing = bsp.planes[face.plane as usize].normal;
     let mut normals = vec![[0.0f32; 3]; side * side];
     for tri in mesh.indices[first_index..].chunks(3) {
         let [a, b, c3] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];

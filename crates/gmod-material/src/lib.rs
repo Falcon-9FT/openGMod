@@ -4,7 +4,7 @@
 //! textures and its settings ([`vmt`]). Textures are images in one of 30 pixel formats
 //! ([`Format`]), with mipmaps, animation frames and cube map faces ([`vtf`]); [`decode`]
 //! turns any of them into RGBA. [`load_material`] and [`load_texture`] read them from the
-//! game's files.
+//! game's files; a [`Library`] keeps what was read. [`png`] writes images.
 
 #![forbid(unsafe_code)]
 
@@ -14,10 +14,13 @@ use gmod_fs::Vfs;
 
 pub mod decode;
 pub mod format;
+mod library;
+pub mod png;
 pub mod vmt;
 pub mod vtf;
 
 pub use format::Format;
+pub use library::Library;
 pub use vmt::{Material, Patch, Vmt};
 pub use vtf::{Image, Vtf};
 

@@ -99,3 +99,15 @@ fn world_mesh() {
     // a slope rising toward +y: normals lean toward -y and still point up
     assert!(disp.iter().all(|v| v.normal[2] > 0.9 && v.normal[1] < 0.0), "{:?}", at(2, 2).normal);
 }
+
+#[test]
+fn faces_look_along_their_plane() {
+    // `side` only says that the plane is the flipped one of a pair; it faces the way the face does
+    let mut bytes = testmap::bytes();
+    let faces = u32::from_le_bytes(bytes[8 + 7 * 16..8 + 7 * 16 + 4].try_into().unwrap()) as usize;
+    bytes[faces + Face::SIZE + 2] = 1; // the wall's side
+    let bsp = Bsp::parse("test.bsp".into(), Arc::from(bytes)).unwrap();
+    assert_eq!(bsp.faces[1].side, 1);
+    let mesh = mesh::build(&bsp, mesh::Options::default());
+    assert!(mesh.vertices[4..8].iter().all(|v| v.normal == [0.0, 1.0, 0.0]), "{:?}", mesh.vertices[4].normal);
+}
