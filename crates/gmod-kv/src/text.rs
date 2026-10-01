@@ -20,6 +20,7 @@ pub fn decode_text(bytes: &[u8]) -> Cow<'_, str> {
 }
 
 fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
-    let units = bytes.chunks_exact(2).map(|pair| unit([pair[0], pair[1]]));
-    char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
+    // an odd byte at the very end cannot be a code unit and is dropped
+    let (pairs, _) = bytes.as_chunks::<2>();
+    char::decode_utf16(pairs.iter().map(|&pair| unit(pair))).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
 }
