@@ -27,12 +27,13 @@ macro_rules! say {
 }
 
 mod check;
+mod lua;
 mod out;
 mod render;
 
 use out::Out;
 
-const COMMANDS: [&str; 7] = ["check", "info", "ls", "find", "cat", "glua", "render"];
+const COMMANDS: [&str; 8] = ["check", "info", "ls", "find", "cat", "glua", "lua", "render"];
 
 const USAGE: &str = "\
 gmod-check - what openGMOD can read of a Garry's Mod installation
@@ -49,6 +50,8 @@ COMMANDS:
     cat <FILE>       a file, to standard output
     glua <FILE>      a Lua file as openGMOD hands it to LuaJIT (a file of the game, or
                      one on disk - that needs no installation)
+    lua [REALM]      start the Lua of the game (server, client or menu; default server)
+                     and list what fails
     render <MAP>     a picture of a map (gm_construct, or a .bsp file) drawn on the CPU:
                      the world with textures and light maps, saved as PNG
 
@@ -294,6 +297,7 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
             Ok(bytes) => print_glua(&bytes, operand),
             Err(e) => fail(&e.to_string()),
         },
+        "lua" => lua::run(std::mem::take(&mut vfs), operand, out),
         "render" => render_map(&mut vfs, operand, args),
         _ => unreachable!("commands are checked when parsing"),
     }
