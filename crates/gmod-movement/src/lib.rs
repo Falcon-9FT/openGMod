@@ -19,9 +19,13 @@
 //!   small one. In the air it is at once, the feet pulled up. Standing up needs room.
 //! * In water to the waist or deeper there is no gravity: the player swims where they look,
 //!   at 0.8 of their speed, sinks slowly when they do nothing and rises while holding jump.
+//! * On a ladder - a brush of `CONTENTS_LADDER` right in front of the box, where the player
+//!   moves or where the ladder was - there is no gravity either: the player hangs on it, and
+//!   moves at 200 units a second where they look, what goes into the ladder turned upward (so
+//!   looking down and walking at it goes down). Jump pushes them off it.
 //!
-//! Not yet: ladders, ground that moves, the push of conveyors and triggers, jumping out of
-//! water onto a ledge.
+//! Not yet: ladders of HL2 that are used (`func_useableladder`), ground that moves, the push
+//! of conveyors and triggers, jumping out of water onto a ledge.
 
 #![forbid(unsafe_code)]
 
@@ -31,16 +35,21 @@ pub type Vec3 = [f32; 3];
 
 /// The world as movement sees it.
 pub trait Collide {
-    /// Sweeps the box `mins`..`maxs` (around the feet) from `start` to `end` through what
-    /// stops players.
-    fn trace(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> Trace;
+    /// Sweeps the box `mins`..`maxs` (around the feet) from `start` to `end`, stopping at
+    /// what `mask` names ([`mask`], [`contents`]).
+    fn trace_mask(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, mask: u32) -> Trace;
     /// The [`contents`] at a point.
     fn contents(&self, point: Vec3) -> u32;
+
+    /// The same through what stops players.
+    fn trace(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> Trace {
+        self.trace_mask(start, end, mins, maxs, mask::PLAYERSOLID)
+    }
 }
 
 impl Collide for Collision {
-    fn trace(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> Trace {
-        Collision::trace(self, start, end, mins, maxs, mask::PLAYERSOLID)
+    fn trace_mask(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, mask: u32) -> Trace {
+        Collision::trace(self, start, end, mins, maxs, mask)
     }
 
     fn contents(&self, point: Vec3) -> u32 {
@@ -55,6 +64,12 @@ pub mod buttons {
     /// Run (`+speed`).
     pub const SPEED: u32 = 131072;
 }
+
+/// How fast a player climbs a ladder, and how hard jumping pushes them off it.
+const CLIMB_SPEED: f32 = 200.0;
+const LADDER_JUMP: f32 = 270.0;
+/// How far in front of the box a ladder is looked for.
+const LADDER_REACH: f32 = 2.0;
 
 /// What a key held asks for: more than any speed, which then caps it (`cl_forwardspeed`).
 pub const FULL_MOVE: f32 = 10000.0;
@@ -168,6 +183,8 @@ pub struct Player {
     pub water_level: u8,
     /// The buttons of the last command.
     pub buttons: u32,
+    /// On a ladder: its normal, facing the player.
+    pub ladder: Option<Vec3>,
 }
 
 fn add(a: Vec3, b: Vec3) -> Vec3 {
@@ -286,6 +303,7 @@ impl Player {
             view_height: settings.view_height,
             water_level: 0,
             buttons: 0,
+            ladder: None,
         };
         player.categorize(world, settings);
         Some(player)
@@ -309,7 +327,10 @@ impl Player {
         self.categorize(world, settings);
         self.duck(world, settings, command, seconds);
         let speed = self.max_speed(settings, command);
-        if self.water_level >= 2 {
+        self.ladder = self.find_ladder(world, settings, command);
+        if let Some(normal) = self.ladder {
+            self.climb(world, settings, command, pressed, normal, seconds);
+        } else if self.water_level >= 2 {
             self.swim(world, settings, command, speed, seconds);
         } else {
             self.walk(world, settings, command, pressed, speed, seconds);
@@ -340,6 +361,54 @@ impl Player {
         });
         if let Some(free) = nudges.map(|nudge| add(self.origin, nudge)).find(|&o| fits(world, o, hull)) {
             self.origin = free;
+        }
+    }
+
+    /// A ladder right in front of the box: where the player moves, or where the ladder was.
+    /// Returns its normal.
+    fn find_ladder(&self, world: &impl Collide, s: &Settings, command: &Command) -> Option<Vec3> {
+        let (mins, maxs) = self.hull(s);
+        let (sin, cos) = command.angles[1].to_radians().sin_cos();
+        let wish = add(scale([cos, sin, 0.0], command.forward_move), scale([sin, -cos, 0.0], command.side_move));
+        let wish = (length(wish) > 0.0).then(|| scale(wish, 1.0 / length(wish)));
+        // the ladder the player was on keeps them, unless they walk off it on the ground
+        let back = self.ladder.filter(|&n| !(self.on_ground && wish.is_some_and(|w| dot(w, n) > 0.0))).map(|n| scale(n, -1.0));
+        for direction in wish.into_iter().chain(back) {
+            let probe = world.trace_mask(self.origin, add(self.origin, scale(direction, LADDER_REACH)), mins, maxs, contents::LADDER);
+            // inside a ladder that is not solid (func_ladder): it faces back along the probe
+            if probe.start_solid {
+                return Some(self.ladder.unwrap_or(scale(direction, -1.0)));
+            }
+            if probe.fraction < 1.0 {
+                return Some(probe.normal);
+            }
+        }
+        None
+    }
+
+    /// A tick on a ladder: no gravity, moving where the player looks, into the ladder upward.
+    fn climb(&mut self, world: &impl Collide, s: &Settings, command: &Command, pressed: u32, normal: Vec3, seconds: f32) {
+        self.on_ground = false;
+        if pressed & buttons::JUMP != 0 {
+            self.velocity = scale(normal, LADDER_JUMP);
+            self.ladder = None;
+        } else {
+            let [pitch, yaw, _] = command.angles.map(f32::to_radians);
+            let ((sp, cp), (sy, cy)) = (pitch.sin_cos(), yaw.sin_cos());
+            let wish = add(scale([cp * cy, cp * sy, -sp], command.forward_move), scale([sy, -cy, 0.0], command.side_move));
+            let len = length(wish);
+            let wish = if len > 0.0 { scale(wish, CLIMB_SPEED / len) } else { [0.0; 3] };
+            let into = dot(wish, normal);
+            let along = sub(wish, scale(normal, into));
+            // up the ladder's face
+            let up = sub([0.0, 0.0, 1.0], scale(normal, normal[2]));
+            let up = if length(up) > 1e-3 { scale(up, 1.0 / length(up)) } else { [0.0, 0.0, 1.0] };
+            self.velocity = sub(along, scale(up, into));
+        }
+        (self.origin, self.velocity) = slide(world, self.origin, self.velocity, seconds, self.hull(s));
+        self.categorize(world, s);
+        if self.on_ground && self.velocity[2] < 0.0 {
+            self.velocity[2] = 0.0;
         }
     }
 

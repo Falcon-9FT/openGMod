@@ -280,3 +280,55 @@ fn walks_up_a_displacement() {
     }
     assert!(stood > 20, "{stood}");
 }
+
+/// A block from x = 100, 256 high, with a ladder in front of it: solid, or only a ladder.
+fn ladder_wall(solid: bool) -> Collision {
+    let contents = if solid { contents::LADDER | contents::SOLID | contents::PLAYERCLIP } else { contents::LADDER };
+    world(
+        vec![
+            TestBrush::cuboid([100.0, -200.0, 0.0], [600.0, 200.0, 256.0]),
+            TestBrush::cuboid([96.0, -32.0, 0.0], [100.0, 32.0, 256.0]).contents(contents).material("TOOLS/TOOLSINVISIBLELADDER", 0),
+        ],
+        Vec::new(),
+    )
+}
+
+#[test]
+fn climbs_ladders() {
+    for solid in [true, false] {
+        let world = ladder_wall(solid);
+        let mut player = standing(&world, [0.0; 3]);
+        // walking at it climbs it
+        run(&mut player, &world, &forward(0), 1.0);
+        assert!(player.ladder.is_some() && player.origin[2] > 60.0, "{solid}: {player:?}");
+        assert!((player.velocity[2] - CLIMB_SPEED).abs() < 1.0, "{player:?}");
+        // letting go, the player hangs on
+        let z = player.origin[2];
+        run(&mut player, &world, &Command::default(), 1.0);
+        assert!(player.ladder.is_some() && (player.origin[2] - z).abs() < 1.0, "{player:?}");
+        // looking down and walking at it goes down
+        let down = Command { angles: [70.0, 0.0, 0.0], ..forward(0) };
+        run(&mut player, &world, &down, 0.2);
+        assert!(player.origin[2] < z - 10.0, "{player:?}");
+        // jump pushes off
+        run(&mut player, &world, &Command { buttons: buttons::JUMP, ..Command::default() }, TICK);
+        assert!(player.ladder.is_none() && player.velocity[0] < -200.0, "{player:?}");
+        run(&mut player, &world, &Command::default(), 2.0);
+        assert!(player.on_ground && player.origin[2] < 1.0 && player.origin[0] < 50.0, "{player:?}");
+    }
+}
+
+#[test]
+fn climbs_over_the_top_and_walks_off_at_the_bottom() {
+    let world = ladder_wall(true);
+    let mut player = standing(&world, [0.0; 3]);
+    run(&mut player, &world, &forward(0), 3.0);
+    assert!(player.on_ground && (player.origin[2] - 256.0).abs() < 1.0 && player.origin[0] > 100.0, "{player:?}");
+    // at the bottom, walking back leaves the ladder
+    let mut player = standing(&world, [0.0; 3]);
+    run(&mut player, &world, &forward(0), 0.3);
+    run(&mut player, &world, &Command { angles: [70.0, 0.0, 0.0], ..forward(0) }, 1.0);
+    assert!(player.on_ground, "{player:?}");
+    run(&mut player, &world, &Command { angles: [0.0, 180.0, 0.0], ..forward(0) }, 0.5);
+    assert!(player.ladder.is_none() && player.origin[0] < 40.0, "{player:?}");
+}
