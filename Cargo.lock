@@ -521,6 +521,8 @@ version = "0.2.0"
 dependencies = [
  "gmod-fs",
  "gmod-glua",
+ "gmod-kv",
+ "gmod-material",
  "mlua",
 ]
 

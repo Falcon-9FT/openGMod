@@ -274,3 +274,256 @@ fn angles() {
     assert_eq!(g.eval::<String>("return tostring(Angle(1, 2, 3) * 2)"), "2.000 4.000 6.000");
     assert_eq!(g.eval::<f64>("local a = Angle(1, 2, 3) return a.p + a.yaw + a[3]"), 6.0);
 }
+
+#[test]
+fn timers_and_hooks() {
+    let g = game(
+        Realm::Server,
+        &[(
+            "lua/main.lua",
+            "hook = { Call = function(name) if name == 'Think' then THINKS = (THINKS or 0) + 1 end end }
+             timer.Simple(0.5, function() print('simple', CurTime()) end)
+             timer.Create('rep', 0.25, 3, function() print('rep', timer.RepsLeft('rep')) end)
+             timer.Create('bad', 0.1, 1, function() error('in a timer') end)",
+        )],
+    );
+    assert!(g.runtime.include("main.lua"));
+    for _ in 0..10 {
+        g.runtime.think(0.1);
+    }
+    let printed = g.printed();
+    let reps: Vec<&str> = printed.lines().filter(|l| l.starts_with("rep")).collect();
+    assert_eq!(reps, ["rep\t2", "rep\t1", "rep\t0"], "{printed}");
+    assert!(printed.contains("simple\t0.5"), "{printed}");
+    assert_eq!(printed.matches("rep\t").count(), 3, "{printed}");
+    assert!(!g.eval::<bool>("return timer.Exists('rep')"));
+    assert_eq!(g.eval::<i32>("return THINKS"), 10);
+    assert!((g.runtime.cur_time() - 1.0).abs() < 1e-9);
+    assert_eq!(g.messages().len(), 1);
+    assert!(g.messages()[0].ends_with("in a timer"), "{:?}", g.messages());
+    // paused timers keep their time
+    g.runtime.run_string("timer.Create('p', 1, 0, function() print('p') end) timer.Pause('p')", "x").unwrap();
+    g.runtime.think(5.0);
+    assert!((g.eval::<f64>("return timer.TimeLeft('p')") - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn convars_and_commands() {
+    let g = game(
+        Realm::Server,
+        &[(
+            "lua/main.lua",
+            "cvars = { OnConVarChanged = function(name, old, new) print('changed', name, old, new) end }
+             concommand = { Run = function(ply, cmd, args, str) print('command', cmd, #args, str, ply == NULL) end }
+             local cv = CreateConVar('sbox_test', '5', { FCVAR_ARCHIVE, FCVAR_NOTIFY }, 'help', 0, 10)
+             print(cv:GetInt(), cv:GetFloat(), cv:GetBool(), cv:GetDefault(), cv:GetFlags(), cv:IsFlagSet(FCVAR_ARCHIVE))
+             cv:SetInt(50)
+             print(cv:GetString(), GetConVar_Internal('SBOX_TEST') == cv, ConVarExists('sv_gravity'))
+             AddConsoleCommand('say_hi')
+             RunConsoleCommand('say_hi', 'a b', 2)
+             RunConsoleCommand('sbox_test', '3')",
+        )],
+    );
+    assert!(g.runtime.include("main.lua"));
+    let printed = g.printed();
+    assert!(printed.contains("5\t5\ttrue\t5\t384\ttrue\n"), "{printed}");
+    assert!(printed.contains("changed\tsbox_test\t5\t10\n10\ttrue\ttrue\n"), "{printed}");
+    assert!(!printed.contains("command"), "commands wait for the next frame");
+    g.runtime.think(0.01);
+    let printed = g.printed();
+    assert!(printed.contains("command\tsay_hi\t2\ta b 2\ttrue\n"), "{printed}");
+    assert!(printed.contains("changed\tsbox_test\t10\t3\n"), "{printed}");
+    g.runtime.run_command("sv_gravity 300; nonsense");
+    assert_eq!(g.eval::<String>("return GetConVar_Internal('sv_gravity'):GetString()"), "300");
+    assert!(g.printed().contains("Unknown command \"nonsense\""));
+    assert_eq!(convar::atof("  12.5e1abc"), 125.0);
+    assert_eq!(convar::atof("abc"), 0.0);
+    assert_eq!(convar::split_commands("a \"b c\";d // e\nf"), [vec!["a", "b c"], vec!["d"], vec!["f"]]);
+}
+
+#[test]
+fn files() {
+    let g = game(
+        Realm::Server,
+        &[("lua/autorun/a.lua", "x"), ("lua/autorun/b.lua", "y"), ("lua/autorun/server/c.lua", "z"), ("data_static/x.txt", "game")],
+    );
+    let home = TempDir::new();
+    g.runtime.set_data_dir(gmod_fs::UserDir::open(&home.0, None).unwrap());
+    g.runtime
+        .run_string(
+            r#"
+            local files, dirs = file.Find("autorun/*", "LUA")
+            print(table.concat(files, ","), table.concat(dirs, ","))
+            print(file.Exists("autorun/a.lua", "LUA"), file.IsDir("autorun", "lsv"), file.Exists("nope.lua", "LUA"))
+            local f = file.Open("Saves/Test.txt", "wb", "DATA")
+            f:Write("hello\nworld") f:WriteByte(33) f:Close()
+            print(file.Open("bad.exe", "wb", "DATA"), file.Open("x.txt", "wb", "GAME"))
+            local r = file.Open("saves/test.txt", "rb", "DATA")
+            print(r:Size(), r:ReadLine(), r:Read(5), r:ReadByte(), r:Read(1), r:EndOfFile())
+            r:Close()
+            local a = file.Open("saves/test.txt", "ab", "DATA") a:Write("!") a:Close()
+            print(file.Open("saves/test.txt", "rb", "DATA"):Read())
+            print(file.Size("saves/test.txt", "DATA"), file.Size("nope", "DATA"), file.Open("data_static/x.txt", "r", "GAME"):Read())
+            print(file.Rename("saves/test.txt", "saves/moved.txt"), file.Delete("saves/moved.txt"), file.Exists("saves/moved.txt", "DATA"))
+            "#,
+            "files",
+        )
+        .unwrap();
+    assert_eq!(
+        g.printed(),
+        "a.lua,b.lua\tserver\ntrue\ttrue\tfalse\nnil\tnil\n12\thello\n\tworld\t33\tnil\ttrue\nhello\nworld!!\n13\t-1\tgame\ntrue\ttrue\tfalse\n"
+    );
+    assert!(home.0.join("data").is_dir());
+}
+
+#[test]
+fn util_library() {
+    let g = game(Realm::Server, &[]);
+    assert_eq!(g.eval::<i64>("return util.AddNetworkString('a')"), 1);
+    assert_eq!(g.eval::<i64>("util.AddNetworkString('b') return util.AddNetworkString('A')"), 1);
+    assert_eq!(g.eval::<String>("return util.NetworkIDToString(2)"), "b");
+    assert_eq!(g.eval::<String>("return util.CRC('123456789')"), "3421780262");
+    assert_eq!(g.eval::<String>("return util.Base64Encode('hello world')"), "aGVsbG8gd29ybGQ=");
+    assert_eq!(g.eval::<String>("return util.Base64Decode('aGVsbG8gd29ybGQ=')"), "hello world");
+    assert_eq!(g.eval::<String>("return util.TableToJSON({1, 2, 'x', true})"), "[1,2,\"x\",true]");
+    assert_eq!(g.eval::<String>("return util.TableToJSON({a = {b = 1.5}})"), "{\"a\":{\"b\":1.5}}");
+    assert_eq!(g.eval::<String>("return util.TableToJSON({v = Vector(1, 2, 3)})"), "{\"v\":\"[1 2 3]\"}");
+    assert!(g.eval::<bool>(
+        "local t = util.JSONToTable('{\"1\": \"a\", \"v\": \"[1 2 3]\", \"l\": [true, null, 2], \"s\": \"\\\\u00e9\"}')
+         return t[1] == 'a' and t.v == Vector(1, 2, 3) and t.l[1] == true and t.l[3] == 2 and t.s == 'é'"
+    ));
+    assert!(g.eval::<bool>("return util.JSONToTable('[1, 2') == nil and util.JSONToTable('\"x\"') == nil"));
+    assert!(g.eval::<bool>(
+        "local t = util.KeyValuesToTable('\"root\" { \"Name\" \"x\" \"Count\" \"3\" \"sub\" { \"1\" \"a\" } }')
+         return t.name == 'x' and t.count == 3 and t.sub[1] == 'a'"
+    ));
+    assert!(g.eval::<bool>("return util.KeyValuesToTable('\"r\" { \"Name\" \"x\" }', false, true).Name == 'x'"));
+    let kv: String = g.eval("return util.TableToKeyValues({ name = 'x' }, 'root')");
+    assert_eq!(kv, "\"root\"\n{\n\t\"name\"\t\t\"x\"\n}\n");
+    assert_eq!(g.eval::<String>("return util.SteamIDTo64('STEAM_0:1:123')"), "76561197960265975");
+    assert_eq!(g.eval::<String>("return util.SteamIDFrom64('76561197960265975')"), "STEAM_0:1:123");
+}
+
+#[test]
+fn net_messages() {
+    let server = game(Realm::Server, &[]);
+    let error = server.runtime.lua().load("net.Start('unknown')").exec().unwrap_err().to_string();
+    assert!(error.contains("unpooled message name"), "{error}");
+    server
+        .runtime
+        .run_string(
+            "util.AddNetworkString('hello')
+             net.Start('hello') net.WriteBit(true) net.WriteUInt(300, 9) net.WriteInt(-5, 4) net.WriteString('héllo')
+             net.WriteFloat(1.5) net.WriteDouble(0.1) net.WriteVector(Vector(1, 2, 3)) net.WriteData('ab\\0c', 4)
+             net.WriteUInt64('18446744073709551615') net.WriteEntity(NULL)
+             print(net.BytesWritten())
+             net.Broadcast()",
+            "send",
+        )
+        .unwrap();
+    let messages = server.runtime.take_net_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].name, "hello");
+
+    let client = game(Realm::Client, &[]);
+    client
+        .runtime
+        .run_string(
+            "net.Receivers = {}
+             function net.Incoming(len, from)
+                 local name = util.NetworkIDToString(net.ReadHeader())
+                 print(name, len, from == NULL, net.ReadBit(), net.ReadUInt(9), net.ReadInt(4), net.ReadString(), net.ReadFloat(),
+                     net.ReadDouble(), net.ReadVector(), net.ReadData(4) == 'ab\\0c', net.ReadUInt64(), net.ReadEntity() == NULL,
+                     net.BytesLeft(), net.ReadUInt(8))
+             end",
+            "receive",
+        )
+        .unwrap();
+    client.runtime.receive_net_message(&messages[0].name, &messages[0].data, entity::EntityHandle::NULL);
+    let printed = client.printed();
+    assert_eq!(
+        printed,
+        format!(
+            "hello\t{}\ttrue\t1\t300\t-5\théllo\t1.5\t0.1\t1.000000 2.000000 3.000000\ttrue\t18446744073709551615\tfalse\t0\t0\n",
+            messages[0].data.len + 16
+        )
+    );
+    assert!(server.printed().starts_with(&format!("{}\n", (messages[0].data.len + 16 + 24).div_ceil(8))));
+    assert!(client.eval::<bool>("return net.ReadString() == ''"), "nothing to read outside a message");
+}
+
+#[test]
+fn materials() {
+    let g = game(
+        Realm::Server,
+        &[(
+            "materials/test/thing.vmt",
+            "\"VertexLitGeneric\" { \"$basetexture\" \"test/thing\" \"$alpha\" \"0.5\" \"$color\" \"[1 0 0]\" }",
+        )],
+    );
+    assert!(g.eval::<bool>(
+        "local m, t = Material('test/thing')
+         return type(t) == 'number' and not m:IsError() and m:GetShader() == 'vertexlitgeneric' and m:GetString('$BaseTexture') == 'test/thing'
+             and m:GetFloat('$alpha') == 0.5 and m:GetVector('$color') == Vector(1, 0, 0) and m:GetName() == 'test/thing'"
+    ));
+    assert!(g.eval::<bool>("local m = Material('missing/thing') return m:IsError() and getmetatable(m) == FindMetaTable('IMaterial')"));
+    assert!(g.eval::<bool>("local m = Material('test/thing') m:SetFloat('$alpha', 1) return m:GetKeyValues()['$alpha'] == 1"));
+}
+
+#[test]
+fn empty_world() {
+    let g = game(Realm::Server, &[]);
+    assert!(g.eval::<bool>("return #player.GetAll() == 0 and #ents.GetAll() == 0 and Entity(1) == NULL and not NULL:IsValid()"));
+    assert!(g.eval::<bool>("return game.GetWorld():IsValid() and game.GetWorld():IsWorld() and tostring(NULL) == '[NULL Entity]'"));
+    assert!(g.eval::<bool>(
+        "return FindMetaTable('Player').MetaName == 'Player' and FindMetaTable('Player').MetaBaseClass == FindMetaTable('Entity')"
+    ));
+    assert!(g.eval::<bool>("return FindMetaTable('Panel') == nil"), "panels are the client's");
+    assert!(g.eval::<bool>("return sql.Query('SELECT 1') == false and sql.m_strError ~= nil and HTTP({}) == false"));
+    assert!(g.eval::<bool>("return ai.GetScheduleID('a') == ai.GetScheduleID('a') and ai.GetScheduleID('a') ~= ai.GetScheduleID('b')"));
+    let error = g.runtime.lua().load("NULL.x = 1").exec().unwrap_err().to_string();
+    assert!(error.contains("Tried to use a NULL entity!"), "{error}");
+}
+
+#[test]
+fn a_gamemode_starts() {
+    let g = game(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", "include('modules.lua')"),
+            (
+                "lua/modules.lua",
+                "gamemode = { list = {} }
+                 function gamemode.Register(t, name, base) t.Base = base gamemode.list[name] = t print('gamemode', name, base) end
+                 function gamemode.Get(name) return gamemode.list[name] end
+                 hook = { Call = function(name, gm) if gm and gm[name] then return gm[name](gm) end print('hook', name, gm ~= nil) end }
+                 scripted_ents = { Register = function(t, name) print('entity', name, t.Folder, t.Base) end }
+                 weapons = { Register = function(t, name) print('weapon', name, t.Primary ~= nil) end }",
+            ),
+            ("lua/autorun/first.lua", "print('autorun')"),
+            ("lua/autorun/client/no.lua", "print('not on the server')"),
+            ("lua/autorun/server/second.lua", "print('autorun server')"),
+            ("gamemodes/base/base.txt", "\"base\" { \"title\" \"Base\" }"),
+            ("gamemodes/base/gamemode/init.lua", "GM.Name = 'Base' print('base', GM.FolderName, GM.Folder)"),
+            ("gamemodes/base/entities/entities/base_anim.lua", "ENT.Type = 'anim'"),
+            ("gamemodes/mine/mine.txt", "\"mine\" { \"base\" \"base\" }"),
+            ("gamemodes/mine/gamemode/init.lua", "AddCSLuaFile('cl_init.lua') include('shared.lua')"),
+            ("gamemodes/mine/gamemode/cl_init.lua", "include('shared.lua')"),
+            ("gamemodes/mine/gamemode/shared.lua", "function GM:Initialize() print('initialize', self.FolderName) end"),
+            ("gamemodes/mine/entities/entities/thing/init.lua", "include('shared.lua')"),
+            ("gamemodes/mine/entities/entities/thing/shared.lua", "ENT.Base = 'base_anim'"),
+            ("lua/weapons/gun.lua", "SWEP.PrintName = 'Gun'"),
+        ],
+    );
+    g.runtime.start("mine");
+    assert_eq!(g.messages(), Vec::<String>::new());
+    assert_eq!(
+        g.printed(),
+        "autorun\nautorun server\nhook\tPreGamemodeLoaded\tfalse\nbase\tbase\tgamemodes/base\ngamemode\tbase\tnil\ngamemode\tmine\tbase\n\
+         hook\tOnGamemodeLoaded\ttrue\nentity\tbase_anim\tbase/entities/entities/base_anim\tnil\n\
+         entity\tthing\tmine/entities/entities/thing\tbase_anim\nweapon\tgun\ttrue\nhook\tPostGamemodeLoaded\ttrue\n\
+         hook\tCreateTeams\ttrue\ninitialize\tmine\n"
+    );
+    assert!(g.eval::<bool>("return GAMEMODE == gamemode.Get('mine') and GM == nil and ENT == nil and SWEP == nil"));
+    assert_eq!(g.eval::<String>("return engine.ActiveGamemode()"), "mine");
+}

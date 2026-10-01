@@ -8,5 +8,7 @@ description = "The Lua runtime: LuaJIT with Garry's Mod's loader (include, requi
 
 [dependencies]
 gmod-fs.workspace = true
+gmod-kv.workspace = true
+gmod-material.workspace = true
 gmod-glua.workspace = true
 mlua.workspace = true

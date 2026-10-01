@@ -9,6 +9,7 @@
 //! | `a && b`, `a \|\| b` | `a and b`, `a or b` |
 //! | `// comment`, `/* comment */` | blanks (line breaks kept) |
 //! | `continue` | `goto` to a label at the end of the loop body |
+//! | `DEFINE_BASECLASS("name")` | `local BaseClass = baseclass.Get("name")` |
 //!
 //! [`translate`] rewrites a chunk token by token and moves nothing to another line, so the
 //! line numbers in LuaJIT's error messages and tracebacks are those of the original file.
@@ -397,6 +398,10 @@ fn structure(src: &[u8], tokens: &[Token], edits: &mut Vec<Edit>) -> Result<(), 
                     edits.push(Edit::insert(token.start, format!("::{}:: ", label(n))));
                 }
             }
+            // GMod's one macro: a statement that defines the local `BaseClass`
+            b"DEFINE_BASECLASS" if is_macro_call(src, tokens, index) => {
+                edits.push(Edit::replace(token.start, token.end, "local BaseClass = baseclass.Get"));
+            }
             b"continue" if is_continue_statement(src, tokens, index) => {
                 let mut target = None;
                 for frame in stack.iter_mut().rev() {
@@ -422,6 +427,15 @@ fn structure(src: &[u8], tokens: &[Token], edits: &mut Vec<Edit>) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Whether the name at `index` is called as a statement of its own: `(` follows, and it is
+/// not a field (`t.DEFINE_BASECLASS(...)`).
+fn is_macro_call(src: &[u8], tokens: &[Token], index: usize) -> bool {
+    let text = |t: &Token| &src[t.start..t.end];
+    let called = tokens.get(index + 1).is_some_and(|next| text(next) == b"(");
+    let field = index.checked_sub(1).is_some_and(|p| matches!(text(&tokens[p]), b"." | b":" | b"::"));
+    called && !field
 }
 
 /// Whether the `continue` at `index` is the statement rather than a name: the block must

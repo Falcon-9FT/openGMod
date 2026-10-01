@@ -152,3 +152,13 @@ fn semantics_sample() {
     assert_eq!(out.matches("goto __glua_continue_").count(), 7);
     assert!(out.contains("local continue = t.continue"), "the name stays a name");
 }
+
+#[test]
+fn define_baseclass() {
+    assert_eq!(tr("DEFINE_BASECLASS( \"gamemode_base\" )\nx = 1"), "local BaseClass = baseclass.Get( \"gamemode_base\" )\nx = 1");
+    assert_eq!(tr("DEFINE_BASECLASS(\"a\")"), "local BaseClass = baseclass.Get(\"a\")");
+    // a field or a value of that name is not the macro
+    for src in ["t.DEFINE_BASECLASS(\"a\")", "obj:DEFINE_BASECLASS(\"a\")", "local DEFINE_BASECLASS = 1", "print(DEFINE_BASECLASS)"] {
+        assert_eq!(tr(src), src);
+    }
+}

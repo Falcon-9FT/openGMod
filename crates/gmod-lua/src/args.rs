@@ -92,6 +92,25 @@ impl<'a> Args<'a> {
         }
     }
 
+    /// Lua's truthiness: anything but `nil` and `false`.
+    pub fn boolean(&self, position: usize) -> bool {
+        !matches!(self.values.get(position - 1), None | Some(Value::Nil) | Some(Value::Boolean(false)))
+    }
+
+    pub fn table(&self, position: usize) -> mlua::Result<mlua::Table> {
+        match self.get(position) {
+            Some(Value::Table(t)) => Ok(t.clone()),
+            _ => Err(self.bad(position, "table")),
+        }
+    }
+
+    pub fn function(&self, position: usize) -> mlua::Result<mlua::Function> {
+        match self.get(position) {
+            Some(Value::Function(f)) => Ok(f.clone()),
+            _ => Err(self.bad(position, "function")),
+        }
+    }
+
     /// A userdata of the engine, by value.
     pub fn userdata<T: Copy + 'static>(&self, position: usize, expected: &str) -> mlua::Result<T> {
         match self.get(position) {
