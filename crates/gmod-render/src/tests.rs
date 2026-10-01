@@ -76,6 +76,9 @@ fn draw(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, camera: &Came
 #[test]
 fn draws_the_test_map() {
     let Some((device, queue)) = device() else {
+        // CI sets this on Windows, which always has WARP: there a skip would hide a broken renderer
+        let required = std::env::var_os("OPENGMOD_REQUIRE_GPU").is_some_and(|v| !v.is_empty());
+        assert!(!required, "no GPU, not even WARP, and OPENGMOD_REQUIRE_GPU is set");
         println!("no GPU here, not even a software one: skipped");
         return;
     };

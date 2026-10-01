@@ -24,6 +24,9 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+        env:
+          # Windows always has WARP, a software GPU: the GPU tests must run there, not skip
+          OPENGMOD_REQUIRE_GPU: ${{ runner.os == 'Windows' && '1' || '' }}
 
   # the oldest Rust the workspace promises to build with (rust-version in Cargo.toml)
   msrv:
