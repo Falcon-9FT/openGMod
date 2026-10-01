@@ -4,7 +4,8 @@
 //! `u32` version, `u32` unpacked size of a compressed lump), `i32` map revision - and the lumps
 //! it points to. Any lump may be LZMA-compressed (`bspzip -repack`); see [`lumps`]. The
 //! pakfile lump is a zip of the files the map brings along ([`Bsp::pakfile`]); the game lump
-//! holds the static props ([`props`]).
+//! holds the static props ([`props`]). What is solid - the brushes and the BSP trees over them -
+//! and the sweeps of boxes and rays through it are in [`collision`].
 //!
 //! A map is read into memory as a whole: maps from workshop addons live inside `.gma` files
 //! and are no files of their own.
@@ -17,15 +18,20 @@ use std::sync::Arc;
 
 use gmod_fs::ZipArchive;
 
+pub mod collision;
 mod entities;
 mod lighting;
 pub mod lumps;
+mod math;
 pub mod mesh;
 pub mod props;
 
+pub use collision::{Collision, Trace, mask};
 pub use entities::{Entity, parse_entities};
 pub use lighting::{luxels, rgbe_to_linear};
-pub use lumps::{Cubemap, DispInfo, DispVert, Face, LumpEntry, Model, Plane, TexData, TexInfo, surf};
+pub use lumps::{
+    Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Plane, TexData, TexInfo, contents, surf,
+};
 pub use props::{GameLump, StaticProp, StaticProps};
 
 use lumps::{index, invalid, lump_bytes, records};
@@ -52,6 +58,13 @@ pub struct Bsp {
     /// Material names, one per `texdata`.
     pub materials: Vec<String>,
     pub models: Vec<Model>,
+    /// The BSP trees of the brush models, each from its model's head node.
+    pub nodes: Vec<Node>,
+    pub leaves: Vec<Leaf>,
+    /// Brushes by leaf: indices into `brushes`.
+    pub leaf_brushes: Vec<u16>,
+    pub brushes: Vec<Brush>,
+    pub brush_sides: Vec<BrushSide>,
     pub lighting: Vec<u8>,
     pub lighting_hdr: Vec<u8>,
     pub displacements: Vec<DispInfo>,
@@ -117,6 +130,18 @@ impl Bsp {
         let texinfo = records(&lump(index::TEXINFO, "texinfo")?, TexInfo::SIZE, "texinfo", TexInfo::parse)?;
         let texdata = records(&lump(index::TEXDATA, "texdata")?, TexData::SIZE, "texdata", TexData::parse)?;
         let models = records(&lump(index::MODELS, "models")?, Model::SIZE, "models", Model::parse)?;
+        let nodes = records(&lump(index::NODES, "nodes")?, Node::SIZE, "nodes", Node::parse)?;
+        let leaf_bytes = lump(index::LEAFS, "leaves")?;
+        let leaf_size = match lumps[index::LEAFS].version {
+            0 if leaf_bytes.len().is_multiple_of(Leaf::SIZE_WITH_LIGHT) => Leaf::SIZE_WITH_LIGHT,
+            _ if leaf_bytes.len().is_multiple_of(Leaf::SIZE) => Leaf::SIZE,
+            _ => Leaf::SIZE_WITH_LIGHT,
+        };
+        let leaves = records(&leaf_bytes, leaf_size, "leaves", Leaf::parse)?;
+        drop(leaf_bytes);
+        let leaf_brushes = records(&lump(index::LEAF_BRUSHES, "leaf brushes")?, 2, "leaf brushes", |f| f.u16())?;
+        let brushes = records(&lump(index::BRUSHES, "brushes")?, Brush::SIZE, "brushes", Brush::parse)?;
+        let brush_sides = records(&lump(index::BRUSH_SIDES, "brush sides")?, BrushSide::SIZE, "brush sides", BrushSide::parse)?;
         let displacements = records(&lump(index::DISPINFO, "displacements")?, DispInfo::SIZE, "displacements", DispInfo::parse)?;
         let disp_verts =
             records(&lump(index::DISP_VERTS, "displacement vertices")?, DispVert::SIZE, "displacement vertices", DispVert::parse)?;
@@ -161,6 +186,11 @@ impl Bsp {
             texdata,
             materials,
             models,
+            nodes,
+            leaves,
+            leaf_brushes,
+            brushes,
+            brush_sides,
             lighting,
             lighting_hdr,
             displacements,
@@ -211,6 +241,42 @@ impl Bsp {
             if model.first_face < 0 || model.num_faces < 0 || (model.first_face + model.num_faces) as usize > self.faces.len() {
                 return Err(invalid(format!("model {i}: faces out of range")));
             }
+            if !self.nodes.is_empty() && !usize::try_from(model.head_node).is_ok_and(|n| n < self.nodes.len()) {
+                return Err(invalid(format!("model {i}: head node {} does not exist", model.head_node)));
+            }
+        }
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !usize::try_from(node.plane).is_ok_and(|p| p < self.planes.len()) {
+                return Err(invalid(format!("node {i}: plane {} does not exist", node.plane)));
+            }
+            for child in node.children {
+                // the compiler writes a node before its children, so a child node comes later;
+                // that also rules out loops, which would never end
+                let fine = match usize::try_from(child) {
+                    Ok(next) => next > i && next < self.nodes.len(),
+                    Err(_) => ((-1 - child) as usize) < self.leaves.len(),
+                };
+                if !fine {
+                    return Err(invalid(format!("node {i}: child {child} out of range")));
+                }
+            }
+        }
+        for (i, leaf) in self.leaves.iter().enumerate() {
+            if leaf.first_leaf_brush as usize + leaf.num_leaf_brushes as usize > self.leaf_brushes.len() {
+                return Err(invalid(format!("leaf {i}: brushes out of range")));
+            }
+        }
+        if let Some(brush) = self.leaf_brushes.iter().find(|&&b| b as usize >= self.brushes.len()) {
+            return Err(invalid(format!("leaf brush {brush} names a brush that does not exist")));
+        }
+        for (i, brush) in self.brushes.iter().enumerate() {
+            if brush.first_side < 0 || brush.num_sides < 0 || brush.first_side as usize + brush.num_sides as usize > self.brush_sides.len()
+            {
+                return Err(invalid(format!("brush {i}: sides out of range")));
+            }
+        }
+        if let Some(side) = self.brush_sides.iter().find(|s| s.plane as usize >= self.planes.len()) {
+            return Err(invalid(format!("a brush side names plane {}, which does not exist", side.plane)));
         }
         for (i, disp) in self.displacements.iter().enumerate() {
             let count = disp.side() * disp.side();

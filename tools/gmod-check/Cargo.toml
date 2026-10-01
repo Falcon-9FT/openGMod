@@ -13,6 +13,7 @@ gmod-lua.workspace = true
 gmod-bsp.workspace = true
 gmod-material.workspace = true
 gmod-model.workspace = true
+gmod-movement.workspace = true
 gmod-world.workspace = true
 
 [dev-dependencies]

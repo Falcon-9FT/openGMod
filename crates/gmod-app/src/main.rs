@@ -1,6 +1,7 @@
-//! `opengmod`: for now, a map from your Garry's Mod on the screen to fly around in - the world,
-//! brush entities and static props with their textures and light, and the sky box. Drawn with
-//! Direct3D 12 on Windows (Vulkan when that is missing).
+//! `opengmod`: for now, a map from your Garry's Mod on the screen to walk and fly around in -
+//! the world, brush entities and static props with their textures and light, and the sky box.
+//! Drawn with Direct3D 12 on Windows (Vulkan when that is missing). Walking moves the player
+//! as the game does ([`gmod_movement`]), tick by tick against what is solid in the map.
 
 #![forbid(unsafe_code)]
 
@@ -16,15 +17,21 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
+use gmod_bsp::Collision;
 use gmod_fs::UserDir;
 use gmod_fs::install::Install;
 use gmod_fs::mount::{MountOptions, mount_install};
+use gmod_movement::{Player, Settings};
 use gmod_render::block_on;
 use gmod_world::World;
 use gmod_world::gpu::Camera;
 
+mod walk;
+
+use walk::{Keys, Walker};
+
 const USAGE: &str = "\
-opengmod - a Garry's Mod map from your installation, to fly around in
+opengmod - a Garry's Mod map from your installation, to walk and fly around in
 
 USAGE:
     opengmod [OPTIONS] [MAP]
@@ -38,12 +45,13 @@ OPTIONS:
 
 CONTROLS:
     click the window to look around with the mouse, Esc to let the mouse go
-    W A S D to fly, Space and Ctrl up and down, Shift faster
+    W A S D to walk, Shift to run, Space to jump, Ctrl to duck
+    V to fly through walls (noclip) and back: W A S D, Space and Ctrl up and down, Shift faster
     F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)";
 
 /// Degrees the view turns per pixel the mouse moves.
 const MOUSE_DEGREES: f32 = 0.12;
-/// Units a second; Shift makes it four times as much.
+/// Units a second flying; Shift makes it four times as much.
 const SPEED: f32 = 400.0;
 /// The game's field of view, across a 4:3 picture.
 const FOV: f32 = 75.0;
@@ -74,8 +82,18 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
     Ok(Some(args))
 }
 
+/// A map read, with what it needs from the game.
+struct Loaded {
+    world: World,
+    collision: Collision,
+    camera: Camera,
+    /// Where players start: the feet, and the angles.
+    spawn: Option<([f32; 3], [f32; 3])>,
+    name: String,
+}
+
 /// Reads the map and everything it needs from the game.
-fn load(args: &Args) -> Result<(World, Camera, String), String> {
+fn load(args: &Args) -> Result<Loaded, String> {
     let started = Instant::now();
     let on_disk = Path::new(&args.map).is_file();
     let install = Install::locate(args.gmod.as_deref());
@@ -103,6 +121,7 @@ fn load(args: &Args) -> Result<(World, Camera, String), String> {
     let bsp = gmod_bsp::Bsp::parse(PathBuf::from(&path), Arc::from(bytes)).map_err(|e| e.to_string())?;
     gmod_world::mount_pakfile(&mut vfs, &bsp).map_err(|e| format!("{path}: pakfile: {e}"))?;
     let world = gmod_world::load(&vfs, &bsp);
+    let collision = Collision::new(&bsp);
     println!("{path}: {} triangles, {} textures, in {:.1} s", world.triangles(), world.textures.len(), started.elapsed().as_secs_f64());
     for (what, names) in [("materials", &world.missing_materials), ("textures", &world.missing_textures), ("models", &world.missing_models)]
     {
@@ -114,7 +133,7 @@ fn load(args: &Args) -> Result<(World, Camera, String), String> {
     }
     let (eye, target) = gmod_world::default_view(&bsp);
     let name = Path::new(&path).file_stem().map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned());
-    Ok((world, Camera::looking_at(eye, target, FOV), name))
+    Ok(Loaded { world, collision, camera: Camera::looking_at(eye, target, FOV), spawn: gmod_world::spawn_point(&bsp), name })
 }
 
 /// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
@@ -296,6 +315,12 @@ impl Gpu {
 
 struct App {
     world: World,
+    collision: Collision,
+    settings: Settings,
+    /// Where players start: the feet, and the angles.
+    spawn: Option<([f32; 3], [f32; 3])>,
+    /// The player, walking; `None` while flying through walls.
+    walker: Option<Walker>,
     name: String,
     camera: Camera,
     gpu: Option<Gpu>,
@@ -326,11 +351,73 @@ impl App {
         self.captured = on;
     }
 
-    /// Moves the camera by the keys held, for the time since the last frame.
-    fn fly(&mut self) {
+    /// A walking player with their feet at `feet`, if there is room for them there.
+    fn stand(&self, feet: [f32; 3]) -> Option<Walker> {
+        if self.collision.is_empty() {
+            return None;
+        }
+        Player::spawn(&self.collision, &self.settings, feet).map(Walker::new)
+    }
+
+    /// Back to where players start, walking if there is room; flying where it is when the map
+    /// has no player start.
+    fn respawn(&mut self) {
+        let Some((origin, [pitch, yaw, _])) = self.spawn else {
+            self.walker = None;
+            return;
+        };
+        self.walker = self.stand(origin);
+        self.camera.eye = self.walker.as_ref().map_or([origin[0], origin[1], origin[2] + self.settings.view_height], |w| w.player.eye());
+        (self.camera.pitch, self.camera.yaw) = (pitch, yaw);
+    }
+
+    /// V: flying through walls, and walking again from where the eyes are, if there is room.
+    fn toggle_noclip(&mut self) {
+        if self.walker.take().is_some() {
+            return;
+        }
+        let [x, y, z] = self.camera.eye;
+        self.walker = self.stand([x, y, z - self.settings.view_height]);
+        if self.walker.is_none() {
+            println!("No room to stand here");
+        }
+    }
+
+    /// The keys that move a walking player.
+    fn movement_keys(&self) -> Keys {
+        let held = |key: KeyCode| self.keys.contains(&key);
+        Keys {
+            forward: held(KeyCode::KeyW),
+            back: held(KeyCode::KeyS),
+            left: held(KeyCode::KeyA),
+            right: held(KeyCode::KeyD),
+            jump: held(KeyCode::Space),
+            duck: held(KeyCode::ControlLeft) || held(KeyCode::ControlRight),
+            run: held(KeyCode::ShiftLeft) || held(KeyCode::ShiftRight),
+        }
+    }
+
+    /// Moves the camera by the keys held, for the time since the last frame: the player walks,
+    /// or the camera flies.
+    fn advance(&mut self) {
         let now = Instant::now();
-        let seconds = (now - self.last_frame).as_secs_f32().min(0.1);
+        let seconds = (now - self.last_frame).as_secs_f32().min(0.25);
         self.last_frame = now;
+        let Some(mut walker) = self.walker.take() else {
+            self.fly(seconds.min(0.1));
+            return;
+        };
+        let command = self.movement_keys().command(self.camera.pitch, self.camera.yaw);
+        self.camera.eye = walker.advance(&self.collision, &self.settings, &command, seconds);
+        self.walker = Some(walker);
+        // fell out of the map
+        if self.camera.eye[2] < self.collision.mins[2] - 1024.0 {
+            self.respawn();
+        }
+    }
+
+    /// Flies the camera by the keys held, through walls.
+    fn fly(&mut self, seconds: f32) {
         let held = |key: KeyCode| self.keys.contains(&key);
         let forward = self.camera.forward();
         let right = self.camera.right();
@@ -355,7 +442,8 @@ impl App {
         if elapsed >= 1.0 {
             if let Some(gpu) = &self.gpu {
                 let [x, y, z] = self.camera.eye.map(|v| v.round() as i32);
-                gpu.window.set_title(&format!("openGMOD - {} - {:.0} fps - {x} {y} {z}", self.name, self.frames as f32 / elapsed));
+                let mode = if self.walker.is_some() { "" } else { " - noclip" };
+                gpu.window.set_title(&format!("openGMOD - {} - {:.0} fps - {x} {y} {z}{mode}", self.name, self.frames as f32 / elapsed));
             }
             self.frames = 0;
             self.counting_since = Instant::now();
@@ -398,6 +486,7 @@ impl ApplicationHandler for App {
                 if state == ElementState::Pressed {
                     match key {
                         KeyCode::Escape => self.capture(false),
+                        KeyCode::KeyV if !repeat => self.toggle_noclip(),
                         KeyCode::F12 if !repeat => self.screenshot = true,
                         KeyCode::F11 if !repeat => {
                             if let Some(gpu) = &self.gpu {
@@ -413,7 +502,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.fly();
+                self.advance();
                 if let Some(gpu) = &mut self.gpu {
                     gpu.draw(&self.camera);
                     if std::mem::take(&mut self.screenshot) {
@@ -466,7 +555,7 @@ fn main() -> ExitCode {
         Err(e) => return fail(&format!("{e}\n\n{USAGE}")),
     };
     println!("openGMOD {}", env!("CARGO_PKG_VERSION"));
-    let (world, camera, name) = match load(&args) {
+    let loaded = match load(&args) {
         Ok(loaded) => loaded,
         Err(e) => return fail(&e),
     };
@@ -478,9 +567,13 @@ fn main() -> ExitCode {
     event_loop.set_control_flow(ControlFlow::Poll);
     let now = Instant::now();
     let mut app = App {
-        world,
-        name,
-        camera,
+        world: loaded.world,
+        collision: loaded.collision,
+        settings: Settings::default(),
+        spawn: loaded.spawn,
+        walker: None,
+        name: loaded.name,
+        camera: loaded.camera,
         gpu: None,
         error: None,
         keys: HashSet::new(),
@@ -490,6 +583,11 @@ fn main() -> ExitCode {
         counting_since: now,
         screenshot: false,
     };
+    // walking from the player start, as the game begins
+    app.respawn();
+    if app.walker.is_none() {
+        println!("No player start with room to stand: flying (V walks from where you are)");
+    }
     if let Err(e) = event_loop.run_app(&mut app) {
         return fail(&format!("window system: {e}"));
     }
