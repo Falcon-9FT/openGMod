@@ -110,7 +110,7 @@ cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, з
 | Lua-рантайм: LuaJIT, `include`, `AddCSLuaFile`, `hook`, `timer`, реалмы | `gmod-lua` | этап 3 |
 | zip (pakfile карт): без сжатия, DEFLATE, LZMA | `gmod-fs::zip` | готово |
 | карты BSP v19–21: LZMA-лампы, дисплейсменты, статические пропы, pakfile, PVS | `gmod-bsp` | чтение и сетка мира готовы; PVS — этап 2 |
-| материалы VMT, текстуры VTF | `gmod-material` | этап 2 |
+| материалы VMT, текстуры VTF | `gmod-material` | чтение готово; рендер — этап 2 |
 | модели MDL / VVD / VTX / PHY | `gmod-model` | этапы 2 и 4 |
 | рендер | `gmod-render` | этап 2 |
 | физика | `gmod-physics` | этап 4 |

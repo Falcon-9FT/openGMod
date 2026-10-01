@@ -143,6 +143,11 @@ impl Vfs {
         self.mounts.insert(index.min(self.mounts.len()), mount);
     }
 
+    /// Takes the mount at `index` out of the search order: the pakfile of a map that is left.
+    pub fn remove(&mut self, index: usize) -> Option<Mount> {
+        (index < self.mounts.len()).then(|| self.mounts.remove(index))
+    }
+
     /// The mounts in search order.
     pub fn mounts(&self) -> &[Mount] {
         &self.mounts

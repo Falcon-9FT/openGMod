@@ -13,9 +13,11 @@ dependencies = [
 name = "gmod-check"
 version = "0.1.0"
 dependencies = [
+ "gmod-bsp",
  "gmod-fs",
  "gmod-glua",
  "gmod-kv",
+ "gmod-material",
 ]
 
 [[package]]
@@ -32,3 +34,11 @@ version = "0.1.0"
 [[package]]
 name = "gmod-kv"
 version = "0.1.0"
+
+[[package]]
+name = "gmod-material"
+version = "0.1.0"
+dependencies = [
+ "gmod-fs",
+ "gmod-kv",
+]

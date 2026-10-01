@@ -1,12 +1,19 @@
 //! The coverage check: every file of the game file system that openGMOD already has a reader
 //! for is read, and what fails is listed.
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
-use gmod_fs::{Backing, Vfs, path};
+use gmod_bsp::{Bsp, mesh};
+use gmod_fs::{Backing, Mount, Vfs, path};
 use gmod_kv::Options;
+use gmod_material::{Vtf, load_material_file, material_path, texture_path};
 
 use crate::out::Out;
+
+/// Texture parameters of materials whose textures are looked for.
+const TEXTURE_PARAMS: [&str; 5] = ["$basetexture", "$basetexture2", "$bumpmap", "$normalmap", "$detail"];
 
 /// How a text file is read as KeyValues, if it is one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +57,14 @@ pub struct Report {
     pub lua: Tally,
     /// Lua files that use GMod's additions to the language.
     pub glua: usize,
+    pub textures: Tally,
+    pub materials: Tally,
+    pub maps: Tally,
+    /// Gaps in the content rather than failures of openGMOD: textures that materials name,
+    /// materials and models that maps name, which the game does not have.
+    pub missing_textures: Vec<String>,
+    pub missing_materials: Vec<String>,
+    pub missing_models: Vec<String>,
     pub unreadable: Vec<String>,
     pub crc: Option<Tally>,
     pub seconds: f64,
@@ -57,7 +72,9 @@ pub struct Report {
 
 impl Report {
     pub fn failures(&self) -> usize {
-        self.keyvalues.failed.len() + self.lua.failed.len() + self.unreadable.len() + self.crc.as_ref().map_or(0, |t| t.failed.len())
+        [&self.keyvalues, &self.lua, &self.textures, &self.materials, &self.maps].iter().map(|t| t.failed.len()).sum::<usize>()
+            + self.unreadable.len()
+            + self.crc.as_ref().map_or(0, |t| t.failed.len())
     }
 
     pub fn print(&self, out: &mut Out, all: bool) {
@@ -73,23 +90,57 @@ impl Report {
             self.lua.failed.len(),
             self.glua
         ));
+        out.line(format!(
+            "  Textures   {:>8} read   {:>6} failed   (VTF, map pakfiles included)",
+            self.textures.ok,
+            self.textures.failed.len()
+        ));
+        out.line(format!(
+            "  Materials  {:>8} read   {:>6} failed   (VMT, patches followed)",
+            self.materials.ok,
+            self.materials.failed.len()
+        ));
+        out.line(format!(
+            "  Maps       {:>8} read   {:>6} failed   (BSP: world, lightmaps, displacements, static props)",
+            self.maps.ok,
+            self.maps.failed.len()
+        ));
         if let Some(crc) = &self.crc {
             out.line(format!("  CRC-32     {:>8} match  {:>6} differ   (archive entries)", crc.ok, crc.failed.len()));
         }
         if !self.unreadable.is_empty() {
             out.line(format!("  unreadable {:>8}", self.unreadable.len()));
         }
-        let mut lists: Vec<(&str, &Vec<String>)> =
-            vec![("KeyValues", &self.keyvalues.failed), ("Lua", &self.lua.failed), ("Unreadable", &self.unreadable)];
-        if let Some(crc) = &self.crc {
-            lists.push(("CRC-32", &crc.failed));
+        let missing = self.missing_textures.len() + self.missing_materials.len() + self.missing_models.len();
+        if missing > 0 {
+            out.line(format!(
+                "  Missing: {} textures named by materials, {} materials and {} models named by maps",
+                self.missing_textures.len(),
+                self.missing_materials.len(),
+                self.missing_models.len()
+            ));
+            out.line("  (gaps in the content, not failures: the game shows these as errors too)");
         }
+        let mut lists: Vec<(&str, &Vec<String>)> = vec![
+            ("KeyValues failures", &self.keyvalues.failed),
+            ("Lua failures", &self.lua.failed),
+            ("Texture failures", &self.textures.failed),
+            ("Material failures", &self.materials.failed),
+            ("Map failures", &self.maps.failed),
+            ("Unreadable", &self.unreadable),
+        ];
+        if let Some(crc) = &self.crc {
+            lists.push(("CRC-32 failures", &crc.failed));
+        }
+        lists.push(("Missing textures", &self.missing_textures));
+        lists.push(("Missing materials", &self.missing_materials));
+        lists.push(("Missing models", &self.missing_models));
         for (what, failed) in lists {
             if failed.is_empty() {
                 continue;
             }
             out.line("");
-            out.line(format!("{what} failures ({}):", failed.len()));
+            out.line(format!("{what} ({}):", failed.len()));
             let shown = if all { failed.len() } else { failed.len().min(20) };
             for line in &failed[..shown] {
                 out.line(format!("  {line}"));
@@ -109,35 +160,46 @@ fn mount_name(vfs: &Vfs, index: usize) -> String {
     format!("{} {name}", mount.kind())
 }
 
-/// Reads every file openGMOD has a reader for.
-pub fn run(vfs: &Vfs, crc: bool) -> Report {
+/// Reads every file openGMOD has a reader for. A map's pakfile is mounted in front of the
+/// others while its materials are looked up, as when the map is played.
+pub fn run(vfs: &mut Vfs, crc: bool) -> Report {
     let started = Instant::now();
     let mut report = Report::default();
     let files = vfs.files("");
     report.files = files.len();
     for (path, index) in &files {
+        let extension = path::extension(path);
         let kv = keyvalues_kind(path);
-        let lua = path::extension(path) == "lua";
-        if kv.is_none() && !lua {
+        let lua = extension == "lua";
+        let texture = extension == "vtf";
+        let map = extension == "bsp" && path.starts_with("maps/");
+        if kv.is_none() && !lua && !texture && !map {
             continue;
         }
-        let where_ = || format!("{path} [{}]", mount_name(vfs, *index));
+        let where_ = format!("{path} [{}]", mount_name(vfs, *index));
         let bytes = match vfs.mounts()[*index].read(path) {
             Ok(bytes) => bytes,
             Err(e) => {
-                report.unreadable.push(format!("{}: {e}", where_()));
+                report.unreadable.push(format!("{where_}: {e}"));
                 continue;
             }
         };
-        if let Some(kind) = kv {
+        if texture {
+            count(&mut report.textures, &where_, check_texture(bytes));
+        } else if map {
+            check_map(vfs, path, &where_, bytes, &mut report);
+        } else if let Some(kind) = kv {
             let text = gmod_kv::decode_text(&bytes);
             let (_, errors) = gmod_kv::parse_lenient(&text, Options { escapes: kind == KeyValuesKind::Escaped });
             match errors.first() {
                 None => report.keyvalues.ok += 1,
                 Some(first) => {
                     let more = if errors.len() > 1 { format!(" (+{} more)", errors.len() - 1) } else { String::new() };
-                    report.keyvalues.failed.push(format!("{}: {first}{more}", where_()));
+                    report.keyvalues.failed.push(format!("{where_}: {first}{more}"));
                 }
+            }
+            if extension == "vmt" && path.starts_with("materials/") {
+                check_material(vfs, path, &where_, &mut report);
             }
         } else {
             match gmod_glua::translate(&bytes) {
@@ -147,7 +209,7 @@ pub fn run(vfs: &Vfs, crc: bool) -> Report {
                         report.glua += 1;
                     }
                 }
-                Err(e) => report.lua.failed.push(format!("{}: {e}", where_())),
+                Err(e) => report.lua.failed.push(format!("{where_}: {e}")),
             }
         }
     }
@@ -156,6 +218,99 @@ pub fn run(vfs: &Vfs, crc: bool) -> Report {
     }
     report.seconds = started.elapsed().as_secs_f64();
     report
+}
+
+fn count(tally: &mut Tally, where_: &str, result: Result<(), String>) {
+    match result {
+        Ok(()) => tally.ok += 1,
+        Err(e) => tally.failed.push(format!("{where_}: {e}")),
+    }
+}
+
+/// A texture reads when its sizes add up and its pixel format can be decoded.
+fn check_texture(bytes: Vec<u8>) -> Result<(), String> {
+    let vtf = Vtf::parse(bytes).map_err(|e| e.to_string())?;
+    match vtf.rgba8(vtf.mipmaps - 1, 0, 0, 0) {
+        Some(_) => Ok(()),
+        None => Err(format!("{vtf:?}: {} pixels cannot be decoded yet", vtf.format.name())),
+    }
+}
+
+/// A material reads when it and the materials it patches do; its textures should be there. A
+/// patch of a material that is not there is a gap in the content, not a failure.
+fn check_material(vfs: &Vfs, path: &str, where_: &str, report: &mut Report) {
+    match load_material_file(vfs, path, 0) {
+        Ok(material) => {
+            report.materials.ok += 1;
+            for param in TEXTURE_PARAMS {
+                let Some(texture) = material.texture(param) else { continue };
+                // render targets are made as the game runs
+                if texture.starts_with("_rt_") {
+                    continue;
+                }
+                if !texture_path(&texture).is_some_and(|file| vfs.exists(&file, "GAME")) {
+                    report.missing_textures.push(format!("{where_}: {param} {texture}"));
+                }
+            }
+        }
+        Err(e) => {
+            let message = e.to_string();
+            let message = message.strip_prefix(&format!("{path}: ")).unwrap_or(&message);
+            // a patch of a material the game does not have
+            if e.kind() == std::io::ErrorKind::NotFound {
+                report.missing_materials.push(format!("{where_}: {message}"));
+            } else {
+                report.materials.failed.push(format!("{where_}: {message}"));
+            }
+        }
+    }
+}
+
+/// A map reads when its lumps do and its world can be built. Its pakfile is checked as well:
+/// the textures and materials in it, and whether the materials and models the map names are
+/// in the game with the pakfile in front.
+fn check_map(vfs: &mut Vfs, path: &str, where_: &str, bytes: Vec<u8>, report: &mut Report) {
+    let bsp = match Bsp::parse(PathBuf::from(path), Arc::from(bytes)) {
+        Ok(bsp) => bsp,
+        Err(e) => return report.maps.failed.push(format!("{where_}: {e}")),
+    };
+    let world = mesh::build(&bsp, mesh::Options::default());
+    if world.broken_faces > 0 {
+        return report.maps.failed.push(format!("{where_}: {} faces of the world cannot be built", world.broken_faces));
+    }
+    let pak = match bsp.pakfile() {
+        Ok(pak) => pak,
+        Err(e) => return report.maps.failed.push(format!("{where_}: pakfile: {e}")),
+    };
+    report.maps.ok += 1;
+    let mounted = pak.is_some();
+    if let Some(pak) = pak {
+        let entries: Vec<String> = pak.entries().iter().map(|e| e.path.clone()).collect();
+        vfs.insert(0, Mount::new(&["GAME", "BSP"], Backing::Zip(pak)));
+        for entry in entries {
+            let inner = format!("{path}: {entry}");
+            match path::extension(&entry) {
+                "vtf" => {
+                    count(&mut report.textures, &inner, vfs.mounts()[0].read(&entry).map_err(|e| e.to_string()).and_then(check_texture))
+                }
+                "vmt" if entry.starts_with("materials/") => check_material(vfs, &entry, &inner, report),
+                _ => {}
+            }
+        }
+    }
+    for name in &bsp.materials {
+        if !material_path(name).is_some_and(|file| vfs.exists(&file, "GAME")) {
+            report.missing_materials.push(format!("{where_}: {name}"));
+        }
+    }
+    for model in &bsp.static_props.models {
+        if !vfs.exists(model, "GAME") {
+            report.missing_models.push(format!("{where_}: {model}"));
+        }
+    }
+    if mounted {
+        vfs.remove(0);
+    }
 }
 
 fn verify_archives(vfs: &Vfs) -> Tally {
@@ -207,6 +362,24 @@ mod tests {
         std::fs::write(path, data).unwrap();
     }
 
+    /// A 1 x 1 BGRA texture, version 7.2.
+    fn texture() -> Vec<u8> {
+        let mut v = b"VTF\0".to_vec();
+        for x in [7u32, 2, 80] {
+            v.extend(x.to_le_bytes());
+        }
+        v.extend([1, 0, 1, 0]); // 1 x 1
+        v.extend([0; 4]); // flags
+        v.extend([1, 0, 0, 0]); // one frame, first frame 0
+        v.resize(52, 0);
+        v.extend(12i32.to_le_bytes()); // BGRA8888
+        v.push(1); // one mipmap
+        v.extend((-1i32).to_le_bytes()); // no thumbnail
+        v.resize(80, 0);
+        v.extend([1, 2, 3, 4]);
+        v
+    }
+
     #[test]
     fn classifies_text_files() {
         assert_eq!(keyvalues_kind("materials/models/a.vmt"), Some(KeyValuesKind::Plain));
@@ -236,6 +409,7 @@ mod tests {
             &game.join("garrysmod_dir.vpk"),
             &[
                 ("materials/ok.vmt", b"\"LightmappedGeneric\" { \"$basetexture\" \"concrete\\floor\" }"),
+                ("materials/concrete/floor.vtf", &texture()),
                 ("lua/includes/init.lua", b"if a != b then end // GLua"),
                 ("lua/plain.lua", b"local x = 1"),
                 ("resource/language/x_english.txt", b"\"lang\" { \"Tokens\" { \"A\" \"say \\\"hi\\\"\" } }"),
@@ -243,6 +417,9 @@ mod tests {
         )
         .unwrap();
         write(&game.join("materials/broken.vmt"), b"\"VertexLitGeneric\" { \"$basetexture\" ");
+        write(&game.join("materials/missing.vmt"), b"\"UnlitGeneric\" { \"$basetexture\" \"nothing/here\" }");
+        write(&game.join("materials/broken.vtf"), b"VTF\0 cut short");
+        write(&game.join("maps/broken.bsp"), b"VBSP cut short");
         write(&game.join("lua/broken.lua"), b"x = 1 /* never closed");
         write(&game.join("scripts/sentences.txt"), b"NOT KEYVALUES {");
         let workshop = root.parent().unwrap().parent().unwrap().join("workshop/content/4000/42");
@@ -255,18 +432,24 @@ mod tests {
         .unwrap();
 
         let install = Install::at(&root).unwrap();
-        let (vfs, warnings) = mount_install(&install, &MountOptions::default());
+        let (mut vfs, warnings) = mount_install(&install, &MountOptions::default());
         assert!(warnings.is_empty(), "{warnings:?}");
-        let report = run(&vfs, true);
-        assert_eq!(report.keyvalues.ok, 3, "{:?}", report.keyvalues.failed);
+        let report = run(&mut vfs, true);
+        assert_eq!(report.keyvalues.ok, 4, "{:?}", report.keyvalues.failed);
         assert_eq!(report.keyvalues.failed.len(), 1);
         assert!(report.keyvalues.failed[0].starts_with("materials/broken.vmt [folder garrysmod]"), "{}", report.keyvalues.failed[0]);
         assert_eq!(report.lua.ok, 3);
         assert_eq!(report.glua, 2);
         assert_eq!(report.lua.failed.len(), 1);
         assert!(report.lua.failed[0].contains("lua/broken.lua"));
+        // a broken material still reads, as the engine reads what it can
+        assert_eq!((report.materials.ok, report.materials.failed.len()), (3, 0), "{:?}", report.materials.failed);
+        assert_eq!(report.missing_textures, ["materials/missing.vmt [folder garrysmod]: $basetexture nothing/here"]);
+        assert_eq!(report.textures.ok, 1);
+        assert!(report.textures.failed[0].starts_with("materials/broken.vtf [folder garrysmod]: "), "{:?}", report.textures.failed);
+        assert_eq!((report.maps.ok, report.maps.failed.len()), (0, 1));
         let crc = report.crc.as_ref().unwrap();
-        assert_eq!((crc.ok, crc.failed.len()), (5, 0));
-        assert_eq!(report.failures(), 2);
+        assert_eq!((crc.ok, crc.failed.len()), (6, 0));
+        assert_eq!(report.failures(), 4);
     }
 }

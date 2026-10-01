@@ -209,7 +209,7 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
     };
     let unpack_dir = if args.unpack { UserDir::default_root().map(|root| root.join("cache").join("workshop")) } else { None };
     let options = MountOptions { addons: args.addons, server_downloads: args.server_downloads, mount_cfg: true, unpack_dir };
-    let (vfs, warnings) = mount_install(&install, &options);
+    let (mut vfs, warnings) = mount_install(&install, &options);
     let mounted_in = started.elapsed();
 
     let operand = args.operand.as_deref().unwrap_or("");
@@ -221,7 +221,7 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
             print_warnings(out, &warnings, args.all);
             out.line(format!("Mounted in {:.1} s.", mounted_in.as_secs_f64()));
             out.line("");
-            let report = check::run(&vfs, args.crc);
+            let report = check::run(&mut vfs, args.crc);
             report.print(out, args.all);
             out.line(format!("Done in {:.1} s.", started.elapsed().as_secs_f64()));
             if report.failures() > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
