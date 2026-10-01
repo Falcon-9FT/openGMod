@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "gmod-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
@@ -464,14 +464,14 @@ dependencies = [
 
 [[package]]
 name = "gmod-bsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gmod-fs",
 ]
 
 [[package]]
 name = "gmod-check"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
@@ -484,22 +484,22 @@ dependencies = [
 
 [[package]]
 name = "gmod-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gmod-kv",
 ]
 
 [[package]]
 name = "gmod-glua"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "gmod-kv"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "gmod-material"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gmod-fs",
  "gmod-kv",
@@ -507,14 +507,14 @@ dependencies = [
 
 [[package]]
 name = "gmod-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gmod-fs",
 ]
 
 [[package]]
 name = "gmod-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "gmod-world"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
