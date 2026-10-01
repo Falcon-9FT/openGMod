@@ -16,6 +16,7 @@ use crate::dir::DirMount;
 use crate::gma::GmaArchive;
 use crate::path::{self, normalize};
 use crate::vpk::VpkArchive;
+use crate::zip::ZipArchive;
 
 /// What a mount reads from.
 #[derive(Debug)]
@@ -23,6 +24,8 @@ pub enum Backing {
     Dir(DirMount),
     Vpk(VpkArchive),
     Gma(GmaArchive),
+    /// A zip; above all the pakfile of the map being played.
+    Zip(ZipArchive),
 }
 
 /// One entry of the search order.
@@ -54,6 +57,7 @@ impl Mount {
             Backing::Dir(d) => d.root(),
             Backing::Vpk(v) => v.path(),
             Backing::Gma(g) => g.path(),
+            Backing::Zip(z) => z.path(),
         }
     }
 
@@ -62,6 +66,7 @@ impl Mount {
             Backing::Dir(_) => "folder",
             Backing::Vpk(_) => "vpk",
             Backing::Gma(_) => "gma",
+            Backing::Zip(_) => "zip",
         }
     }
 
@@ -71,6 +76,7 @@ impl Mount {
             Backing::Dir(d) => d.contains(path),
             Backing::Vpk(v) => v.contains(path),
             Backing::Gma(g) => g.contains(path),
+            Backing::Zip(z) => z.contains(path),
         }
     }
 
@@ -80,6 +86,7 @@ impl Mount {
             Backing::Dir(d) => d.read(path),
             Backing::Vpk(v) => v.read(path),
             Backing::Gma(g) => g.read(path),
+            Backing::Zip(z) => z.read(path),
         }
     }
 
@@ -89,6 +96,7 @@ impl Mount {
             Backing::Dir(d) => d.list(dir),
             Backing::Vpk(v) => v.list(dir),
             Backing::Gma(g) => g.list(dir),
+            Backing::Zip(z) => z.list(dir),
         }
     }
 
@@ -98,6 +106,7 @@ impl Mount {
             Backing::Dir(d) => d.walk(),
             Backing::Vpk(v) => v.entries().iter().map(|e| e.path.clone()).collect(),
             Backing::Gma(g) => g.entries().iter().map(|e| e.path.clone()).collect(),
+            Backing::Zip(z) => z.entries().iter().map(|e| e.path.clone()).collect(),
         }
     }
 }

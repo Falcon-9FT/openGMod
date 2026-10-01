@@ -3,7 +3,8 @@
 //! * [`install`] finds the player's Garry's Mod (a folder given, `GMOD_ROOT`, Steam's
 //!   libraries) and checks that it is complete.
 //! * [`vpk`] and [`gma`] read the archives the content ships in: Valve's packs and GMod's
-//!   addon files. [`DirMount`] reads a folder of loose files without regard to case.
+//!   addon files; [`zip`] reads a map's pakfile. [`DirMount`] reads a folder of loose files
+//!   without regard to case. [`lzma`] and [`inflate`] unpack what is compressed.
 //! * [`workshop`] finds the player's addons: subscribed workshop items, `.gma` files in
 //!   `garrysmod/addons`, server downloads; old compressed downloads are unpacked with
 //!   [`lzma`] into openGMOD's own folder.
@@ -22,6 +23,7 @@ mod dir;
 pub mod gameinfo;
 pub mod gma;
 mod index;
+pub mod inflate;
 pub mod install;
 mod io_util;
 pub mod lzma;
@@ -31,6 +33,7 @@ pub mod user;
 pub mod vfs;
 pub mod vpk;
 pub mod workshop;
+pub mod zip;
 
 pub use dir::DirMount;
 pub use gma::GmaArchive;
@@ -38,6 +41,7 @@ pub use install::Install;
 pub use user::UserDir;
 pub use vfs::{Backing, Mount, Vfs};
 pub use vpk::VpkArchive;
+pub use zip::ZipArchive;
 
 #[cfg(test)]
 mod testutil;

@@ -170,6 +170,7 @@ fn verify_archives(vfs: &Vfs) -> Tally {
             Backing::Dir(_) => {}
             Backing::Vpk(vpk) => vpk.entries().iter().for_each(|e| check(&e.path, vpk.verify(e))),
             Backing::Gma(gma) => gma.entries().iter().for_each(|e| check(&e.path, gma.verify(e))),
+            Backing::Zip(zip) => zip.entries().iter().for_each(|e| check(&e.path, zip.verify(e))),
         }
     }
     tally

@@ -6,7 +6,9 @@
 //!
 //! The "alone" container (`.lzma`) is 13 bytes of header before the stream: the properties
 //! byte (`(pb * 5 + lp) * 9 + lc`), `u32` dictionary size and `u64` uncompressed size, little
-//! endian, all ones when unknown (then the stream ends with an end marker).
+//! endian, all ones when unknown (then the stream ends with an end marker). Map lumps and zip
+//! entries (method 14) store the 5 property bytes and the sizes their own way and hand the bare
+//! stream to [`decompress_raw`].
 
 use std::io;
 
@@ -32,19 +34,30 @@ pub fn decompress_alone(input: &[u8], max_output: u64) -> io::Result<Vec<u8>> {
     if input.len() < 13 {
         return Err(invalid("too short for an LZMA stream"));
     }
-    let properties = input[0];
-    if properties >= 9 * 5 * 5 {
-        return Err(invalid(format!("LZMA properties byte {properties:#04x} is out of range")));
-    }
-    let lc = (properties % 9) as u32;
-    let lp = ((properties / 9) % 5) as u32;
-    let pb = (properties / 45) as u32;
     let size = u64::from_le_bytes(input[5..13].try_into().unwrap());
     let size = (size != u64::MAX).then_some(size);
-    if size.is_some_and(|s| s > max_output) {
-        return Err(invalid(format!("LZMA stream unpacks to {} bytes, more than the limit of {max_output}", size.unwrap())));
+    decompress_raw(&input[..5], &input[13..], size, max_output)
+}
+
+/// Decompresses a bare LZMA stream: `properties` are the 5 bytes of the properties byte and
+/// the dictionary size, `size` the unpacked size if known (else the stream ends with an end
+/// marker).
+pub fn decompress_raw(properties: &[u8], stream: &[u8], size: Option<u64>, max_output: u64) -> io::Result<Vec<u8>> {
+    let Some(&byte) = properties.first() else {
+        return Err(invalid("LZMA properties missing"));
+    };
+    if byte >= 9 * 5 * 5 {
+        return Err(invalid(format!("LZMA properties byte {byte:#04x} is out of range")));
     }
-    decode(&input[13..], lc, lp, pb, size, max_output)
+    let lc = (byte % 9) as u32;
+    let lp = ((byte / 9) % 5) as u32;
+    let pb = (byte / 45) as u32;
+    if let Some(size) = size
+        && size > max_output
+    {
+        return Err(invalid(format!("LZMA stream unpacks to {size} bytes, more than the limit of {max_output}")));
+    }
+    decode(stream, lc, lp, pb, size, max_output)
 }
 
 struct RangeDecoder<'a> {

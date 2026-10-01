@@ -36,7 +36,7 @@
   чужих файлов на C++ — главный источник уязвимостей в Source. В Rust эти ошибки исключены
   языком: в crate'ах openGMOD стоит `#![forbid(unsafe_code)]`, а размеры из файлов проверяются,
   прежде чем по ним что-то выделяется.
-* **Сборка одной командой** на Windows, Linux и macOS (Cargo), CI на каждый коммит.
+* **Сборка одной командой** на Windows и Linux (Cargo), CI на каждый коммит.
 * **Экосистема:** wgpu и winit (рендер и окна), mlua (LuaJIT), cpal (звук). Производительность
   на уровне C++.
 
@@ -49,7 +49,8 @@
 
 ### Рендер: wgpu + winit
 
-Как в openOMSI. Vulkan / DirectX 12 / Metal / OpenGL через одну абстракцию. Шейдеры Source
+Как в openOMSI, но без Metal: Vulkan и DirectX 12, OpenGL — запасной. Платформы — Windows и Linux;
+бэкенды wgpu включаются по отдельности, Metal в сборку не входит. Шейдеры Source
 (`LightmappedGeneric`, `VertexLitGeneric`, `UnlitGeneric`, `WorldVertexTransition`, `Water`,
 `Refract`...) переписываются на WGSL по их наблюдаемому результату.
 
@@ -104,17 +105,17 @@ cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, з
 | аддоны и воркшоп: подписки Steam, `appworkshop_4000.acf`, `addons/*.gma`, распаковка `.bin` (LZMA) | `gmod-fs::workshop` | готово; не учитывается ещё выключение аддона в меню |
 | KeyValues | `gmod-kv` | готово; `#base`/`#include` пока только распознаются |
 | диалект Lua | `gmod-glua` | готово |
-| Lua-рантайм: LuaJIT, `include`, `AddCSLuaFile`, `hook`, `timer`, реалмы | `gmod-lua` | этап 2 |
-| карты BSP v19–21: LZMA-лампы, дисплейсменты, статические пропы, pakfile, PVS | `gmod-bsp` | этап 1 |
-| материалы VMT, текстуры VTF | `gmod-material` | этап 1 |
-| модели MDL / VVD / VTX / PHY | `gmod-model` | этапы 1 и 3 |
-| рендер | `gmod-render` | этап 1 |
-| физика | `gmod-physics` | этап 3 |
-| сущности: энтити движка, SENT, SWEP, метатаблицы | `gmod-game` | этап 3 |
-| ввод, HUD, VGUI/Derma | `gmod-ui` | этап 4 |
-| звук | `gmod-audio` | этап 4 |
-| сеть: `net`, `NWVars`, сервер | `gmod-net` | этап 5 |
-| приложение `opengmod` | `gmod-app` | с этапа 1 |
+| Lua-рантайм: LuaJIT, `include`, `AddCSLuaFile`, `hook`, `timer`, реалмы | `gmod-lua` | этап 3 |
+| карты BSP v19–21: LZMA-лампы, дисплейсменты, статические пропы, pakfile, PVS | `gmod-bsp` | этап 2 |
+| материалы VMT, текстуры VTF | `gmod-material` | этап 2 |
+| модели MDL / VVD / VTX / PHY | `gmod-model` | этапы 2 и 4 |
+| рендер | `gmod-render` | этап 2 |
+| физика | `gmod-physics` | этап 4 |
+| сущности: энтити движка, SENT, SWEP, метатаблицы | `gmod-game` | этап 4 |
+| ввод, HUD, VGUI/Derma | `gmod-ui` | этап 5 |
+| звук | `gmod-audio` | этап 5 |
+| сеть: `net`, `NWVars`, сервер | `gmod-net` | этап 6 |
+| приложение `opengmod` | `gmod-app` | с этапа 2 |
 
 ## Файловая система
 
