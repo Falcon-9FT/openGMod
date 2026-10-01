@@ -16,18 +16,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --release
-      - run: cargo build --release -p gmod-check
+      - run: cargo build --release -p gmod-check -p gmod-app
       - name: Publish
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          $exe = "target/release/gmod-check.exe"
+          $programs = @("target/release/opengmod.exe", "target/release/gmod-check.exe")
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            # the release exists (a re-run): replace the program
-            gh release upload $env:TAG $exe --clobber
+            # the release exists (a re-run): replace the programs
+            gh release upload $env:TAG @programs --clobber
           } else {
-            gh release create $env:TAG $exe --title "openGMOD $env:TAG" --notes-file .github/release-notes.md --prerelease
+            gh release create $env:TAG @programs --title "openGMOD $env:TAG" --notes-file .github/release-notes.md --prerelease
           }

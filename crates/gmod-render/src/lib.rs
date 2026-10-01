@@ -191,6 +191,18 @@ fn sampler(device: &wgpu::Device, clamp_s: bool, clamp_t: bool, filtered: bool) 
     })
 }
 
+/// An uploaded texture and which sampler it takes, or the missing texture.
+fn pick<'a>(
+    textures: &'a [Option<(wgpu::TextureView, usize)>],
+    missing: &'a wgpu::TextureView,
+    index: Option<usize>,
+) -> (&'a wgpu::TextureView, usize) {
+    match index.and_then(|i| textures.get(i)).and_then(Option::as_ref) {
+        Some((view, sampler)) => (view, *sampler),
+        None => (missing, 0),
+    }
+}
+
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -420,12 +432,7 @@ impl Renderer {
                 }
             })
             .collect();
-        let texture = |index: Option<usize>| -> (&wgpu::TextureView, usize) {
-            match index.and_then(|i| textures[i].as_ref()) {
-                Some((view, sampler)) => (view, *sampler),
-                None => (&missing_view, 0),
-            }
-        };
+        let texture = |index: Option<usize>| pick(&textures, &missing_view, index);
 
         // geometry, and per surface its parameters and textures
         let geometry = gpu::geometry(world);
