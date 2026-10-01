@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.vpk binary
+*.gma binary
+*.bin binary

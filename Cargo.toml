@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gmod-kv",
+    "crates/gmod-fs",
+    "crates/gmod-glua",
+    "tools/gmod-check",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+repository = "https://github.com/Falcon-9FT/openGMod"
+
+[workspace.dependencies]
+gmod-kv = { path = "crates/gmod-kv" }
+gmod-fs = { path = "crates/gmod-fs" }
+gmod-glua = { path = "crates/gmod-glua" }
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 4
+lto = "thin"
+
+# The checks read every file of an installation (hundreds of thousands); an unoptimised build
+# makes that minutes instead of seconds.
+[profile.dev]
+opt-level = 1

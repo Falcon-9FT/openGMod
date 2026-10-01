@@ -1,0 +1,18 @@
+# build output
+/target
+**/*.rs.bk
+
+# local tools and editors
+.DS_Store
+.claude/
+.idea/
+.vscode/
+
+# Never commit game content: anything copied out of a Garry's Mod installation for testing
+# belongs here (or anywhere outside the repository).
+/content/
+*.vpk
+*.gma
+*.bsp
+*.mdl
+*.vtf

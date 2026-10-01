@@ -1,0 +1,4 @@
+# Compact: short constructs on one line, long lines allowed - the code reads like prose
+# rather than a column.
+max_width = 140
+use_small_heuristics = "Max"
