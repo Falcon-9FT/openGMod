@@ -1,12 +1,18 @@
 name: Release
 
-# A version tag (v0.1.0, ...) builds the Windows programs and publishes them as a release.
+# Builds the Windows programs and publishes them as a release. Two ways to start it:
+# * push a version tag (v0.2.0, ...);
+# * "Run workflow" on the Actions tab: the tag is "v" and the workspace version from Cargo.toml,
+#   made on the commit the workflow runs on.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency: release
 
 jobs:
   windows:
@@ -23,13 +29,23 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           $programs = @("target/release/opengmod.exe", "target/release/gmod-check.exe")
-          gh release view $env:TAG *> $null
-          if ($LASTEXITCODE -eq 0) {
-            # the release exists (a re-run): replace the programs
-            gh release upload $env:TAG @programs --clobber
+          if ($env:REF_TYPE -eq "tag") {
+            $tag = $env:REF_NAME
           } else {
-            gh release create $env:TAG @programs --title "openGMOD $env:TAG" --notes-file .github/release-notes.md --prerelease
+            $app = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq "gmod-app"
+            $tag = "v$($app.version)"
+          }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag @programs --target $env:GITHUB_SHA --title "openGMOD $tag" --notes-file .github/release-notes.md --prerelease
+          } elseif ($env:REF_TYPE -eq "tag") {
+            # the release exists (a re-run): replace the programs
+            gh release upload $tag @programs --clobber
+          } else {
+            Write-Error "$tag is out already: raise the version in Cargo.toml for a new release"
+            exit 1
           }
