@@ -121,14 +121,19 @@ fn load(args: &Args) -> Result<Loaded, String> {
     let bsp = gmod_bsp::Bsp::parse(PathBuf::from(&path), Arc::from(bytes)).map_err(|e| e.to_string())?;
     gmod_world::mount_pakfile(&mut vfs, &bsp).map_err(|e| format!("{path}: pakfile: {e}"))?;
     let world = gmod_world::load(&vfs, &bsp);
-    let collision = Collision::new(&bsp);
+    let (collision, unread_physics) = gmod_world::collision(&vfs, &bsp);
     println!("{path}: {} triangles, {} textures, in {:.1} s", world.triangles(), world.textures.len(), started.elapsed().as_secs_f64());
-    for (what, names) in [("materials", &world.missing_materials), ("textures", &world.missing_textures), ("models", &world.missing_models)]
-    {
+    let lists = [
+        ("Missing materials", &world.missing_materials),
+        ("Missing textures", &world.missing_textures),
+        ("Missing models", &world.missing_models),
+        ("Physics models that could not be read, their props not solid", &unread_physics),
+    ];
+    for (what, names) in lists {
         if !names.is_empty() {
             let shown: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
             let more = if names.len() > 3 { format!(" and {} more", names.len() - 3) } else { String::new() };
-            println!("Missing {what} ({}): {}{more}", names.len(), shown.join(", "));
+            println!("{what} ({}): {}{more}", names.len(), shown.join(", "));
         }
     }
     let (eye, target) = gmod_world::default_view(&bsp);

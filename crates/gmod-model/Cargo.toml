@@ -3,7 +3,11 @@ name = "gmod-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Source engine models: .mdl headers, bones, skins and body parts, .vvd vertices, .vtx triangles; static meshes for drawing props"
+description = "Source engine models: .mdl headers, bones, skins and body parts, .vvd vertices, .vtx triangles, .phy physics; static meshes for drawing props"
 
 [dependencies]
 gmod-fs.workspace = true
+
+[features]
+# small model files for the tests of other crates
+testmodel = []

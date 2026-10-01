@@ -68,12 +68,25 @@ pub struct StaticProp {
     pub model: u16,
     pub first_leaf: u16,
     pub leaf_count: u16,
+    /// How it collides: [`solid`].
     pub solid: u8,
     pub flags: u8,
     pub skin: i32,
     pub fade_min: f32,
     pub fade_max: f32,
     pub lighting_origin: [f32; 3],
+}
+
+/// How a static prop collides.
+pub mod solid {
+    /// Not at all.
+    pub const NONE: u8 = 0;
+    /// By the box of its model's hull, turned with it.
+    pub const BBOX: u8 = 2;
+    pub const OBB: u8 = 3;
+    pub const OBB_YAW: u8 = 4;
+    /// By its physics model (`.phy`); without one, not at all.
+    pub const VPHYSICS: u8 = 6;
 }
 
 /// The static props of a map.

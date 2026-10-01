@@ -1,4 +1,5 @@
-//! A map ready to draw: what a renderer needs, from the GPU one to the CPU preview.
+//! A map ready to draw - what a renderer needs, from the GPU one to the CPU preview - and to
+//! walk in: what is solid ([`collision`]).
 //!
 //! [`load`] turns a map into [`Piece`]s - the world, every brush entity that can be seen
 //! (`func_brush`, doors ...) moved to where it stands, and every static prop with its model -
@@ -10,6 +11,9 @@
 //! The map's pakfile holds materials, models and the props' light: mount it in front first
 //! ([`mount_pakfile`]), as the engine does while the map is played. [`gpu`] lays the world out
 //! for a GPU.
+//!
+//! What is solid is the map's brushes and displacements, and its static props by their
+//! physics models (`.phy`) or by the box of their hull, as each prop says.
 
 #![forbid(unsafe_code)]
 
@@ -17,10 +21,12 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
+use gmod_bsp::collision::{Collision, Hull};
+use gmod_bsp::props::solid;
 use gmod_bsp::{Bsp, mesh};
 use gmod_fs::{Backing, Mount, Vfs};
 use gmod_material::{Library, Material, Vtf};
-use gmod_model::{Model, Vhv};
+use gmod_model::{Mdl, Model, Vhv};
 
 pub mod gpu;
 
@@ -278,6 +284,54 @@ pub fn default_view(bsp: &Bsp) -> (Vec3, Vec3) {
     let size = sub(world.maxs, world.mins);
     let eye = add(middle, [-size[0] * 0.4, -size[1] * 0.4, size[2] * 0.6]);
     (eye, middle)
+}
+
+/// What is solid in a map: its brushes and displacements ([`Collision::new`]), and its static
+/// props, by their physics models or by the boxes of their hulls. Returns too what could not be
+/// read for the props: models whose physics model is broken, or of another build. The map's
+/// pakfile should be mounted ([`mount_pakfile`]).
+pub fn collision(vfs: &Vfs, bsp: &Bsp) -> (Collision, Vec<String>) {
+    let mut collision = Collision::new(bsp);
+    let mut shapes: HashMap<(u16, bool), Option<usize>> = HashMap::new();
+    let mut failed = Vec::new();
+    for (n, prop) in bsp.static_props.props.iter().enumerate() {
+        let boxed = match prop.solid {
+            solid::NONE => continue,
+            solid::BBOX | solid::OBB | solid::OBB_YAW => true,
+            _ => false,
+        };
+        let Some(name) = bsp.static_props.models.get(prop.model as usize) else { continue };
+        let shape = *shapes.entry((prop.model, boxed)).or_insert_with(|| match prop_hulls(vfs, name, boxed) {
+            Ok(hulls) => hulls.map(|hulls| collision.add_shape(hulls)),
+            // a model the game does not have is missing from the picture as well
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                failed.push(e.to_string());
+                None
+            }
+        });
+        if let Some(shape) = shape {
+            collision.add_static(n, shape, prop.origin, prop.angles);
+        }
+    }
+    (collision, failed)
+}
+
+/// The convex hulls a model collides by: those of its physics model, or the box of its hull.
+/// `None` when it has no physics model: then it does not collide.
+fn prop_hulls(vfs: &Vfs, name: &str, boxed: bool) -> io::Result<Option<Vec<Hull>>> {
+    let mdl = Mdl::parse(&vfs.read(name, "GAME")?).map_err(|e| io::Error::new(e.kind(), format!("{name}: {e}")))?;
+    if boxed {
+        return Ok(Some(vec![Hull::cuboid(mdl.hull.0, mdl.hull.1)]));
+    }
+    let Some(phy) = gmod_model::load_physics(vfs, name, mdl.checksum)? else { return Ok(None) };
+    let hulls: Vec<Hull> = phy
+        .solids
+        .iter()
+        .flat_map(|s| &s.convexes)
+        .filter_map(|c| Hull::new(&c.points, &c.triangles.iter().map(|t| t.map(usize::from)).collect::<Vec<_>>()))
+        .collect();
+    Ok((!hulls.is_empty()).then_some(hulls))
 }
 
 /// Brush entities that are never seen: volumes for the game's logic and effects.
@@ -663,6 +717,58 @@ mod tests {
         assert_eq!(eye, [64.0, 64.0, 80.0]);
         assert_eq!(spawn_point(&bsp), Some(([64.0, 64.0, 16.0], [0.0, 90.0, 0.0])));
         assert!((target[1] - 164.0).abs() < 1e-3 && (target[0] - 64.0).abs() < 1e-3, "{target:?}");
+    }
+
+    #[test]
+    fn static_props_are_solid_by_their_physics() {
+        use gmod_bsp::collision::{EPSILON, mask};
+        use gmod_bsp::testmap::{TestBrush, TestMap, TestStaticProp};
+        use gmod_model::testmodel::{self, TestConvex};
+
+        let root = std::env::temp_dir().join(format!("gmod-world-physics-{}", std::process::id()));
+        let game = Game(root.clone());
+        let hull = ([-20.0, -20.0, 0.0], [20.0, 20.0, 40.0]);
+        let shape = [vec![TestConvex::cuboid([-16.0, -16.0, 0.0], [16.0, 16.0, 32.0])]];
+        let files: [(&str, Vec<u8>); 5] = [
+            ("models/test/crate.mdl", testmodel::mdl(77, hull)),
+            ("models/test/crate.phy", testmodel::phy(77, &shape, false, "solid { \"index\" \"0\" \"mass\" \"50\" }")),
+            ("models/test/ghost.mdl", testmodel::mdl(5, hull)),
+            ("models/test/other.mdl", testmodel::mdl(6, hull)),
+            ("models/test/other.phy", testmodel::phy(999, &shape, false, "")),
+        ];
+        let prop = |model: &str, x: f32, solid: u8| TestStaticProp { model: model.into(), origin: [x, 0.0, 0.0], angles: [0.0; 3], solid };
+        let map = TestMap {
+            models: vec![vec![TestBrush::cuboid([-2048.0, -2048.0, -32.0], [2048.0, 2048.0, 0.0])]],
+            static_props: vec![
+                prop("models/test/crate.mdl", 200.0, solid::VPHYSICS),
+                prop("models/test/crate.mdl", 400.0, solid::BBOX),
+                prop("models/test/crate.mdl", 600.0, solid::NONE),
+                prop("models/test/ghost.mdl", 800.0, solid::VPHYSICS),
+                prop("models/test/other.mdl", 1000.0, solid::VPHYSICS),
+                prop("models/test/gone.mdl", 1200.0, solid::VPHYSICS),
+            ],
+            ..TestMap::default()
+        };
+        for (path, data) in files {
+            let path = game.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, data).unwrap();
+        }
+        let mut vfs = Vfs::new();
+        vfs.push(Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&root))));
+        let bsp = Bsp::parse("maps/test.bsp".into(), Arc::from(map.bytes())).unwrap();
+        assert_eq!(bsp.static_props.props.len(), 6);
+        let (collision, failed) = collision(&vfs, &bsp);
+        let down = |x: f32| collision.trace_line([x, 0.0, 100.0], [x, 0.0, -100.0], mask::SOLID);
+        // by its physics model, and by the box of its hull
+        assert_eq!((down(200.0).end[2], down(200.0).static_prop), (32.0 + EPSILON, Some(0)));
+        assert_eq!((down(400.0).end[2], down(400.0).static_prop), (40.0 + EPSILON, Some(1)));
+        // not solid, without a physics model, with another build's, and not in the game
+        for x in [600.0, 800.0, 1000.0, 1200.0] {
+            assert_eq!((down(x).end[2], down(x).static_prop), (EPSILON, None), "at {x}");
+        }
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("other.phy") && failed[0].contains("another build"), "{failed:?}");
     }
 
     #[test]
