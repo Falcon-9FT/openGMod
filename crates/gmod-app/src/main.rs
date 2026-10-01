@@ -117,6 +117,20 @@ fn load(args: &Args) -> Result<(World, Camera, String), String> {
     Ok((world, Camera::looking_at(eye, target, FOV), name))
 }
 
+/// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
+/// llvmpipe), a discrete one before an integrated one, and of the same kind Direct3D 12 before
+/// Vulkan.
+fn adapter_rank(kind: wgpu::DeviceType, backend: wgpu::Backend) -> (u8, bool) {
+    let kind = match kind {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::Other => 2,
+        wgpu::DeviceType::VirtualGpu => 3,
+        wgpu::DeviceType::Cpu => 4,
+    };
+    (kind, backend != wgpu::Backend::Dx12)
+}
+
 /// The window and what draws into it.
 struct Gpu {
     window: Arc<Window>,
@@ -135,16 +149,19 @@ impl Gpu {
         let attributes = Window::default_attributes().with_title(title).with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attributes).map_err(|e| format!("window: {e}"))?);
         let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle()));
-        // Direct3D 12 first on Windows, Vulkan where it is not
-        descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        let backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        descriptor.backends = backends;
         let instance = wgpu::Instance::new(descriptor);
         let surface = instance.create_surface(window.clone()).map_err(|e| format!("surface: {e}"))?;
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .map_err(|e| format!("no graphics adapter with Direct3D 12 or Vulkan: {e}"))?;
+        // chosen here and not by request_adapter, which takes Vulkan first when both drive a GPU
+        let adapter = block_on(instance.enumerate_adapters(backends))
+            .into_iter()
+            .filter(|adapter| adapter.is_surface_supported(&surface))
+            .min_by_key(|adapter| {
+                let info = adapter.get_info();
+                adapter_rank(info.device_type, info.backend)
+            })
+            .ok_or("no graphics adapter with Direct3D 12 or Vulkan")?;
         let info = adapter.get_info();
         println!("GPU: {} ({:?})", info.name, info.backend);
         let features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
@@ -505,5 +522,28 @@ mod tests {
     #[test]
     fn futures_run_to_their_end() {
         assert_eq!(block_on(async { 6 * 7 }), 42);
+    }
+
+    #[test]
+    fn direct3d_first_but_a_real_gpu_before_a_software_one() {
+        use wgpu::{Backend, DeviceType};
+        let mut adapters = [
+            (DeviceType::Cpu, Backend::Dx12),
+            (DeviceType::IntegratedGpu, Backend::Vulkan),
+            (DeviceType::DiscreteGpu, Backend::Vulkan),
+            (DeviceType::IntegratedGpu, Backend::Dx12),
+            (DeviceType::DiscreteGpu, Backend::Dx12),
+        ];
+        adapters.sort_by_key(|&(kind, backend)| adapter_rank(kind, backend));
+        assert_eq!(
+            adapters,
+            [
+                (DeviceType::DiscreteGpu, Backend::Dx12),
+                (DeviceType::DiscreteGpu, Backend::Vulkan),
+                (DeviceType::IntegratedGpu, Backend::Dx12),
+                (DeviceType::IntegratedGpu, Backend::Vulkan),
+                (DeviceType::Cpu, Backend::Dx12),
+            ]
+        );
     }
 }
