@@ -7,8 +7,8 @@ openGMOD — чистая реимплементация («clean room»), ка�
 
 * **Утёкший код Valve и Facepunch.** Утечки Half-Life 2 (2003) и CS:GO/TF2 (2020), всё, что из
   них выросло (`nillerusr/source-engine`, Kisak-Strike и т. п.), «восстановленный из ассемблера»
-  код IVP/VPhysics (`source-physics`, `ivp-source1` и подобные). Даже не открывайте их, когда
-  работаете над openGMOD.
+  код IVP/VPhysics (`source-physics`, `ivp-source1` и подобные, в том числе их копии без строк
+  копирайта). Даже не открывайте их, когда работаете над openGMOD.
 * **Код Source SDK** (`ValveSoftware/source-sdk-2013`, в том числе TF2 SDK). Его лицензия разрешает
   использовать SDK только для модов, работающих на движке Source 1 от Valve, и только бесплатно.
   С движком-заменой под MIT это несовместимо: ни кода, ни заголовков оттуда.
