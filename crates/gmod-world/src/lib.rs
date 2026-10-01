@@ -234,19 +234,32 @@ pub fn mount_pakfile(vfs: &mut Vfs, bsp: &Bsp) -> io::Result<bool> {
     Ok(mounted)
 }
 
+/// The entities a view starts from, in the order they are looked for: where players start, in
+/// the games whose maps GMod plays, and the points spectators look from.
+const STARTS: [&str; 9] = [
+    "info_player_start",
+    "gmod_player_start",
+    "info_observer_point",
+    "info_player_teamspawn",
+    "info_player_deathmatch",
+    "info_player_counterterrorist",
+    "info_player_terrorist",
+    "info_player_combine",
+    "info_player_rebel",
+];
+
+/// Where a player starts: the first spawn point of the kinds [`STARTS`] lists. Returns its
+/// origin, which is where the feet are, and its angles.
+pub fn spawn_point(bsp: &Bsp) -> Option<(Vec3, Vec3)> {
+    STARTS.iter().filter(|class| **class != "info_observer_point").find_map(|class| {
+        let entity = bsp.entities.iter().find(|e| e.class_name() == *class)?;
+        Some((entity.vec3("origin")?, entity.vec3("angles").unwrap_or([0.0; 3])))
+    })
+}
+
 /// Where to look from when nothing else says: a player start or an observer point, else above
 /// the middle of the world. Returns the eye and a point it looks at.
 pub fn default_view(bsp: &Bsp) -> (Vec3, Vec3) {
-    const STARTS: [&str; 8] = [
-        "info_player_start",
-        "info_observer_point",
-        "info_player_teamspawn",
-        "info_player_deathmatch",
-        "info_player_counterterrorist",
-        "info_player_terrorist",
-        "info_player_combine",
-        "info_player_rebel",
-    ];
     for class in STARTS {
         if let Some(entity) = bsp.entities.iter().find(|e| e.class_name() == class)
             && let Some(origin) = entity.vec3("origin")
@@ -648,6 +661,7 @@ mod tests {
         // the player start, at eye height, looking along +y
         let (eye, target) = default_view(&bsp);
         assert_eq!(eye, [64.0, 64.0, 80.0]);
+        assert_eq!(spawn_point(&bsp), Some(([64.0, 64.0, 16.0], [0.0, 90.0, 0.0])));
         assert!((target[1] - 164.0).abs() < 1e-3 && (target[0] - 64.0).abs() < 1e-3, "{target:?}");
     }
 

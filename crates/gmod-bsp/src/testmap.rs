@@ -230,3 +230,313 @@ pub fn bytes() -> Vec<u8> {
     set_entry(&mut out, index::GAME_LUMP, directory_at, game.len(), 0);
     out
 }
+
+/// A brush of a [`TestMap`]: a box, cut further by planes (the solid is behind each).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestBrush {
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+    /// Normals and distances.
+    pub cuts: Vec<([f32; 3], f32)>,
+    pub contents: u32,
+    pub material: &'static str,
+    /// `surf` flags of its sides.
+    pub flags: i32,
+}
+
+impl TestBrush {
+    /// A solid box.
+    pub fn cuboid(mins: [f32; 3], maxs: [f32; 3]) -> TestBrush {
+        TestBrush { mins, maxs, cuts: Vec::new(), contents: crate::contents::SOLID, material: "DEV/DEV_MEASUREGENERIC01", flags: 0 }
+    }
+
+    pub fn contents(mut self, contents: u32) -> TestBrush {
+        self.contents = contents;
+        self
+    }
+
+    pub fn material(mut self, material: &'static str, flags: i32) -> TestBrush {
+        self.material = material;
+        self.flags = flags;
+        self
+    }
+
+    /// Cuts away what is in front of a plane.
+    pub fn cut(mut self, normal: [f32; 3], dist: f32) -> TestBrush {
+        let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        self.cuts.push((normal.map(|n| n / len), dist / len));
+        self
+    }
+}
+
+/// A displacement of a [`TestMap`]: a square grid flat at the height of `corner`, from there
+/// along +x and +y, its points raised by `heights` (row by row; the rows go along +y, the
+/// points of a row along +x).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestDisplacement {
+    pub corner: [f32; 3],
+    pub size: f32,
+    pub power: i32,
+    pub heights: Vec<f32>,
+}
+
+/// A map of brushes for tests, lump by lump: the world and brush entities, each with a BSP
+/// tree split along its brushes' bounds, displacements in the world, and entities.
+#[derive(Debug, Clone, Default)]
+pub struct TestMap {
+    /// The brushes of each brush model; the first are the world's.
+    pub models: Vec<Vec<TestBrush>>,
+    pub displacements: Vec<TestDisplacement>,
+    /// The entities after `worldspawn`, as the entity lump writes them.
+    pub entities: String,
+    /// The leaves as maps of version 19 write them, with an ambient light cube each.
+    pub old_leaves: bool,
+}
+
+/// A brush as the tree builder sees it: its index and bounds.
+type Boxed = (usize, [f32; 3], [f32; 3]);
+
+#[derive(Default)]
+struct Tree {
+    planes: Vec<u8>,
+    plane_count: usize,
+    nodes: Vec<u8>,
+    node_count: usize,
+    leaves: Vec<u8>,
+    leaf_count: usize,
+    leaf_brushes: Vec<u8>,
+    leaf_brush_count: usize,
+    old_leaves: bool,
+}
+
+impl Tree {
+    fn plane(&mut self, normal: [f32; 3], dist: f32) -> usize {
+        let axial = normal.iter().filter(|n| **n == 0.0).count() == 2;
+        let dominant = (0..3).max_by(|&a, &b| normal[a].abs().total_cmp(&normal[b].abs())).unwrap_or(0) as i32;
+        self.planes.extend(f32s(&[normal[0], normal[1], normal[2], dist]));
+        self.planes.extend(i32s(&[if axial { dominant } else { 3 + dominant }]));
+        self.plane_count += 1;
+        self.plane_count - 1
+    }
+
+    fn leaf(&mut self, brushes: &[Boxed], contents: &[u32], region: ([f32; 3], [f32; 3])) -> i32 {
+        let mut leaf = brushes.iter().fold(0u32, |c, b| c | contents[b.0]).to_le_bytes().to_vec();
+        leaf.extend(0i16.to_le_bytes()); // cluster
+        leaf.extend(0u16.to_le_bytes()); // area and flags
+        for v in region.0.iter().chain(&region.1) {
+            leaf.extend((v.clamp(-32768.0, 32767.0) as i16).to_le_bytes());
+        }
+        leaf.extend([0, 0, 0, 0]); // leaf faces
+        leaf.extend((self.leaf_brush_count as u16).to_le_bytes());
+        leaf.extend((brushes.len() as u16).to_le_bytes());
+        leaf.extend((-1i16).to_le_bytes()); // water data
+        leaf.resize(if self.old_leaves { 56 } else { 32 }, 0);
+        self.leaves.extend(leaf);
+        for b in brushes {
+            self.leaf_brushes.extend((b.0 as u16).to_le_bytes());
+        }
+        self.leaf_brush_count += brushes.len();
+        self.leaf_count += 1;
+        -(self.leaf_count as i32)
+    }
+
+    /// The node over `brushes` in `region`, its subtree written after it; a leaf when there is
+    /// nothing left to split, unless a node is needed (a model's head).
+    fn build(&mut self, brushes: &[Boxed], contents: &[u32], region: ([f32; 3], [f32; 3]), depth: usize, node_needed: bool) -> i32 {
+        // the split that best halves the brushes, at a brush's side inside the region
+        let mut best: Option<(usize, f32, usize)> = None;
+        if brushes.len() > 1 && depth < 24 {
+            for axis in 0..3 {
+                for b in brushes {
+                    for value in [b.1[axis], b.2[axis]] {
+                        if value <= region.0[axis] || value >= region.1[axis] {
+                            continue;
+                        }
+                        let front = brushes.iter().filter(|o| o.2[axis] >= value).count();
+                        let back = brushes.iter().filter(|o| o.1[axis] <= value).count();
+                        let worst = front.max(back);
+                        if worst < brushes.len() && best.is_none_or(|(_, _, w)| worst < w) {
+                            best = Some((axis, value, worst));
+                        }
+                    }
+                }
+            }
+        }
+        let (axis, value) = match best {
+            Some((axis, value, _)) => (axis, value),
+            None if node_needed => (0, (region.0[0] + region.1[0]) / 2.0),
+            None => return self.leaf(brushes, contents, region),
+        };
+        let index = self.node_count;
+        self.node_count += 1;
+        let at = self.nodes.len();
+        self.nodes.resize(at + 32, 0);
+        let mut normal = [0.0; 3];
+        normal[axis] = 1.0;
+        let plane = self.plane(normal, value);
+        let in_front: Vec<Boxed> = brushes.iter().copied().filter(|b| b.2[axis] >= value).collect();
+        let behind: Vec<Boxed> = brushes.iter().copied().filter(|b| b.1[axis] <= value).collect();
+        let (mut front_region, mut back_region) = (region, region);
+        front_region.0[axis] = value;
+        back_region.1[axis] = value;
+        let front = self.build(&in_front, contents, front_region, depth + 1, false);
+        let back = self.build(&behind, contents, back_region, depth + 1, false);
+        let mut node = i32s(&[plane as i32, front, back]);
+        for v in region.0.iter().chain(&region.1) {
+            node.extend((v.clamp(-32768.0, 32767.0) as i16).to_le_bytes());
+        }
+        node.resize(32, 0);
+        self.nodes[at..at + 32].copy_from_slice(&node);
+        index as i32
+    }
+}
+
+impl TestMap {
+    /// The map's bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut tree = Tree { old_leaves: self.old_leaves, ..Tree::default() };
+        // leaf 0, as compilers write it: outside everything
+        tree.leaf(&[], &[], ([0.0; 3], [0.0; 3]));
+
+        let mut names: Vec<&str> = Vec::new();
+        let mut texinfos: Vec<(i32, usize)> = Vec::new();
+        let mut surface = |material: &'static str, flags: i32| -> i16 {
+            let texdata = names.iter().position(|n| *n == material).unwrap_or_else(|| {
+                names.push(material);
+                names.len() - 1
+            });
+            let index = texinfos.iter().position(|t| *t == (flags, texdata)).unwrap_or_else(|| {
+                texinfos.push((flags, texdata));
+                texinfos.len() - 1
+            });
+            index as i16
+        };
+
+        let (mut brushes, mut sides) = (Vec::new(), Vec::new());
+        let (mut brush_count, mut side_count) = (0usize, 0usize);
+        let mut contents = Vec::new();
+        let mut models = Vec::new();
+        let models_in = if self.models.is_empty() { vec![Vec::new()] } else { self.models.clone() };
+        for (m, model) in models_in.iter().enumerate() {
+            let mut boxed = Vec::new();
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for brush in model {
+                let side_surface = surface(brush.material, brush.flags);
+                let mut planes = Vec::new();
+                for axis in 0..3 {
+                    let mut normal = [0.0; 3];
+                    normal[axis] = 1.0;
+                    planes.push((normal, brush.maxs[axis]));
+                    normal[axis] = -1.0;
+                    planes.push((normal, -brush.mins[axis]));
+                }
+                planes.extend(brush.cuts.iter().copied());
+                brushes.extend(i32s(&[side_count as i32, planes.len() as i32, brush.contents as i32]));
+                for (normal, dist) in planes {
+                    let plane = tree.plane(normal, dist);
+                    sides.extend((plane as u16).to_le_bytes());
+                    sides.extend(side_surface.to_le_bytes());
+                    sides.extend([0, 0, 0, 0]); // no displacement, no bevel
+                    side_count += 1;
+                }
+                boxed.push((brush_count, brush.mins, brush.maxs));
+                contents.push(brush.contents);
+                brush_count += 1;
+                lo = std::array::from_fn(|i| lo[i].min(brush.mins[i]));
+                hi = std::array::from_fn(|i| hi[i].max(brush.maxs[i]));
+            }
+            if model.is_empty() {
+                (lo, hi) = ([-1.0; 3], [1.0; 3]);
+            }
+            let region = (lo.map(|v| v - 1.0), hi.map(|v| v + 1.0));
+            let head = tree.build(&boxed, &contents, region, 0, true);
+            let faces = if m == 0 { self.displacements.len() as i32 } else { 0 };
+            models.extend(f32s(&[lo, hi, [0.0; 3]].concat()));
+            models.extend(i32s(&[head, 0, faces]));
+        }
+
+        // the displacements: a four-sided face each, and the grid over it
+        let (mut vertices, mut edges, mut surfedges, mut faces) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut dispinfo, mut disp_verts) = (Vec::new(), Vec::new());
+        let mut vert_count = 0;
+        for (k, disp) in self.displacements.iter().enumerate() {
+            let [x, y, z] = disp.corner;
+            let s = disp.size;
+            let first_vertex = vertices.len() / 12;
+            // clockwise seen from above
+            vertices.extend(f32s(&[x, y, z, x, y + s, z, x + s, y + s, z, x + s, y, z]));
+            let first_edge = surfedges.len() / 4;
+            for c in 0..4 {
+                let edge = edges.len() / 4;
+                edges.extend(((first_vertex + c) as u16).to_le_bytes());
+                edges.extend(((first_vertex + (c + 1) % 4) as u16).to_le_bytes());
+                surfedges.extend((edge as i32).to_le_bytes());
+            }
+            let plane = tree.plane([0.0, 0.0, 1.0], z);
+            faces.extend(face(plane as u16, first_edge as i32, surface("NATURE/BLENDGROUNDTOGRASS", 0), k as i16, -1, [0, 0], [0, 0]));
+            let side = (1usize << disp.power) + 1;
+            assert_eq!(disp.heights.len(), side * side, "heights of a displacement of power {}", disp.power);
+            let mut info = f32s(&[x, y, z]);
+            info.extend(i32s(&[vert_count as i32, 0, disp.power, 0]));
+            info.extend(f32s(&[45.0]));
+            info.extend(i32s(&[crate::contents::SOLID as i32]));
+            info.extend((k as u16).to_le_bytes());
+            info.resize(176, 0);
+            dispinfo.extend(info);
+            for h in &disp.heights {
+                disp_verts.extend(f32s(&[0.0, 0.0, 1.0, *h, 0.0]));
+            }
+            vert_count += side * side;
+        }
+
+        let mut string_data = Vec::new();
+        let mut string_table = Vec::new();
+        let mut texdata = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            string_table.extend((string_data.len() as i32).to_le_bytes());
+            string_data.extend(name.as_bytes());
+            string_data.push(0);
+            texdata.extend(f32s(&[0.5, 0.5, 0.5]));
+            texdata.extend(i32s(&[i as i32, 64, 64, 64, 64]));
+        }
+        let texinfo_bytes: Vec<u8> = texinfos
+            .iter()
+            .flat_map(|&(flags, texdata)| texinfo([1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0; 4], [0.0; 4], flags, texdata as i32))
+            .collect();
+        let entities = format!("{{\n\"classname\" \"worldspawn\"\n}}\n{}", self.entities).into_bytes();
+
+        let lumps: Vec<(usize, Vec<u8>, u32)> = vec![
+            (index::ENTITIES, entities, 0),
+            (index::PLANES, tree.planes, 0),
+            (index::TEXDATA, texdata, 0),
+            (index::VERTEXES, vertices, 0),
+            (index::NODES, tree.nodes, 0),
+            (index::TEXINFO, texinfo_bytes, 0),
+            (index::FACES, faces, 0),
+            (index::LEAFS, tree.leaves, if self.old_leaves { 0 } else { 1 }),
+            (index::EDGES, edges, 0),
+            (index::SURFEDGES, surfedges, 0),
+            (index::MODELS, models, 0),
+            (index::LEAF_BRUSHES, tree.leaf_brushes, 0),
+            (index::BRUSHES, brushes, 0),
+            (index::BRUSH_SIDES, sides, 0),
+            (index::DISPINFO, dispinfo, 0),
+            (index::DISP_VERTS, disp_verts, 0),
+            (index::TEXDATA_STRING_DATA, string_data, 0),
+            (index::TEXDATA_STRING_TABLE, string_table, 0),
+        ];
+        let mut out = vec![0u8; 8 + 64 * 16 + 4];
+        out[0..4].copy_from_slice(b"VBSP");
+        out[4..8].copy_from_slice(&20i32.to_le_bytes());
+        for (index, data, version) in lumps {
+            while !out.len().is_multiple_of(4) {
+                out.push(0);
+            }
+            let at = 8 + index * 16;
+            let entry = i32s(&[out.len() as i32, data.len() as i32, version as i32, 0]);
+            out[at..at + 16].copy_from_slice(&entry);
+            out.extend(data);
+        }
+        out
+    }
+}

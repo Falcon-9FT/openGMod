@@ -61,6 +61,8 @@ pub struct Report {
     pub materials: Tally,
     pub models: Tally,
     pub maps: Tally,
+    /// Maps where a player put at the start stands: what is solid there is read right.
+    pub collision: Tally,
     /// Gaps in the content rather than failures of openGMOD: textures that materials name,
     /// materials that models and maps name, models that maps name, which the game does not have.
     pub missing_textures: Vec<String>,
@@ -73,7 +75,7 @@ pub struct Report {
 
 impl Report {
     pub fn failures(&self) -> usize {
-        [&self.keyvalues, &self.lua, &self.textures, &self.materials, &self.models, &self.maps]
+        [&self.keyvalues, &self.lua, &self.textures, &self.materials, &self.models, &self.maps, &self.collision]
             .iter()
             .map(|t| t.failed.len())
             .sum::<usize>()
@@ -110,9 +112,14 @@ impl Report {
             self.models.failed.len()
         ));
         out.line(format!(
-            "  Maps       {:>8} read   {:>6} failed   (BSP: world, lightmaps, displacements, static props)",
+            "  Maps       {:>8} read   {:>6} failed   (BSP: world, lightmaps, displacements, static props, brushes)",
             self.maps.ok,
             self.maps.failed.len()
+        ));
+        out.line(format!(
+            "  Collision  {:>8} stand  {:>6} failed   (a player put at each map's start stands there)",
+            self.collision.ok,
+            self.collision.failed.len()
         ));
         if let Some(crc) = &self.crc {
             out.line(format!("  CRC-32     {:>8} match  {:>6} differ   (archive entries)", crc.ok, crc.failed.len()));
@@ -137,6 +144,7 @@ impl Report {
             ("Material failures", &self.materials.failed),
             ("Model failures", &self.models.failed),
             ("Map failures", &self.maps.failed),
+            ("Collision failures", &self.collision.failed),
             ("Unreadable", &self.unreadable),
         ];
         if let Some(crc) = &self.crc {
@@ -302,9 +310,9 @@ fn check_model(vfs: &Vfs, path: &str, where_: &str, report: &mut Report) {
     }
 }
 
-/// A map reads when its lumps do and its world can be built. Its pakfile is checked as well:
-/// the textures, materials and models in it, and whether the materials and models the map
-/// names are in the game with the pakfile in front.
+/// A map reads when its lumps do and its world can be built; a player put at its start should
+/// stand there. Its pakfile is checked as well: the textures, materials and models in it, and
+/// whether the materials and models the map names are in the game with the pakfile in front.
 fn check_map(vfs: &mut Vfs, path: &str, where_: &str, bytes: Vec<u8>, report: &mut Report) {
     let bsp = match Bsp::parse(PathBuf::from(path), Arc::from(bytes)) {
         Ok(bsp) => bsp,
@@ -319,6 +327,9 @@ fn check_map(vfs: &mut Vfs, path: &str, where_: &str, bytes: Vec<u8>, report: &m
         Err(e) => return report.maps.failed.push(format!("{where_}: pakfile: {e}")),
     };
     report.maps.ok += 1;
+    if let Some(stands) = crate::trace::stand_at_start(&bsp) {
+        count(&mut report.collision, where_, stands);
+    }
     let mounted = pak.is_some();
     if let Some(pak) = pak {
         let entries: Vec<String> = pak.entries().iter().map(|e| e.path.clone()).collect();

@@ -9,6 +9,7 @@ members = [
     "crates/gmod-material",
     "crates/gmod-model",
     "crates/gmod-world",
+    "crates/gmod-movement",
     "crates/gmod-render",
     "crates/gmod-app",
     "tools/gmod-check",
@@ -29,6 +30,7 @@ gmod-bsp = { path = "crates/gmod-bsp" }
 gmod-material = { path = "crates/gmod-material" }
 gmod-model = { path = "crates/gmod-model" }
 gmod-world = { path = "crates/gmod-world" }
+gmod-movement = { path = "crates/gmod-movement" }
 gmod-render = { path = "crates/gmod-render" }
 # LuaJIT 2.1, built from source with the crate
 mlua = { version = "0.12.1", features = ["luajit", "vendored"] }

@@ -13,6 +13,7 @@
 //! * Faces flagged nodraw, sky, trigger, hint or skip are left out.
 
 use crate::lighting::rgbe_to_linear;
+use crate::math::{Vec3, add, cross, dot, lerp3, normalize, scale, sub};
 use crate::{Bsp, Face, TexInfo, surf};
 
 /// A vertex of the world.
@@ -80,29 +81,8 @@ const MAX_LIGHTMAP_SIDE: i32 = 1024;
 /// Width of the lightmap atlas.
 const ATLAS_WIDTH: u32 = 2048;
 
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
-}
-
 fn lerp2(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
-}
-
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-
-fn normalize(v: [f32; 3]) -> [f32; 3] {
-    let len = dot(v, v).sqrt();
-    if len > 1e-12 { [v[0] / len, v[1] / len, v[2] / len] } else { [0.0, 0.0, 1.0] }
 }
 
 /// Where a face's lightmap went in the atlas, in luxels.
@@ -277,19 +257,58 @@ fn polygon(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placement: Op
     }
 }
 
-/// Builds a displacement; false if its base face is not four-sided.
-fn displacement(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placement: Option<Placement>, mesh: &mut Mesh) -> bool {
+/// The corners of a displacement's four-sided base face, from the one nearest its start
+/// position on; `None` when the face has another number of sides.
+pub(crate) fn displacement_corners(bsp: &Bsp, face: &Face) -> Option<[Vec3; 4]> {
     let disp = &bsp.displacements[face.dispinfo as usize];
-    let corners: Vec<[f32; 3]> = bsp.face_vertices(face).collect();
+    let corners: Vec<Vec3> = bsp.face_vertices(face).collect();
     if corners.len() != 4 {
-        return false;
+        return None;
     }
-    let distance = |p: [f32; 3]| {
+    let distance = |p: Vec3| {
         let d = sub(p, disp.start_position);
         dot(d, d)
     };
     let start = (0..4).min_by(|&a, &b| distance(corners[a]).total_cmp(&distance(corners[b]))).unwrap_or(0);
-    let c: [[f32; 3]; 4] = std::array::from_fn(|i| corners[(start + i) % 4]);
+    Some(std::array::from_fn(|i| corners[(start + i) % 4]))
+}
+
+/// The points of a displacement, row by row (`side` × `side` of them), each raised from the
+/// base face; `None` when the base face is not four-sided.
+pub(crate) fn displacement_points(bsp: &Bsp, face: &Face) -> Option<Vec<Vec3>> {
+    let c = displacement_corners(bsp, face)?;
+    let disp = &bsp.displacements[face.dispinfo as usize];
+    let side = disp.side();
+    let verts = &bsp.disp_verts[disp.first_vert as usize..disp.first_vert as usize + side * side];
+    let step = 1.0 / (side - 1) as f32;
+    let mut points = Vec::with_capacity(side * side);
+    for y in 0..side {
+        let ty = y as f32 * step;
+        let (a, b) = (lerp3(c[0], c[1], ty), lerp3(c[3], c[2], ty));
+        for x in 0..side {
+            let v = verts[y * side + x];
+            points.push(add(lerp3(a, b, x as f32 * step), scale(v.direction, v.distance)));
+        }
+    }
+    Some(points)
+}
+
+/// The triangles of a displacement of `side` × `side` points, as indices of its points: two a
+/// cell, with the diagonal alternating as the engine lays it; clockwise seen from the front.
+pub(crate) fn displacement_triangles(side: usize) -> impl Iterator<Item = [usize; 3]> {
+    (0..side - 1).flat_map(move |y| {
+        (0..side - 1).flat_map(move |x| {
+            let i0 = y * side + x;
+            let (i1, i2, i3) = (i0 + 1, i0 + side, i0 + side + 1);
+            if (x + y) % 2 == 0 { [[i0, i2, i1], [i1, i2, i3]] } else { [[i0, i2, i3], [i0, i3, i1]] }
+        })
+    })
+}
+
+/// Builds a displacement; false if its base face is not four-sided.
+fn displacement(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placement: Option<Placement>, mesh: &mut Mesh) -> bool {
+    let (Some(c), Some(points)) = (displacement_corners(bsp, face), displacement_points(bsp, face)) else { return false };
+    let disp = &bsp.displacements[face.dispinfo as usize];
     let uv: [[f32; 2]; 4] = c.map(|p| texture_uv(info, size, p));
     let lm: [[f32; 2]; 4] = c.map(|p| luxel(info, placement, p));
 
@@ -299,36 +318,22 @@ fn displacement(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placemen
     let step = 1.0 / (side - 1) as f32;
     for y in 0..side {
         let ty = y as f32 * step;
-        let (a, b) = (lerp3(c[0], c[1], ty), lerp3(c[3], c[2], ty));
         let (uv_a, uv_b) = (lerp2(uv[0], uv[1], ty), lerp2(uv[3], uv[2], ty));
         let (lm_a, lm_b) = (lerp2(lm[0], lm[1], ty), lerp2(lm[3], lm[2], ty));
         for x in 0..side {
             let tx = x as f32 * step;
-            let v = verts[y * side + x];
-            let flat = lerp3(a, b, tx);
-            let raised =
-                [flat[0] + v.direction[0] * v.distance, flat[1] + v.direction[1] * v.distance, flat[2] + v.direction[2] * v.distance];
             mesh.vertices.push(Vertex {
-                position: raised,
+                position: points[y * side + x],
                 normal: [0.0; 3],
                 uv: lerp2(uv_a, uv_b, tx),
                 lightmap_uv: lerp2(lm_a, lm_b, tx),
-                alpha: (v.alpha / 255.0).clamp(0.0, 1.0),
+                alpha: (verts[y * side + x].alpha / 255.0).clamp(0.0, 1.0),
             });
         }
     }
     let first_index = mesh.indices.len();
-    for y in 0..side - 1 {
-        for x in 0..side - 1 {
-            let i0 = (base + y * side + x) as u32;
-            let (i1, i2, i3) = (i0 + 1, i0 + side as u32, i0 + side as u32 + 1);
-            // the diagonal alternates, as the engine lays it
-            if (x + y) % 2 == 0 {
-                mesh.indices.extend([i0, i2, i1, i1, i2, i3]);
-            } else {
-                mesh.indices.extend([i0, i2, i3, i0, i3, i1]);
-            }
-        }
+    for tri in displacement_triangles(side) {
+        mesh.indices.extend(tri.map(|i| (base + i) as u32));
     }
     // smooth normals from the triangles, turned to face the way the base face does
     let facing = bsp.planes[face.plane as usize].normal;
@@ -339,13 +344,13 @@ fn displacement(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placemen
             cross(sub(mesh.vertices[b].position, mesh.vertices[a].position), sub(mesh.vertices[c3].position, mesh.vertices[a].position));
         for i in [a, b, c3] {
             let slot = &mut normals[i - base];
-            *slot = [slot[0] + n[0], slot[1] + n[1], slot[2] + n[2]];
+            *slot = add(*slot, n);
         }
     }
-    let flip = normals.iter().fold([0.0f32; 3], |s, n| [s[0] + n[0], s[1] + n[1], s[2] + n[2]]);
+    let flip = normals.iter().fold([0.0f32; 3], |s, &n| add(s, n));
     let sign = if dot(flip, facing) < 0.0 { -1.0 } else { 1.0 };
     for (i, n) in normals.into_iter().enumerate() {
-        mesh.vertices[base + i].normal = normalize(n.map(|c| c * sign));
+        mesh.vertices[base + i].normal = normalize(scale(n, sign));
     }
     true
 }

@@ -30,10 +30,11 @@ mod check;
 mod lua;
 mod out;
 mod render;
+mod trace;
 
 use out::Out;
 
-const COMMANDS: [&str; 8] = ["check", "info", "ls", "find", "cat", "glua", "lua", "render"];
+const COMMANDS: [&str; 9] = ["check", "info", "ls", "find", "cat", "glua", "lua", "render", "trace"];
 
 const USAGE: &str = "\
 gmod-check - what openGMOD can read of a Garry's Mod installation
@@ -55,6 +56,8 @@ COMMANDS:
                      is there
     render <MAP>     a picture of a map (gm_construct, or a .bsp file) drawn on the CPU:
                      the world with textures and light maps, saved as PNG
+    trace <MAP>      a sweep through a map from --from to --to, as util.TraceLine makes
+                     it (util.TraceHull with --mins and --maxs), printed as TraceResult
 
 OPTIONS:
     --gmod <DIR>         the Garry's Mod folder (default: GMOD_ROOT, then Steam's libraries)
@@ -66,8 +69,11 @@ OPTIONS:
     --all                check: list every failure, not only the first 20 of each kind;
                          lua: every library, with its missing functions
     --out <FILE>         render: the PNG to write (default: <MAP>.png here)
-    --from <X,Y,Z>       render: the eye (default: a player start)
-    --to <X,Y,Z>         render: the point looked at
+    --from <X,Y,Z>       render: the eye (default: a player start); trace: the start
+    --to <X,Y,Z>         render: the point looked at; trace: the end
+    --mins <X,Y,Z>       trace: the box around the point swept, with --maxs (none: a ray)
+    --maxs <X,Y,Z>
+    --mask <N>           trace: what stops it, as GMod's MASK_ numbers (default: MASK_SOLID)
     --size <WxH>         render: pixels (default: 1280x720)
     --fov <DEGREES>      render: horizontal field of view (default: 90)
     -V, --version        the version
@@ -89,6 +95,10 @@ pub struct Args {
     pub version: bool,
     pub out: Option<PathBuf>,
     pub view: render::View,
+    /// `trace`: the box, and what stops it.
+    pub mins: Option<[f32; 3]>,
+    pub maxs: Option<[f32; 3]>,
+    pub mask: Option<u32>,
 }
 
 /// `X,Y,Z` as three numbers.
@@ -118,6 +128,9 @@ impl Args {
             version: false,
             out: None,
             view: render::View::default(),
+            mins: None,
+            maxs: None,
+            mask: None,
         };
         let mut positional = Vec::new();
         while let Some(arg) = raw.next() {
@@ -139,6 +152,16 @@ impl Args {
                     args.view.height = h.parse().map_err(|_| format!("{size:?} is not WxH"))?;
                 }
                 "--fov" => args.view.fov = raw.next().and_then(|f| f.parse().ok()).ok_or("--fov needs degrees")?,
+                "--mins" => args.mins = Some(point(&raw.next().ok_or("--mins needs X,Y,Z")?)?),
+                "--maxs" => args.maxs = Some(point(&raw.next().ok_or("--maxs needs X,Y,Z")?)?),
+                "--mask" => {
+                    let text = raw.next().ok_or("--mask needs a number")?;
+                    let number = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                        Some(hex) => u32::from_str_radix(hex, 16),
+                        None => text.parse(),
+                    };
+                    args.mask = Some(number.map_err(|_| format!("{text:?} is not a mask"))?);
+                }
                 "-h" | "--help" => args.help = true,
                 "-V" | "--version" => args.version = true,
                 flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
@@ -156,12 +179,18 @@ impl Args {
         if let Some(extra) = positional.next() {
             return Err(format!("unexpected argument {extra:?}"));
         }
-        let needs_operand = ["ls", "find", "cat", "glua", "render"].contains(&args.command.as_str());
+        let needs_operand = ["ls", "find", "cat", "glua", "render", "trace"].contains(&args.command.as_str());
         if !COMMANDS.contains(&args.command.as_str()) {
             return Err(format!("unknown command {:?}", args.command));
         }
         if needs_operand && args.operand.is_none() && args.command != "ls" {
             return Err(format!("{} needs an argument", args.command));
+        }
+        if args.command == "trace" && (args.view.eye.is_none() || args.view.target.is_none()) {
+            return Err("trace needs --from and --to".into());
+        }
+        if args.mins.is_some() != args.maxs.is_some() {
+            return Err("--mins and --maxs go together".into());
         }
         Ok(args)
     }
@@ -238,10 +267,14 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
     let started = Instant::now();
     let install = match Install::locate(args.gmod.as_deref()) {
         Ok(install) => install,
-        // a map on disk can be drawn without the game, only not with its materials
+        // a map on disk can be drawn without the game, only not with its materials, and
+        // traced without it
         Err(e) if args.command == "render" && args.operand.as_deref().is_some_and(|map| Path::new(map).is_file()) => {
             say!("{e}\nDrawing without the game's materials.");
             return render_map(&mut Vfs::new(), args.operand.as_deref().unwrap_or_default(), args);
+        }
+        Err(_) if args.command == "trace" && args.operand.as_deref().is_some_and(|map| Path::new(map).is_file()) => {
+            return trace_map(&Vfs::new(), args.operand.as_deref().unwrap_or_default(), args);
         }
         Err(e) => {
             out.line(e.to_string());
@@ -301,12 +334,13 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
         },
         "lua" => lua::run(std::mem::take(&mut vfs), operand, args.all, out),
         "render" => render_map(&mut vfs, operand, args),
+        "trace" => trace_map(&vfs, operand, args),
         _ => unreachable!("commands are checked when parsing"),
     }
 }
 
-/// `render`: the map is a file on disk, or a name in the game (`gm_construct`).
-fn render_map(vfs: &mut Vfs, map: &str, args: &Args) -> ExitCode {
+/// A map: a file on disk, or a name in the game (`gm_construct`).
+fn read_map(vfs: &Vfs, map: &str) -> Result<gmod_bsp::Bsp, String> {
     let on_disk = Path::new(map).is_file();
     let path = if on_disk {
         map.to_string()
@@ -315,14 +349,31 @@ fn render_map(vfs: &mut Vfs, map: &str, args: &Args) -> ExitCode {
         if name.contains('/') || name.contains('\\') { format!("{name}.bsp") } else { format!("maps/{name}.bsp") }
     };
     let bytes = if on_disk { std::fs::read(&path) } else { vfs.read(&path, "GAME") };
-    let bytes = match bytes {
-        Ok(bytes) => bytes,
-        Err(e) => return fail(&format!("{path}: {e}")),
-    };
-    let bsp = match gmod_bsp::Bsp::parse(PathBuf::from(&path), Arc::from(bytes)) {
+    let bytes = bytes.map_err(|e| format!("{path}: {e}"))?;
+    gmod_bsp::Bsp::parse(PathBuf::from(&path), Arc::from(bytes)).map_err(|e| e.to_string())
+}
+
+/// `trace`: a sweep through the map, printed.
+fn trace_map(vfs: &Vfs, map: &str, args: &Args) -> ExitCode {
+    let bsp = match read_map(vfs, map) {
         Ok(bsp) => bsp,
-        Err(e) => return fail(&e.to_string()),
+        Err(e) => return fail(&e),
     };
+    let (Some(from), Some(to)) = (args.view.eye, args.view.target) else { return fail("trace needs --from and --to") };
+    let mask = args.mask.unwrap_or(gmod_bsp::mask::SOLID);
+    for line in trace::report(&bsp, from, to, args.mins.unwrap_or_default(), args.maxs.unwrap_or_default(), mask) {
+        say!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `render`: a picture of the map, saved as PNG.
+fn render_map(vfs: &mut Vfs, map: &str, args: &Args) -> ExitCode {
+    let bsp = match read_map(vfs, map) {
+        Ok(bsp) => bsp,
+        Err(e) => return fail(&e),
+    };
+    let path = bsp.label.display().to_string();
     let picture = match render::render(vfs, &bsp, &args.view) {
         Ok(picture) => picture,
         Err(e) => return fail(&format!("{path}: {e}")),
@@ -493,5 +544,14 @@ mod tests {
         assert!(parse(&["render"]).is_err(), "render needs a map");
         assert!(parse(&["render", "x", "--from", "1,2"]).is_err());
         assert!(parse(&["render", "x", "--size", "big"]).is_err());
+
+        let args = parse(&["trace", "gm_flatgrass", "--from", "0,0,100", "--to", "0,0,-100", "--mins", "-16,-16,0", "--maxs", "16,16,72"])
+            .unwrap();
+        assert_eq!((args.mins, args.maxs, args.mask), (Some([-16.0, -16.0, 0.0]), Some([16.0, 16.0, 72.0]), None));
+        assert_eq!(parse(&["trace", "x", "--from", "0,0,0", "--to", "1,1,1", "--mask", "0x4001"]).unwrap().mask, Some(0x4001));
+        assert_eq!(parse(&["trace", "x", "--from", "0,0,0", "--to", "1,1,1", "--mask", "33636363"]).unwrap().mask, Some(33636363));
+        assert!(parse(&["trace", "x", "--from", "0,0,0"]).is_err(), "trace needs both ends");
+        assert!(parse(&["trace", "x", "--from", "0,0,0", "--to", "1,1,1", "--mins", "1,1,1"]).is_err(), "a box needs both corners");
+        assert!(parse(&["trace", "x", "--from", "0,0,0", "--to", "1,1,1", "--mask", "solid"]).is_err());
     }
 }

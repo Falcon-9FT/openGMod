@@ -10,12 +10,17 @@ pub mod index {
     pub const PLANES: usize = 1;
     pub const TEXDATA: usize = 2;
     pub const VERTEXES: usize = 3;
+    pub const NODES: usize = 5;
     pub const TEXINFO: usize = 6;
     pub const FACES: usize = 7;
     pub const LIGHTING: usize = 8;
+    pub const LEAFS: usize = 10;
     pub const EDGES: usize = 12;
     pub const SURFEDGES: usize = 13;
     pub const MODELS: usize = 14;
+    pub const LEAF_BRUSHES: usize = 17;
+    pub const BRUSHES: usize = 18;
+    pub const BRUSH_SIDES: usize = 19;
     pub const DISPINFO: usize = 26;
     pub const DISP_VERTS: usize = 33;
     pub const GAME_LUMP: usize = 35;
@@ -40,6 +45,39 @@ pub mod surf {
     pub const SKIP: i32 = 0x0200;
     pub const NOLIGHT: i32 = 0x0400;
     pub const BUMPLIGHT: i32 = 0x0800;
+}
+
+/// What a brush is made of, as flags (`CONTENTS_` in GMod's Lua); a brush can be several
+/// things at once, water and a ladder say.
+pub mod contents {
+    pub const EMPTY: u32 = 0;
+    pub const SOLID: u32 = 0x1;
+    pub const WINDOW: u32 = 0x2;
+    pub const AUX: u32 = 0x4;
+    pub const GRATE: u32 = 0x8;
+    pub const SLIME: u32 = 0x10;
+    pub const WATER: u32 = 0x20;
+    pub const BLOCKLOS: u32 = 0x40;
+    pub const OPAQUE: u32 = 0x80;
+    pub const TESTFOGVOLUME: u32 = 0x100;
+    pub const IGNORE_NODRAW_OPAQUE: u32 = 0x2000;
+    pub const MOVEABLE: u32 = 0x4000;
+    pub const AREAPORTAL: u32 = 0x8000;
+    pub const PLAYERCLIP: u32 = 0x1_0000;
+    pub const MONSTERCLIP: u32 = 0x2_0000;
+    pub const CURRENT_0: u32 = 0x4_0000;
+    pub const CURRENT_90: u32 = 0x8_0000;
+    pub const CURRENT_180: u32 = 0x10_0000;
+    pub const CURRENT_270: u32 = 0x20_0000;
+    pub const CURRENT_UP: u32 = 0x40_0000;
+    pub const CURRENT_DOWN: u32 = 0x80_0000;
+    pub const ORIGIN: u32 = 0x100_0000;
+    pub const MONSTER: u32 = 0x200_0000;
+    pub const DEBRIS: u32 = 0x400_0000;
+    pub const DETAIL: u32 = 0x800_0000;
+    pub const TRANSLUCENT: u32 = 0x1000_0000;
+    pub const LADDER: u32 = 0x2000_0000;
+    pub const HITBOX: u32 = 0x4000_0000;
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
@@ -119,6 +157,10 @@ impl<'a> Fields<'a> {
 
     pub(crate) fn i16(&mut self) -> i16 {
         i16::from_le_bytes(self.take())
+    }
+
+    pub(crate) fn i16x3(&mut self) -> [i16; 3] {
+        [self.i16(), self.i16(), self.i16()]
     }
 
     pub(crate) fn u32(&mut self) -> u32 {
@@ -218,6 +260,122 @@ impl Face {
             first_primitive: f.u16(),
             smoothing_groups: f.u32(),
         }
+    }
+}
+
+/// A node of a BSP tree: its plane cuts space in two, and each half goes on in a child. A
+/// child `>= 0` is another node, one `< 0` a leaf (`-1 - child`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Node {
+    pub plane: i32,
+    /// In front of the plane, then behind it.
+    pub children: [i32; 2],
+    pub mins: [i16; 3],
+    pub maxs: [i16; 3],
+    pub first_face: u16,
+    pub num_faces: u16,
+    pub area: i16,
+}
+
+impl Node {
+    pub(crate) const SIZE: usize = 32;
+
+    pub(crate) fn parse(f: &mut Fields) -> Node {
+        Node {
+            plane: f.i32(),
+            children: [f.i32(), f.i32()],
+            mins: f.i16x3(),
+            maxs: f.i16x3(),
+            first_face: f.u16(),
+            num_faces: f.u16(),
+            area: f.i16(),
+        }
+    }
+}
+
+/// A leaf of a BSP tree: a convex cell of space, with the brushes that reach into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Leaf {
+    /// [`contents`] flags.
+    pub contents: u32,
+    /// The visibility cluster; -1 outside the world.
+    pub cluster: i16,
+    pub area: u16,
+    pub flags: u16,
+    pub mins: [i16; 3],
+    pub maxs: [i16; 3],
+    pub first_leaf_face: u16,
+    pub num_leaf_faces: u16,
+    /// The leaf's brushes: a range of the leaf brush lump.
+    pub first_leaf_brush: u16,
+    pub num_leaf_brushes: u16,
+    pub water_data: i16,
+}
+
+impl Leaf {
+    pub(crate) const SIZE: usize = 32;
+    /// Version 0 of the lump (the maps of BSP version 19) keeps an ambient light cube in every
+    /// leaf: six ColorRGBExp32 samples before the padding.
+    pub(crate) const SIZE_WITH_LIGHT: usize = 56;
+
+    pub(crate) fn parse(f: &mut Fields) -> Leaf {
+        let contents = f.u32();
+        let cluster = f.i16();
+        // a 9-bit area and 7 bits of flags in one short
+        let area_flags = f.u16();
+        Leaf {
+            contents,
+            cluster,
+            area: area_flags & 0x1FF,
+            flags: area_flags >> 9,
+            mins: f.i16x3(),
+            maxs: f.i16x3(),
+            first_leaf_face: f.u16(),
+            num_leaf_faces: f.u16(),
+            first_leaf_brush: f.u16(),
+            num_leaf_brushes: f.u16(),
+            water_data: f.i16(),
+        }
+    }
+}
+
+/// A brush: a convex solid, the space behind the planes of all its sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Brush {
+    pub first_side: i32,
+    pub num_sides: i32,
+    /// [`contents`] flags.
+    pub contents: u32,
+}
+
+impl Brush {
+    pub(crate) const SIZE: usize = 12;
+
+    pub(crate) fn parse(f: &mut Fields) -> Brush {
+        Brush { first_side: f.i32(), num_sides: f.i32(), contents: f.u32() }
+    }
+}
+
+/// A side of a brush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrushSide {
+    /// Its plane faces out of the brush.
+    pub plane: u16,
+    /// The surface, -1 for none.
+    pub texinfo: i16,
+    pub dispinfo: i16,
+    /// A bevel: a plane the compiler adds along an edge or a corner so that a box swept
+    /// against the brush stops at its edges as it does at its faces. It is no face of its own.
+    pub bevel: bool,
+}
+
+impl BrushSide {
+    pub(crate) const SIZE: usize = 8;
+
+    pub(crate) fn parse(f: &mut Fields) -> BrushSide {
+        // the bevel is a short in the maps of GMod, a byte followed by another flag in later
+        // games: its low byte either way
+        BrushSide { plane: f.u16(), texinfo: f.i16(), dispinfo: f.i16(), bevel: f.u8() != 0 }
     }
 }
 

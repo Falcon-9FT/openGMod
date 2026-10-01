@@ -538,6 +538,7 @@ dependencies = [
  "gmod-bsp",
  "gmod-fs",
  "gmod-material",
+ "gmod-movement",
  "gmod-render",
  "gmod-world",
  "wgpu",
@@ -562,6 +563,7 @@ dependencies = [
  "gmod-lua",
  "gmod-material",
  "gmod-model",
+ "gmod-movement",
  "gmod-world",
 ]
 
@@ -606,6 +608,13 @@ name = "gmod-model"
 version = "0.2.0"
 dependencies = [
  "gmod-fs",
+]
+
+[[package]]
+name = "gmod-movement"
+version = "0.2.0"
+dependencies = [
+ "gmod-bsp",
 ]
 
 [[package]]
