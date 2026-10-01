@@ -1,8 +1,13 @@
-//! The engine's globals: which realm this is, the version, the clocks, the enumerations.
+//! The engine's globals: which realm this is, the version, the enumerations; and the
+//! libraries about the game being played: `gmod`, `game`, `engine`, `system`.
 
-use mlua::{Lua, Table, Value};
+use std::cell::RefCell;
 
-use crate::{Realm, host};
+use mlua::{Lua, MultiValue, Table, Value};
+
+use crate::args::Args;
+use crate::entity::EntityHandle;
+use crate::{Realm, host, timer};
 
 /// The enumerations of GMod's Lua (`ACT_IDLE`, `TEAM_SPECTATOR`, `SENSORBONE.HIP` ...): the
 /// engine defines them, the game's Lua uses them. From the GMod wiki; `scripts/wiki-api.py`
@@ -33,6 +38,125 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     install_enums(lua, &globals)?;
 
     globals.raw_set("SysTime", lua.create_function(|lua, ()| Ok(host(lua).started.elapsed().as_secs_f64()))?)?;
+    install_libraries(lua, &globals)?;
+    Ok(())
+}
+
+/// The game being played: map, gamemode, players.
+#[derive(Default)]
+pub(crate) struct Game {
+    pub map: RefCell<String>,
+    pub gamemode_name: RefCell<String>,
+    /// The table of the active gamemode (`GAMEMODE`).
+    pub gamemode: RefCell<Option<Table>>,
+    pub time_scale: std::cell::Cell<f64>,
+    /// Gamemodes loaded, base first.
+    pub chain: RefCell<Vec<String>>,
+    /// What `DeriveGamemode` named while the gamemode being loaded ran.
+    pub derived: RefCell<Vec<String>>,
+}
+
+/// The active gamemode's table, or nil.
+pub(crate) fn gamemode(lua: &Lua) -> mlua::Result<Value> {
+    Ok(host(lua).game.gamemode.borrow().clone().map_or(Value::Nil, Value::Table))
+}
+
+fn def(lua: &Lua, table: &Table, name: &'static str, f: fn(&Args) -> mlua::Result<Value>) -> mlua::Result<()> {
+    table.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
+}
+
+fn string(a: &Args, text: &str) -> mlua::Result<Value> {
+    Ok(Value::String(a.lua.create_string(text)?))
+}
+
+/// The gamemodes of the installation: folders of `gamemodes/` with a `<name>.txt`.
+pub(crate) fn gamemodes(lua: &Lua) -> Vec<(String, gmod_kv::Block)> {
+    let vfs = host(lua).vfs.clone();
+    let mut out = Vec::new();
+    for name in vfs.find("gamemodes/*", "GAME").dirs {
+        let Ok(bytes) = vfs.read(&format!("gamemodes/{name}/{name}.txt"), "GAME") else { continue };
+        let (document, _) = gmod_kv::parse_lenient(&gmod_kv::decode_text(&bytes), gmod_kv::Options::default());
+        if let Some(info) = document.root.iter().find_map(|pair| pair.value.as_block()) {
+            out.push((name, info.clone()));
+        }
+    }
+    out
+}
+
+fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
+    host(lua).game.time_scale.set(1.0);
+
+    let gmod = lua.create_table()?;
+    def(lua, &gmod, "GetGamemode", |a| gamemode(a.lua))?;
+    globals.raw_set("gmod", gmod)?;
+
+    let game = lua.create_table()?;
+    def(lua, &game, "SinglePlayer", |_| Ok(Value::Boolean(true)))?;
+    def(lua, &game, "MaxPlayers", |_| Ok(Value::Integer(1)))?;
+    def(lua, &game, "IsDedicated", |_| Ok(Value::Boolean(false)))?;
+    def(lua, &game, "GetMap", |a| string(a, &host(a.lua).game.map.borrow()))?;
+    def(lua, &game, "GetIPAddress", |a| string(a, "loopback"))?;
+    def(lua, &game, "GetWorld", |a| Ok(Value::UserData(a.lua.create_userdata(EntityHandle { index: Some(0) })?)))?;
+    def(lua, &game, "ConsoleCommand", |a| {
+        let line = a.string(1)?;
+        host(a.lua).console_buffer(line);
+        Ok(Value::Nil)
+    })?;
+    def(lua, &game, "GetTimeScale", |a| Ok(Value::Number(host(a.lua).game.time_scale.get())))?;
+    def(lua, &game, "SetTimeScale", |a| {
+        host(a.lua).game.time_scale.set(a.number(1)?);
+        Ok(Value::Nil)
+    })?;
+    def(lua, &game, "GetSkillLevel", |a| {
+        let level = crate::convar::value(a.lua, "skill").map_or(1, |v| crate::convar::atof(&v) as i64);
+        Ok(Value::Integer(level))
+    })?;
+    // particle and decal definitions are for the renderer, which does not read them yet
+    def(lua, &game, "AddParticles", |_| Ok(Value::Nil))?;
+    def(lua, &game, "AddDecal", |_| Ok(Value::Nil))?;
+    globals.raw_set("game", game)?;
+
+    let engine = lua.create_table()?;
+    def(lua, &engine, "ActiveGamemode", |a| string(a, &host(a.lua).game.gamemode_name.borrow()))?;
+    def(lua, &engine, "GetGamemodes", |a| {
+        let list = a.lua.create_table()?;
+        for (name, info) in gamemodes(a.lua) {
+            let entry = a.lua.create_table()?;
+            entry.raw_set("name", name.as_str())?;
+            entry.raw_set("title", info.str("title").unwrap_or(&name))?;
+            entry.raw_set("maps", info.str("maps").unwrap_or_default())?;
+            entry.raw_set("menusystem", info.str("menusystem").is_some_and(|v| v != "0"))?;
+            entry.raw_set("workshopid", info.str("workshopid").unwrap_or_default())?;
+            list.raw_push(entry)?;
+        }
+        Ok(Value::Table(list))
+    })?;
+    def(lua, &engine, "GetAddons", |a| Ok(Value::Table(a.lua.create_table()?)))?;
+    def(lua, &engine, "GetGames", |a| Ok(Value::Table(a.lua.create_table()?)))?;
+    def(lua, &engine, "TickInterval", |_| Ok(Value::Number(timer::TICK_INTERVAL)))?;
+    def(lua, &engine, "TickCount", |a| Ok(Value::Integer(host(a.lua).clock.ticks.get() as i64)))?;
+    def(lua, &engine, "AbsoluteFrameTime", |a| Ok(Value::Number(host(a.lua).clock.frame_time.get())))?;
+    def(lua, &engine, "ServerFrameTime", |a| Ok(Value::Number(host(a.lua).clock.frame_time.get())))?;
+    def(lua, &engine, "IsPlayingDemo", |_| Ok(Value::Boolean(false)))?;
+    def(lua, &engine, "IsRecordingDemo", |_| Ok(Value::Boolean(false)))?;
+    def(lua, &engine, "LightStyle", |_| Ok(Value::Nil))?;
+    globals.raw_set("engine", engine)?;
+
+    let system = lua.create_table()?;
+    def(lua, &system, "IsWindows", |_| Ok(Value::Boolean(cfg!(windows))))?;
+    def(lua, &system, "IsLinux", |_| Ok(Value::Boolean(cfg!(target_os = "linux"))))?;
+    def(lua, &system, "IsOSX", |_| Ok(Value::Boolean(cfg!(target_os = "macos"))))?;
+    def(lua, &system, "AppTime", |a| Ok(Value::Number(host(a.lua).started.elapsed().as_secs_f64())))?;
+    def(lua, &system, "UpTime", |a| Ok(Value::Number(host(a.lua).started.elapsed().as_secs_f64())))?;
+    def(lua, &system, "SteamTime", |_| {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        Ok(Value::Integer(now as i64))
+    })?;
+    def(lua, &system, "IsWindowed", |_| Ok(Value::Boolean(true)))?;
+    def(lua, &system, "HasFocus", |_| Ok(Value::Boolean(true)))?;
+    // 255: no battery
+    def(lua, &system, "BatteryPower", |_| Ok(Value::Integer(255)))?;
+    globals.raw_set("system", system)?;
     Ok(())
 }
 

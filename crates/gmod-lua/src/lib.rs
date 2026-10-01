@@ -16,9 +16,16 @@
 //!   a way out of the sandbox; `load`, `loadstring` and the loader accept source only.
 //! * the console ([`console`]): `print`, `Msg`, `MsgN`, `MsgC`, `ErrorNoHalt` and the error
 //!   reports GMod prints when a script fails, handed to the program through [`Output`].
-//! * the engine's globals ([`engine`]): realm flags, time, versions, and the functions the
-//!   game's own Lua calls while it starts. They grow towards the whole API one library at a
-//!   time.
+//! * the engine's types and libraries: [`meta`] (`FindMetaTable`, `TYPE_*`), [`vector`]
+//!   (`Vector`, `Angle`), [`entity`] (`NULL`, the metatables of `Entity`, `Player` ...),
+//!   [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
+//!   (`file`, `File`), [`util`], [`net`], [`material`] (`Material`), [`engine`] (`game`,
+//!   `engine`, `system`, `gmod`, the enumerations), and [`world`] (`ents`, `player` ... as
+//!   they answer while there are no entities). They grow towards the whole API - `gmod-check
+//!   lua` counts how much of it is there.
+//! * starting the game ([`Runtime::start`]): `includes/init.lua`, autorun, the gamemode and
+//!   its bases, scripted entities and weapons, the hooks up to `Initialize`; then
+//!   [`Runtime::think`] moves time on, runs timers and the `Think` hook.
 //!
 //! Errors in scripts are not errors of the runtime: as in GMod, a file that fails is
 //! reported ([`Output::Error`], [`Runtime::errors`]) and the files around it keep loading.
@@ -35,11 +42,20 @@ use mlua::Lua;
 
 mod args;
 pub mod console;
+pub mod convar;
 pub mod engine;
+pub mod entity;
 pub mod files;
+pub mod filesystem;
+pub mod material;
 pub mod meta;
+pub mod net;
 pub mod sandbox;
+mod startup;
+pub mod timer;
+pub mod util;
 pub mod vector;
+pub mod world;
 
 #[cfg(test)]
 mod tests;
@@ -174,11 +190,24 @@ pub(crate) struct Host {
     /// Lua files loaded so far.
     pub files_loaded: Cell<usize>,
     pub started: Instant,
+    pub clock: timer::Clock,
+    pub console: convar::Console,
+    /// openGMOD's own folder, whose `data/` Lua reads and writes as `DATA`.
+    pub data_dir: RefCell<Option<gmod_fs::UserDir>>,
+    pub game: engine::Game,
+    pub network_strings: util::NetworkStrings,
+    pub ai_names: world::AiNames,
+    pub net: net::Net,
 }
 
 impl Host {
     pub(crate) fn print(&self, text: &str) {
         (self.output.borrow_mut())(Output::Text(text));
+    }
+
+    /// Queues a console line for the next frame, as the engine's command buffer does.
+    pub(crate) fn console_buffer(&self, line: String) {
+        self.console.buffer.borrow_mut().push(line);
     }
 
     pub(crate) fn report(&self, error: ScriptError) {
@@ -224,13 +253,29 @@ impl Runtime {
             pending_stack: RefCell::new(Vec::new()),
             files_loaded: Cell::new(0),
             started: Instant::now(),
+            clock: timer::Clock::default(),
+            console: convar::Console::default(),
+            data_dir: RefCell::new(None),
+            game: engine::Game::default(),
+            network_strings: util::NetworkStrings::default(),
+            ai_names: world::AiNames::default(),
+            net: net::Net::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
         sandbox::install(&lua)?;
         console::install(&lua)?;
         files::install(&lua)?;
+        timer::install(&lua)?;
+        convar::install(&lua)?;
+        filesystem::install(&lua)?;
         vector::install(&lua)?;
+        entity::install(&lua, realm)?;
+        util::install(&lua)?;
+        material::install(&lua)?;
+        world::install(&lua)?;
+        net::install(&lua, realm)?;
+        startup::install(&lua)?;
         engine::install(&lua, realm)?;
         Ok(Runtime { lua })
     }
@@ -249,10 +294,26 @@ impl Runtime {
         *host(&self.lua).output.borrow_mut() = Box::new(output);
     }
 
+    /// openGMOD's own folder: its `data/` is the `DATA` search path of the `file` library,
+    /// the only place Lua writes to.
+    pub fn set_data_dir(&self, dir: gmod_fs::UserDir) {
+        *host(&self.lua).data_dir.borrow_mut() = Some(dir);
+    }
+
     /// Runs the file the engine starts the realm with ([`Realm::init_file`]). False if it
     /// could not be run at all; errors inside it are reported as usual.
     pub fn init(&self) -> bool {
         self.include(self.realm().init_file())
+    }
+
+    /// Starts the game as the engine does: `includes/init.lua`, autorun, the gamemode and
+    /// its bases, scripted entities and weapons, and the hooks up to `Initialize`. Errors
+    /// are reported on the way; [`errors`](Self::errors) has them all.
+    pub fn start(&self, gamemode: &str) {
+        self.init();
+        if self.realm() != Realm::Menu {
+            startup::start(self, gamemode);
+        }
     }
 
     /// Runs a Lua file as the engine does (`lua/` or `gamemodes/` relative, as `include`
@@ -270,6 +331,75 @@ impl Runtime {
             error
         })?;
         files::call_reporting(&self.lua, function, mlua::MultiValue::new()).map(drop)
+    }
+
+    /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
+    /// timers that are due, the `Tick` hook for every tick that passed, the `Think` hook.
+    pub fn think(&self, seconds: f64) {
+        let ticks = {
+            let clock = &host(&self.lua).clock;
+            let before = (clock.cur_time.get() / timer::TICK_INTERVAL).floor();
+            clock.cur_time.set(clock.cur_time.get() + seconds);
+            clock.frame_time.set(seconds);
+            let ticks = ((clock.cur_time.get() / timer::TICK_INTERVAL).floor() - before).max(0.0) as u64;
+            clock.ticks.set(clock.ticks.get() + ticks);
+            ticks
+        };
+        convar::run_buffer(&self.lua);
+        timer::run_timers(&self.lua);
+        for _ in 0..ticks {
+            self.call_hook("Tick", mlua::MultiValue::new());
+        }
+        self.call_hook("Think", mlua::MultiValue::new());
+    }
+
+    /// Runs console commands now, as typed into the server's console (`sv_gravity 300;
+    /// my_command "a b"`).
+    pub fn run_command(&self, line: &str) {
+        for words in convar::split_commands(line) {
+            convar::execute(&self.lua, &words);
+        }
+    }
+
+    /// Game time: what `CurTime` returns.
+    pub fn cur_time(&self) -> f64 {
+        host(&self.lua).clock.cur_time.get()
+    }
+
+    /// Calls a hook as the engine does: `hook.Call(name, GAMEMODE, ...)`. What the hook
+    /// returned, or nothing when it failed (the error is reported) or the `hook` library is
+    /// not loaded.
+    pub fn call_hook(&self, name: &str, args: mlua::MultiValue) -> mlua::MultiValue {
+        let call = || -> mlua::Result<Option<(mlua::Function, mlua::MultiValue)>> {
+            let Some(hook) = self.lua.globals().get::<Option<mlua::Table>>("hook")? else { return Ok(None) };
+            let Some(call) = hook.get::<Option<mlua::Function>>("Call")? else { return Ok(None) };
+            let mut full = mlua::MultiValue::new();
+            full.push_back(mlua::Value::String(self.lua.create_string(name)?));
+            full.push_back(engine::gamemode(&self.lua)?);
+            full.extend(args);
+            Ok(Some((call, full)))
+        };
+        match call() {
+            Ok(Some((call, args))) => files::call_reporting(&self.lua, call, args).unwrap_or_default(),
+            Ok(None) => mlua::MultiValue::new(),
+            Err(e) => {
+                host(&self.lua).report(ScriptError::from_lua(&e));
+                mlua::MultiValue::new()
+            }
+        }
+    }
+
+    /// The `net` messages sent since the last call, oldest first.
+    pub fn take_net_messages(&self) -> Vec<net::NetMessage> {
+        std::mem::take(&mut *host(&self.lua).net.sent.borrow_mut())
+    }
+
+    /// A `net` message arrives (from the player `from`, or from the server: `NULL`): the
+    /// receiver Lua registered with `net.Receive` runs.
+    pub fn receive_net_message(&self, name: &str, data: &net::Bits, from: entity::EntityHandle) {
+        if let Err(e) = net::receive(&self.lua, name, data, from) {
+            host(&self.lua).report(ScriptError::from_lua(&e));
+        }
     }
 
     /// Every error reported so far.
