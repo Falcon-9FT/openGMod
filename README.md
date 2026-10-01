@@ -2,7 +2,7 @@
 
 **openGMOD** — реимплементация движка Garry's Mod с нуля на Rust, по примеру
 [OpenMW](https://openmw.org) и [openOMSI](https://github.com/turbo-devv/openOMSI). Цель — 64-битный
-многопоточный движок с современным рендером (wgpu: Vulkan / DirectX 12 / OpenGL), на котором
+многопоточный движок с современным рендером (wgpu: Vulkan / DirectX 12), на котором
 работают контент, Lua-аддоны, геймоды и воркшоп Garry's Mod без изменений.
 
 > [!IMPORTANT]

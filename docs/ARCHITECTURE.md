@@ -49,8 +49,8 @@
 
 ### Рендер: wgpu + winit
 
-Как в openOMSI, но без Metal: Vulkan и DirectX 12, OpenGL — запасной. Платформы — Windows и Linux;
-бэкенды wgpu включаются по отдельности, Metal в сборку не входит. Шейдеры Source
+Как в openOMSI, но только Vulkan и DirectX 12. Платформы — Windows (DirectX 12 или Vulkan) и Linux
+(Vulkan). Бэкенды wgpu включаются по отдельности: Metal и OpenGL в сборку не входят. Шейдеры Source
 (`LightmappedGeneric`, `VertexLitGeneric`, `UnlitGeneric`, `WorldVertexTransition`, `Water`,
 `Refract`...) переписываются на WGSL по их наблюдаемому результату.
 
