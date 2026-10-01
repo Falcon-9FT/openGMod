@@ -131,5 +131,5 @@ openGMod/
 
 ## Лицензия
 
-openGMOD распространяется под [лицензией MIT](LICENSE). Garry's Mod — товарный знак Facepunch
-Studios, Source — товарный знак Valve. openGMOD — независимый проект, с ними не связан.
+Лицензия пока не выбрана: все права на код openGMOD сохраняются за автором. Garry's Mod — товарный
+знак Facepunch Studios, Source — товарный знак Valve. openGMOD — независимый проект, с ними не связан.

@@ -2,7 +2,6 @@
 name = "gmod-model"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
 description = "Source engine models: .mdl headers, bones, skins and body parts, .vvd vertices, .vtx triangles; static meshes for drawing props"
 

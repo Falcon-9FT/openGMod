@@ -2,7 +2,6 @@
 name = "gmod-world"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
 description = "A map ready to draw: world, brush entities and static props as triangles by material, with their light, textures and sky box"
 
