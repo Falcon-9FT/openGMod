@@ -1,0 +1,7 @@
+# Windows: the C runtime is linked statically, so that the programs run without the Visual C++
+# redistributable installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

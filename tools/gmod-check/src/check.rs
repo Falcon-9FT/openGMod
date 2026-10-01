@@ -6,6 +6,8 @@ use std::time::Instant;
 use gmod_fs::{Backing, Vfs, path};
 use gmod_kv::Options;
 
+use crate::out::Out;
+
 /// How a text file is read as KeyValues, if it is one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyValuesKind {
@@ -58,24 +60,24 @@ impl Report {
         self.keyvalues.failed.len() + self.lua.failed.len() + self.unreadable.len() + self.crc.as_ref().map_or(0, |t| t.failed.len())
     }
 
-    pub fn print(&self, all: bool) {
-        println!("Checked {} files in {:.1} s:", self.files, self.seconds);
-        println!(
+    pub fn print(&self, out: &mut Out, all: bool) {
+        out.line(format!("Checked {} files in {:.1} s:", self.files, self.seconds));
+        out.line(format!(
             "  KeyValues  {:>8} read   {:>6} failed   (materials, scripts, VGUI resources, localisation)",
             self.keyvalues.ok,
             self.keyvalues.failed.len()
-        );
-        println!(
+        ));
+        out.line(format!(
             "  Lua        {:>8} read   {:>6} failed   ({} use GMod's additions to Lua)",
             self.lua.ok,
             self.lua.failed.len(),
             self.glua
-        );
+        ));
         if let Some(crc) = &self.crc {
-            println!("  CRC-32     {:>8} match  {:>6} differ   (archive entries)", crc.ok, crc.failed.len());
+            out.line(format!("  CRC-32     {:>8} match  {:>6} differ   (archive entries)", crc.ok, crc.failed.len()));
         }
         if !self.unreadable.is_empty() {
-            println!("  unreadable {:>8}", self.unreadable.len());
+            out.line(format!("  unreadable {:>8}", self.unreadable.len()));
         }
         let mut lists: Vec<(&str, &Vec<String>)> =
             vec![("KeyValues", &self.keyvalues.failed), ("Lua", &self.lua.failed), ("Unreadable", &self.unreadable)];
@@ -86,17 +88,17 @@ impl Report {
             if failed.is_empty() {
                 continue;
             }
-            println!();
-            println!("{what} failures ({}):", failed.len());
+            out.line("");
+            out.line(format!("{what} failures ({}):", failed.len()));
             let shown = if all { failed.len() } else { failed.len().min(20) };
             for line in &failed[..shown] {
-                println!("  {line}");
+                out.line(format!("  {line}"));
             }
             if shown < failed.len() {
-                println!("  ... {} more (--all shows them)", failed.len() - shown);
+                out.line(format!("  ... {} more (--all shows them)", failed.len() - shown));
             }
         }
-        println!();
+        out.line("");
     }
 }
 

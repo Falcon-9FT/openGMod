@@ -28,7 +28,12 @@
 
 ## Проверить свою установку
 
-Нужен [Rust](https://rustup.rs) 1.88 или новее.
+**Проще всего на Windows:**
+1. Скачайте `gmod-check.exe` со страницы [Releases](https://github.com/Falcon-9FT/openGMod/releases).
+2. Запустите его двойным щелчком (или перетащите на него папку `GarrysMod`).
+3. Отчёт сохранится рядом с программой в `gmod-check-report.txt`.
+
+Из исходников нужен [Rust](https://rustup.rs) 1.88 или новее:
 
 ```sh
 cargo run --release -p gmod-check                     # найдёт GMod через Steam и проверит всё
