@@ -39,7 +39,7 @@ OPTIONS:
 CONTROLS:
     click the window to look around with the mouse, Esc to let the mouse go
     W A S D to fly, Space and Ctrl up and down, Shift faster
-    F11 full screen";
+    F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)";
 
 /// Degrees the view turns per pixel the mouse moves.
 const MOUSE_DEGREES: f32 = 0.12;
@@ -188,6 +188,64 @@ impl Gpu {
         }
     }
 
+    /// Draws one more frame into a texture of its own and saves it as a PNG in
+    /// `~/.opengmod/screenshots`.
+    fn screenshot(&mut self, camera: &Camera, name: &str) -> Result<PathBuf, String> {
+        let bgra = matches!(self.view_format, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm);
+        let rgba = matches!(self.view_format, wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Rgba8Unorm);
+        if !bgra && !rgba {
+            return Err(format!("screenshots of {:?} pictures are not made yet", self.view_format));
+        }
+        let (width, height) = (self.config.width, self.config.height);
+        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screenshot"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.view_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("screenshot") });
+        self.renderer.render(&self.device, &self.queue, &mut encoder, &view, (width, height), camera);
+        // copies out of a texture go in rows of a multiple of 256 bytes
+        let row = (width * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screenshot"),
+            size: u64::from(row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(height) },
+            },
+            size,
+        );
+        self.queue.submit([encoder.finish()]);
+        buffer.map_async(wgpu::MapMode::Read, .., |_| ());
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("the GPU: {e}"))?;
+        let data = buffer.slice(..).get_mapped_range().map_err(|e| format!("the picture: {e}"))?.to_vec();
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let p = &data[y * row as usize + x * 4..][..4];
+                rgb.extend(if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] });
+            }
+        }
+        let dir = UserDir::default_root().ok_or("there is no home folder for the screenshots")?.join("screenshots");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let file = dir.join(format!("{name}-{seconds}.png"));
+        std::fs::write(&file, gmod_material::png::encode(width, height, 3, &rgb)).map_err(|e| format!("{}: {e}", file.display()))?;
+        Ok(file)
+    }
+
     fn draw(&mut self, camera: &Camera) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -230,6 +288,8 @@ struct App {
     last_frame: Instant,
     frames: u32,
     counting_since: Instant,
+    /// F12 was pressed: save the next frame.
+    screenshot: bool,
 }
 
 impl App {
@@ -321,6 +381,7 @@ impl ApplicationHandler for App {
                 if state == ElementState::Pressed {
                     match key {
                         KeyCode::Escape => self.capture(false),
+                        KeyCode::F12 if !repeat => self.screenshot = true,
                         KeyCode::F11 if !repeat => {
                             if let Some(gpu) = &self.gpu {
                                 let full = gpu.window.fullscreen().is_some();
@@ -338,6 +399,12 @@ impl ApplicationHandler for App {
                 self.fly();
                 if let Some(gpu) = &mut self.gpu {
                     gpu.draw(&self.camera);
+                    if std::mem::take(&mut self.screenshot) {
+                        match gpu.screenshot(&self.camera, &self.name) {
+                            Ok(file) => println!("Screenshot: {}", file.display()),
+                            Err(e) => println!("No screenshot: {e}"),
+                        }
+                    }
                     gpu.window.request_redraw();
                 }
                 self.count_frame();
@@ -404,6 +471,7 @@ fn main() -> ExitCode {
         last_frame: now,
         frames: 0,
         counting_since: now,
+        screenshot: false,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         return fail(&format!("window system: {e}"));

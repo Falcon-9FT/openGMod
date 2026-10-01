@@ -456,6 +456,7 @@ version = "0.2.0"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
+ "gmod-material",
  "gmod-render",
  "gmod-world",
  "wgpu",

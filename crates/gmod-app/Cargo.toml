@@ -14,6 +14,7 @@ path = "src/main.rs"
 gmod-fs.workspace = true
 gmod-bsp.workspace = true
 gmod-world.workspace = true
+gmod-material.workspace = true
 gmod-render.workspace = true
 wgpu.workspace = true
 winit.workspace = true
