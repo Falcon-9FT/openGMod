@@ -6,6 +6,7 @@ members = [
     "crates/gmod-glua",
     "crates/gmod-bsp",
     "crates/gmod-material",
+    "crates/gmod-model",
     "tools/gmod-check",
 ]
 
@@ -22,6 +23,7 @@ gmod-fs = { path = "crates/gmod-fs" }
 gmod-glua = { path = "crates/gmod-glua" }
 gmod-bsp = { path = "crates/gmod-bsp" }
 gmod-material = { path = "crates/gmod-material" }
+gmod-model = { path = "crates/gmod-model" }
 
 [profile.release]
 opt-level = 3

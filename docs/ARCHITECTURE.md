@@ -111,7 +111,7 @@ cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, з
 | zip (pakfile карт): без сжатия, DEFLATE, LZMA | `gmod-fs::zip` | готово |
 | карты BSP v19–21: LZMA-лампы, дисплейсменты, статические пропы, pakfile, PVS | `gmod-bsp` | чтение и сетка мира готовы; PVS — этап 2 |
 | материалы VMT, текстуры VTF | `gmod-material` | чтение готово; рендер — этап 2 |
-| модели MDL / VVD / VTX / PHY | `gmod-model` | этапы 2 и 4 |
+| модели MDL / VVD / VTX / PHY | `gmod-model` | статические сетки и свет пропов готовы; PHY и анимация — этап 4 |
 | рендер | `gmod-render` | этап 2 |
 | физика | `gmod-physics` | этап 4 |
 | сущности: энтити движка, SENT, SWEP, метатаблицы | `gmod-game` | этап 4 |

@@ -329,11 +329,16 @@ fn render_map(vfs: &mut Vfs, map: &str, args: &Args) -> ExitCode {
     let [ex, ey, ez] = picture.eye;
     let [tx, ty, tz] = picture.target;
     say!("{path}: {} triangles from {ex},{ey},{ez} to {tx},{ty},{tz} in {:.1} s", picture.triangles, picture.seconds);
-    for (what, names) in [("materials", &picture.missing_materials), ("textures", &picture.missing_textures)] {
+    let lists = [
+        ("materials", "drawn as purple squares", &picture.missing_materials),
+        ("textures", "drawn as purple squares", &picture.missing_textures),
+        ("models", "not drawn", &picture.missing_models),
+    ];
+    for (what, how, names) in lists {
         if !names.is_empty() {
             let shown: Vec<&str> = names.iter().take(5).map(String::as_str).collect();
             let more = if names.len() > 5 { format!(" and {} more", names.len() - 5) } else { String::new() };
-            say!("Missing {what} ({}), drawn as purple squares: {}{more}", names.len(), shown.join(", "));
+            say!("Missing {what} ({}), {how}: {}{more}", names.len(), shown.join(", "));
         }
     }
     say!("Saved {}", file.display());

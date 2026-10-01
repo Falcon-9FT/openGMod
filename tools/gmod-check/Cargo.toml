@@ -12,3 +12,4 @@ gmod-fs.workspace = true
 gmod-glua.workspace = true
 gmod-bsp.workspace = true
 gmod-material.workspace = true
+gmod-model.workspace = true

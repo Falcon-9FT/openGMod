@@ -59,9 +59,10 @@ pub struct Report {
     pub glua: usize,
     pub textures: Tally,
     pub materials: Tally,
+    pub models: Tally,
     pub maps: Tally,
     /// Gaps in the content rather than failures of openGMOD: textures that materials name,
-    /// materials and models that maps name, which the game does not have.
+    /// materials that models and maps name, models that maps name, which the game does not have.
     pub missing_textures: Vec<String>,
     pub missing_materials: Vec<String>,
     pub missing_models: Vec<String>,
@@ -72,7 +73,10 @@ pub struct Report {
 
 impl Report {
     pub fn failures(&self) -> usize {
-        [&self.keyvalues, &self.lua, &self.textures, &self.materials, &self.maps].iter().map(|t| t.failed.len()).sum::<usize>()
+        [&self.keyvalues, &self.lua, &self.textures, &self.materials, &self.models, &self.maps]
+            .iter()
+            .map(|t| t.failed.len())
+            .sum::<usize>()
             + self.unreadable.len()
             + self.crc.as_ref().map_or(0, |t| t.failed.len())
     }
@@ -101,6 +105,11 @@ impl Report {
             self.materials.failed.len()
         ));
         out.line(format!(
+            "  Models     {:>8} read   {:>6} failed   (MDL with VVD and VTX: the triangles of every model)",
+            self.models.ok,
+            self.models.failed.len()
+        ));
+        out.line(format!(
             "  Maps       {:>8} read   {:>6} failed   (BSP: world, lightmaps, displacements, static props)",
             self.maps.ok,
             self.maps.failed.len()
@@ -114,7 +123,7 @@ impl Report {
         let missing = self.missing_textures.len() + self.missing_materials.len() + self.missing_models.len();
         if missing > 0 {
             out.line(format!(
-                "  Missing: {} textures named by materials, {} materials and {} models named by maps",
+                "  Missing: {} textures named by materials, {} materials named by models and maps, {} models named by maps",
                 self.missing_textures.len(),
                 self.missing_materials.len(),
                 self.missing_models.len()
@@ -126,6 +135,7 @@ impl Report {
             ("Lua failures", &self.lua.failed),
             ("Texture failures", &self.textures.failed),
             ("Material failures", &self.materials.failed),
+            ("Model failures", &self.models.failed),
             ("Map failures", &self.maps.failed),
             ("Unreadable", &self.unreadable),
         ];
@@ -173,6 +183,10 @@ pub fn run(vfs: &mut Vfs, crc: bool) -> Report {
         let lua = extension == "lua";
         let texture = extension == "vtf";
         let map = extension == "bsp" && path.starts_with("maps/");
+        if extension == "mdl" {
+            check_model(vfs, path, &format!("{path} [{}]", mount_name(vfs, *index)), &mut report);
+            continue;
+        }
         if kv.is_none() && !lua && !texture && !map {
             continue;
         }
@@ -266,9 +280,31 @@ fn check_material(vfs: &Vfs, path: &str, where_: &str, report: &mut Report) {
     }
 }
 
+/// A model reads when its three files do and fit together into triangles; its materials should
+/// be there.
+fn check_model(vfs: &Vfs, path: &str, where_: &str, report: &mut Report) {
+    let model = match gmod_model::load(vfs, path).and_then(|model| model.mesh(0, 0).map(|_| model)) {
+        Ok(model) => model,
+        Err(e) => {
+            let message = e.to_string();
+            let message = message.strip_prefix(&format!("{path}: ")).unwrap_or(&message);
+            return report.models.failed.push(format!("{where_}: {message}"));
+        }
+    };
+    report.models.ok += 1;
+    for texture in 0..model.mdl.textures.len() {
+        let candidates = model.mdl.material_candidates(texture);
+        if !candidates.iter().any(|name| material_path(name).is_some_and(|file| vfs.exists(&file, "GAME")))
+            && let Some(first) = candidates.first()
+        {
+            report.missing_materials.push(format!("{where_}: {first}"));
+        }
+    }
+}
+
 /// A map reads when its lumps do and its world can be built. Its pakfile is checked as well:
-/// the textures and materials in it, and whether the materials and models the map names are
-/// in the game with the pakfile in front.
+/// the textures, materials and models in it, and whether the materials and models the map
+/// names are in the game with the pakfile in front.
 fn check_map(vfs: &mut Vfs, path: &str, where_: &str, bytes: Vec<u8>, report: &mut Report) {
     let bsp = match Bsp::parse(PathBuf::from(path), Arc::from(bytes)) {
         Ok(bsp) => bsp,
@@ -294,6 +330,7 @@ fn check_map(vfs: &mut Vfs, path: &str, where_: &str, bytes: Vec<u8>, report: &m
                     count(&mut report.textures, &inner, vfs.mounts()[0].read(&entry).map_err(|e| e.to_string()).and_then(check_texture))
                 }
                 "vmt" if entry.starts_with("materials/") => check_material(vfs, &entry, &inner, report),
+                "mdl" => check_model(vfs, &entry, &inner, report),
                 _ => {}
             }
         }
@@ -420,6 +457,7 @@ mod tests {
         write(&game.join("materials/missing.vmt"), b"\"UnlitGeneric\" { \"$basetexture\" \"nothing/here\" }");
         write(&game.join("materials/broken.vtf"), b"VTF\0 cut short");
         write(&game.join("maps/broken.bsp"), b"VBSP cut short");
+        write(&game.join("models/broken.mdl"), b"IDST cut short");
         write(&game.join("lua/broken.lua"), b"x = 1 /* never closed");
         write(&game.join("scripts/sentences.txt"), b"NOT KEYVALUES {");
         let workshop = root.parent().unwrap().parent().unwrap().join("workshop/content/4000/42");
@@ -448,8 +486,10 @@ mod tests {
         assert_eq!(report.textures.ok, 1);
         assert!(report.textures.failed[0].starts_with("materials/broken.vtf [folder garrysmod]: "), "{:?}", report.textures.failed);
         assert_eq!((report.maps.ok, report.maps.failed.len()), (0, 1));
+        assert_eq!((report.models.ok, report.models.failed.len()), (0, 1));
+        assert!(report.models.failed[0].starts_with("models/broken.mdl [folder garrysmod]: "), "{:?}", report.models.failed);
         let crc = report.crc.as_ref().unwrap();
         assert_eq!((crc.ok, crc.failed.len()), (6, 0));
-        assert_eq!(report.failures(), 4);
+        assert_eq!(report.failures(), 5);
     }
 }

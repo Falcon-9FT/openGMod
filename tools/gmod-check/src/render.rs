@@ -3,18 +3,19 @@
 //! check that the readers fit together; the engine itself draws with the GPU.
 //!
 //! Brush entities (`func_brush`, doors ...) are drawn where they stand: their geometry is kept
-//! relative to the entity's `origin`, turned by its `angles`. Not drawn yet: models (static
-//! props, entities), decals and overlays, the 3D sky box, fog, reflections and bump maps.
+//! relative to the entity's `origin`, turned by its `angles`. Static props are drawn with their
+//! models, lit by the light baked into the map for them (`sp_hdr_<n>.vhv`). Not drawn yet:
+//! models of entities, decals and overlays, the 3D sky box, fog, reflections and bump maps.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gmod_bsp::Bsp;
-use gmod_bsp::mesh::{self, Mesh};
+use gmod_bsp::{Bsp, mesh};
 use gmod_fs::{Backing, Mount, Vfs};
 use gmod_material::vtf::flags;
 use gmod_material::{Library, Material, Vtf, png};
+use gmod_model::{Model, Vhv};
 
 /// What to draw and from where.
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub struct Picture {
     pub triangles: usize,
     pub missing_materials: Vec<String>,
     pub missing_textures: Vec<String>,
+    pub missing_models: Vec<String>,
     pub seconds: f64,
 }
 
@@ -308,23 +310,17 @@ impl Camera {
     }
 }
 
-/// A vertex in camera space with what is interpolated across a triangle.
+/// A vertex in camera space with what is interpolated across a triangle: texture and light
+/// map coordinates, blend alpha and vertex light.
 #[derive(Debug, Clone, Copy)]
 struct Corner {
     p: Vec3,
-    uv: [f32; 2],
-    lm: [f32; 2],
-    alpha: f32,
+    q: [f32; 8],
 }
 
 fn lerp_corner(a: &Corner, b: &Corner, t: f32) -> Corner {
     let l = |x: f32, y: f32| x + (y - x) * t;
-    Corner {
-        p: [l(a.p[0], b.p[0]), l(a.p[1], b.p[1]), l(a.p[2], b.p[2])],
-        uv: [l(a.uv[0], b.uv[0]), l(a.uv[1], b.uv[1])],
-        lm: [l(a.lm[0], b.lm[0]), l(a.lm[1], b.lm[1])],
-        alpha: l(a.alpha, b.alpha),
-    }
+    Corner { p: std::array::from_fn(|i| l(a.p[i], b.p[i])), q: std::array::from_fn(|i| l(a.q[i], b.q[i])) }
 }
 
 /// Cuts away the part of a triangle in front of the near plane.
@@ -351,7 +347,7 @@ struct Projected {
     y: f32,
     /// 1 / depth.
     w: f32,
-    q: [f32; 5],
+    q: [f32; 8],
 }
 
 /// What a frame is made of: colour in linear light, and 1 / depth (0 is nothing).
@@ -383,27 +379,36 @@ impl Atlas<'_> {
 }
 
 struct Scene<'a> {
-    mesh: &'a Mesh,
-    atlas: Atlas<'a>,
+    piece: &'a Piece,
+    /// The light map, for brushes; models are lit per vertex.
+    atlas: Option<Atlas<'a>>,
     textures: &'a [Texture],
     linear: &'a [f32; 256],
 }
 
-/// A brush model in the world: the world itself, or a brush entity moved to where it stands.
+/// A vertex of a piece, in the world.
+#[derive(Debug, Clone, Copy, Default)]
+struct PieceVertex {
+    position: Vec3,
+    normal: Vec3,
+    uv: [f32; 2],
+    lightmap_uv: [f32; 2],
+    alpha: f32,
+    light: Vec3,
+}
+
+/// Something drawn: the world, a brush entity or a prop, moved to where it stands.
 struct Piece {
-    mesh: Mesh,
+    vertices: Vec<PieceVertex>,
+    indices: Vec<u32>,
+    lightmap: Option<mesh::Lightmap>,
     surfaces: Vec<Surface>,
 }
 
 impl Piece {
     fn scene<'a>(&'a self, textures: &'a [Texture], linear: &'a [f32; 256]) -> Scene<'a> {
-        let lightmap = &self.mesh.lightmap;
-        Scene {
-            mesh: &self.mesh,
-            atlas: Atlas { width: lightmap.width as usize, height: lightmap.height as usize, texels: &lightmap.texels },
-            textures,
-            linear,
-        }
+        let atlas = self.lightmap.as_ref().map(|l| Atlas { width: l.width as usize, height: l.height as usize, texels: &l.texels });
+        Scene { piece: self, atlas, textures, linear }
     }
 }
 
@@ -439,16 +444,16 @@ fn placed_models(bsp: &Bsp) -> Vec<(usize, Vec3, Vec3)> {
     models
 }
 
-/// Moves a brush entity's geometry from its own space into the world: turned by pitch, yaw
-/// and roll (degrees), then moved to `origin`.
-fn place(mesh: &mut Mesh, origin: Vec3, angles: Vec3) {
+/// Moves geometry from its own space into the world: turned by pitch, yaw and roll (degrees),
+/// then moved to `origin`.
+fn place(vertices: &mut [PieceVertex], origin: Vec3, angles: Vec3) {
     let [pitch, yaw, roll] = angles.map(f32::to_radians);
     let ((sp, cp), (sy, cy), (sr, cr)) = (pitch.sin_cos(), yaw.sin_cos(), roll.sin_cos());
     let forward = [cp * cy, cp * sy, -sp];
     let left = [sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, sr * cp];
     let up = [cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp];
     let turn = |v: Vec3| add(add(scale(forward, v[0]), scale(left, v[1])), scale(up, v[2]));
-    for vertex in &mut mesh.vertices {
+    for vertex in vertices {
         vertex.position = add(origin, turn(vertex.position));
         vertex.normal = turn(vertex.normal);
     }
@@ -464,16 +469,21 @@ fn lod(texture: &Texture, du: [f32; 2], dv: [f32; 2]) -> f32 {
 
 /// Draws the triangles of a surface: opaque ones write depth, translucent ones blend.
 fn draw(frame: &mut Frame, camera: &Camera, scene: &Scene, s: &Surface) {
-    let mesh = scene.mesh;
-    for tri in mesh.indices[s.first..s.first + s.count].chunks_exact(3) {
-        let v = [mesh.vertices[tri[0] as usize], mesh.vertices[tri[1] as usize], mesh.vertices[tri[2] as usize]];
+    let piece = scene.piece;
+    for tri in piece.indices[s.first..s.first + s.count].chunks_exact(3) {
+        let v = [piece.vertices[tri[0] as usize], piece.vertices[tri[1] as usize], piece.vertices[tri[2] as usize]];
         if !s.no_cull {
             let normal = add(add(v[0].normal, v[1].normal), v[2].normal);
             if dot(normal, sub(camera.eye, v[0].position)) < 0.0 {
                 continue;
             }
         }
-        let corners = v.map(|v| Corner { p: camera.to_camera(v.position), uv: v.uv, lm: v.lightmap_uv, alpha: v.alpha });
+        let corners = v.map(|v| {
+            let [u, t] = v.uv;
+            let [lu, lv] = v.lightmap_uv;
+            let [r, g, b] = v.light;
+            Corner { p: camera.to_camera(v.position), q: [u, t, lu, lv, v.alpha, r, g, b] }
+        });
         let polygon = clip_near(&corners);
         if polygon.len() < 3 {
             continue;
@@ -486,7 +496,7 @@ fn draw(frame: &mut Frame, camera: &Camera, scene: &Scene, s: &Surface) {
                     x: camera.center[0] + c.p[0] * w * camera.focal,
                     y: camera.center[1] - c.p[1] * w * camera.focal,
                     w,
-                    q: [c.uv[0] * w, c.uv[1] * w, c.lm[0] * w, c.lm[1] * w, c.alpha * w],
+                    q: c.q.map(|q| q * w),
                 }
             })
             .collect();
@@ -520,7 +530,7 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
         (dx, dy)
     };
     let (dw_dx, dw_dy) = gradient(a.w, b.w, c.w);
-    let dq: [(f32, f32); 5] = std::array::from_fn(|k| gradient(a.q[k], b.q[k], c.q[k]));
+    let dq: [(f32, f32); 8] = std::array::from_fn(|k| gradient(a.q[k], b.q[k], c.q[k]));
     let edge = |p: &Projected, q: &Projected, x: f32, y: f32| (q.x - p.x) * (y - p.y) - (q.y - p.y) * (x - p.x);
     let base = s.base.map(|i| &scene.textures[i]);
     let base2 = s.base2.map(|i| &scene.textures[i]);
@@ -558,7 +568,11 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
             {
                 continue;
             }
-            let light = if s.lit { scene.atlas.sample([value(2), value(3)]) } else { [1.0; 3] };
+            let light = match &scene.atlas {
+                _ if !s.lit => [1.0; 3],
+                Some(atlas) => atlas.sample([value(2), value(3)]),
+                None => [value(5), value(6), value(7)],
+            };
             let mut color: Vec3 = std::array::from_fn(|i| albedo[i] * s.tint[i] * light[i]);
             let mut opacity = albedo[3] * s.alpha;
             if let Some(fog) = s.water {
@@ -671,6 +685,81 @@ pub fn render(vfs: &mut Vfs, bsp: &Bsp, view: &View) -> Result<Picture, String> 
     result
 }
 
+/// Light for a model vertex without baked light: some from everywhere, more from above.
+fn plain_light(normal: Vec3) -> Vec3 {
+    let sun = dot(normal, normalize([0.4, 0.3, 1.0])).max(0.0);
+    [0.35 + 0.5 * sun; 3]
+}
+
+/// Adds the static props of a map as pieces; returns the models that could not be read.
+fn static_props(
+    vfs: &Vfs,
+    bsp: &Bsp,
+    library: &mut Library,
+    textures: &mut Textures,
+    missing_materials: &mut Vec<String>,
+    pieces: &mut Vec<Piece>,
+) -> Vec<String> {
+    let mut models: HashMap<u16, Option<Model>> = HashMap::new();
+    let mut missing = Vec::new();
+    let hdr = !bsp.lighting_hdr.is_empty();
+    for (n, prop) in bsp.static_props.props.iter().enumerate() {
+        let Some(name) = bsp.static_props.models.get(prop.model as usize) else { continue };
+        let Some(model) = models.entry(prop.model).or_insert_with(|| {
+            gmod_model::load(vfs, name)
+                .inspect_err(|e| missing.push(if e.kind() == std::io::ErrorKind::NotFound { name.clone() } else { format!("{name}: {e}") }))
+                .ok()
+        }) else {
+            continue;
+        };
+        // the light baked for this prop: HDR when the map has it
+        let names =
+            if hdr { [format!("sp_hdr_{n}.vhv"), format!("sp_{n}.vhv")] } else { [format!("sp_{n}.vhv"), format!("sp_hdr_{n}.vhv")] };
+        let baked = names.iter().find_map(|file| vfs.read(file, "GAME").ok().and_then(|bytes| Vhv::parse(&bytes).ok()));
+        let skin = usize::try_from(prop.skin).unwrap_or(0);
+        let mesh = match &baked {
+            Some(baked) => model.lit_mesh(0, skin, baked),
+            None => model.mesh(0, skin),
+        };
+        let Ok(mesh) = mesh else { continue };
+        let mut vertices: Vec<PieceVertex> = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(i, v)| PieceVertex {
+                position: v.position,
+                normal: v.normal,
+                uv: v.uv,
+                lightmap_uv: [0.0; 2],
+                alpha: 0.0,
+                light: mesh.light.as_ref().map_or([1.0; 3], |light| light[i]),
+            })
+            .collect();
+        place(&mut vertices, prop.origin, prop.angles);
+        // without baked light, light from above: in the world, so after placing
+        if mesh.light.is_none() {
+            for v in &mut vertices {
+                v.light = plain_light(v.normal);
+            }
+        }
+        let mut surfaces = Vec::new();
+        for batch in &mesh.batches {
+            let candidates = model.mdl.material_candidates(batch.texture);
+            let material = candidates.iter().find_map(|candidate| library.material(vfs, candidate).ok());
+            if material.is_none()
+                && let Some(first) = candidates.first()
+                && !missing_materials.contains(first)
+            {
+                missing_materials.push(first.clone());
+            }
+            let (first, count) = (batch.first_index as usize, batch.index_count as usize);
+            surfaces.push(surface(material.as_deref(), first, count, vfs, library, textures));
+        }
+        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: None, surfaces });
+    }
+    missing
+}
+
 fn draw_map(vfs: &Vfs, bsp: &Bsp, view: &View, started: Instant) -> Result<Picture, String> {
     if view.width == 0 || view.height == 0 || view.width > 16384 || view.height > 16384 {
         return Err(format!("a picture of {}x{} pixels cannot be drawn", view.width, view.height));
@@ -681,12 +770,24 @@ fn draw_map(vfs: &Vfs, bsp: &Bsp, view: &View, started: Instant) -> Result<Pictu
     let mut materials: HashMap<usize, Option<Arc<Material>>> = HashMap::new();
     let mut pieces = Vec::new();
     for (model, origin, angles) in placed_models(bsp) {
-        let mut mesh = mesh::build(bsp, mesh::Options { model, ..mesh::Options::default() });
+        let mesh = mesh::build(bsp, mesh::Options { model, ..mesh::Options::default() });
         if mesh.indices.is_empty() {
             continue;
         }
+        let mut vertices: Vec<PieceVertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| PieceVertex {
+                position: v.position,
+                normal: v.normal,
+                uv: v.uv,
+                lightmap_uv: v.lightmap_uv,
+                alpha: v.alpha,
+                light: [1.0; 3],
+            })
+            .collect();
         if model != 0 {
-            place(&mut mesh, origin, angles);
+            place(&mut vertices, origin, angles);
         }
         let mut surfaces = Vec::new();
         for batch in &mesh.batches {
@@ -700,8 +801,9 @@ fn draw_map(vfs: &Vfs, bsp: &Bsp, view: &View, started: Instant) -> Result<Pictu
             let (first, count) = (batch.first_index as usize, batch.index_count as usize);
             surfaces.push(surface(material.as_deref(), first, count, vfs, &mut library, &mut textures));
         }
-        pieces.push(Piece { mesh, surfaces });
+        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces });
     }
+    let missing_models = static_props(vfs, bsp, &mut library, &mut textures, &mut missing_materials, &mut pieces);
     // the sky box named by the world
     let sky_name = bsp.worldspawn().and_then(|w| w.get("skyname")).unwrap_or("").to_string();
     let sky: [SkyFace; 6] = std::array::from_fn(|i| {
@@ -734,9 +836,8 @@ fn draw_map(vfs: &Vfs, bsp: &Bsp, view: &View, started: Instant) -> Result<Pictu
         .iter()
         .flat_map(|piece| piece.surfaces.iter().filter(|s| s.translucent).map(move |s| (piece, s)))
         .map(|(piece, s)| {
-            let mesh = &piece.mesh;
-            let indices = &mesh.indices[s.first..s.first + s.count];
-            let sum = indices.iter().fold([0.0; 3], |acc, &i| add(acc, mesh.vertices[i as usize].position));
+            let indices = &piece.indices[s.first..s.first + s.count];
+            let sum = indices.iter().fold([0.0; 3], |acc, &i| add(acc, piece.vertices[i as usize].position));
             let middle = scale(sum, 1.0 / indices.len().max(1) as f32);
             let d = sub(middle, eye);
             (dot(d, d), piece, s)
@@ -752,9 +853,10 @@ fn draw_map(vfs: &Vfs, bsp: &Bsp, view: &View, started: Instant) -> Result<Pictu
         png: png::encode(view.width, view.height, 3, &rgb),
         eye,
         target,
-        triangles: pieces.iter().map(|p| p.mesh.indices.len() / 3).sum(),
+        triangles: pieces.iter().map(|p| p.indices.len() / 3).sum(),
         missing_materials,
         missing_textures: textures.missing,
+        missing_models,
         seconds: started.elapsed().as_secs_f64(),
     })
 }
@@ -788,18 +890,17 @@ mod tests {
 
     #[test]
     fn brush_entities_are_placed() {
-        let mut mesh = Mesh::default();
-        mesh.vertices.push(mesh::Vertex { position: [10.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0], ..mesh::Vertex::default() });
+        let mut vertices = [PieceVertex { position: [10.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0], ..PieceVertex::default() }];
         // yaw 90 turns +x into +y; then the origin moves it
-        place(&mut mesh, [100.0, 200.0, 300.0], [0.0, 90.0, 0.0]);
-        let v = mesh.vertices[0];
+        place(&mut vertices, [100.0, 200.0, 300.0], [0.0, 90.0, 0.0]);
+        let v = vertices[0];
         let near = |a: Vec3, b: Vec3| sub(a, b).iter().all(|d| d.abs() < 1e-4);
         assert!(near(v.position, [100.0, 210.0, 300.0]), "{:?}", v.position);
         assert!(near(v.normal, [0.0, 1.0, 0.0]), "{:?}", v.normal);
         // pitch 90 looks down: +x turns into -z
-        mesh.vertices[0].normal = [1.0, 0.0, 0.0];
-        place(&mut mesh, [0.0; 3], [90.0, 0.0, 0.0]);
-        assert!(near(mesh.vertices[0].normal, [0.0, 0.0, -1.0]), "{:?}", mesh.vertices[0].normal);
+        vertices[0].normal = [1.0, 0.0, 0.0];
+        place(&mut vertices, [0.0; 3], [90.0, 0.0, 0.0]);
+        assert!(near(vertices[0].normal, [0.0, 0.0, -1.0]), "{:?}", vertices[0].normal);
     }
 
     #[test]

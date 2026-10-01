@@ -18,6 +18,7 @@ dependencies = [
  "gmod-glua",
  "gmod-kv",
  "gmod-material",
+ "gmod-model",
 ]
 
 [[package]]
@@ -41,4 +42,11 @@ version = "0.1.0"
 dependencies = [
  "gmod-fs",
  "gmod-kv",
+]
+
+[[package]]
+name = "gmod-model"
+version = "0.1.0"
+dependencies = [
+ "gmod-fs",
 ]
