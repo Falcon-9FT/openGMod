@@ -10,6 +10,7 @@ description = "Checks how much of a Garry's Mod installation openGMOD can read; 
 gmod-kv.workspace = true
 gmod-fs.workspace = true
 gmod-glua.workspace = true
+gmod-lua.workspace = true
 gmod-bsp.workspace = true
 gmod-material.workspace = true
 gmod-model.workspace = true

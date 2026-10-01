@@ -4,6 +4,7 @@ members = [
     "crates/gmod-kv",
     "crates/gmod-fs",
     "crates/gmod-glua",
+    "crates/gmod-lua",
     "crates/gmod-bsp",
     "crates/gmod-material",
     "crates/gmod-model",
@@ -24,11 +25,14 @@ repository = "https://github.com/Falcon-9FT/openGMod"
 gmod-kv = { path = "crates/gmod-kv" }
 gmod-fs = { path = "crates/gmod-fs" }
 gmod-glua = { path = "crates/gmod-glua" }
+gmod-lua = { path = "crates/gmod-lua" }
 gmod-bsp = { path = "crates/gmod-bsp" }
 gmod-material = { path = "crates/gmod-material" }
 gmod-model = { path = "crates/gmod-model" }
 gmod-world = { path = "crates/gmod-world" }
 gmod-render = { path = "crates/gmod-render" }
+# LuaJIT 2.1, built from source with the crate
+mlua = { version = "0.12.1", features = ["luajit", "vendored"] }
 # the GPU: Direct3D 12 and Vulkan only - no OpenGL, no Metal until macOS
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
