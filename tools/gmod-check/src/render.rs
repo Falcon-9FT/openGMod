@@ -470,8 +470,8 @@ fn lod(texture: &Texture, du: [f32; 2], dv: [f32; 2]) -> f32 {
 /// Draws the triangles of a surface: opaque ones write depth, translucent ones blend.
 fn draw(frame: &mut Frame, camera: &Camera, scene: &Scene, s: &Surface) {
     let piece = scene.piece;
-    for tri in piece.indices[s.first..s.first + s.count].chunks_exact(3) {
-        let v = [piece.vertices[tri[0] as usize], piece.vertices[tri[1] as usize], piece.vertices[tri[2] as usize]];
+    for tri in piece.indices[s.first..s.first + s.count].as_chunks::<3>().0 {
+        let v = tri.map(|i| piece.vertices[i as usize]);
         if !s.no_cull {
             let normal = add(add(v[0].normal, v[1].normal), v[2].normal);
             if dot(normal, sub(camera.eye, v[0].position)) < 0.0 {
