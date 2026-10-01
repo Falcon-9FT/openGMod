@@ -19,6 +19,7 @@ dependencies = [
  "gmod-kv",
  "gmod-material",
  "gmod-model",
+ "gmod-world",
 ]
 
 [[package]]
@@ -49,4 +50,14 @@ name = "gmod-model"
 version = "0.1.0"
 dependencies = [
  "gmod-fs",
+]
+
+[[package]]
+name = "gmod-world"
+version = "0.1.0"
+dependencies = [
+ "gmod-bsp",
+ "gmod-fs",
+ "gmod-material",
+ "gmod-model",
 ]

@@ -8,3 +8,7 @@ description = "Source engine maps (.bsp v19-21): lumps, entities, static props, 
 
 [dependencies]
 gmod-fs.workspace = true
+
+[features]
+# the small map of the tests, for tests of other crates
+testmap = []

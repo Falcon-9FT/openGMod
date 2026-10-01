@@ -257,7 +257,9 @@ impl Bsp {
     }
 }
 
-#[cfg(test)]
-mod testmap;
+/// A small map written for tests, also those of crates that read maps (feature `testmap`).
+#[cfg(any(test, feature = "testmap"))]
+#[doc(hidden)]
+pub mod testmap;
 #[cfg(test)]
 mod tests;

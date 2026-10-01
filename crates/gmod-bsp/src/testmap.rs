@@ -4,9 +4,9 @@
 
 use crate::lumps::index;
 
-pub(crate) const RED: [u8; 4] = [255, 0, 0, 0];
-pub(crate) const GREEN: [u8; 4] = [0, 255, 0, 0];
-pub(crate) const BLUE: [u8; 4] = [0, 0, 255, 0];
+pub const RED: [u8; 4] = [255, 0, 0, 0];
+pub const GREEN: [u8; 4] = [0, 255, 0, 0];
+pub const BLUE: [u8; 4] = [0, 0, 255, 0];
 
 fn f32s(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -84,7 +84,7 @@ fn texinfo(s: [f32; 4], t: [f32; 4], ls: [f32; 4], lt: [f32; 4], flags: i32, tex
 }
 
 /// The map's bytes.
-pub(crate) fn bytes() -> Vec<u8> {
+pub fn bytes() -> Vec<u8> {
     let quads: [[[f32; 3]; 4]; 5] = [
         [[0.0, 0.0, 0.0], [128.0, 0.0, 0.0], [128.0, 128.0, 0.0], [0.0, 128.0, 0.0]],
         [[0.0, 0.0, 0.0], [0.0, 0.0, 128.0], [128.0, 0.0, 128.0], [128.0, 0.0, 0.0]],
