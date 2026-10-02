@@ -27,12 +27,13 @@ macro_rules! say {
 }
 
 mod check;
+mod lua;
 mod out;
 mod render;
 
 use out::Out;
 
-const COMMANDS: [&str; 7] = ["check", "info", "ls", "find", "cat", "glua", "render"];
+const COMMANDS: [&str; 8] = ["check", "info", "ls", "find", "cat", "glua", "lua", "render"];
 
 const USAGE: &str = "\
 gmod-check - what openGMOD can read of a Garry's Mod installation
@@ -49,6 +50,9 @@ COMMANDS:
     cat <FILE>       a file, to standard output
     glua <FILE>      a Lua file as openGMOD hands it to LuaJIT (a file of the game, or
                      one on disk - that needs no installation)
+    lua [REALM]      start the Lua of the game as the engine does (server, client or
+                     menu; default server): list what fails, and how much of GMod's API
+                     is there
     render <MAP>     a picture of a map (gm_construct, or a .bsp file) drawn on the CPU:
                      the world with textures and light maps, saved as PNG
 
@@ -59,7 +63,8 @@ OPTIONS:
     --server-downloads   also mount the addons servers made GMod download
     --no-unpack          do not unpack old compressed workshop downloads (.bin)
     --crc                check: also verify the CRC-32 of every archive entry (reads everything)
-    --all                check: list every failure, not only the first 20 of each kind
+    --all                check: list every failure, not only the first 20 of each kind;
+                         lua: every library, with its missing functions
     --out <FILE>         render: the PNG to write (default: <MAP>.png here)
     --from <X,Y,Z>       render: the eye (default: a player start)
     --to <X,Y,Z>         render: the point looked at
@@ -294,6 +299,7 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
             Ok(bytes) => print_glua(&bytes, operand),
             Err(e) => fail(&e.to_string()),
         },
+        "lua" => lua::run(std::mem::take(&mut vfs), operand, args.all, out),
         "render" => render_map(&mut vfs, operand, args),
         _ => unreachable!("commands are checked when parsing"),
     }

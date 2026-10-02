@@ -351,6 +351,10 @@ fixup-ы есть, уровень `L` собирается из диапазон
 | `a && b`, `a \|\| b` | `a and b`, `a or b` |
 | `// …`, `/* … */` | комментарии |
 | `continue` | переход к следующей итерации цикла |
+| `DEFINE_BASECLASS("имя")` | `local BaseClass = baseclass.Get("имя")` |
+
+`DEFINE_BASECLASS` — единственный макрос GMod: его разворачивает сам компилятор, а не Lua.
+Разворачивается только вызов-оператор, не поле (`t.DEFINE_BASECLASS`) и не значение.
 
 `continue` — оператор, только если сразу за ним кончается блок (`end`, `else`, `elseif`,
 `until`, `;`). Иначе это обычное имя: `t.continue`, `local continue`, `goto continue`.

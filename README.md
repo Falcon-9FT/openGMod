@@ -13,7 +13,8 @@ Linux и macOS — позже.
 
 > [!WARNING]
 > **Ранняя стадия.** Готово чтение контента, и карту уже можно открыть и облететь (`opengmod`).
-> Самой игры пока нет: ни Lua, ни физики, ни мультиплеера. Что дальше — в
+> Lua запускается: на сервере без окна геймод `sandbox` из установки стартует без ошибок. Самой
+> игры пока нет: ни энтити, ни физики, ни интерфейса, ни мультиплеера. Что дальше — в
 > [дорожной карте](docs/ROADMAP.md).
 
 ## Что уже есть
@@ -22,7 +23,8 @@ Linux и macOS — позже.
 |---|---|
 | [`gmod-fs`](crates/gmod-fs) | находит GMod (указанная папка, `GMOD_ROOT`, библиотеки Steam), читает VPK и GMA и собирает файловую систему так же, как GMod: `gameinfo.txt`, подписки воркшопа (включая старые сжатые `.bin`), аддоны из `garrysmod/addons`, игры из `cfg/mount.cfg` |
 | [`gmod-kv`](crates/gmod-kv) | KeyValues: материалы `.vmt`, скрипты, VGUI `.res`, локализация, файлы Steam |
-| [`gmod-glua`](crates/gmod-glua) | диалект Lua из GMod (`!=`, `!`, `&&`, `\|\|`, `//`, `/* */`, `continue`) → обычный LuaJIT, строка в строку |
+| [`gmod-glua`](crates/gmod-glua) | диалект Lua из GMod (`!=`, `!`, `&&`, `\|\|`, `//`, `/* */`, `continue`, `DEFINE_BASECLASS`) → обычный LuaJIT, строка в строку |
+| [`gmod-lua`](crates/gmod-lua) | Lua-рантайм: LuaJIT 2.1, реалмы, загрузчик GMod (`include`, `require`, `AddCSLuaFile`), песочница без байткода, запуск геймода, библиотеки движка (`Vector`, `Angle`, `timer`, ConVar'ы, `file`, `util`, `net`...) |
 | [`gmod-bsp`](crates/gmod-bsp) | карты BSP v19–21: все нужные для отрисовки лампы, дисплейсменты, статические пропы, pakfile; сетка мира с атласом световых карт |
 | [`gmod-material`](crates/gmod-material) | текстуры VTF 7.0–7.5 (все 30 форматов пикселей, DXT, кубмапы, анимация) и материалы VMT (параметры шейдеров, условия, патч-материалы) |
 | [`gmod-model`](crates/gmod-model) | модели MDL + VVD + VTX: кости, скины, бодигруппы, сетки для отрисовки; запечённый свет статических пропов (VHV) |
@@ -32,7 +34,9 @@ Linux и macOS — позже.
 | [`gmod-check`](tools/gmod-check) | проверка вашей установки: что openGMOD уже умеет прочитать; картинка карты без видеокарты |
 
 Проверено на настоящих данных. Все 596 Lua-файлов GMod после перевода компилируются в LuaJIT
-2.0 и 2.1. Тестовые VPK, собранные инструментами Valve, читаются с совпадающими CRC. Карта TF2
+2.0 и 2.1. Lua актуальной GMod (репозиторий Facepunch/garrysmod) на сервере загружается целиком:
+`includes/init.lua`, autorun, геймоды `base` и `sandbox`, их энтити и оружие — 196 файлов без
+единой ошибки. Тестовые VPK, собранные инструментами Valve, читаются с совпадающими CRC. Карта TF2
 читается целиком, 286 текстур из неё и из репозитория GMod декодируются, DXT совпадает с
 декодером ImageMagick с точностью до округления.
 
@@ -72,6 +76,8 @@ cargo run --release -p gmod-check -- info             # что смонтиро�
 cargo run --release -p gmod-check -- ls lua/autorun   # папка игровой файловой системы
 cargo run --release -p gmod-check -- find "maps/*.bsp"
 cargo run --release -p gmod-check -- glua lua/includes/init.lua   # Lua так, как его увидит LuaJIT
+cargo run --release -p gmod-check -- lua                          # запустить Lua сервера и sandbox
+cargo run --release -p gmod-check -- lua client --all             # клиент; все недостающие функции
 cargo run --release -p gmod-check -- --crc            # плюс проверка CRC каждого файла архивов
 cargo run --release -p gmod-check -- render gm_construct          # картинка карты в gm_construct.png
 cargo run --release -p gmod-check -- render gm_flatgrass --from 0,0,200 --to 800,0,100 --size 1920x1080
@@ -85,6 +91,12 @@ KeyValues, весь Lua, текстуры, материалы, модели и �
 (`.bin`) распаковываются в `~/.opengmod/cache/workshop`, а не в папку игры (`--no-unpack`
 отключает распаковку).
 
+`lua` запускает Lua игры так, как это делает движок: `includes/init.lua`, autorun, геймод
+`sandbox` с базовым, энтити и оружие, хуки до `Initialize` и секунду игрового времени. Он
+печатает ошибки скриптов (как консоль GMod), глобальные функции, которых не хватило, и сколько
+функций API из вики GMod уже есть в этом реалме. Файлы, которые Lua пишет (`file.Write`),
+попадают в `~/.opengmod/data`.
+
 `render` рисует карту на процессоре и сохраняет PNG — то же, что видно в `opengmod`, но без
 видеокарты: для проверки и для машин без DirectX 12 и Vulkan. Без `--from` камера встаёт на
 точку появления игрока.
@@ -97,9 +109,10 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Внешние зависимости есть только у рендера и окна (`gmod-render`, `gmod-app`): wgpu и winit.
-Остальные crate'ы обходятся стандартной библиотекой. Lua-рантайм и физика добавят mlua
-(LuaJIT) и Jolt (C++, собирается через CMake).
+Внешние зависимости есть у рендера и окна (`gmod-render`, `gmod-app`: wgpu и winit) и у
+Lua-рантайма (`gmod-lua`: mlua и rusqlite; LuaJIT и SQLite собираются из исходников
+компилятором C, на Windows — MSVC). Остальные crate'ы обходятся стандартной библиотекой. Физика добавит Jolt (C++,
+собирается через CMake).
 
 ## Устройство репозитория
 
@@ -109,6 +122,7 @@ openGMod/
 │   ├── gmod-fs/     установка, VPK, GMA, zip, LZMA, воркшоп, файловая система, папка пользователя
 │   ├── gmod-kv/     KeyValues
 │   ├── gmod-glua/   диалект Lua из GMod → LuaJIT
+│   ├── gmod-lua/    Lua-рантайм: LuaJIT, загрузчик, библиотеки движка
 │   ├── gmod-bsp/    карты BSP и сетка мира из них
 │   ├── gmod-material/ текстуры VTF и материалы VMT
 │   ├── gmod-model/  модели MDL, VVD, VTX
@@ -118,7 +132,7 @@ openGMod/
 ├── tools/
 │   └── gmod-check/  проверка установки и просмотр игровой файловой системы
 ├── docs/            архитектура, физика, дорожная карта, форматы
-└── scripts/         вспомогательные скрипты разработки
+└── scripts/         вспомогательные скрипты разработки (списки API из вики GMod — wiki-api.py)
 ```
 
 ## Документация
