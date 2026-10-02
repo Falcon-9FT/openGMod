@@ -185,6 +185,22 @@ fn run_folder(lua: &Lua, folder: &str) {
     }
 }
 
+/// The main menu after `includes/init_menu.lua`: Derma and its controls and skins, then the
+/// menu itself (`lua/menu/menu.lua`), which makes its panel on the first frame.
+pub(crate) fn start_menu(runtime: &crate::Runtime) {
+    let lua = runtime.lua();
+    include_from_engine(lua, "derma/init.lua");
+    // the controls of spawn icons add what they show to the spawn menu's content types
+    if let Ok(require) = lua.globals().get::<Function>("require") {
+        let _ = crate::files::call_reporting(lua, require, "spawnmenu".into_lua_multi(lua).unwrap_or_default());
+    }
+    for folder in ["vgui", "skins"] {
+        run_folder(lua, folder);
+    }
+    include_from_engine(lua, "menu/menu.lua");
+    runtime.call_hook("MenuStart", MultiValue::new());
+}
+
 /// Everything after `includes/init.lua`, up to and with the `Initialize` hook.
 pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
     let lua = runtime.lua();

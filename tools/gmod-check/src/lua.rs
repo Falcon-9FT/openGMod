@@ -61,9 +61,16 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
             // and the player of a single-player game joins
             runtime.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() });
         }
-        // one second of game time: the timers and hooks of the first frames
+        // one second of game time: the timers and hooks of the first frames; the menu paints
+        // its panels in them
+        if realm == Realm::Menu {
+            runtime.set_screen_size(1280, 720);
+        }
         for _ in 0..60 {
             runtime.think(1.0 / 60.0);
+            if realm == Realm::Menu {
+                runtime.paint(1.0 / 60.0);
+            }
         }
     }
 

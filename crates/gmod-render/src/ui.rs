@@ -26,6 +26,8 @@ pub struct Overlay {
     pages: Vec<(wgpu::Texture, wgpu::BindGroup)>,
     /// Images by number; none for one that could not be read.
     images: HashMap<u32, Option<wgpu::BindGroup>>,
+    /// The textures of images that change ([`Overlay::update_image`]), with their sizes.
+    live: HashMap<u32, (wgpu::Texture, u32, u32)>,
     vertices: wgpu::Buffer,
 }
 
@@ -162,6 +164,7 @@ impl Overlay {
             screen_group,
             pages: Vec::new(),
             images: HashMap::new(),
+            live: HashMap::new(),
             vertices: vertex_buffer(device, 4096 * Vertex::SIZE as u64),
         }
     }
@@ -218,6 +221,25 @@ impl Overlay {
             },
         );
         self.images.insert(id, group);
+    }
+
+    /// An image by number that changes from frame to frame (a web page): its new pixels, RGBA
+    /// `width` by `height`, go into its texture, which is made again only when the size changed.
+    pub fn update_image(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, id: u32, width: u32, height: u32, pixels: &[u8]) {
+        let limit = device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > limit || height > limit || (pixels.len() as u64) < u64::from(width) * u64::from(height) * 4
+        {
+            return;
+        }
+        match self.live.get(&id) {
+            Some((texture, w, h)) if (*w, *h) == (width, height) => write(queue, texture, width, height, pixels),
+            _ => {
+                let (texture, view) = upload(device, queue, width, height, pixels, self.srgb);
+                let group = self.group(device, &view);
+                self.images.insert(id, Some(group));
+                self.live.insert(id, (texture, width, height));
+            }
+        }
     }
 
     /// Draws the canvas over what `target` (`size` pixels) has.

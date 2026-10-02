@@ -64,11 +64,13 @@ pub mod entity;
 pub mod ents;
 pub mod files;
 pub mod filesystem;
+pub mod html;
 pub mod http;
 pub mod hud;
 pub mod inputs;
 pub mod material;
 pub mod matrix;
+pub mod menu;
 pub mod meta;
 pub mod movedata;
 pub mod net;
@@ -95,6 +97,8 @@ mod tests;
 
 pub use entity::EntityHandle;
 pub use ents::{Drawn, Map};
+pub use html::{WebButton, WebEvent, WebPage, WebPages};
+pub use menu::{Addon, MountableGame};
 pub use mlua;
 pub use movedata::UserCmd;
 pub use player::{PlayerInfo, PlayerView, WeaponView};
@@ -252,6 +256,10 @@ pub(crate) struct Host {
     pub client: client::Client,
     /// The client's panels.
     pub panels: vgui::Panels,
+    /// The pages of its HTML panels.
+    pub pages: html::Pages,
+    /// The addons and games, and what the main menu tells the program.
+    pub menu: menu::Menu,
     /// The engine's HUD: where its elements go, its colours.
     pub hud: RefCell<hud::Hud>,
     /// The sounds Lua played, for the program.
@@ -333,6 +341,8 @@ impl Runtime {
             screen: surface::Screen::default(),
             client: client::Client::default(),
             panels: vgui::Panels::default(),
+            pages: html::Pages::default(),
+            menu: menu::Menu::default(),
             hud: RefCell::new(hud::Hud::default()),
             sounds: sound::Sounds::default(),
             surfaces: surfaceprops::Surfaces::default(),
@@ -373,6 +383,7 @@ impl Runtime {
             client::load(&lua);
             hud::load(&lua);
         }
+        menu::install(&lua, realm)?;
         Ok(Runtime { lua })
     }
 
@@ -417,11 +428,15 @@ impl Runtime {
     }
 
     /// Starts the game as the engine does: `includes/init.lua`, autorun, the gamemode and
-    /// its bases, scripted entities and weapons, and the hooks up to `Initialize`. Errors
-    /// are reported on the way; [`errors`](Self::errors) has them all.
+    /// its bases, scripted entities and weapons, and the hooks up to `Initialize`; the main
+    /// menu starts with its Derma and `menu/menu.lua` (`gamemode` is the one it shows).
+    /// Errors are reported on the way; [`errors`](Self::errors) has them all.
     pub fn start(&self, gamemode: &str) {
         self.init();
-        if self.realm() != Realm::Menu {
+        if self.realm() == Realm::Menu {
+            *host(&self.lua).game.gamemode_name.borrow_mut() = gamemode.to_string();
+            startup::start_menu(self);
+        } else {
             startup::start(self, gamemode);
         }
     }

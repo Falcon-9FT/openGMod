@@ -1120,6 +1120,17 @@ impl crate::Runtime {
         Some((image, pixels))
     }
 
+    /// Lets HTML panels show pages, which `pages` makes.
+    pub fn set_web_pages(&self, pages: crate::html::WebPages) {
+        *host(&self.lua).pages.web.borrow_mut() = Some(pages);
+    }
+
+    /// The pictures pages drew since the last call, by the image ([`gmod_ui::Texture::Image`])
+    /// each is drawn as: to send the GPU before the frame is drawn.
+    pub fn take_page_pictures(&self) -> Vec<(u32, gmod_material::png::Rgba)> {
+        crate::html::take_pictures(&self.lua)
+    }
+
     /// The console lines the client sends the server - the commands it does not know itself -
     /// oldest first.
     pub fn take_server_commands(&self) -> Vec<String> {

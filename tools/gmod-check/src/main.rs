@@ -290,7 +290,13 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
         }
     };
     let unpack_dir = if args.unpack { UserDir::default_root().map(|root| root.join("cache").join("workshop")) } else { None };
-    let options = MountOptions { addons: args.addons, server_downloads: args.server_downloads, mount_cfg: true, unpack_dir };
+    let options = MountOptions {
+        addons: args.addons,
+        server_downloads: args.server_downloads,
+        mount_cfg: true,
+        unpack_dir,
+        ..MountOptions::default()
+    };
     let (mut vfs, warnings) = mount_install(&install, &options);
     let mounted_in = started.elapsed();
 

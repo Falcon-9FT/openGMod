@@ -520,6 +520,7 @@ fn util_library() {
     assert_eq!(g.eval::<String>("return util.Base64Encode('hello world')"), "aGVsbG8gd29ybGQ=");
     assert_eq!(g.eval::<String>("return util.Base64Decode('aGVsbG8gd29ybGQ=')"), "hello world");
     assert_eq!(g.eval::<String>("return util.TableToJSON({1, 2, 'x', true})"), "[1,2,\"x\",true]");
+    assert_eq!(g.eval::<String>("return util.TableToJSON({})"), "[]");
     assert_eq!(g.eval::<String>("return util.TableToJSON({a = {b = 1.5}})"), "{\"a\":{\"b\":1.5}}");
     assert_eq!(g.eval::<String>("return util.TableToJSON({v = Vector(1, 2, 3)})"), "{\"v\":\"[1 2 3]\"}");
     assert!(g.eval::<bool>(
@@ -2335,4 +2336,141 @@ fn dynamic_lights_shine_until_they_die() {
     assert!((l.color[0] - 4.0).abs() < 1e-5 && (l.color[1] - 128.0 * 4.0 / 255.0).abs() < 1e-5 && l.color[2] == 0.0);
     g.runtime.think(1.0);
     assert!(g.runtime.dynamic_lights().is_empty());
+}
+
+/// A page that tells what it was asked to, and tells what the test wants.
+#[derive(Default)]
+struct FakePage {
+    calls: RefCell<Vec<String>>,
+    events: RefCell<Vec<crate::WebEvent>>,
+    picture: RefCell<Option<gmod_material::png::Rgba>>,
+    loading: std::cell::Cell<bool>,
+}
+
+struct SharedPage(Rc<FakePage>);
+
+impl crate::WebPage for SharedPage {
+    fn open_url(&self, url: &str) {
+        self.0.calls.borrow_mut().push(format!("open {url}"));
+        self.0.loading.set(true);
+    }
+    fn set_html(&self, html: &str) {
+        self.0.calls.borrow_mut().push(format!("html {html}"));
+    }
+    fn run_js(&self, js: &str) {
+        self.0.calls.borrow_mut().push(format!("js {js}"));
+    }
+    fn add_function(&self, object: &str, function: &str) {
+        self.0.calls.borrow_mut().push(format!("function {object}.{function}"));
+    }
+    fn answer(&self, callback: u64, values: &str) {
+        self.0.calls.borrow_mut().push(format!("answer {callback} {values}"));
+    }
+    fn is_loading(&self) -> bool {
+        self.0.loading.get()
+    }
+    fn stop(&self) {}
+    fn reload(&self) {}
+    fn go_back(&self) {}
+    fn go_forward(&self) {}
+    fn resize(&self, width: u32, height: u32) {
+        self.0.calls.borrow_mut().push(format!("size {width}x{height}"));
+    }
+    fn take_picture(&self) -> Option<gmod_material::png::Rgba> {
+        self.0.picture.borrow_mut().take()
+    }
+    fn take_events(&self) -> Vec<crate::WebEvent> {
+        std::mem::take(&mut *self.0.events.borrow_mut())
+    }
+    fn focus(&self, on: bool) {
+        self.0.calls.borrow_mut().push(format!("focus {on}"));
+    }
+    fn mouse_move(&self, x: i32, y: i32, _: u32) {
+        self.0.calls.borrow_mut().push(format!("move {x},{y}"));
+    }
+    fn mouse_leave(&self) {}
+    fn mouse_button(&self, x: i32, y: i32, button: crate::WebButton, down: bool, _: u32) {
+        self.0.calls.borrow_mut().push(format!("button {button:?} {down} {x},{y}"));
+    }
+    fn mouse_wheel(&self, _: i32, _: i32, notches: i32, _: u32) {
+        self.0.calls.borrow_mut().push(format!("wheel {notches}"));
+    }
+    fn key(&self, virtual_key: i32, down: bool, modifiers: u32) {
+        self.0.calls.borrow_mut().push(format!("key {virtual_key:#x} {down} {modifiers}"));
+    }
+    fn type_text(&self, text: &str, _: u32) {
+        self.0.calls.borrow_mut().push(format!("text {text}"));
+    }
+}
+
+#[test]
+fn html_panels_show_pages_and_talk_to_them() {
+    let g = client_game(&[]);
+    let page = Rc::new(FakePage::default());
+    let made = page.clone();
+    g.runtime.set_web_pages(Rc::new(move |w, h| {
+        made.calls.borrow_mut().push(format!("new {w}x{h}"));
+        Some(Box::new(SharedPage(made.clone())) as Box<dyn crate::WebPage>)
+    }));
+    g.runtime
+        .run_string(
+            "H = vgui.Create('HTML') H:SetPos(10, 20) H:SetSize(300, 200) H:MakePopup()
+             H:NewObject('lua') H:NewObjectCallback('lua', 'Run')
+             H:OpenURL('asset://garrysmod/html/menu.html')
+             LOADING = H:IsLoading()
+             function H:OnCallback(object, func, args) CALLED = object .. '.' .. func .. '(' .. table.concat(args, ',') .. ')' return 'Phrase', 2 end
+             function H:OnDocumentReady(url) READY = url end
+             function H:ConsoleMessage(msg, file, line, level) LOGGED = msg .. '@' .. file .. ':' .. line .. ' ' .. level end",
+            "html",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("return LOADING"));
+    assert_eq!(
+        page.calls.borrow()[..3],
+        ["new 300x200".to_string(), "function lua.Run".to_string(), "open asset://garrysmod/html/menu.html".to_string()]
+    );
+
+    // what the page tells reaches Lua; a call that waits is answered with what Lua returned
+    page.events.borrow_mut().extend([
+        crate::WebEvent::Loaded { url: "asset://garrysmod/html/menu.html".into() },
+        crate::WebEvent::Callback {
+            object: "language".into(),
+            function: "Update".into(),
+            callback: Some(7),
+            args: "[\"new_game\",3]".into(),
+        },
+        crate::WebEvent::Console { message: "hi".into(), source: "menu.js".into(), line: 4, level: "warn" },
+    ]);
+    *page.picture.borrow_mut() = Some(gmod_material::png::Rgba { width: 300, height: 200, pixels: vec![0; 300 * 200 * 4] });
+    g.runtime.paint(0.016);
+    assert!(g.eval::<bool>(
+        "return READY == 'asset://garrysmod/html/menu.html' and CALLED == 'language.Update(new_game,3)' and LOGGED == 'hi@menu.js:4 warn'"
+    ));
+    assert!(page.calls.borrow().contains(&"answer 7 [\"Phrase\",2]".to_string()), "{:?}", page.calls.borrow());
+
+    // its picture is drawn where the panel is, once the program has it
+    let pictures = g.runtime.take_page_pictures();
+    assert_eq!(pictures.len(), 1);
+    let id = pictures[0].0;
+    let drawn = g.runtime.with_canvas(|canvas, _| canvas.batches().iter().any(|b| b.texture == gmod_ui::Texture::Image(id)));
+    assert!(drawn);
+
+    // the mouse and the keys go to the page, in its pixels
+    g.runtime.set_cursor(60, 70);
+    g.runtime.button(107, true);
+    g.runtime.button(107, false);
+    g.runtime.button(11, true); // KEY_A
+    g.runtime.type_text("a");
+    let calls = page.calls.borrow().clone();
+    for call in ["move 50,50", "focus true", "button Left true 50,50", "button Left false 50,50", "key 0x41 true 0", "text a"] {
+        assert!(calls.contains(&call.to_string()), "{call}: {calls:?}");
+    }
+
+    // resized with the panel; gone with it
+    g.runtime.run_string("H:SetSize(400, 300)", "resize").unwrap();
+    g.runtime.paint(0.016);
+    assert!(page.calls.borrow().contains(&"size 400x300".to_string()));
+    g.runtime.run_string("H:Remove()", "remove").unwrap();
+    g.runtime.paint(0.016);
+    assert_eq!(Rc::strong_count(&page), 2, "the page went with its panel");
 }

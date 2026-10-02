@@ -317,7 +317,7 @@ impl Panels {
     }
 
     /// Where a panel's top left corner is on the screen.
-    fn screen_pos(&self, h: PanelHandle) -> (i32, i32) {
+    pub(crate) fn screen_pos(&self, h: PanelHandle) -> (i32, i32) {
         let (mut x, mut y) = (0, 0);
         let mut at = Some(h);
         for _ in 0..256 {
@@ -559,12 +559,21 @@ fn push_opt(lua: &Lua, h: Option<PanelHandle>) -> mlua::Result<Value> {
 
 /// Calls a panel's function `name` (from its table or the metatable) with the panel first.
 /// None when it has none, or it failed (the error is reported).
-fn call(lua: &Lua, h: PanelHandle, name: &str, args: impl IntoLuaMulti) -> Option<MultiValue> {
+pub(crate) fn call(lua: &Lua, h: PanelHandle, name: &str, args: impl IntoLuaMulti) -> Option<MultiValue> {
     let Ok(Value::UserData(ud)) = push(lua, h) else { return None };
     let Ok(Value::Function(f)) = index(lua, &ud, Value::String(lua.create_string(name).ok()?)) else { return None };
     let mut values = MultiValue::from_iter([Value::UserData(ud)]);
     values.extend(args.into_lua_multi(lua).ok()?);
     files::call_reporting(lua, f, values).ok()
+}
+
+/// A panel's size.
+pub(crate) fn size_of(lua: &Lua, h: PanelHandle) -> Option<(i32, i32)> {
+    host(lua).panels.get(h, |n| (n.w, n.h))
+}
+
+fn is_html(lua: &Lua, h: PanelHandle) -> bool {
+    host(lua).panels.get(h, |n| n.class == Class::Html).unwrap_or(false)
 }
 
 /// Whether a panel has a function `name`.
@@ -684,6 +693,7 @@ fn set_focus(lua: &Lua, h: Option<PanelHandle>) {
     }
     panels.focus.set(h);
     if let Some(old) = old.filter(|o| panels.is_valid(*o)) {
+        crate::html::focus(lua, old, false);
         call(lua, old, "OnLoseFocus", ());
         call(lua, old, "OnFocusChanged", false);
     }
@@ -696,6 +706,7 @@ fn set_focus(lua: &Lua, h: Option<PanelHandle>) {
             n.select_all_on_focus
         });
         let _ = select_all;
+        crate::html::focus(lua, h, true);
         call(lua, h, "OnGetFocus", ());
         call(lua, h, "OnFocusChanged", true);
     }
@@ -746,6 +757,7 @@ fn delete(lua: &Lua, h: PanelHandle) {
             call(lua, parent, "OnChildRemoved", child);
         }
     }
+    crate::html::forget(lua, h);
     if let Ok(cache) = lua.named_registry_value::<Table>(CACHE) {
         let _ = cache.raw_set(h.index, Value::Nil);
     }
@@ -792,6 +804,7 @@ fn shown_panels(lua: &Lua) -> Vec<PanelHandle> {
 
 /// `Think` and `AnimationThink` of every panel that shows.
 pub(crate) fn think(lua: &Lua) {
+    crate::html::update(lua);
     for h in shown_panels(lua) {
         if host(lua).panels.is_valid(h) {
             call(lua, h, "AnimationThink", ());
@@ -950,11 +963,13 @@ fn paint_panel(lua: &Lua, h: PanelHandle, origin: (i32, i32), clip: Clip, alpha:
         screen.canvas.borrow_mut().rect(0.0, 0.0, w as f32, hh as f32, color);
     }
     let painted = has(lua, h, "Paint");
+    // a page is not drawn when `Paint` says so (`DHTML` while it loads)
+    let mut covered = false;
     if painted {
-        call(lua, h, "Paint", (w, hh));
+        covered = returned_true(&call(lua, h, "Paint", (w, hh)));
         enter(lua, corner, clip, alpha);
     }
-    paint_own(lua, h, painted);
+    paint_own(lua, h, painted, covered);
     for child in panels.drawn_children(h) {
         if panels.get(child, |n| n.popup || n.on_top || n.manual).unwrap_or(true) {
             continue;
@@ -1068,7 +1083,7 @@ fn label_lines(lua: &Lua, h: PanelHandle) -> Option<(gmod_ui::FontId, Lines)> {
 
 /// What the engine draws of a panel after its `Paint`: a label's text, a rich text's lines,
 /// a spawn icon's image, a text entry's text (when Lua does not paint it).
-fn paint_own(lua: &Lua, h: PanelHandle, painted: bool) {
+fn paint_own(lua: &Lua, h: PanelHandle, painted: bool, covered: bool) {
     let Some((class, fg, shadow, w, hh, icon)) = host(lua).panels.get(h, |n| (n.class, n.fg, n.shadow, n.w, n.h, n.icon)) else { return };
     let screen = &host(lua).screen;
     match class {
@@ -1083,6 +1098,12 @@ fn paint_own(lua: &Lua, h: PanelHandle, painted: bool) {
         }
         Class::TextEntry if !painted => draw_entry(lua, h, fg, [0, 120, 215, 255], fg),
         Class::RichText => paint_rich(lua, h),
+        Class::Html if !covered => {
+            if let Some(id) = crate::html::image_of(lua, h) {
+                let color = screen.color([255; 4]);
+                screen.canvas.borrow_mut().image(Texture::Image(id), false, [0.0, 0.0, w as f32, hh as f32], [0.0, 0.0, 1.0, 1.0], color);
+            }
+        }
         Class::ModelImage => {
             if let Some(id) = icon {
                 let color = screen.color([255; 4]);
@@ -1204,6 +1225,9 @@ pub(crate) fn cursor_moved(lua: &Lua) {
     if old != under {
         host.panels.hovered.set(under);
         if let Some(old) = old.filter(|o| host.panels.is_valid(*o)) {
+            if is_html(lua, old) {
+                crate::html::mouse_left(lua, old);
+            }
             set_field(lua, old, "Hovered", false);
             call(lua, old, "OnCursorExited", ());
         }
@@ -1213,6 +1237,9 @@ pub(crate) fn cursor_moved(lua: &Lua) {
         }
     }
     if let Some(target) = host.panels.capture.get().or(under) {
+        if is_html(lua, target) {
+            crate::html::mouse_moved(lua, target);
+        }
         let (sx, sy) = host.panels.screen_pos(target);
         call(lua, target, "OnCursorMoved", (point.0 - sx, point.1 - sy));
     }
@@ -1256,14 +1283,20 @@ pub(crate) fn mouse_button(lua: &Lua, code: i32, down: bool) -> bool {
         if let Some(popup) = host.panels.popup_of(target) {
             move_to_front(lua, popup);
         }
-        let takes_keys = host.panels.get(target, |n| n.keyboard && n.class == Class::TextEntry).unwrap_or(false);
+        let takes_keys = host.panels.get(target, |n| n.keyboard && matches!(n.class, Class::TextEntry | Class::Html)).unwrap_or(false);
         if takes_keys {
             set_focus(lua, Some(target));
         } else if host.panels.focus.get().is_some_and(|f| host.panels.get(f, |n| n.class == Class::TextEntry).unwrap_or(false)) {
             set_focus(lua, None);
         }
+        if is_html(lua, target) {
+            crate::html::mouse_button(lua, target, code, true);
+        }
         bubble(lua, target, "OnMousePressed", code);
     } else {
+        if is_html(lua, target) {
+            crate::html::mouse_button(lua, target, code, false);
+        }
         bubble(lua, target, "OnMouseReleased", code);
         let clicked = host.panels.get(target, |n| n.class == Class::Button && n.enabled).unwrap_or(false);
         if clicked && code == MOUSE_LEFT && host.panels.hovered.get() == Some(target) {
@@ -1283,6 +1316,11 @@ pub(crate) fn mouse_wheel(lua: &Lua, delta: i32) -> bool {
         return false;
     }
     let mut at = host.panels.hovered.get();
+    if let Some(h) = at.filter(|h| is_html(lua, *h))
+        && crate::html::mouse_wheel(lua, h, delta)
+    {
+        return true;
+    }
     for _ in 0..256 {
         let Some(h) = at else { break };
         if is_world(lua, h) {
@@ -1316,6 +1354,9 @@ const KEY_RIGHT: i32 = 91;
 pub(crate) fn key(lua: &Lua, code: i32, down: bool) -> bool {
     let panels = &host(lua).panels;
     let Some(target) = panels.keyboard_target() else { return false };
+    if is_html(lua, target) {
+        crate::html::key(lua, target, code, down);
+    }
     if !down {
         bubble(lua, target, "OnKeyCodeReleased", code);
         return true;
@@ -1331,6 +1372,10 @@ pub(crate) fn key(lua: &Lua, code: i32, down: bool) -> bool {
 pub(crate) fn text_typed(lua: &Lua, text: &str) -> bool {
     let panels = &host(lua).panels;
     let Some(target) = panels.keyboard_target() else { return false };
+    if is_html(lua, target) {
+        crate::html::type_text(lua, target, text);
+        return true;
+    }
     if !panels.get(target, |n| n.class == Class::TextEntry && n.enabled).unwrap_or(false) {
         return true;
     }
@@ -2250,32 +2295,76 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
         Ok(Value::Nil)
     })?;
 
-    // pages: not shown, but they answer
+    // pages
     def(lua, m, "OpenURL", |a| {
         let url = a.opt_string(2)?.unwrap_or_default();
-        write(a, |n| n.url = url)
+        let h = this(a)?;
+        host(a.lua).panels.with(h, |n| n.url = url.clone());
+        crate::html::with_page(a.lua, h, |page| page.open_url(&url));
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "SetHTML", |a| {
+        let html = a.opt_string(2)?.unwrap_or_default();
+        crate::html::with_page(a.lua, this(a)?, |page| page.set_html(&html));
+        Ok(Value::Nil)
     })?;
     def(lua, m, "SetURL", |a| {
         let url = a.opt_string(2)?.unwrap_or_default();
-        write(a, |n| n.url = url)
+        let h = this(a)?;
+        host(a.lua).panels.with(h, |n| n.url = url.clone());
+        crate::html::with_page(a.lua, h, |page| page.open_url(&url));
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "Exec", |a| {
+        let js = a.opt_string(2)?.unwrap_or_default();
+        crate::html::with_page(a.lua, this(a)?, |page| page.run_js(&js));
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "RunJavascript", |a| {
+        let js = a.opt_string(2)?.unwrap_or_default();
+        crate::html::with_page(a.lua, this(a)?, |page| page.run_js(&js));
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "NewObject", |a| {
+        // the object is made with its first function
+        crate::html::with_page(a.lua, this(a)?, |_| ());
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "NewObjectCallback", |a| {
+        let (object, function) = (a.opt_string(2)?.unwrap_or_default(), a.opt_string(3)?.unwrap_or_default());
+        crate::html::with_page(a.lua, this(a)?, |page| page.add_function(&object, &function));
+        Ok(Value::Nil)
     })?;
     def(lua, m, "IsLoading", |a| {
-        this(a)?;
-        Ok(Value::Boolean(false))
+        let loading = crate::html::with_page(a.lua, this(a)?, |page| page.is_loading());
+        Ok(Value::Boolean(loading.unwrap_or(false)))
     })?;
-    for name in [
-        "SetHTML",
-        "RunJavascript",
-        "Exec",
-        "NewObject",
-        "NewObjectCallback",
-        "StopLoading",
-        "Refresh",
-        "GoBack",
-        "GoForward",
-        "GoToHistoryOffset",
-        "UpdateHTMLTexture",
-    ] {
+    def(lua, m, "StopLoading", |a| {
+        crate::html::with_page(a.lua, this(a)?, |page| page.stop());
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "Refresh", |a| {
+        crate::html::with_page(a.lua, this(a)?, |page| page.reload());
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "GoBack", |a| {
+        crate::html::with_page(a.lua, this(a)?, |page| page.go_back());
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "GoForward", |a| {
+        crate::html::with_page(a.lua, this(a)?, |page| page.go_forward());
+        Ok(Value::Nil)
+    })?;
+    def(lua, m, "GoToHistoryOffset", |a| {
+        let offset = a.opt_number(2)?.unwrap_or(0.0) as i32;
+        crate::html::with_page(a.lua, this(a)?, |page| {
+            for _ in 0..offset.unsigned_abs().min(64) {
+                if offset < 0 { page.go_back() } else { page.go_forward() }
+            }
+        });
+        Ok(Value::Nil)
+    })?;
+    for name in ["UpdateHTMLTexture", "SetOpenLinksExternally"] {
         def(lua, m, name, nothing)?;
     }
     def(lua, m, "GetHTMLMaterial", nothing)?;

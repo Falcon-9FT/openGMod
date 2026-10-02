@@ -339,8 +339,9 @@ pub(crate) fn execute_as(lua: &Lua, words: &[String], player: EntityHandle) {
     let known = host(lua).console.commands.borrow().contains_key(&name.to_ascii_lowercase());
     if !known {
         let host = host(lua);
-        if host.realm == crate::Realm::Client {
-            // the server's, as a client's console sends what it does not know
+        if host.realm != crate::Realm::Server {
+            // the server's, as a client's console sends what it does not know; the menu's
+            // go to the engine (`map`, `disconnect` ...)
             host.client.to_server.borrow_mut().push(words.iter().map(|w| quoted(w)).collect::<Vec<_>>().join(" "));
         } else {
             host.print(&format!("Unknown command \"{name}\"\n"));

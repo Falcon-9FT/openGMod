@@ -304,7 +304,8 @@ fn sequence_length(table: &Table) -> mlua::Result<Option<usize>> {
             _ => return Ok(None),
         }
     }
-    Ok((count > 0 && table.raw_len() == count).then_some(count))
+    // an empty table is an empty array, as GMod writes it
+    Ok((table.raw_len() == count).then_some(count))
 }
 
 fn write_json(lua: &Lua, out: &mut String, value: &Value, pretty: bool, depth: usize) -> mlua::Result<()> {
@@ -647,4 +648,17 @@ fn sprite_trail(a: &Args) -> mlua::Result<Value> {
     crate::entity::set_parent(a.lua, trail, target);
     crate::ents::spawn(a.lua, trail);
     crate::entity::push(a.lua, trail)
+}
+
+/// A JSON document as Lua values, as `util.JSONToTable` reads it but for any value and
+/// without its limits: what a page sends Lua.
+pub(crate) fn from_json(lua: &Lua, text: &str) -> Option<Value> {
+    Json { text: text.as_bytes(), at: 0, lua, limits: false, conversions: false }.document()
+}
+
+/// A Lua value as JSON, as `util.TableToJSON` writes tables: what Lua sends a page.
+pub(crate) fn to_json(lua: &Lua, value: &Value) -> mlua::Result<String> {
+    let mut out = String::new();
+    write_json(lua, &mut out, value, false, 0)?;
+    Ok(out)
 }
