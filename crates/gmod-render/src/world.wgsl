@@ -1,9 +1,12 @@
-// The world, brush entities and props: base texture (blended with a second one on
-// displacements), times light from the light map or the vertex, times the tint.
+// The world, brush entities, props and the models of entities: base texture (blended with a
+// second one on displacements), times light from the light map or the vertex, times the tint.
 
 struct Camera {
     view_projection: mat4x4<f32>,
     eye: vec4<f32>,
+    // for a model of an entity: where the light comes from in the model's space, w 1; the
+    // world (w 0) has its light baked
+    sun: vec4<f32>,
 };
 
 struct Surface {
@@ -30,6 +33,7 @@ struct VertexInput {
     @location(2) lightmap_uv: vec2<f32>,
     @location(3) alpha: f32,
     @location(4) light: vec3<f32>,
+    @location(5) normal: vec3<f32>,
 };
 
 struct VertexOutput {
@@ -48,6 +52,11 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.lightmap_uv = input.lightmap_uv;
     output.alpha = input.alpha;
     output.light = input.light;
+    if (camera.sun.w > 0.5) {
+        // some light from everywhere, more from above, as props without baked light have
+        let sun = max(dot(input.normal, camera.sun.xyz), 0.0) / max(length(input.normal), 1e-6);
+        output.light = vec3<f32>(0.35 + 0.5 * sun);
+    }
     return output;
 }
 

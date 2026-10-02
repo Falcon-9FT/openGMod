@@ -2,8 +2,10 @@
 //! gamemode and the addons, as Garry's Mod starts them - running the map, and the player of a
 //! single-player game moved through it by the keys and the mouse. What the game prints goes to
 //! the terminal, and lines typed there are the player's console (`give weapon_crowbar`,
-//! `gm_spawn models/props_c17/oildrum001.mdl`, the commands of the addons).
+//! `gm_spawn models/props_c17/oildrum001.mdl`, `lua_run`, the commands of the addons). The
+//! models of the entities the player sees are read the first time one shows ([`Models`]).
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -11,8 +13,10 @@ use std::sync::mpsc::{self, Receiver};
 use gmod_fs::Vfs;
 use gmod_lua::player::{IMPULSE_FLASHLIGHT, key};
 use gmod_lua::vector::{Angle, Vector};
-use gmod_lua::{EntityHandle, Map, Output, PlayerInfo, PlayerView, Realm, Runtime, UserCmd};
+use gmod_lua::{Drawn, EntityHandle, Map, Output, PlayerInfo, PlayerView, Realm, Runtime, UserCmd};
 use gmod_movement::FULL_MOVE;
+use gmod_render::{ModelId, Placed};
+use gmod_world::World;
 
 use crate::walk::Keys;
 
@@ -119,6 +123,47 @@ impl Game {
         let turned = (angle_apart(view.angles.p, pitch) || angle_apart(view.angles.y, yaw)).then_some((view.angles.p, view.angles.y));
         Some(Shown { eye, turned, view })
     }
+
+    /// The models of the entities the player sees.
+    pub fn drawn(&self) -> Vec<Drawn> {
+        self.runtime.drawn(self.player)
+    }
+}
+
+/// The models of the game's entities, each read from the game's files the first time an entity
+/// has it, and given to the renderer.
+pub struct Models {
+    vfs: Arc<Vfs>,
+    /// By name and skin; none for those that could not be read.
+    loaded: HashMap<(String, i64), Option<ModelId>>,
+}
+
+impl Models {
+    pub fn new(vfs: Arc<Vfs>) -> Models {
+        Models { vfs, loaded: HashMap::new() }
+    }
+
+    /// Where to draw the models of `drawn`. Those not seen before are read and handed to
+    /// `upload`; one that cannot be read is told once and not drawn.
+    pub fn place(&mut self, drawn: &[Drawn], mut upload: impl FnMut(&World) -> ModelId) -> Vec<Placed> {
+        drawn
+            .iter()
+            .filter_map(|d| {
+                let key = (d.model.to_ascii_lowercase().replace('\\', "/"), d.skin);
+                let model = *self.loaded.entry(key).or_insert_with_key(|(name, skin)| {
+                    match gmod_world::model(&self.vfs, name, usize::try_from(*skin).unwrap_or(0)) {
+                        Ok(model) => Some(upload(&model)),
+                        Err(e) => {
+                            println!("{name}: {e}");
+                            None
+                        }
+                    }
+                });
+                let (o, a) = (d.origin, d.angles);
+                Some(Placed { model: model?, origin: [o.x, o.y, o.z], angles: [a.p, a.y, a.r], scale: d.scale })
+            })
+            .collect()
+    }
 }
 
 fn between(from: Vector, to: Vector, t: f32) -> [f32; 3] {
@@ -222,6 +267,23 @@ mod tests {
         let shown = game.frame(&forward, &still.1, -60.0, 90.0, 0.5).unwrap();
         assert!(shown.eye[2] > before[2] + 50.0, "noclip flies where the player looks: {before:?} {:?}", shown.eye);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn models_are_read_once() {
+        let mut models = Models::new(Arc::new(Vfs::new()));
+        let drawn = Drawn {
+            entity: EntityHandle::NULL,
+            model: "models/props_c17/oildrum001.mdl".into(),
+            skin: 0,
+            origin: Vector::new(1.0, 2.0, 3.0),
+            angles: Angle::new(0.0, 90.0, 0.0),
+            scale: 1.0,
+        };
+        // not in the game's files: not drawn, and not looked for again
+        assert!(models.place(&[drawn.clone(), drawn.clone()], |_| unreachable!("nothing to upload")).is_empty());
+        assert_eq!(models.loaded.len(), 1);
+        assert_eq!(models.loaded.get(&(drawn.model.clone(), 0)), Some(&None));
     }
 
     #[test]

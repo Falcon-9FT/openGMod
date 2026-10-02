@@ -32,7 +32,7 @@ use gmod_world::gpu::Camera;
 mod game;
 mod walk;
 
-use game::{Buttons, Game};
+use game::{Buttons, Game, Models};
 use walk::{Keys, Walker};
 
 const USAGE: &str = "\
@@ -344,6 +344,8 @@ struct App {
     collision: Arc<Collision>,
     /// The game running in the map; without it the player only walks.
     game: Option<Game>,
+    /// The models of the game's entities.
+    models: Option<Models>,
     /// The game's status for the title: health, the weapon.
     status: String,
     settings: Settings,
@@ -519,6 +521,13 @@ impl App {
         }
     }
 
+    /// Gives the renderer the models of the game's entities and where they are now.
+    fn show_entities(&mut self) {
+        let (Some(game), Some(models), Some(gpu)) = (&self.game, &mut self.models, &mut self.gpu) else { return };
+        let placed = models.place(&game.drawn(), |model| gpu.renderer.add_model(&gpu.device, &gpu.queue, model));
+        gpu.renderer.set_entities(placed);
+    }
+
     fn count_frame(&mut self) {
         self.frames += 1;
         let elapsed = self.counting_since.elapsed().as_secs_f32();
@@ -619,6 +628,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.advance();
+                self.show_entities();
                 if let Some(gpu) = &mut self.gpu {
                     gpu.draw(&self.camera);
                     if std::mem::take(&mut self.screenshot) {
@@ -698,6 +708,7 @@ fn main() -> ExitCode {
     let mut app = App {
         world: loaded.world,
         collision: loaded.collision,
+        models: game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone())),
         game,
         status: String::new(),
         settings: Settings::default(),

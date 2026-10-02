@@ -33,7 +33,8 @@
 //!   the map ([`Runtime::spawn_map`]); players joining ([`Runtime::join`]) and what they press
 //!   ([`Runtime::set_input`]); then [`Runtime::think`] moves time on, runs timers, and for
 //!   every tick the players' commands and movement, the entities that think and the `Tick`
-//!   hook; then the `Think` hook.
+//!   hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`])
+//!   and the models of the entities they see ([`Runtime::drawn`]).
 //!
 //! Errors in scripts are not errors of the runtime: as in GMod, a file that fails is
 //! reported ([`Output::Error`], [`Runtime::errors`]) and the files around it keep loading.
@@ -78,7 +79,7 @@ pub mod world;
 mod tests;
 
 pub use entity::EntityHandle;
-pub use ents::Map;
+pub use ents::{Drawn, Map};
 pub use mlua;
 pub use movedata::UserCmd;
 pub use player::{PlayerInfo, PlayerView, WeaponView};
@@ -444,8 +445,17 @@ impl Runtime {
 
     /// Runs console commands typed by a player, as a client's console sends them: the
     /// engine's commands for players (`noclip`, `kill`, `give`, choosing a weapon), ConVars, and
-    /// the commands of `concommand.Add`, which get the player.
+    /// the commands of `concommand.Add`, which get the player. The host of the game - the
+    /// first player - also has `lua_run`, the rest of the line being the code.
     pub fn run_player_command(&self, player: EntityHandle, line: &str) {
+        let trimmed = line.trim_start();
+        if let Some(code) = trimmed.get(..8).filter(|start| start.eq_ignore_ascii_case("lua_run ")).map(|_| &trimmed[8..])
+            && player.index == Some(1)
+        {
+            // errors are reported as they happen
+            let _ = self.run_string(code, "lua_run");
+            return;
+        }
         for words in convar::split_commands(line) {
             if !player::command(&self.lua, player, &words) {
                 convar::execute_as(&self.lua, &words, player);
@@ -456,6 +466,12 @@ impl Runtime {
     /// What to show of a player: where they see from, their health, the weapon in hand.
     pub fn view(&self, player: EntityHandle) -> Option<PlayerView> {
         player::view(&self.lua, player)
+    }
+
+    /// The models of entities to draw as a player sees them: every entity with a model that
+    /// is not hidden, but not the player and what they carry.
+    pub fn drawn(&self, viewer: EntityHandle) -> Vec<Drawn> {
+        ents::drawn(&self.lua, viewer)
     }
 
     /// How far game time is into the next tick, 0 to 1: where to draw between where things

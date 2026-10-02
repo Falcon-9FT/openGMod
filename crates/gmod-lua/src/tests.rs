@@ -1486,3 +1486,56 @@ fn what_a_player_types_and_what_is_shown_of_them() {
     assert!(!g.runtime.view(alice).unwrap().alive);
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
+
+#[test]
+fn what_is_drawn_of_the_entities() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime
+        .run_string(
+            "local function make(model, pos, spawn)
+                 local e = ents.Create('prop_physics') e:SetModel(model) e:SetPos(pos) e:SetAngles(Angle(0, 90, 0))
+                 if spawn ~= false then e:Spawn() end
+                 return e
+             end
+             BOX = make('models/box.mdl', Vector(10, 20, 30))
+             BOX:SetSkin(1) BOX:SetModelScale(2)
+             make('models/box.mdl', Vector(0, 0, 0)):SetNoDraw(true)
+             make('models/box.mdl', Vector(0, 0, 0)):AddEffects(EF_NODRAW)
+             make('models/box.mdl', Vector(0, 0, 0), false)
+             make('*1', Vector(0, 0, 0))
+             ON_TOP = make('models/box.mdl', Vector(0, 0, 0))
+             ON_TOP:SetParent(BOX) ON_TOP:SetLocalPos(Vector(10, 0, 0))
+             Entity(1):SetModel('models/box.mdl') Entity(1):GetActiveWeapon():SetModel('models/box.mdl')",
+            "props",
+        )
+        .unwrap();
+    let drawn = g.runtime.drawn(alice);
+    let found: Vec<(&str, vector::Vector)> = drawn.iter().map(|d| (d.model.as_str(), d.origin)).collect();
+    // the hidden, the one not spawned and the brush model are not drawn; neither is Alice nor
+    // the pistol in her hands
+    assert_eq!(found.len(), 2, "{drawn:?}");
+    let first = &drawn[0];
+    assert_eq!((first.model.as_str(), first.skin, first.scale), ("models/box.mdl", 1, 2.0));
+    assert_eq!((first.origin, first.angles), (vector::Vector::new(10.0, 20.0, 30.0), vector::Angle::new(0.0, 90.0, 0.0)));
+    // what is parented is drawn where its parent puts it: turned with it
+    let second = &drawn[1];
+    assert!((second.origin - vector::Vector::new(10.0, 30.0, 30.0)).length() < 0.001, "{second:?}");
+    // others see Alice; neither they nor she see her view model, nor the hands on it
+    g.runtime
+        .run_string(
+            "local vm = Entity(1):GetViewModel() vm:SetModel('models/box.mdl')
+             local hands = ents.Create('prop_dynamic') hands:SetModel('models/box.mdl') hands:Spawn() hands:SetParent(vm)",
+            "hands",
+        )
+        .unwrap();
+    assert_eq!(g.runtime.drawn(alice).len(), 2);
+    let others = g.runtime.drawn(EntityHandle::NULL);
+    assert!(others.iter().any(|d| d.entity == alice));
+    assert_eq!(others.len(), 4, "{others:?}");
+
+    // the host's console runs Lua
+    g.runtime.run_player_command(alice, "lua_run print(GetHostName(), #ents.FindByClass('prop_physics'))");
+    assert_eq!(g.printed(), "openGMOD\t6\n");
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}

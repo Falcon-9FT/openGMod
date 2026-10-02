@@ -38,6 +38,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     install_enums(lua, &globals)?;
 
     globals.raw_set("SysTime", lua.create_function(|lua, ()| Ok(host(lua).started.elapsed().as_secs_f64()))?)?;
+    globals.raw_set("GetHostName", lua.create_function(|lua, ()| Ok(crate::convar::value(lua, "hostname").unwrap_or_default()))?)?;
     install_libraries(lua, &globals)?;
     Ok(())
 }

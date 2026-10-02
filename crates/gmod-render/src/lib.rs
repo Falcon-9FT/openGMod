@@ -2,16 +2,20 @@
 //!
 //! [`Renderer::new`] uploads a [`World`] as [`gmod_world::gpu`] lays it out: one vertex and
 //! one index buffer, the textures (DXT stays compressed as BC1-BC3 where the GPU takes it),
-//! a light map per brush model. [`Renderer::render`] draws a frame: the sky box, the opaque
-//! surfaces, then the translucent ones from the farthest. Depth runs from 1 at the eye to 0 at
-//! infinity.
+//! a light map per brush model. Models of entities are uploaded the same way when they are
+//! first needed ([`Renderer::add_model`]) and drawn where the entities are
+//! ([`Renderer::set_entities`]), lit from above by their turned normals. [`Renderer::render`]
+//! draws a frame: the sky box, the opaque surfaces of the world and the entities, then the
+//! translucent ones - the world's from the farthest, then the entities'. Depth runs from 1 at
+//! the eye to 0 at infinity.
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 
-use gmod_world::World;
 use gmod_world::gpu::{self, Camera, Draw, PixelFormat, TextureData};
+use gmod_world::{Texture, World};
 
 /// Runs a future to its end on this thread: what setting up a GPU needs, without a runtime.
 pub fn block_on<F: Future>(future: F) -> F::Output {
@@ -40,6 +44,10 @@ const MAX_TEXTURE: u32 = 4096;
 const PARAMS_STRIDE: u64 = 256;
 /// Bytes of a surface's parameters.
 const PARAMS_SIZE: u64 = 48;
+/// Bytes of a camera for the shaders: its matrix, its eye, where the light of models comes from.
+const CAMERA_SIZE: u64 = 96;
+/// Bytes between two cameras in their buffer: the world's, then one for each entity drawn.
+const CAMERA_STRIDE: u64 = 256;
 
 /// Which pipeline a surface needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,18 +86,48 @@ impl Pipelines {
     }
 }
 
-/// What can be drawn of a world, on the GPU.
-pub struct Renderer {
-    pipelines: Pipelines,
-    camera_buffer: wgpu::Buffer,
-    camera_group: wgpu::BindGroup,
-    sky_camera_buffer: wgpu::Buffer,
-    sky_camera_group: wgpu::BindGroup,
+/// A model added to a [`Renderer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModelId(usize);
+
+/// A model where an entity is: its origin, its angles (pitch, yaw, roll in degrees) and how
+/// much bigger than it was made it is drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placed {
+    pub model: ModelId,
+    pub origin: [f32; 3],
+    pub angles: [f32; 3],
+    pub scale: f32,
+}
+
+/// An uploaded texture and which sampler it takes; none when it could not be uploaded.
+type Uploaded = Option<(wgpu::TextureView, usize)>;
+
+/// Pieces on the GPU - the world's or a model's - and what each of their surfaces is drawn
+/// with.
+struct Mesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     draws: Vec<(Draw, Kind)>,
     surface_groups: Vec<wgpu::BindGroup>,
     lightmap_groups: Vec<wgpu::BindGroup>,
+}
+
+/// What can be drawn of a world, on the GPU.
+pub struct Renderer {
+    shared: Shared,
+    pipelines: Pipelines,
+    /// The cameras: the world's, then one for each entity drawn, `CAMERA_STRIDE` apart.
+    camera_buffer: wgpu::Buffer,
+    camera_group: wgpu::BindGroup,
+    camera_slots: usize,
+    sky_camera_buffer: wgpu::Buffer,
+    sky_camera_group: wgpu::BindGroup,
+    world: Mesh,
+    models: Vec<Mesh>,
+    /// Textures by name, the world's and the models', each uploaded once.
+    textures: HashMap<String, Uploaded>,
+    entities: Vec<Placed>,
     sky_vertices: Option<wgpu::Buffer>,
     sky_groups: Vec<wgpu::BindGroup>,
     depth: Option<(wgpu::TextureView, (u32, u32))>,
@@ -234,15 +272,138 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
     }
 }
 
-/// The 80 bytes of a camera for the shaders: its matrix and its eye.
-fn camera_bytes(matrix: [f32; 16], eye: [f32; 3]) -> Vec<u8> {
-    matrix.iter().chain(&eye).chain(&[1.0]).flat_map(|v| v.to_le_bytes()).collect()
+/// A camera for the shaders, padded to `CAMERA_STRIDE`: its matrix, its eye, and for a model
+/// where the light comes from in the model's space (w 1; 0 for the world, lit as it was baked).
+fn camera_bytes(matrix: [f32; 16], eye: [f32; 3], sun: Option<[f32; 3]>) -> Vec<u8> {
+    let sun = sun.map_or([0.0; 4], |[x, y, z]| [x, y, z, 1.0]);
+    let mut bytes: Vec<u8> = matrix.iter().chain(&eye).chain(&[1.0]).chain(&sun).flat_map(|v| v.to_le_bytes()).collect();
+    bytes.resize(CAMERA_STRIDE as usize, 0);
+    bytes
+}
+
+/// A bind group of one camera in a buffer of them, chosen by its offset when drawing.
+fn camera_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, buffer: &wgpu::Buffer) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("camera"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: 0, size: NonZeroU64::new(CAMERA_SIZE) }),
+        }],
+    })
+}
+
+fn camera_buffer(device: &wgpu::Device, slots: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cameras"),
+        size: slots as u64 * CAMERA_STRIDE,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 struct Layouts {
     camera: wgpu::BindGroupLayout,
     surface: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
+}
+
+/// What uploading needs after the world is up: the layouts, the samplers, the missing texture
+/// and the white light map of what is lit per vertex.
+struct Shared {
+    layouts: Layouts,
+    samplers: Vec<wgpu::Sampler>,
+    missing: wgpu::TextureView,
+    white: wgpu::TextureView,
+    lightmap_sampler: wgpu::Sampler,
+    compressed: bool,
+}
+
+impl Shared {
+    fn texture(&self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &Texture) -> Uploaded {
+        let data = gpu::texture_data(&texture.vtf, self.compressed, MAX_TEXTURE)?;
+        let view = upload_texture(device, queue, &texture.name, &data);
+        Some((view, usize::from(data.clamp_s) | usize::from(data.clamp_t) << 1))
+    }
+
+    /// Uploads the pieces of `world`, whose textures are `textures`.
+    fn mesh(&self, device: &wgpu::Device, queue: &wgpu::Queue, world: &World, textures: &[Uploaded]) -> Mesh {
+        let texture = |index: Option<usize>| pick(textures, &self.missing, index);
+        let geometry = gpu::geometry(world);
+        let vertices = buffer(device, queue, "vertices", wgpu::BufferUsages::VERTEX, &geometry.vertices);
+        let indices = buffer(device, queue, "indices", wgpu::BufferUsages::INDEX, &geometry.indices);
+        let mut params = vec![0u8; (geometry.draws.len() as u64 * PARAMS_STRIDE).max(PARAMS_STRIDE) as usize];
+        let mut draws = Vec::with_capacity(geometry.draws.len());
+        for (i, draw) in geometry.draws.iter().enumerate() {
+            let piece = &world.pieces[draw.piece];
+            let surface = &piece.surfaces[draw.surface];
+            let values = gpu::surface_params(surface, piece.lightmap.is_some());
+            let at = i * PARAMS_STRIDE as usize;
+            for (k, v) in values.iter().enumerate() {
+                params[at + k * 4..at + k * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            let kind = match (surface.translucent, surface.additive, surface.no_cull) {
+                (_, true, _) => Kind::Additive,
+                (true, _, false) => Kind::Blend,
+                (true, _, true) => Kind::BlendTwoSided,
+                (false, _, false) => Kind::Opaque,
+                (false, _, true) => Kind::OpaqueTwoSided,
+            };
+            draws.push((*draw, kind));
+        }
+        let params_buffer = buffer(device, queue, "surfaces", wgpu::BufferUsages::UNIFORM, &params);
+        let surface_groups = geometry
+            .draws
+            .iter()
+            .enumerate()
+            .map(|(i, draw)| {
+                let surface = &world.pieces[draw.piece].surfaces[draw.surface];
+                let (base, sampler_index) = texture(surface.base);
+                let (blend, _) = texture(surface.base2.or(surface.base));
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("surface"),
+                    layout: &self.layouts.surface,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &params_buffer,
+                                offset: i as u64 * PARAMS_STRIDE,
+                                size: NonZeroU64::new(PARAMS_SIZE),
+                            }),
+                        },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(base) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(blend) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[sampler_index]) },
+                    ],
+                })
+            })
+            .collect();
+        // light maps; what is lit per vertex gets the white one
+        let lightmap_groups = world
+            .pieces
+            .iter()
+            .map(|piece| {
+                let view = piece
+                    .lightmap
+                    .as_ref()
+                    .filter(|l| l.width > 0 && l.height > 0)
+                    .map(|l| upload_lightmap(device, queue, l.width, l.height, &gpu::lightmap_data(l)));
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("light map"),
+                    layout: &self.layouts.texture,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(view.as_ref().unwrap_or(&self.white)),
+                        },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.lightmap_sampler) },
+                    ],
+                })
+            })
+            .collect();
+        Mesh { vertices, indices, draws, surface_groups, lightmap_groups }
+    }
 }
 
 fn pipeline(
@@ -258,6 +419,7 @@ fn pipeline(
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 32, shader_location: 2 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 40, shader_location: 3 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 44, shader_location: 4 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 5 },
     ];
     let buffers = [Some(wgpu::VertexBufferLayout {
         array_stride: gpu::VERTEX_SIZE as u64,
@@ -366,11 +528,18 @@ fn sky_pipeline(device: &wgpu::Device, layouts: &Layouts, format: wgpu::TextureF
 impl Renderer {
     /// Uploads a world. `format` is the format of the views it will draw into (sRGB).
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, world: &World) -> Renderer {
+        let camera_entry = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: NonZeroU64::new(CAMERA_SIZE),
+            },
+            count: None,
+        };
         let layouts = Layouts {
-            camera: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("camera"),
-                entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT)],
-            }),
+            camera: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("camera"), entries: &[camera_entry] }),
             surface: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("surface"),
                 entries: &[uniform_entry(0, wgpu::ShaderStages::FRAGMENT), texture_entry(1), texture_entry(2), sampler_entry(3)],
@@ -398,122 +567,43 @@ impl Renderer {
             sky: sky_pipeline(device, &layouts, format),
         };
 
-        let uniform = wgpu::BufferUsages::UNIFORM;
-        let camera_buffer = buffer(device, queue, "camera", uniform, &[0; 80]);
-        let sky_camera_buffer = buffer(device, queue, "sky camera", uniform, &[0; 80]);
-        let camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera"),
-            layout: &layouts.camera,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }],
-        });
-        let sky_camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sky camera"),
-            layout: &layouts.camera,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: sky_camera_buffer.as_entire_binding() }],
-        });
+        let camera_slots = 1;
+        let sky_camera_buffer = camera_buffer(device, 1);
+        let sky_camera_group = camera_group(device, &layouts.camera, &sky_camera_buffer);
+        let camera_buffer = camera_buffer(device, camera_slots);
+        let camera_group = camera_group(device, &layouts.camera, &camera_buffer);
+
+        let shared = Shared {
+            samplers: (0..4).map(|i| sampler(device, i & 1 != 0, i & 2 != 0, true)).collect(),
+            missing: upload_texture(device, queue, "missing", &gpu::missing_texture()),
+            white: upload_lightmap(
+                device,
+                queue,
+                1,
+                1,
+                &gpu::lightmap_data(&gmod_world::Lightmap { width: 1, height: 1, texels: vec![[1.0; 3]] }),
+            ),
+            lightmap_sampler: sampler(device, true, true, false),
+            compressed: device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            layouts,
+        };
 
         // textures: what cannot be uploaded is drawn as missing
-        let compressed = device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
-        let samplers: Vec<wgpu::Sampler> = (0..4).map(|i| sampler(device, i & 1 != 0, i & 2 != 0, true)).collect();
-        let missing = gpu::missing_texture();
-        let missing_view = upload_texture(device, queue, "missing", &missing);
         let mut failed_textures = Vec::new();
-        let textures: Vec<Option<(wgpu::TextureView, usize)>> = world
+        let mut by_name = HashMap::new();
+        let textures: Vec<Uploaded> = world
             .textures
             .iter()
-            .map(|texture| match gpu::texture_data(&texture.vtf, compressed, MAX_TEXTURE) {
-                Some(data) => {
-                    let view = upload_texture(device, queue, &texture.name, &data);
-                    Some((view, usize::from(data.clamp_s) | usize::from(data.clamp_t) << 1))
-                }
-                None => {
+            .map(|texture| {
+                let uploaded = shared.texture(device, queue, texture);
+                if uploaded.is_none() {
                     failed_textures.push(texture.name.clone());
-                    None
                 }
+                by_name.insert(texture.name.clone(), uploaded.clone());
+                uploaded
             })
             .collect();
-        let texture = |index: Option<usize>| pick(&textures, &missing_view, index);
-
-        // geometry, and per surface its parameters and textures
-        let geometry = gpu::geometry(world);
-        let vertices = buffer(device, queue, "vertices", wgpu::BufferUsages::VERTEX, &geometry.vertices);
-        let indices = buffer(device, queue, "indices", wgpu::BufferUsages::INDEX, &geometry.indices);
-        let mut params = vec![0u8; (geometry.draws.len() as u64 * PARAMS_STRIDE).max(PARAMS_STRIDE) as usize];
-        let mut draws = Vec::with_capacity(geometry.draws.len());
-        for (i, draw) in geometry.draws.iter().enumerate() {
-            let piece = &world.pieces[draw.piece];
-            let surface = &piece.surfaces[draw.surface];
-            let values = gpu::surface_params(surface, piece.lightmap.is_some());
-            let at = i * PARAMS_STRIDE as usize;
-            for (k, v) in values.iter().enumerate() {
-                params[at + k * 4..at + k * 4 + 4].copy_from_slice(&v.to_le_bytes());
-            }
-            let kind = match (surface.translucent, surface.additive, surface.no_cull) {
-                (_, true, _) => Kind::Additive,
-                (true, _, false) => Kind::Blend,
-                (true, _, true) => Kind::BlendTwoSided,
-                (false, _, false) => Kind::Opaque,
-                (false, _, true) => Kind::OpaqueTwoSided,
-            };
-            draws.push((*draw, kind));
-        }
-        let params_buffer = buffer(device, queue, "surfaces", uniform, &params);
-        let surface_groups = geometry
-            .draws
-            .iter()
-            .enumerate()
-            .map(|(i, draw)| {
-                let surface = &world.pieces[draw.piece].surfaces[draw.surface];
-                let (base, sampler_index) = texture(surface.base);
-                let (blend, _) = texture(surface.base2.or(surface.base));
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("surface"),
-                    layout: &layouts.surface,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &params_buffer,
-                                offset: i as u64 * PARAMS_STRIDE,
-                                size: NonZeroU64::new(PARAMS_SIZE),
-                            }),
-                        },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(base) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(blend) },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&samplers[sampler_index]) },
-                    ],
-                })
-            })
-            .collect();
-
-        // light maps; props, lit per vertex, get a white one
-        let lightmap_sampler = sampler(device, true, true, false);
-        let white = upload_lightmap(
-            device,
-            queue,
-            1,
-            1,
-            &gpu::lightmap_data(&gmod_world::Lightmap { width: 1, height: 1, texels: vec![[1.0; 3]] }),
-        );
-        let lightmap_groups = world
-            .pieces
-            .iter()
-            .map(|piece| {
-                let view = piece
-                    .lightmap
-                    .as_ref()
-                    .filter(|l| l.width > 0 && l.height > 0)
-                    .map(|l| upload_lightmap(device, queue, l.width, l.height, &gpu::lightmap_data(l)));
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("light map"),
-                    layout: &layouts.texture,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view.as_ref().unwrap_or(&white)) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&lightmap_sampler) },
-                    ],
-                })
-            })
-            .collect();
+        let mesh = shared.mesh(device, queue, world, &textures);
 
         // the sky box: two triangles a face
         let quads = gpu::sky_quads(world);
@@ -524,10 +614,10 @@ impl Renderer {
             for corner in [0, 1, 2, 0, 2, 3] {
                 sky_bytes.extend(quad.corners[corner].iter().flat_map(|v| v.to_le_bytes()));
             }
-            let (view, _) = texture(Some(quad.texture));
+            let (view, _) = pick(&textures, &shared.missing, Some(quad.texture));
             sky_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("sky"),
-                layout: &layouts.texture,
+                layout: &shared.layouts.texture,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sky_sampler) },
@@ -537,21 +627,49 @@ impl Renderer {
         let sky_vertices = (!quads.is_empty()).then(|| buffer(device, queue, "sky", wgpu::BufferUsages::VERTEX, &sky_bytes));
 
         Renderer {
+            shared,
             pipelines,
             camera_buffer,
             camera_group,
+            camera_slots,
             sky_camera_buffer,
             sky_camera_group,
-            vertices,
-            indices,
-            draws,
-            surface_groups,
-            lightmap_groups,
+            world: mesh,
+            models: Vec::new(),
+            textures: by_name,
+            entities: Vec::new(),
             sky_vertices,
             sky_groups,
             depth: None,
             failed_textures,
         }
+    }
+
+    /// Uploads a model ([`gmod_world::model`]) to draw where entities have it. Textures the
+    /// world or another model already has are not uploaded again.
+    pub fn add_model(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, model: &World) -> ModelId {
+        let textures: Vec<Uploaded> = model
+            .textures
+            .iter()
+            .map(|texture| {
+                if let Some(known) = self.textures.get(&texture.name) {
+                    return known.clone();
+                }
+                let uploaded = self.shared.texture(device, queue, texture);
+                if uploaded.is_none() {
+                    self.failed_textures.push(texture.name.clone());
+                }
+                self.textures.insert(texture.name.clone(), uploaded.clone());
+                uploaded
+            })
+            .collect();
+        self.models.push(self.shared.mesh(device, queue, model, &textures));
+        ModelId(self.models.len() - 1)
+    }
+
+    /// The models to draw from now on, and where.
+    pub fn set_entities(&mut self, entities: Vec<Placed>) {
+        self.entities = entities.into_iter().filter(|e| e.model.0 < self.models.len()).collect();
     }
 
     fn depth_view(&mut self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::TextureView {
@@ -587,19 +705,33 @@ impl Renderer {
     ) {
         let depth = self.depth_view(device, size);
         let aspect = size.0.max(1) as f32 / size.1.max(1) as f32;
-        queue.write_buffer(&self.camera_buffer, 0, &camera_bytes(camera.view_projection(aspect), camera.eye));
-        queue.write_buffer(&self.sky_camera_buffer, 0, &camera_bytes(camera.sky_projection(aspect), [0.0; 3]));
+        let view_projection = camera.view_projection(aspect);
+        // the world's camera, then each entity's: the camera after the entity's placement
+        let slots = 1 + self.entities.len();
+        if slots > self.camera_slots {
+            self.camera_slots = slots.next_power_of_two();
+            self.camera_buffer = camera_buffer(device, self.camera_slots);
+            self.camera_group = camera_group(device, &self.shared.layouts.camera, &self.camera_buffer);
+        }
+        let mut cameras = camera_bytes(view_projection, camera.eye, None);
+        for placed in &self.entities {
+            let (mut matrix, sun) = gpu::placement(placed.origin, placed.angles);
+            matrix[..12].iter_mut().for_each(|v| *v *= placed.scale);
+            cameras.extend(camera_bytes(gpu::multiply(&view_projection, &matrix), camera.eye, Some(sun)));
+        }
+        queue.write_buffer(&self.camera_buffer, 0, &cameras);
+        queue.write_buffer(&self.sky_camera_buffer, 0, &camera_bytes(camera.sky_projection(aspect), [0.0; 3], None));
         // translucent surfaces from the farthest
         let distance = |draw: &Draw| {
             let d = [draw.center[0] - camera.eye[0], draw.center[1] - camera.eye[1], draw.center[2] - camera.eye[2]];
             d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
         };
-        let mut order: Vec<usize> = (0..self.draws.len()).filter(|&i| !self.draws[i].1.translucent()).collect();
+        let draws = &self.world.draws;
+        let mut opaque: Vec<usize> = (0..draws.len()).filter(|&i| !draws[i].1.translucent()).collect();
         // opaque ones by pipeline, to switch less
-        order.sort_by_key(|&i| self.draws[i].1 as u8);
-        let mut translucent: Vec<usize> = (0..self.draws.len()).filter(|&i| self.draws[i].1.translucent()).collect();
-        translucent.sort_by(|&a, &b| distance(&self.draws[b].0).total_cmp(&distance(&self.draws[a].0)));
-        order.extend(translucent);
+        opaque.sort_by_key(|&i| draws[i].1 as u8);
+        let mut translucent: Vec<usize> = (0..draws.len()).filter(|&i| draws[i].1.translucent()).collect();
+        translucent.sort_by(|&a, &b| distance(&draws[b].0).total_cmp(&distance(&draws[a].0)));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("world"),
@@ -623,30 +755,55 @@ impl Renderer {
         });
         if let Some(sky) = &self.sky_vertices {
             pass.set_pipeline(&self.pipelines.sky);
-            pass.set_bind_group(0, &self.sky_camera_group, &[]);
+            pass.set_bind_group(0, &self.sky_camera_group, &[0]);
             pass.set_vertex_buffer(0, sky.slice(..));
             for (i, group) in self.sky_groups.iter().enumerate() {
                 pass.set_bind_group(1, group, &[]);
                 pass.draw(i as u32 * 6..i as u32 * 6 + 6, 0..1);
             }
         }
-        pass.set_bind_group(0, &self.camera_group, &[]);
-        pass.set_vertex_buffer(0, self.vertices.slice(..));
-        pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         let mut current = None;
-        for i in order {
-            let (draw, kind) = self.draws[i];
-            if draw.index_count == 0 {
-                continue;
-            }
-            if current != Some(kind) {
-                pass.set_pipeline(self.pipelines.get(kind));
-                current = Some(kind);
-            }
-            pass.set_bind_group(1, &self.surface_groups[i], &[]);
-            pass.set_bind_group(2, &self.lightmap_groups[draw.piece], &[]);
-            pass.draw_indexed(draw.first_index..draw.first_index + draw.index_count, 0, 0..1);
+        draw_mesh(&mut pass, &self.pipelines, &mut current, &self.camera_group, 0, &self.world, opaque);
+        let entity = |slot: usize| ((slot + 1) as u64 * CAMERA_STRIDE) as u32;
+        for (slot, placed) in self.entities.iter().enumerate() {
+            let mesh = &self.models[placed.model.0];
+            let list = (0..mesh.draws.len()).filter(|&i| !mesh.draws[i].1.translucent());
+            draw_mesh(&mut pass, &self.pipelines, &mut current, &self.camera_group, entity(slot), mesh, list);
         }
+        draw_mesh(&mut pass, &self.pipelines, &mut current, &self.camera_group, 0, &self.world, translucent);
+        for (slot, placed) in self.entities.iter().enumerate() {
+            let mesh = &self.models[placed.model.0];
+            let list = (0..mesh.draws.len()).filter(|&i| mesh.draws[i].1.translucent());
+            draw_mesh(&mut pass, &self.pipelines, &mut current, &self.camera_group, entity(slot), mesh, list);
+        }
+    }
+}
+
+/// Draws the surfaces `list` of a mesh, seen through the camera at `offset`.
+fn draw_mesh(
+    pass: &mut wgpu::RenderPass,
+    pipelines: &Pipelines,
+    current: &mut Option<Kind>,
+    camera: &wgpu::BindGroup,
+    offset: u32,
+    mesh: &Mesh,
+    list: impl IntoIterator<Item = usize>,
+) {
+    pass.set_bind_group(0, camera, &[offset]);
+    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+    for i in list {
+        let (draw, kind) = mesh.draws[i];
+        if draw.index_count == 0 {
+            continue;
+        }
+        if *current != Some(kind) {
+            pass.set_pipeline(pipelines.get(kind));
+            *current = Some(kind);
+        }
+        pass.set_bind_group(1, &mesh.surface_groups[i], &[]);
+        pass.set_bind_group(2, &mesh.lightmap_groups[draw.piece], &[]);
+        pass.draw_indexed(draw.first_index..draw.first_index + draw.index_count, 0, 0..1);
     }
 }
 

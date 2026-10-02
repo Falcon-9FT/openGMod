@@ -439,6 +439,60 @@ pub(crate) fn think(lua: &Lua) {
     }
 }
 
+/// An entity's model, where it is drawn: what [`crate::Runtime::drawn`] lists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Drawn {
+    pub entity: EntityHandle,
+    /// The model's path in the game's files: `models/props_c17/oildrum001.mdl`.
+    pub model: String,
+    pub skin: i64,
+    pub origin: Vector,
+    pub angles: Angle,
+    pub scale: f32,
+}
+
+/// `RENDERMODE_NONE`: not drawn at all.
+const RENDERMODE_NONE: i64 = 10;
+/// `EF_NODRAW`.
+const EF_NODRAW: i64 = 32;
+
+/// The models of entities as `viewer` sees them, through its own eyes: not the viewer itself
+/// nor what it carries (its weapon, its view model and the hands on it), not what is hidden,
+/// not brush entities (the map draws those) and not ragdolls, which fall only with physics.
+pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
+    let entities = &host(lua).entities;
+    // the viewer, or what goes with its eyes, all the way up the parents
+    let carried = |mut handle: EntityHandle| {
+        for _ in 0..16 {
+            let Some(ent) = entities.get(handle) else { return false };
+            if handle == viewer || matches!(ent.class.as_str(), "predicted_viewmodel" | "viewmodel") {
+                return true;
+            }
+            handle = ent.parent;
+        }
+        false
+    };
+    entities
+        .handles()
+        .into_iter()
+        .filter(|&handle| !carried(handle))
+        .filter_map(|handle| {
+            let (model, skin, scale) = {
+                let ent = entities.get(handle)?;
+                let hidden =
+                    ent.removed || !ent.spawned || ent.no_draw || ent.effects & EF_NODRAW != 0 || ent.render_mode == RENDERMODE_NONE;
+                let studio = ent.model.len() > 4 && ent.model[ent.model.len() - 4..].eq_ignore_ascii_case(".mdl");
+                if hidden || !studio || ent.class == "hl2mp_ragdoll" {
+                    return None;
+                }
+                (ent.model.clone(), ent.skin, ent.model_scale)
+            };
+            let (origin, angles) = entities.transform(handle)?;
+            Some(Drawn { entity: handle, model, skin, origin, angles, scale })
+        })
+        .collect()
+}
+
 /// Parses `1 2 3` as the engine does: what is missing is 0.
 fn three(text: &str) -> [f32; 3] {
     let mut parts = text.split_whitespace().map(|p| crate::convar::atof(p) as f32);
