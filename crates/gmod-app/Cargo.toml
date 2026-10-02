@@ -20,6 +20,8 @@ gmod-render.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 gmod-audio.workspace = true
+gmod-web.workspace = true
+gmod-kv.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 cpal.workspace = true

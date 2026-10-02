@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, OnceLock};
 
 use gmod_fs::Vfs;
 use gmod_lua::player::{IMPULSE_FLASHLIGHT, key};
@@ -83,14 +84,13 @@ pub struct Game {
     /// The player's client.
     client: Runtime,
     player: EntityHandle,
-    console: Receiver<String>,
     /// The impulse for the next command (the flashlight).
     impulse: u8,
 }
 
 impl Game {
     /// Starts the Lua of the server on the game's files with the map, and lets the player join.
-    pub fn start(vfs: Arc<Vfs>, map: &Map) -> Result<Game, String> {
+    pub fn start(vfs: Arc<Vfs>, map: &Map, gamemode: &str, pages: Option<gmod_lua::WebPages>) -> Result<Game, String> {
         let new = |realm: Realm| -> Result<Runtime, String> {
             let runtime = Runtime::new(realm, vfs.clone()).map_err(|e| format!("LuaJIT could not be started: {e}"))?;
             runtime.set_output(|output| match output {
@@ -106,11 +106,14 @@ impl Game {
             Ok(runtime)
         };
         let runtime = new(Realm::Server)?;
-        runtime.start("sandbox");
+        runtime.start(gamemode);
         runtime.spawn_map(map);
         let player = runtime.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() }).ok_or("no player could join the game")?;
         let client = new(Realm::Client)?;
-        client.start("sandbox");
+        if let Some(pages) = pages {
+            client.set_web_pages(pages);
+        }
+        client.start(gamemode);
         client.spawn_map(map);
         client.set_local_player(player);
         client.apply_snapshot(&runtime.snapshot());
@@ -119,7 +122,7 @@ impl Game {
             "Lua: {} files, {errors} errors; type commands here (give weapon_crowbar, gm_spawn <model>)",
             runtime.files_loaded() + client.files_loaded()
         );
-        let game = Game { runtime, client, player, console: console(), impulse: 0 };
+        let game = Game { runtime, client, player, impulse: 0 };
         game.send_client_commands();
         Ok(game)
     }
@@ -202,7 +205,7 @@ impl Game {
         cmd.impulse = std::mem::take(&mut self.impulse);
         self.runtime.set_input(self.player, cmd);
         self.send_client_commands();
-        while let Ok(line) = self.console.try_recv() {
+        for line in typed_lines() {
             self.command(&line);
         }
         self.runtime.think(seconds);
@@ -268,18 +271,24 @@ fn angle_apart(a: f32, b: f32) -> bool {
     ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs() > 0.01
 }
 
-/// Lines typed into the terminal, read on a thread of their own.
-fn console() -> Receiver<String> {
-    let (send, receive) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in std::io::stdin().lines() {
-            let Ok(line) = line else { break };
-            if send.send(line).is_err() {
-                break;
+/// The lines typed into the terminal since the last call, read on a thread of their own
+/// (started by the first call).
+pub fn typed_lines() -> Vec<String> {
+    static CONSOLE: OnceLock<Mutex<Receiver<String>>> = OnceLock::new();
+    let console = CONSOLE.get_or_init(|| {
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines() {
+                let Ok(line) = line else { break };
+                if send.send(line).is_err() {
+                    break;
+                }
             }
-        }
+        });
+        Mutex::new(receive)
     });
-    receive
+    let console = console.lock().unwrap_or_else(|e| e.into_inner());
+    std::iter::from_fn(|| console.try_recv().ok()).collect()
 }
 
 /// The title of the window while the game runs: health and the weapon in hand.
@@ -335,7 +344,7 @@ mod tests {
         let mut map = Map::from_bsp("gm_test", &bsp, Arc::new(Collision::new(&bsp)));
         let start = [("classname", "info_player_start"), ("origin", "0 0 0"), ("angles", "0 90 0")];
         map.entities.push(start.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
-        let mut game = Game::start(Arc::new(vfs), &map).unwrap();
+        let mut game = Game::start(Arc::new(vfs), &map, "sandbox", None).unwrap();
 
         // the camera turns to where the spawn point looks, and sees from the player's eyes
         let still = (Keys::default(), Buttons::default());

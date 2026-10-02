@@ -32,7 +32,17 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          $programs = @("target/release/opengmod.exe", "target/release/gmod-check.exe")
+          # opengmod.exe needs Chromium's files beside it (CEF, put into target/release by the
+          # build): it goes out as a zip of them all; gmod-check.exe alone, too
+          $dist = "dist/openGMOD"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item target/release/opengmod.exe, target/release/gmod-check.exe $dist
+          Get-ChildItem target/release -File |
+            Where-Object { $_.Extension -in ".dll", ".pak", ".dat", ".bin" -or $_.Name -in "vk_swiftshader_icd.json", "CREDITS.html" } |
+            Copy-Item -Destination $dist
+          Copy-Item -Recurse target/release/locales "$dist/locales"
+          Compress-Archive -Path "$dist/*" -DestinationPath openGMOD-windows-x64.zip -Force
+          $programs = @("openGMOD-windows-x64.zip", "target/release/gmod-check.exe")
           if ($env:REF_TYPE -eq "tag") {
             $tag = $env:REF_NAME
           } else {

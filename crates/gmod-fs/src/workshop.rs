@@ -106,6 +106,37 @@ pub fn addon_files(install: &Install) -> Vec<AddonFile> {
     out
 }
 
+/// What an addon is known by when it is switched off: its workshop item, or for a `.gma` put
+/// into `garrysmod/addons` by hand, its file's name.
+pub fn addon_key(addon: &AddonFile) -> String {
+    match addon.workshop_id {
+        Some(id) if addon.origin != Origin::AddonsFolder => id.to_string(),
+        _ => addon.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default(),
+    }
+}
+
+/// The addons switched off: a file with one [`addon_key`] a line. None when it is missing.
+pub fn read_disabled(path: &Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|text| text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Writes the addons switched off, sorted.
+pub fn write_disabled(path: &Path, disabled: &HashSet<String>) -> io::Result<()> {
+    let mut keys: Vec<&String> = disabled.iter().collect();
+    keys.sort();
+    let mut text = String::from("// addons openGMOD does not mount: workshop items, or files of garrysmod/addons\n");
+    for key in keys {
+        text.push_str(key);
+        text.push('\n');
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, text)
+}
+
 /// Unpacks an old compressed workshop download into `cache_dir` (unless an unpacked copy at
 /// least as new is already there) and returns the unpacked `.gma`.
 pub fn unpack_legacy(packed: &Path, workshop_id: Option<u64>, cache_dir: &Path) -> io::Result<PathBuf> {
@@ -186,6 +217,15 @@ mod tests {
         let mut expected = all.to_vec();
         expected.remove(2);
         assert_eq!(summary(addon_files(&install)), expected);
+
+        // what each is switched off by: the item, or the file's name
+        let keys: Vec<String> = addon_files(&install).iter().map(addon_key).collect();
+        assert_eq!(keys, ["111", "222", "by_hand.gma", "444"]);
+        let file = tmp.path().join("settings/disabled.txt");
+        let disabled: HashSet<String> = ["111".to_string(), "by_hand.gma".to_string()].into_iter().collect();
+        write_disabled(&file, &disabled).unwrap();
+        assert_eq!(read_disabled(&file), disabled);
+        assert!(read_disabled(&tmp.path().join("none.txt")).is_empty());
     }
 
     #[test]
