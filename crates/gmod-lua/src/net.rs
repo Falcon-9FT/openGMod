@@ -5,7 +5,7 @@
 //! that is sent leaves through [`crate::Runtime::take_net_messages`], and one that arrives is
 //! handed in with [`crate::Runtime::receive_net_message`], which runs `net.Incoming` as the
 //! engine does. Vectors and angles are sent as three 32-bit floats, without the precision
-//! Source's encoding loses.
+//! Source's encoding loses; a matrix is its sixteen floats, row by row.
 
 use std::cell::RefCell;
 
@@ -13,6 +13,7 @@ use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::args::Args;
 use crate::entity::EntityHandle;
+use crate::matrix::Matrix;
 use crate::vector::{Angle, Vector};
 use crate::{Realm, host, util};
 
@@ -241,6 +242,14 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
             }
         })
     })?;
+    def(lua, &net, "WriteMatrix", |a| {
+        let m = a.userdata::<Matrix>(1, "VMatrix")?;
+        write(a, |b| {
+            for c in m.m.as_flattened() {
+                b.push(c.to_bits().into(), 32);
+            }
+        })
+    })?;
     def(lua, &net, "WriteEntity", |a| {
         let index = match a.get(1) {
             Some(Value::UserData(ud)) => ud.borrow::<EntityHandle>().ok().and_then(|e| e.index).unwrap_or(0),
@@ -293,6 +302,12 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     def(lua, &net, "ReadNormal", |a| {
         let [x, y, z] = read(a, |r| [0; 3].map(|_| f32::from_bits(r.take(32) as u32))).unwrap_or_default();
         Ok(Value::UserData(a.lua.create_userdata(Vector::new(x, y, z))?))
+    })?;
+    def(lua, &net, "ReadMatrix", |a| {
+        let values = read(a, |r| [0; 16].map(|_| f32::from_bits(r.take(32) as u32)));
+        let mut m = Matrix::ZERO;
+        m.m.as_flattened_mut().copy_from_slice(&values.unwrap_or_default());
+        Ok(Value::UserData(a.lua.create_userdata(m)?))
     })?;
     def(lua, &net, "ReadAngle", |a| {
         let [p, y, r] = read(a, |reader| [0; 3].map(|_| f32::from_bits(reader.take(32) as u32))).unwrap_or_default();
