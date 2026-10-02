@@ -37,20 +37,22 @@ pub fn report(bsp: &Bsp, collision: &Collision, points: &[[f32; 3]]) -> Vec<Stri
     let mut out = vec![format!("{}: version {}", bsp.label.display(), bsp.version)];
     out.push(format!("  light maps, LDR: {}", lightmap_stats(&bsp.lighting)));
     out.push(format!("  light maps, HDR: {}", lightmap_stats(&bsp.lighting_hdr)));
-    match bsp.ambient_samples() {
-        Ok(samples) => {
-            let with = samples.iter().filter(|s| !s.is_empty()).count();
-            let mut tops: Vec<f32> = samples.iter().flatten().map(|s| luminance(s.cube[4])).collect();
-            tops.sort_by(f32::total_cmp);
-            let median = tops.get(tops.len() / 2).copied().unwrap_or(0.0);
-            out.push(format!(
-                "  ambient samples: {} in {with} of {} leaves; light from above: median {median:.3}, max {:.3}",
-                tops.len(),
-                samples.len(),
-                tops.last().copied().unwrap_or(0.0)
-            ));
+    for (name, set) in [("LDR", bsp.ambient_samples_of(false)), ("HDR", bsp.ambient_samples_of(true))] {
+        match set {
+            Ok(samples) => {
+                let with = samples.iter().filter(|s| !s.is_empty()).count();
+                let mut tops: Vec<f32> = samples.iter().flatten().map(|s| luminance(s.cube[4])).collect();
+                tops.sort_by(f32::total_cmp);
+                let median = tops.get(tops.len() / 2).copied().unwrap_or(0.0);
+                out.push(format!(
+                    "  ambient samples, {name}: {} in {with} of {} leaves; light from above: median {median:.3}, max {:.3}",
+                    tops.len(),
+                    samples.len(),
+                    tops.last().copied().unwrap_or(0.0)
+                ));
+            }
+            Err(e) => out.push(format!("  ambient samples, {name}: {e}")),
         }
-        Err(e) => out.push(format!("  ambient samples: {e}")),
     }
     let lights = bsp.world_lights();
     let count = |k: fn(&LightKind) -> bool| lights.iter().filter(|l| k(&l.kind)).count();

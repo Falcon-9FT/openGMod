@@ -38,6 +38,9 @@ impl Default for ModelLight {
 pub struct MapLight {
     /// The samples of each leaf.
     samples: Vec<Vec<AmbientSample>>,
+    /// Whether the samples hold light at all: a map whose samples are all next to black gives
+    /// its models some light from everywhere, as a map without them does, not none.
+    baked: bool,
     lights: Vec<WorldLight>,
 }
 
@@ -69,7 +72,9 @@ impl MapLight {
             .into_iter()
             .filter(|l| matches!(l.kind, LightKind::Point | LightKind::Spot | LightKind::Sky | LightKind::Quake))
             .collect();
-        MapLight { samples: bsp.ambient_samples().unwrap_or_default(), lights }
+        let samples = bsp.ambient_samples().unwrap_or_default();
+        let baked = samples.iter().flatten().any(|s| s.cube.iter().flatten().any(|&v| v >= 0.01));
+        MapLight { samples, baked, lights }
     }
 
     /// Whether the map has light of its own for models.
@@ -90,14 +95,17 @@ impl MapLight {
             .map(|up| [origin[0], origin[1], origin[2] + up])
             .find_map(|p| leaf_samples(p).map(|s| (p, Some(s))))
             .unwrap_or((origin, None));
-        if let Some(samples) = samples {
-            let nearest = samples.iter().min_by(|a, b| length(sub(a.position, point)).total_cmp(&length(sub(b.position, point))));
-            if let Some(sample) = nearest {
-                light.ambient = sample.cube;
+        match samples {
+            // samples that hold nothing leave the light of a map without them
+            _ if !self.baked => {}
+            Some(samples) => {
+                let nearest = samples.iter().min_by(|a, b| length(sub(a.position, point)).total_cmp(&length(sub(b.position, point))));
+                if let Some(sample) = nearest {
+                    light.ambient = sample.cube;
+                }
             }
-        } else {
             // in a leaf with no samples (inside a wall, outside the map): nothing baked
-            light.ambient = [[0.05; 3]; 6];
+            None => light.ambient = [[0.05; 3]; 6],
         }
         // the strongest first; each must see the point
         let mut candidates: Vec<([f32; 3], [f32; 3])> = self.lights.iter().filter_map(|l| self.reaching(l, point)).collect();

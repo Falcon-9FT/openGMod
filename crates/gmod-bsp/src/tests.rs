@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::testmap::{BLUE, GREEN, RED};
+use crate::testmap::{BLUE, GREEN, RED, TestBrush, TestMap};
 
 fn map() -> Bsp {
     Bsp::parse("test.bsp".into(), Arc::from(testmap::bytes())).unwrap()
@@ -155,4 +155,18 @@ fn the_light_for_what_moves() {
     assert!((0..3).all(|i| sample.position[i] >= f32::from(leaf.mins[i]) && sample.position[i] <= f32::from(leaf.maxs[i])));
     // a map without them has none
     assert!(map().world_lights().is_empty());
+}
+
+#[test]
+fn hdr_ambient_light_that_holds_nothing_gives_way_to_ldr() {
+    let room = || vec![TestBrush::cuboid([-64.0, -64.0, -16.0], [64.0, 64.0, 0.0])];
+    let ldr = [[128, 128, 128, 0]; 6];
+    // as gm_construct's: one dark cube everywhere
+    let dark = TestMap { models: vec![room()], ambient: Some(ldr), ambient_hdr: Some([[1, 1, 1, 248]; 6]), ..TestMap::default() };
+    let bsp = Bsp::parse("dark.bsp".into(), Arc::from(dark.bytes())).unwrap();
+    assert_eq!(bsp.ambient_samples().unwrap().iter().flatten().next().unwrap().cube[4], [128.0 / 255.0; 3]);
+    // real HDR light is taken first
+    let bright = TestMap { models: vec![room()], ambient: Some(ldr), ambient_hdr: Some([[255, 255, 255, 0]; 6]), ..TestMap::default() };
+    let bsp = Bsp::parse("bright.bsp".into(), Arc::from(bright.bytes())).unwrap();
+    assert_eq!(bsp.ambient_samples().unwrap().iter().flatten().next().unwrap().cube[4], [1.0; 3]);
 }

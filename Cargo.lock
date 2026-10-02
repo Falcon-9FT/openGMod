@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "gmod-app"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "cpal",
  "gmod-audio",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "gmod-audio"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-fs",
  "gmod-kv",
@@ -1051,14 +1051,14 @@ dependencies = [
 
 [[package]]
 name = "gmod-bsp"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-fs",
 ]
 
 [[package]]
 name = "gmod-check"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
@@ -1073,22 +1073,22 @@ dependencies = [
 
 [[package]]
 name = "gmod-fs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-kv",
 ]
 
 [[package]]
 name = "gmod-glua"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "gmod-kv"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "gmod-lua"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-audio",
  "gmod-bsp",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "gmod-material"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-fs",
  "gmod-kv",
@@ -1116,28 +1116,28 @@ dependencies = [
 
 [[package]]
 name = "gmod-model"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-fs",
 ]
 
 [[package]]
 name = "gmod-movement"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-bsp",
 ]
 
 [[package]]
 name = "gmod-physics"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rapier3d",
 ]
 
 [[package]]
 name = "gmod-render"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "gmod-ui"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "fontdue",
  "ttf-parser",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "gmod-web"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "cef",
  "gmod-material",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "gmod-world"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",

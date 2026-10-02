@@ -317,6 +317,8 @@ pub struct TestMap {
     /// One ambient light sample in the middle of every leaf, of this cube (`ColorRGBExp32`
     /// for +x, -x, +y, -y, +z, -z), in the lumps of version 20.
     pub ambient: Option<[[u8; 4]; 6]>,
+    /// The same in the HDR lumps.
+    pub ambient_hdr: Option<[[u8; 4]; 6]>,
     pub lights: Vec<TestLight>,
 }
 
@@ -532,15 +534,20 @@ impl TestMap {
             .collect();
         let entities = format!("{{\n\"classname\" \"worldspawn\"\n}}\n{}", self.entities).into_bytes();
 
-        let (mut ambient_index, mut ambient_samples) = (Vec::new(), Vec::new());
-        if let Some(cube) = self.ambient {
-            for leaf in 0..tree.leaf_count {
-                ambient_index.extend(1u16.to_le_bytes());
-                ambient_index.extend((leaf as u16).to_le_bytes());
-                ambient_samples.extend(cube.iter().flatten());
-                ambient_samples.extend([128, 128, 128, 0]);
+        let ambient_lumps = |cube: Option<[[u8; 4]; 6]>| {
+            let (mut index, mut samples) = (Vec::new(), Vec::new());
+            if let Some(cube) = cube {
+                for leaf in 0..tree.leaf_count {
+                    index.extend(1u16.to_le_bytes());
+                    index.extend((leaf as u16).to_le_bytes());
+                    samples.extend(cube.iter().flatten());
+                    samples.extend([128, 128, 128, 0]);
+                }
             }
-        }
+            (index, samples)
+        };
+        let (ambient_index, ambient_samples) = ambient_lumps(self.ambient);
+        let (ambient_index_hdr, ambient_samples_hdr) = ambient_lumps(self.ambient_hdr);
         let mut world_lights = Vec::new();
         for light in &self.lights {
             world_lights.extend(f32s(&[light.origin, light.intensity, light.normal].concat()));
@@ -554,7 +561,9 @@ impl TestMap {
 
         let lumps: Vec<(usize, Vec<u8>, u32)> = vec![
             (15, world_lights, 0),
+            (51, ambient_index_hdr, 0),
             (52, ambient_index, 0),
+            (55, ambient_samples_hdr, 0),
             (56, ambient_samples, 0),
             (index::ENTITIES, entities, 0),
             (index::PLANES, tree.planes, 0),

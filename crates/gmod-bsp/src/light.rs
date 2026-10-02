@@ -164,11 +164,29 @@ impl Bsp {
                     .collect());
             }
         }
-        let hdr = self.raw_lump(index::LEAF_AMBIENT_INDEX_HDR);
-        let (indices, samples) = if hdr.is_empty() {
-            (self.raw_lump(index::LEAF_AMBIENT_INDEX), self.raw_lump(index::LEAF_AMBIENT_LIGHTING))
+        // the HDR samples, unless they are not there or hold nothing: some maps (gm_construct)
+        // have HDR ambient lumps next to black everywhere beside LDR ones of the real light
+        let hdr = self.ambient_samples_of(true)?;
+        if hdr.iter().any(|s| !s.is_empty()) && !holds_nothing(&hdr) {
+            return Ok(hdr);
+        }
+        let ldr = self.ambient_samples_of(false)?;
+        Ok(if ldr.iter().any(|s| !s.is_empty()) { ldr } else { hdr })
+    }
+
+    /// The ambient light samples of each leaf from the HDR lumps or the LDR ones (version 20
+    /// and later), empty for each leaf when the map has none of those.
+    pub fn ambient_samples_of(&self, hdr: bool) -> std::io::Result<Vec<Vec<AmbientSample>>> {
+        let leaf_box = |leaf: &Leaf, at: [u8; 3]| -> [f32; 3] {
+            std::array::from_fn(|i| {
+                let (lo, hi) = (f32::from(leaf.mins[i]), f32::from(leaf.maxs[i]));
+                lo + (hi - lo) * f32::from(at[i]) / 255.0
+            })
+        };
+        let (indices, samples) = if hdr {
+            (self.raw_lump(index::LEAF_AMBIENT_INDEX_HDR), self.raw_lump(index::LEAF_AMBIENT_LIGHTING_HDR))
         } else {
-            (hdr, self.raw_lump(index::LEAF_AMBIENT_LIGHTING_HDR))
+            (self.raw_lump(index::LEAF_AMBIENT_INDEX), self.raw_lump(index::LEAF_AMBIENT_LIGHTING))
         };
         if indices.is_empty() {
             return Ok(vec![Vec::new(); self.leaves.len()]);
@@ -198,4 +216,9 @@ impl Bsp {
             })
             .collect())
     }
+}
+
+/// Whether samples hold no light worth the name: all of them next to black.
+fn holds_nothing(samples: &[Vec<AmbientSample>]) -> bool {
+    samples.iter().flatten().flat_map(|s| s.cube.iter().flatten()).all(|&v| v < 0.01)
 }
