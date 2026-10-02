@@ -23,6 +23,10 @@
 //!   moves or where the ladder was - there is no gravity either: the player hangs on it, and
 //!   moves at 200 units a second where they look, what goes into the ladder turned upward (so
 //!   looking down and walking at it goes down). Jump pushes them off it.
+//! * Noclip ([`Player::noclip`]) flies where the player looks, through everything: the
+//!   speed builds up by `noclip_accelerate` toward `noclip_speed` times the player's speed and
+//!   bleeds off by friction, never by less than a quarter of that top speed a second times
+//!   the friction, so that letting go stops the player quickly.
 //!
 //! Not yet: ladders of HL2 that are used (`func_useableladder`), ground that moves, the push
 //! of conveyors and triggers, jumping out of water onto a ledge.
@@ -126,6 +130,10 @@ pub struct Settings {
     /// The eyes over the feet, standing and ducked.
     pub view_height: f32,
     pub duck_view_height: f32,
+    /// Noclip goes this many times the player's speed (`sv_noclipspeed`), speeding up by
+    /// `sv_noclipaccelerate`.
+    pub noclip_speed: f32,
+    pub noclip_accelerate: f32,
 }
 
 impl Default for Settings {
@@ -150,6 +158,8 @@ impl Default for Settings {
             duck_hull: ([-16.0, -16.0, 0.0], [16.0, 16.0, 36.0]),
             view_height: 64.0,
             duck_view_height: 28.0,
+            noclip_speed: 5.0,
+            noclip_accelerate: 5.0,
         }
     }
 }
@@ -335,6 +345,29 @@ impl Player {
         } else {
             self.walk(world, settings, command, pressed, speed, seconds);
         }
+    }
+
+    /// One tick of noclip: flying where the player looks, up and down included, through
+    /// everything and without gravity. Running (`+speed`) flies at the running speed.
+    pub fn noclip(&mut self, settings: &Settings, command: &Command, seconds: f32) {
+        self.buttons = command.buttons;
+        self.on_ground = false;
+        self.ladder = None;
+        let [pitch, yaw, _] = command.angles.map(f32::to_radians);
+        let ((sp, cp), (sy, cy)) = (pitch.sin_cos(), yaw.sin_cos());
+        let wish = add(scale([cp * cy, cp * sy, -sp], command.forward_move), scale([sy, -cy, 0.0], command.side_move));
+        let top = if command.buttons & buttons::SPEED != 0 { settings.run_speed } else { settings.walk_speed } * settings.noclip_speed;
+        let len = length(wish);
+        let (direction, wanted) = if len > 0.0 { (scale(wish, 1.0 / len), len.min(top)) } else { ([0.0; 3], 0.0) };
+        self.accelerate(direction, wanted, settings.noclip_accelerate, seconds);
+        let speed = length(self.velocity);
+        if speed < 1.0 {
+            self.velocity = [0.0; 3];
+            return;
+        }
+        let slower = (speed - speed.max(top / 4.0) * settings.friction * seconds).max(0.0);
+        self.velocity = scale(self.velocity, slower / speed);
+        self.origin = add(self.origin, scale(self.velocity, seconds));
     }
 
     /// A player inside something - put there, or left there by a moving brush - is moved to
