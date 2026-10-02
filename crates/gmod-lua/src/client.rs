@@ -552,8 +552,36 @@ pub(crate) fn screen_to_vector(lua: &Lua, x: f32, y: f32) -> Vector {
     (forward + right * dx + up * dy).normalized()
 }
 
+/// Where a point of the world is on the screen, in pixels, as the view sees it, and whether
+/// it is in front of the eyes - [`screen_to_vector`] the other way.
+pub(crate) fn to_screen(lua: &Lua, point: Vector) -> (f32, f32, bool) {
+    let host = host(lua);
+    let view = host.client.view.get();
+    let (w, h) = host.screen.size.get();
+    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+    let half = (view.fov.to_radians() / 2.0).tan() * (w / h) / (4.0 / 3.0);
+    let (forward, right, up) = view.angles.vectors();
+    let d = point - view.origin;
+    let depth = d.dot(forward);
+    let (sx, sy) = if depth.abs() < 1e-4 { (0.0, 0.0) } else { (d.dot(right) / depth / half, d.dot(up) / depth / (half * h / w)) };
+    let x = (sx + 1.0) * w / 2.0;
+    let y = (1.0 - sy) * h / 2.0;
+    let visible = depth > 0.0 && (0.0..=w).contains(&x) && (0.0..=h).contains(&y);
+    (x, y, visible)
+}
+
 pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     let globals = lua.globals();
+    let vector_meta = crate::meta::meta_table(lua, "Vector", crate::meta::type_id::VECTOR)?;
+    def(lua, &vector_meta, "ToScreen", |a| {
+        let point = a.userdata::<Vector>(1, "Vector")?;
+        let (x, y, visible) = to_screen(a.lua, point);
+        let t = a.lua.create_table()?;
+        t.raw_set("x", x)?;
+        t.raw_set("y", y)?;
+        t.raw_set("visible", visible)?;
+        Ok(Value::Table(t))
+    })?;
     def(lua, &globals, "LocalPlayer", |a| entity::push(a.lua, host(a.lua).client.local_player.get()))?;
     def(lua, &globals, "GetViewEntity", |a| entity::push(a.lua, host(a.lua).client.local_player.get()))?;
     def(lua, &globals, "EyePos", |a| userdata(a.lua, host(a.lua).client.view.get().origin))?;

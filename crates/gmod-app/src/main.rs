@@ -751,9 +751,6 @@ impl App {
     /// A frame of the main menu: Chromium's work, the menu's Lua when it shows, and what it
     /// asked of the engine.
     fn menu_frame(&mut self, seconds: f32) {
-        if let Some(web) = &self.web {
-            web.pump();
-        }
         self.report_menu();
         let Some(menu) = &self.menu else { return };
         if self.menu_shown()

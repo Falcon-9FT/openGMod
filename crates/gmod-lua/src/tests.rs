@@ -2474,3 +2474,21 @@ fn html_panels_show_pages_and_talk_to_them() {
     g.runtime.paint(0.016);
     assert_eq!(Rc::strong_count(&page), 2, "the page went with its panel");
 }
+
+#[test]
+fn points_of_the_world_on_the_screen() {
+    let g = client_game(&[]);
+    g.runtime.set_view(crate::client::View {
+        origin: crate::vector::Vector::new(0.0, 0.0, 0.0),
+        angles: crate::vector::Angle::default(),
+        fov: 90.0,
+    });
+    // straight ahead is the middle of the screen; behind is not seen
+    assert!(g.eval::<bool>(
+        "local s = Vector(100, 0, 0):ToScreen() return math.abs(s.x - 320) < 0.5 and math.abs(s.y - 240) < 0.5 and s.visible"
+    ));
+    assert!(g.eval::<bool>("local s = Vector(100, 0, 20):ToScreen() return s.y < 240 and s.visible"));
+    assert!(g.eval::<bool>("return not Vector(-100, 0, 0):ToScreen().visible"));
+    // keys that are numbers are numbers, whole or not
+    assert!(g.eval::<bool>("local t = util.KeyValuesToTable('\"r\" { \"1\" \"a\" \"2.5\" \"b\" }') return t[1] == 'a' and t[2.5] == 'b'"));
+}

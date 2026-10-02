@@ -16,7 +16,10 @@
 //! ([`Files`]): `asset://garrysmod/html/menu.html` is the main menu.
 //!
 //! CEF runs pages in processes of their own, started from the program itself: [`subprocess`]
-//! must be the first thing the program does.
+//! must be the first thing the program does. In the program, Chromium has a thread of its own
+//! for its work (its "UI" thread): the program's window and its messages are left alone, which
+//! on Windows a Chromium pumped from inside the window's own messages does not do. What
+//! Chromium tells comes on that thread and waits behind a lock until the program takes it.
 
 // The wrappers CEF's crate makes for handlers are unsafe inside; this crate's own unsafe is in
 // two places, each with why it is sound: reading a picture and writing a file's bytes.
@@ -25,16 +28,19 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use cef::rc::Rc as _;
 use cef::{
     App, Browser, BrowserSettings, CefString, Client, CommandLine, DisplayHandler, ImplApp, ImplBrowser, ImplBrowserHost, ImplClient,
     ImplCommandLine, ImplDisplayHandler, ImplFrame, ImplLifeSpanHandler, ImplLoadHandler, ImplRenderHandler, ImplRequest,
-    ImplResourceHandler, ImplResponse, ImplSchemeHandlerFactory, ImplSchemeRegistrar, KeyEvent, KeyEventType, LifeSpanHandler, LoadHandler,
-    LogSeverity, MouseButtonType, MouseEvent, PaintElementType, Rect, RenderHandler, Request, ResourceHandler, ResourceReadCallback,
-    Response, SchemeHandlerFactory, SchemeOptions, SchemeRegistrar, ScreenInfo, Settings, WindowInfo, WrapApp, WrapClient,
-    WrapDisplayHandler, WrapLifeSpanHandler, WrapLoadHandler, WrapRenderHandler, WrapResourceHandler, WrapSchemeHandlerFactory,
+    ImplResourceHandler, ImplResponse, ImplSchemeHandlerFactory, ImplSchemeRegistrar, ImplTask, KeyEvent, KeyEventType, LifeSpanHandler,
+    LoadHandler, LogSeverity, MouseButtonType, MouseEvent, PaintElementType, Rect, RenderHandler, Request, ResourceHandler,
+    ResourceReadCallback, Response, SchemeHandlerFactory, SchemeOptions, SchemeRegistrar, ScreenInfo, Settings, Task, ThreadId, WindowInfo,
+    WrapApp, WrapClient, WrapDisplayHandler, WrapLifeSpanHandler, WrapLoadHandler, WrapRenderHandler, WrapResourceHandler,
+    WrapSchemeHandlerFactory, WrapTask,
 };
 
 /// What `asset://` serves: the bytes of a file, by the URL's host and its path.
@@ -248,7 +254,8 @@ fn user_agent_product() -> String {
 
 /// Chromium, started.
 pub struct Web {
-    _private: (),
+    /// A cache of this process's own, removed when Chromium is done.
+    own_cache: Option<std::path::PathBuf>,
 }
 
 impl Web {
@@ -257,10 +264,17 @@ impl Web {
     /// Chromium's own log goes to `log`.
     pub fn start(cache: &Path, log: &Path, files_from: Files) -> Result<Web, String> {
         let _ = files().set(files_from);
+        // a cache another Chromium holds (another openGMOD, or what is left of one that hung)
+        // cannot be shared: this one gets a folder of its own beside it
+        let own_cache = cache_in_use(cache).then(|| cache.join(format!("process-{}", std::process::id())));
+        if let Some(own) = &own_cache {
+            println!("Chromium's cache is in use by another program: {} is used", own.display());
+        }
+        let cache = own_cache.as_deref().unwrap_or(cache);
         let args = cef::args::Args::new();
         let settings = Settings {
             windowless_rendering_enabled: 1,
-            external_message_pump: 1,
+            multi_threaded_message_loop: 1,
             no_sandbox: 1,
             root_cache_path: CefString::from(cache.to_string_lossy().as_ref()),
             cache_path: CefString::from(cache.join("default").to_string_lossy().as_ref()),
@@ -277,29 +291,19 @@ impl Web {
         }
         let mut factory = AssetFactory::new();
         cef::register_scheme_handler_factory(Some(&"asset".into()), None, Some(&mut factory));
-        Ok(Web { _private: () })
+        Ok(Web { own_cache })
     }
 
-    /// Lets Chromium do what it has to: call often, every frame.
-    pub fn pump(&self) {
-        cef::do_message_loop_work();
-    }
-
-    /// A new page, `width` by `height` pixels, empty.
+    /// A new page, `width` by `height` pixels, empty. Made on Chromium's thread, as it must
+    /// be; none when it is not made within a few seconds.
     pub fn page(&self, width: u32, height: u32) -> Option<Page> {
         let shared: Shared = Arc::new(Mutex::new(State { size: (width.max(1), height.max(1)), ..State::default() }));
-        let window = WindowInfo { windowless_rendering_enabled: 1, ..Default::default() };
-        let settings = BrowserSettings { windowless_frame_rate: 60, background_color: 0, ..Default::default() };
-        let mut client = PageClient::new(
-            PageRender::new(shared.clone()),
-            PageDisplay::new(shared.clone()),
-            PageLoad::new(shared.clone()),
-            PageLife::new(),
-        );
-        let browser =
-            cef::browser_host_create_browser_sync(Some(&window), Some(&mut client), Some(&"".into()), Some(&settings), None, None)?;
-        OPEN.fetch_add(1, Ordering::SeqCst);
-        pages().lock().unwrap_or_else(|e| e.into_inner()).insert(browser.identifier(), shared.clone());
+        let (send, receive) = sync_channel(1);
+        let mut task = MakePage::new(Arc::new(Mutex::new(Some((shared.clone(), send)))));
+        if cef::post_task(ThreadId::UI, Some(&mut task)) != 1 {
+            return None;
+        }
+        let browser = receive.recv_timeout(Duration::from_secs(10)).ok()??;
         Some(Page { browser, shared })
     }
 }
@@ -309,10 +313,60 @@ impl Drop for Web {
         // the pages dropped before close as Chromium gets to it: a few seconds at most
         let started = std::time::Instant::now();
         while OPEN.load(Ordering::SeqCst) > 0 && started.elapsed().as_secs() < 3 {
-            cef::do_message_loop_work();
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(5));
         }
         cef::shutdown();
+        if let Some(dir) = &self.own_cache {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Whether a Chromium is using the cache in `dir`: it holds `lockfile` open on Windows, and has
+/// `SingletonLock` point to its process elsewhere.
+fn cache_in_use(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let lock = dir.join("lockfile");
+        lock.exists() && std::fs::OpenOptions::new().write(true).share_mode(0).open(&lock).is_err()
+    }
+    #[cfg(not(windows))]
+    {
+        // `<host>-<pid>`, the process that holds it
+        let Ok(target) = std::fs::read_link(dir.join("SingletonLock")) else { return false };
+        let pid = target.to_string_lossy().rsplit('-').next().and_then(|p| p.parse::<u32>().ok());
+        pid.is_some_and(|pid| pid != std::process::id() && Path::new(&format!("/proc/{pid}")).exists())
+    }
+}
+
+/// Makes a page on Chromium's thread and sends it back.
+type PageOrder = Arc<Mutex<Option<(Shared, SyncSender<Option<Browser>>)>>>;
+
+cef::wrap_task! {
+    struct MakePage {
+        order: PageOrder,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Some((shared, send)) = self.order.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+            let window = WindowInfo { windowless_rendering_enabled: 1, ..Default::default() };
+            let settings = BrowserSettings { windowless_frame_rate: 60, background_color: 0, ..Default::default() };
+            let mut client = PageClient::new(
+                PageRender::new(shared.clone()),
+                PageDisplay::new(shared.clone()),
+                PageLoad::new(shared.clone()),
+                PageLife::new(),
+            );
+            let browser =
+                cef::browser_host_create_browser_sync(Some(&window), Some(&mut client), Some(&"".into()), Some(&settings), None, None);
+            if let Some(browser) = &browser {
+                OPEN.fetch_add(1, Ordering::SeqCst);
+                pages().lock().unwrap_or_else(|e| e.into_inner()).insert(browser.identifier(), shared);
+            }
+            let _ = send.send(browser);
+        }
     }
 }
 

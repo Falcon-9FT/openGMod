@@ -200,8 +200,11 @@ pub(crate) fn kv_block(lua: &Lua, block: &gmod_kv::Block, ordered: bool, keep_ca
             entry.raw_set("Value", value)?;
             table.raw_push(entry)?;
         } else {
+            // a key that is a number is one, as `tonumber` takes it: a table of entries numbered
+            // 1, 2, 2.5 ... is sorted by number, not half by text
             let key = match lua.coerce_number(Value::String(lua.create_string(&key)?))? {
-                Some(n) if n == n.trunc() => Value::Integer(n as i64),
+                Some(n) if n == n.trunc() && n.abs() < 9e15 => Value::Integer(n as i64),
+                Some(n) if n.is_finite() => Value::Number(n),
                 _ => Value::String(lua.create_string(&key)?),
             };
             table.raw_set(key, value)?;

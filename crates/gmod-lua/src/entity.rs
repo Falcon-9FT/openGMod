@@ -808,6 +808,23 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         set_world_pos(a.lua, handle, a.userdata::<Vector>(2, "Vector")?);
         Ok(Value::Nil)
     })?;
+    // down to what is below, up to 256 units, as the engine's UTIL_DropToFloor
+    def("DropToFloor", |a| {
+        let handle = this(a, 1)?;
+        let pos = transform(a)?.0;
+        let (mins, maxs) = read(a, |ent| (ent.mins, ent.maxs))?;
+        let sweep = crate::trace::Sweep {
+            mins,
+            maxs,
+            mask: gmod_bsp::mask::SOLID,
+            ..crate::trace::Sweep::line(pos, pos - Vector::new(0.0, 0.0, 256.0), crate::trace::Filter::Entities(vec![handle]))
+        };
+        let hit = crate::trace::trace(a.lua, &sweep);
+        if !hit.all_solid && hit.fraction < 1.0 {
+            set_world_pos(a.lua, handle, hit.end);
+        }
+        Ok(Value::Nil)
+    })?;
     def("SetAngles", |a| {
         let handle = this(a, 1)?;
         set_world_angles(a.lua, handle, a.userdata::<Angle>(2, "Angle")?);

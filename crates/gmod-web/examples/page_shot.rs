@@ -27,7 +27,6 @@ fn main() {
     let start = Instant::now();
     let mut picture = None;
     while start.elapsed().as_secs_f64() < seconds {
-        web.pump();
         for event in page.take_events() {
             println!("{event:?}");
             // the menu's phrases, answered as the game would
@@ -47,7 +46,6 @@ fn main() {
     std::fs::write(out, gmod_material::png::encode(picture.width, picture.height, 4, &picture.rgba)).expect("write");
     drop(page);
     for _ in 0..50 {
-        web.pump();
         std::thread::sleep(Duration::from_millis(10));
     }
 }
