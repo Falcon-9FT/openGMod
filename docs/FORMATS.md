@@ -90,6 +90,36 @@ Valve: многотомных, однофайловых, с preload, подпи�
 
 Реализация: `gmod-kv`.
 
+## Схемы VGUI и раскладка HUD
+
+Схемы — `resource/SourceScheme.res`, `ClientScheme.res`, `ChatScheme.res` — это KeyValues, в
+корневом блоке которых:
+
+* `Colors` — именованные цвета, `"r g b a"` (`a` можно не писать — 255);
+* `BaseSettings` — цвета элементов (`FgColor`, `BgColor`, `FgColorHud`, `DamagedFg`...): цвет
+  или имя цвета из `Colors` или из самого `BaseSettings`;
+* `Fonts` — шрифты по именам (`Default`, `HudNumbers`, `Trebuchet24`...). Шрифт — блок
+  вариантов (`"1" { ... }`, `"2" { ... }`): `name` (семейство), `tall` (высота ячейки в
+  пикселях, вместе с выносными элементами), `weight`, флаги `antialias`, `additive`,
+  `dropshadow`, `outline`, `italic`, `underline`, `strikeout`, `symbol` (0 или 1), `blur` и
+  `scanlines` (в пикселях), `yres "600 767"` — вариант для экранов такой высоты.
+
+Условия (`[$WIN32]`, `[$OSX]`...) вычисляются как на ПК: `$WIN32` — любой ПК. Шрифт по имени
+берёт вариант, чей `yres` подходит экрану, иначе вариант без `yres`, иначе первый. Шрифты HUD
+пропорциональные: если ни один `yres` не подходит, вариант без `yres` (или первый)
+растягивается с экрана высотой 480 пикселей на настоящий (`tall`, `blur` и `scanlines` ×
+высота экрана / 480).
+
+`scripts/HudLayout.res` — где стоят элементы HUD: блоки `HudHealth`, `HudSuit`, `HudAmmo`,
+`HudAmmoSecondary` с `xpos`, `ypos`, `wide`, `tall`, `visible` и местами надписи, числа и
+малого числа внутри (`text_xpos`/`text_ypos`, `digit_xpos`/`digit_ypos`,
+`digit2_xpos`/`digit2_ypos`). Единица — пиксель экрана высотой 480, на экране высотой 1080 она
+равна 2,25 пикселя. Координата — число от левого или верхнего края, `r150` — от правого или
+нижнего, `c-20` — от центра. Чего в файле нет, берётся из раскладки Half-Life 2 в том виде, в
+каком её оставила GMod.
+
+Реализация: `gmod-lua::surface` (шрифты схем), `gmod-lua::hud` (раскладка и цвета HUD).
+
 ## `gameinfo.txt` и `cfg/mount.cfg`
 
 `GameInfo/FileSystem/SearchPaths` — строки вида `ids  путь`:
