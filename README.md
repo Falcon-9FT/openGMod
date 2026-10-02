@@ -110,8 +110,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Внешние зависимости есть у рендера и окна (`gmod-render`, `gmod-app`: wgpu и winit) и у
-Lua-рантайма (`gmod-lua`: mlua, LuaJIT собирается из исходников компилятором C, на Windows —
-MSVC). Остальные crate'ы обходятся стандартной библиотекой. Физика добавит Jolt (C++,
+Lua-рантайма (`gmod-lua`: mlua и rusqlite; LuaJIT и SQLite собираются из исходников
+компилятором C, на Windows — MSVC). Остальные crate'ы обходятся стандартной библиотекой. Физика добавит Jolt (C++,
 собирается через CMake).
 
 ## Устройство репозитория

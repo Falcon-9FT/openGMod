@@ -17,9 +17,9 @@
 //! * the console ([`console`]): `print`, `Msg`, `MsgN`, `MsgC`, `ErrorNoHalt` and the error
 //!   reports GMod prints when a script fails, handed to the program through [`Output`].
 //! * the engine's types and libraries: [`meta`] (`FindMetaTable`, `TYPE_*`), [`vector`]
-//!   (`Vector`, `Angle`), [`entity`] (`NULL`, the metatables of `Entity`, `Player` ...),
+//!   (`Vector`, `Angle`), [`matrix`] (`VMatrix`), [`entity`] (`NULL`, the metatables of `Entity`, `Player` ...),
 //!   [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
-//!   (`file`, `File`), [`util`], [`net`], [`material`] (`Material`), [`engine`] (`game`,
+//!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`material`] (`Material`), [`engine`] (`game`,
 //!   `engine`, `system`, `gmod`, the enumerations), and [`world`] (`ents`, `player` ... as
 //!   they answer while there are no entities). They grow towards the whole API - `gmod-check
 //!   lua` counts how much of it is there.
@@ -48,9 +48,11 @@ pub mod entity;
 pub mod files;
 pub mod filesystem;
 pub mod material;
+pub mod matrix;
 pub mod meta;
 pub mod net;
 pub mod sandbox;
+pub mod sql;
 mod startup;
 pub mod timer;
 pub mod util;
@@ -198,6 +200,7 @@ pub(crate) struct Host {
     pub network_strings: util::NetworkStrings,
     pub ai_names: world::AiNames,
     pub net: net::Net,
+    pub database: sql::Database,
 }
 
 impl Host {
@@ -260,6 +263,7 @@ impl Runtime {
             network_strings: util::NetworkStrings::default(),
             ai_names: world::AiNames::default(),
             net: net::Net::default(),
+            database: sql::Database::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -270,10 +274,12 @@ impl Runtime {
         convar::install(&lua)?;
         filesystem::install(&lua)?;
         vector::install(&lua)?;
+        matrix::install(&lua)?;
         entity::install(&lua, realm)?;
         util::install(&lua)?;
         material::install(&lua)?;
         world::install(&lua)?;
+        sql::install(&lua)?;
         net::install(&lua, realm)?;
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
@@ -295,9 +301,11 @@ impl Runtime {
     }
 
     /// openGMOD's own folder: its `data/` is the `DATA` search path of the `file` library,
-    /// the only place Lua writes to.
+    /// the only place Lua writes to, and the `sql` database is in it ([`sql::file_name`]).
     pub fn set_data_dir(&self, dir: gmod_fs::UserDir) {
-        *host(&self.lua).data_dir.borrow_mut() = Some(dir);
+        let host = host(&self.lua);
+        *host.data_dir.borrow_mut() = Some(dir);
+        host.database.close();
     }
 
     /// Runs the file the engine starts the realm with ([`Realm::init_file`]). False if it

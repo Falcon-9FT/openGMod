@@ -276,6 +276,135 @@ fn angles() {
 }
 
 #[test]
+fn matrices() {
+    let g = game(Realm::Server, &[]);
+    let near = |code: &str, expected: &[f64]| {
+        let got: Vec<f64> = g.eval::<mlua::Variadic<f64>>(code).to_vec();
+        assert_eq!(got.len(), expected.len(), "{code}: {got:?}");
+        for (got_one, want) in got.iter().zip(expected) {
+            assert!((got_one - want).abs() < 1e-4, "{code}: {got:?}");
+        }
+    };
+    assert!(g.eval::<bool>("local m = Matrix() return m:IsIdentity() and m:IsRotationMatrix() and not m:IsZero()"));
+    assert!(g.eval::<bool>("return getmetatable(Matrix()) == FindMetaTable('VMatrix') and getmetatable(Matrix()).MetaID == TYPE_MATRIX"));
+    near(
+        "return Matrix({{1, 2, 3, 4}, {5, 6, 7, 8}}):Unpack()",
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    );
+    near("local m = Matrix() m:SetField(2, 4, 7) return m:GetField(2, 4), m:GetTranslation():Unpack()", &[7.0, 0.0, 7.0, 0.0]);
+    // the axes of an angle; right is the second column negated
+    near("local m = Matrix() m:SetAngles(Angle(0, 90, 0)) return m:GetForward():Unpack()", &[0.0, 1.0, 0.0]);
+    near("local m = Matrix() m:SetAngles(Angle(0, 90, 0)) return m:GetRight():Unpack()", &[1.0, 0.0, 0.0]);
+    near("local m = Matrix() m:SetAngles(Angle(0, 90, 0)) return m:GetField(1, 2), m:GetField(2, 2)", &[-1.0, 0.0]);
+    near("local m = Matrix() m:SetAngles(Angle(10, 20, 30)) return m:GetAngles():Unpack()", &[10.0, 20.0, 30.0]);
+    near("local m = Matrix() m:SetAngles(Angle(-90, 45, 0)) return m:GetAngles():Unpack()", &[-90.0, 45.0, 0.0]);
+    // a point is turned, then moved; methods multiply on the right
+    near(
+        "local m = Matrix() m:SetTranslation(Vector(10, 0, 0)) m:Rotate(Angle(0, 90, 0)) return (m * Vector(1, 0, 0)):Unpack()",
+        &[10.0, 1.0, 0.0],
+    );
+    near(
+        "local m = Matrix() m:Translate(Vector(1, 2, 3)) m:Translate(Vector(1, 1, 1)) return m:GetTranslation():Unpack()",
+        &[2.0, 3.0, 4.0],
+    );
+    near("local m = Matrix() m:Scale(Vector(2, 3, 4)) return (m * Vector(1, 1, 1)):Unpack()", &[2.0, 3.0, 4.0]);
+    near("local m = Matrix() m:SetAngles(Angle(0, 30, 0)) m:SetScale(Vector(2, 2, 2)) return m:GetScale():Unpack()", &[2.0, 2.0, 2.0]);
+    near("local m = Matrix() m:SetAngles(Angle(0, 30, 0)) m:SetScale(Vector(2, 2, 2)) return m:GetAngles():Unpack()", &[0.0, 30.0, 0.0]);
+    near("local m = Matrix() m:SetTranslation(Vector(1, 2, 3)) m:ScaleTranslation(2) return m:GetTranslation():Unpack()", &[2.0, 4.0, 6.0]);
+    // inverses
+    near(
+        "local m = Matrix() m:SetAngles(Angle(10, 20, 30)) m:SetTranslation(Vector(5, 6, 7)) m:Scale(Vector(2, 1, 3))
+         local i = m:GetInverse() return (i * (m * Vector(1, 2, 3))):Unpack()",
+        &[1.0, 2.0, 3.0],
+    );
+    near(
+        "local m = Matrix() m:SetAngles(Angle(10, 20, 30)) m:SetTranslation(Vector(5, 6, 7))
+         local i = Matrix() i:Set(m) i:InvertTR() return (i * m):Unpack()",
+        &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    );
+    assert!(
+        g.eval::<bool>("local m = Matrix() m:Zero() return m:IsZero() and m:GetInverse() == nil and m:Invert() == false and m:IsZero()")
+    );
+    assert!(g.eval::<bool>(
+        "local m = Matrix() m:Scale(Vector(2, 2, 2)) return m:Invert() and m:GetField(1, 1) == 0.5 and not m:IsRotationMatrix()"
+    ));
+    // arithmetic and conversions
+    near("return (Matrix() + Matrix() - Matrix()):GetField(1, 1), (-Matrix()):GetField(2, 2)", &[1.0, -1.0]);
+    near("local m = Matrix() m:Add(Matrix()) m:Sub(Matrix({{0, 0, 0, 1}})) return m:GetField(1, 1), m:GetField(1, 4)", &[2.0, -1.0]);
+    near("local m = Matrix({{1, 2}, {3, 4}}) return m:GetTransposed():GetField(1, 2), m:ToTable()[2][1]", &[3.0, 3.0]);
+    near(
+        "local m = Matrix() m:SetUnpacked(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16) return Matrix(m:ToTable()):GetField(4, 3)",
+        &[15.0],
+    );
+    assert!(g.eval::<bool>("return Matrix() == Matrix() and Matrix() ~= Matrix({{2}})"));
+    assert!(g.eval::<String>("return tostring(Matrix())").starts_with("[1.000000,\t0.000000,\t0.000000,\t0.000000]\n"));
+    let error = g.runtime.lua().load("Matrix():GetField(5, 1)").exec().unwrap_err().to_string();
+    assert!(error.contains("bad argument #2 to 'GetField'"), "{error}");
+
+    // over the network, sixteen floats
+    let server = game(Realm::Server, &[]);
+    server
+        .runtime
+        .run_string("util.AddNetworkString('m') net.Start('m') net.WriteMatrix(Matrix({{1, 2, 3, 4}})) net.Broadcast()", "send")
+        .unwrap();
+    let message = server.runtime.take_net_messages().remove(0);
+    assert_eq!(message.data.len, 16 * 32);
+    let client = game(Realm::Client, &[]);
+    client.runtime.run_string("function net.Incoming() net.ReadHeader() print(net.ReadMatrix():GetField(1, 4)) end", "receive").unwrap();
+    client.runtime.receive_net_message(&message.name, &message.data, entity::EntityHandle::NULL);
+    assert_eq!(client.printed(), "4\n");
+}
+
+#[test]
+fn sql_database() {
+    let g = game(Realm::Server, &[]);
+    let home = TempDir::new();
+    g.runtime.set_data_dir(gmod_fs::UserDir::open(&home.0, None).unwrap());
+    g.runtime
+        .run_string(
+            r#"
+            print(sql.Query("CREATE TABLE t (id INTEGER, name TEXT, score REAL, note TEXT); INSERT INTO t VALUES (1, 'a', 1.5, NULL);"))
+            print(sql.Query("INSERT INTO t VALUES (2, 'b', 2, 'x'); -- a comment"))
+            local rows = sql.Query("SELECT * FROM t ORDER BY id")
+            print(#rows, rows[1].id, type(rows[1].id), rows[1].name, rows[1].score, rows[1].note, rows[2].score)
+            print(sql.Query("SELECT * FROM t WHERE id = 3"), sql.Query("SELECT nope"), sql.m_strError)
+            local typed = sql.QueryTyped("SELECT * FROM t WHERE name = ? OR id = ? ORDER BY id", "b", 1)
+            print(#typed, typed[1].id, type(typed[1].id), typed[1].note, typed[2].note, typed[2].score)
+            print(#sql.QueryTyped("SELECT * FROM t WHERE id = ?", 9), sql.QueryTyped("SELECT ?", 1, 2))
+            local row = sql.QueryTyped("SELECT ? AS yes, ? AS none, 9007199254740993 AS big", true, nil)[1]
+            print(row.yes, row.none, row.big, type(row.big))
+            print(sql.QueryTyped("SELECT 1; SELECT 2"))
+            print(sql.Query("ATTACH DATABASE 'other.db' AS other"), sql.Query("VACUUM INTO 'copy.db'"), sql.Query("VACUUM"))
+            "#,
+            "sql",
+        )
+        .unwrap();
+    let printed = g.printed();
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(lines[0], "nil");
+    assert_eq!(lines[1], "nil");
+    assert_eq!(lines[2], "2\t1\tstring\ta\t1.5\tNULL\t2.0");
+    assert_eq!(lines[3], "nil\tfalse\tno such column: nope");
+    assert_eq!(lines[4], "2\t1\tnumber\tnil\tx\t2");
+    assert_eq!(lines[5], "0\tfalse");
+    assert_eq!(lines[6], "1\tnil\t9007199254740993\tstring");
+    assert_eq!(lines[7], "false");
+    assert_eq!(lines[8], "false\tfalse\tfalse");
+    assert!(!home.0.join("other.db").exists() && !home.0.join("copy.db").exists());
+    let error = g.runtime.lua().load("sql.QueryTyped('SELECT ?', {})").exec().unwrap_err().to_string();
+    assert!(error.contains("bad argument #2 to 'QueryTyped'"), "{error}");
+
+    // the database is a file in openGMOD's folder, there for the next runtime
+    assert!(home.0.join(sql::file_name(Realm::Server)).is_file());
+    let again = game(Realm::Server, &[]);
+    again.runtime.set_data_dir(gmod_fs::UserDir::open(&home.0, None).unwrap());
+    assert_eq!(again.eval::<String>("return sql.Query('SELECT name FROM t WHERE id = 2')[1].name"), "b");
+    // without the folder, in memory
+    let memory = game(Realm::Client, &[]);
+    assert!(memory.eval::<bool>("return sql.Query('CREATE TABLE x (a)') == nil and sql.Query('SELECT * FROM x') == nil"));
+}
+
+#[test]
 fn timers_and_hooks() {
     let g = game(
         Realm::Server,
@@ -479,7 +608,7 @@ fn empty_world() {
         "return FindMetaTable('Player').MetaName == 'Player' and FindMetaTable('Player').MetaBaseClass == FindMetaTable('Entity')"
     ));
     assert!(g.eval::<bool>("return FindMetaTable('Panel') == nil"), "panels are the client's");
-    assert!(g.eval::<bool>("return sql.Query('SELECT 1') == false and sql.m_strError ~= nil and HTTP({}) == false"));
+    assert!(g.eval::<bool>("return HTTP({}) == false"));
     assert!(g.eval::<bool>("return ai.GetScheduleID('a') == ai.GetScheduleID('a') and ai.GetScheduleID('a') ~= ai.GetScheduleID('b')"));
     let error = g.runtime.lua().load("NULL.x = 1").exec().unwrap_err().to_string();
     assert!(error.contains("Tried to use a NULL entity!"), "{error}");

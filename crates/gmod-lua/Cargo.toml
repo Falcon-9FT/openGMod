@@ -12,3 +12,4 @@ gmod-kv.workspace = true
 gmod-material.workspace = true
 gmod-glua.workspace = true
 mlua.workspace = true
+rusqlite.workspace = true

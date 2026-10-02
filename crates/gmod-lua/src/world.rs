@@ -1,5 +1,5 @@
 //! The libraries about the world - `ents`, `player`, `ai`, `motionsensor` - as they answer while
-//! the world is empty, and the engine's services that are not there yet (`sql`, `HTTP`).
+//! the world is empty, and the engine's service that is not there yet (`HTTP`).
 //!
 //! Entities come with stage 4: until then the server has no entities and no players, and
 //! these functions say exactly that (`player.GetAll()` is `{}`, `Entity(1)` is `NULL`). What
@@ -14,9 +14,6 @@ use mlua::{Lua, MultiValue, Table, Value};
 use crate::args::Args;
 use crate::entity::EntityHandle;
 use crate::host;
-
-/// What `sql.Query` answers until openGMOD has SQLite.
-const NO_SQL: &str = "openGMOD has no SQLite yet";
 
 /// Schedule and task names of `ai.GetScheduleID` and `ai.GetTaskID`, numbered as they come.
 #[derive(Default)]
@@ -114,14 +111,6 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         def(lua, &motionsensor, name, nothing)?;
     }
     globals.raw_set("motionsensor", motionsensor)?;
-
-    let sql = lua.create_table()?;
-    def(lua, &sql, "Query", |a| {
-        let sql: Table = a.lua.globals().get("sql")?;
-        sql.raw_set("m_strError", NO_SQL)?;
-        Ok(Value::Boolean(false))
-    })?;
-    globals.raw_set("sql", sql)?;
 
     // no requests go out yet: HTTP says it could not make one
     def(lua, &globals, "HTTP", no)?;
