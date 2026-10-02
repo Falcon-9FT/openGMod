@@ -96,7 +96,7 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     def(lua, &game, "IsDedicated", |_| Ok(Value::Boolean(false)))?;
     def(lua, &game, "GetMap", |a| string(a, &host(a.lua).game.map.borrow()))?;
     def(lua, &game, "GetIPAddress", |a| string(a, "loopback"))?;
-    def(lua, &game, "GetWorld", |a| Ok(Value::UserData(a.lua.create_userdata(EntityHandle { index: Some(0) })?)))?;
+    def(lua, &game, "GetWorld", |a| crate::entity::push(a.lua, EntityHandle::WORLD))?;
     def(lua, &game, "ConsoleCommand", |a| {
         let line = a.string(1)?;
         host(a.lua).console_buffer(line);

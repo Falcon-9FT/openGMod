@@ -155,7 +155,7 @@ cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, з
 | аддоны и воркшоп: подписки Steam, `appworkshop_4000.acf`, `addons/*.gma`, распаковка `.bin` (LZMA) | `gmod-fs::workshop` | готово; не учитывается ещё выключение аддона в меню |
 | KeyValues | `gmod-kv` | готово; `#base`/`#include` пока только распознаются |
 | диалект Lua | `gmod-glua` | готово |
-| Lua-рантайм: LuaJIT, `include`, `AddCSLuaFile`, `hook`, `timer`, реалмы | `gmod-lua` | сервер запускает `sandbox` без ошибок; есть `VMatrix`, SQLite и `HTTP`; нет мира (энтити — этап 4), клиентских библиотек (этап 5) |
+| Lua-рантайм: LuaJIT, `include`, `AddCSLuaFile`, `hook`, `timer`, реалмы | `gmod-lua` | сервер запускает `sandbox` без ошибок; есть `VMatrix`, SQLite, `HTTP` и энтити; нет игроков (этап 4), клиентских библиотек (этап 5) |
 | zip (pakfile карт): без сжатия, DEFLATE, LZMA | `gmod-fs::zip` | готово |
 | карты BSP v19–21: LZMA-лампы, дисплейсменты, статические пропы, pakfile, PVS | `gmod-bsp` | чтение и сетка мира готовы; PVS — этап 2 |
 | столкновения и трассировки: браши, дерево BSP, дисплейсменты, брашевые энтити, статические пропы; `util.TraceLine`, `util.TraceHull`, `util.PointContents` | `gmod-bsp::collision`, `gmod-world::collision` | готово для всего, что не движется; подвижные модели — вместе с физикой, этап 4 |
@@ -165,7 +165,7 @@ cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, з
 | рендер | `gmod-render` | мир, пропы, небо, прозрачность готовы; 3D skybox, отражения, декали — этап 2 |
 | движение игрока: то, что в GMod проходит через `CMoveData` и хуки `SetupMove`, `Move`, `FinishMove` | `gmod-movement` | ходьба, бег, ступеньки, склоны, прыжок, приседание, плавание, лестницы-браши готовы; лестницы по кнопке E и движущиеся опоры — этап 4 |
 | физика | `gmod-physics` | этап 4 |
-| сущности: энтити движка, SENT, SWEP, метатаблицы | `gmod-game` | этап 4 |
+| сущности: энтити движка, SENT, SWEP, метатаблицы | `gmod-lua::entity`, `gmod-lua::ents` | энтити, SENT, `ents.*` и энтити карты готовы; игроки, оружие, NPC и поведение классов движка — этап 4 |
 | ввод, HUD, VGUI/Derma | `gmod-ui` | этап 5 |
 | звук | `gmod-audio` | этап 5 |
 | сеть: `net`, `NWVars`, сервер | `gmod-net` | этап 6 |

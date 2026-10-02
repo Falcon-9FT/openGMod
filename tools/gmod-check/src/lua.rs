@@ -13,7 +13,7 @@ use gmod_lua::{Output, Realm, Runtime, ScriptError};
 
 use crate::out::Out;
 
-pub fn run(vfs: Vfs, realm: &str, all: bool, out: &mut Out) -> ExitCode {
+pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &mut Out) -> ExitCode {
     let realm = match realm.to_ascii_lowercase().as_str() {
         "" | "server" | "sv" => Realm::Server,
         "client" | "cl" => Realm::Client,
@@ -49,6 +49,9 @@ pub fn run(vfs: Vfs, realm: &str, all: bool, out: &mut Out) -> ExitCode {
         runtime.set_data_dir(dir);
     }
     runtime.start("sandbox");
+    if let Some(map) = map.filter(|_| realm == Realm::Server) {
+        runtime.spawn_map(map);
+    }
     // one second of game time: the timers and hooks of the first frames
     for _ in 0..60 {
         runtime.think(1.0 / 60.0);
@@ -66,6 +69,9 @@ pub fn run(vfs: Vfs, realm: &str, all: bool, out: &mut Out) -> ExitCode {
         runtime.sent_files().len(),
         started.elapsed().as_secs_f64()
     ));
+    if let Some(map) = map.filter(|_| realm == Realm::Server) {
+        out.line(format!("Map {}: {} entities.", map.name, runtime.entity_count()));
+    }
     let missing = missing_globals(&errors);
     if !missing.is_empty() {
         out.line("Missing in openGMOD (global, errors it caused):");

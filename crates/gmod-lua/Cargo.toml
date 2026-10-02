@@ -9,7 +9,11 @@ description = "The Lua runtime: LuaJIT with Garry's Mod's loader (include, requi
 gmod-fs.workspace = true
 gmod-kv.workspace = true
 gmod-material.workspace = true
+gmod-model.workspace = true
 gmod-glua.workspace = true
 mlua.workspace = true
 rusqlite.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+gmod-model = { workspace = true, features = ["testmodel"] }

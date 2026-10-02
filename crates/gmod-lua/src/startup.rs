@@ -6,7 +6,8 @@
 //!    `GAMEMODE` is the result;
 //! 3. scripted entities, weapons and (on clients) effects: those of every gamemode in the
 //!    chain, base first, then those of `lua/`; each into a fresh `ENT`, `SWEP` or `EFFECT`
-//!    and registered with `scripted_ents`, `weapons` or `effects`;
+//!    and registered with `scripted_ents`, `weapons` or `effects`, whose `OnLoaded` then
+//!    runs (it fills the base classes `DEFINE_BASECLASS` hands out);
 //! 4. the hooks `PreGamemodeLoaded` (before 2), `OnGamemodeLoaded`, `PostGamemodeLoaded`,
 //!    `CreateTeams` and `Initialize`.
 
@@ -204,11 +205,23 @@ pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
     if realm != Realm::Server {
         kinds.push(Kind::Effect);
     }
-    for kind in kinds {
+    for &kind in &kinds {
         for name in &chain {
             load_scripts(lua, &format!("gamemodes/{name}/entities/{}", kind.folder()), kind);
         }
         load_scripts(lua, &format!("lua/{}", kind.folder()), kind);
+    }
+    // all are there: each library sets up the base classes (`DEFINE_BASECLASS`) now
+    for kind in kinds {
+        let on_loaded = lua
+            .globals()
+            .get::<Option<Table>>(kind.library())
+            .ok()
+            .flatten()
+            .and_then(|l| l.get::<Option<Function>>("OnLoaded").ok().flatten());
+        if let Some(f) = on_loaded {
+            let _ = files::call_reporting(lua, f, MultiValue::new());
+        }
     }
     runtime.call_hook("PostGamemodeLoaded", MultiValue::new());
     runtime.call_hook("CreateTeams", MultiValue::new());

@@ -72,6 +72,13 @@
 Цель: одиночная игра в sandbox. Ходить, спавнить пропы, физган, тулган, сварка и верёвки.
 
 * Энтити: движок, SENT/SWEP из Lua, `ents.*`, метатаблицы `Entity`/`Player`/`Weapon`/`NPC`.
+  * Энтити в Lua ✅ — `gmod-lua::entity`, `gmod-lua::ents`: индексы и серийные номера, одна
+    userdata на энтити (работает как ключ таблицы), своя таблица, около 120 методов `Entity`,
+    `ents.Create`/`Find*`, SENT (`Initialize`, `Think`, `KeyValue`, `OnRemove`,
+    `SetupDataTables`), NW/NW2/DT-переменные, энтити карты с ключами, родителями и
+    `InitPostEntity`; `gmod-check lua --map` грузит энтити карты.
+  * Дальше: игроки (`Player`, хуки спавна, движение через `CMoveData`), оружие, NPC, поведение
+    энтити движка (двери, триггеры, ввод-вывод `Fire`).
 * Физика на Jolt ([PHYSICS.md](PHYSICS.md)):
   * пропы с формами из `.phy` (формы читаются ✅ — `gmod-model::phy`; статические пропы уже
     твёрдые для трассировок и игрока);

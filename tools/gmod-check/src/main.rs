@@ -53,7 +53,7 @@ COMMANDS:
                      one on disk - that needs no installation)
     lua [REALM]      start the Lua of the game as the engine does (server, client or
                      menu; default server): list what fails, and how much of GMod's API
-                     is there
+                     is there; with --map, the server loads that map's entities
     render <MAP>     a picture of a map (gm_construct, or a .bsp file) drawn on the CPU:
                      the world with textures and light maps, saved as PNG
     trace <MAP>      a sweep through a map from --from to --to, as util.TraceLine makes
@@ -71,6 +71,7 @@ OPTIONS:
     --out <FILE>         render: the PNG to write (default: <MAP>.png here)
     --from <X,Y,Z>       render: the eye (default: a player start); trace: the start
     --to <X,Y,Z>         render: the point looked at; trace: the end
+    --map <MAP>          lua: the map whose entities the server loads (gm_construct, or a .bsp)
     --mins <X,Y,Z>       trace: the box around the point swept, with --maxs (none: a ray)
     --maxs <X,Y,Z>
     --mask <N>           trace: what stops it, as GMod's MASK_ numbers (default: MASK_SOLID)
@@ -99,6 +100,8 @@ pub struct Args {
     pub mins: Option<[f32; 3]>,
     pub maxs: Option<[f32; 3]>,
     pub mask: Option<u32>,
+    /// `lua`: the map whose entities the server loads.
+    pub map: Option<String>,
 }
 
 /// `X,Y,Z` as three numbers.
@@ -131,6 +134,7 @@ impl Args {
             mins: None,
             maxs: None,
             mask: None,
+            map: None,
         };
         let mut positional = Vec::new();
         while let Some(arg) = raw.next() {
@@ -152,6 +156,7 @@ impl Args {
                     args.view.height = h.parse().map_err(|_| format!("{size:?} is not WxH"))?;
                 }
                 "--fov" => args.view.fov = raw.next().and_then(|f| f.parse().ok()).ok_or("--fov needs degrees")?,
+                "--map" => args.map = Some(raw.next().ok_or("--map needs a map")?),
                 "--mins" => args.mins = Some(point(&raw.next().ok_or("--mins needs X,Y,Z")?)?),
                 "--maxs" => args.maxs = Some(point(&raw.next().ok_or("--maxs needs X,Y,Z")?)?),
                 "--mask" => {
@@ -332,10 +337,26 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
             Ok(bytes) => print_glua(&bytes, operand),
             Err(e) => fail(&e.to_string()),
         },
-        "lua" => lua::run(std::mem::take(&mut vfs), operand, args.all, out),
+        "lua" => {
+            let map = match args.map.as_deref().map(|map| read_map(&vfs, map).map(|bsp| lua_map(map, &bsp))).transpose() {
+                Ok(map) => map,
+                Err(e) => return fail(&e),
+            };
+            lua::run(std::mem::take(&mut vfs), operand, map.as_ref(), args.all, out)
+        }
         "render" => render_map(&mut vfs, operand, args),
         "trace" => trace_map(&mut vfs, operand, args),
         _ => unreachable!("commands are checked when parsing"),
+    }
+}
+
+/// What the Lua runtime needs of a map: its name, entities and brush models.
+fn lua_map(map: &str, bsp: &gmod_bsp::Bsp) -> gmod_lua::Map {
+    let name = Path::new(map).file_stem().map_or_else(|| map.to_string(), |s| s.to_string_lossy().into_owned());
+    gmod_lua::Map {
+        name,
+        entities: bsp.entities.iter().map(|e| e.pairs.clone()).collect(),
+        brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
     }
 }
 

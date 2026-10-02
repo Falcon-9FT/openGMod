@@ -149,9 +149,17 @@ fn registry(lua: &Lua) -> mlua::Result<Table> {
     lua.named_registry_value(REGISTRY)
 }
 
-/// The `MetaName` of a userdata of the engine.
+/// The `MetaName` of a userdata of the engine; an entity's says what kind it is (`Player`).
 pub(crate) fn type_name(ud: &AnyUserData) -> Option<String> {
+    if let Ok(handle) = ud.borrow::<crate::entity::EntityHandle>() {
+        return Some(handle.kind.meta_name().to_string());
+    }
     ud.metatable().ok()?.get::<Option<String>>("MetaName").ok().flatten()
+}
+
+/// A named metatable, if there is one.
+pub(crate) fn named(lua: &Lua, name: &str) -> mlua::Result<Option<Table>> {
+    registry(lua)?.raw_get::<Option<Table>>(name)
 }
 
 /// The named metatable of one of the engine's types, made if it is not there yet: `MetaName`,
