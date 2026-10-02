@@ -224,10 +224,8 @@ impl Screen {
 /// The size of an image: a PNG's from its header, a material's from its base texture.
 fn measure(lua: &Lua, image: &Image) -> Option<(u32, u32)> {
     let vfs = host(lua).vfs.clone();
-    let lower = image.name.to_lowercase();
-    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        let data = [format!("materials/{lower}"), lower.clone()].iter().find_map(|p| vfs.read(p, "GAME").ok())?;
-        return image_size(&data);
+    if is_image_file(&image.name) {
+        return image_size(&read_image_file(lua, &image.name)?);
     }
     let material = gmod_material::load_material(&vfs, &image.name).ok()?;
     let texture = material.params().iter().find(|(k, _)| k == "$basetexture").map(|(_, v)| v.clone())?;
@@ -276,14 +274,27 @@ pub(crate) fn pixels(lua: &Lua, name: &str, is_texture: bool) -> Option<Rc<Rgba>
 
 /// Reads the pixels of an image file (`.png`), a texture (`is_texture`) or a material's base
 /// texture: its first frame, at full size.
+/// Whether a material's name is an image file used as one (`.png`, `.jpg`).
+pub(crate) fn is_image_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+}
+
+/// The bytes of an image file used as a material: under `materials/` (where `../` leaves it:
+/// `../backgrounds/x.jpg`), else from the root.
+pub(crate) fn read_image_file(lua: &Lua, name: &str) -> Option<Vec<u8>> {
+    let vfs = host(lua).vfs.clone();
+    [format!("materials/{name}"), name.to_string()]
+        .iter()
+        .filter_map(|p| gmod_fs::path::normalize(p))
+        .find_map(|p| vfs.read(&p, "GAME").ok())
+}
+
 pub(crate) fn decode(lua: &Lua, name: &str, is_texture: bool) -> Option<Rgba> {
     let vfs = host(lua).vfs.clone();
     let lower = name.replace('\\', "/").to_lowercase();
-    if lower.ends_with(".png") {
-        return [format!("materials/{lower}"), lower.clone()]
-            .iter()
-            .find_map(|p| vfs.read(p, "GAME").ok())
-            .and_then(|data| gmod_material::png::decode(&data).ok());
+    if is_image_file(&lower) {
+        return read_image_file(lua, &lower).and_then(|data| gmod_material::jpeg::decode_image(&data).ok());
     }
     let texture = if is_texture {
         Some(lower)

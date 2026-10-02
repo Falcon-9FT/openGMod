@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.89"
 repository = "https://github.com/Falcon-9FT/openGMod"
@@ -50,6 +50,8 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 ureq = { version = "=3.4.2", features = ["platform-verifier"] }
 # sounds: WAV (PCM, ADPCM), MP3 and OGG decoded in pure Rust
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "pcm", "adpcm", "mp3", "ogg", "vorbis"] }
+# JPEG images (the menu's backgrounds, screenshots, workshop previews): pure Rust
+zune-jpeg = "0.5.15"
 # web pages (HTML panels, the main menu): Chromium, its build downloaded when built (CEF)
 cef = "154.3.0"
 # the sound card: WASAPI on Windows (Linux and macOS later)

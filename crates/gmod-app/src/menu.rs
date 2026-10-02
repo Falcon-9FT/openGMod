@@ -21,9 +21,14 @@ use gmod_web::{Button, Modifiers, PageEvent, Web};
 /// Starts Chromium with `asset://` serving the game's files from `vfs`. None, with why, when it
 /// cannot: the program runs on without HTML.
 pub fn start_web(vfs: Arc<Vfs>) -> Result<Web, String> {
-    let cache = gmod_fs::UserDir::default_root().ok_or("no home folder for Chromium's cache")?.join("cache").join("chromium");
+    let root = gmod_fs::UserDir::default_root().ok_or("no home folder for Chromium's cache")?;
+    let log = root.join("logs").join("chromium.log");
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    println!("Chromium's log: {}", log.display());
     let files: gmod_web::Files = Arc::new(move |host, path| asset(&vfs, host, path));
-    Web::start(&cache, files)
+    Web::start(&root.join("cache").join("chromium"), &log, files)
 }
 
 /// What `asset://` serves: `asset://garrysmod/<path>` the game's files, `asset://mapimage/<map>`

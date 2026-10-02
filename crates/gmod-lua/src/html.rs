@@ -154,6 +154,13 @@ pub(crate) fn image_of(lua: &Lua, h: PanelHandle) -> Option<u32> {
     host(lua).pages.slots.borrow().get(&h).filter(|s| s.drawn).map(|s| s.image)
 }
 
+/// How many pages there are, and how many of them drew.
+pub(crate) fn counts(lua: &Lua) -> (usize, usize) {
+    let host = host(lua);
+    let slots = host.pages.slots.borrow();
+    (slots.len(), slots.values().filter(|s| s.drawn).count())
+}
+
 /// The pictures pages drew since the last call, by image number.
 pub(crate) fn take_pictures(lua: &Lua) -> Vec<(u32, Rgba)> {
     host(lua).pages.pictures.borrow_mut().drain().collect()

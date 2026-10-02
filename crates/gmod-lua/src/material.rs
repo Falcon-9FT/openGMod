@@ -89,15 +89,14 @@ fn pixel(a: &Args, image: Option<std::rc::Rc<gmod_material::png::Rgba>>, x: f64,
 /// Loads a material by name: a `.vmt`, or an image (`.png`, `.jpg`) used as one.
 fn load(lua: &Lua, name: &str) -> LuaMaterial {
     let vfs = host(lua).vfs.clone();
-    let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        let found = [format!("materials/{lower}"), lower.clone()].iter().any(|p| vfs.exists(p, "GAME"));
-        return LuaMaterial {
-            name: name.to_string(),
-            shader: "UnlitGeneric".into(),
-            params: RefCell::new(vec![("$basetexture".into(), name.to_string())]),
-            error: !found,
-        };
+    if crate::surface::is_image_file(name) {
+        let size = crate::surface::read_image_file(lua, name).map(|data| crate::surface::image_size(&data).unwrap_or((0, 0)));
+        let mut params = vec![("$basetexture".to_string(), name.to_string())];
+        if let Some((w, h)) = size {
+            params.push(("$realwidth".into(), w.to_string()));
+            params.push(("$realheight".into(), h.to_string()));
+        }
+        return LuaMaterial { name: name.to_string(), shader: "UnlitGeneric".into(), params: RefCell::new(params), error: size.is_none() };
     }
     match gmod_material::load_material(&vfs, name) {
         Ok(material) => LuaMaterial {
@@ -172,7 +171,25 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // the menu's: a material from an image file, whose image can be swapped
+    // (`SetDynamicImage`); the flags are `Material`'s
+    lua.globals().raw_set(
+        "DynamicMaterial",
+        lua.create_function(|lua, values: MultiValue| {
+            let name = Args::new(lua, values, "DynamicMaterial").string(1)?;
+            lua.create_userdata(load(lua, &name))
+        })?,
+    )?;
+
     let m = meta::meta_table(lua, "IMaterial", type_id::MATERIAL)?;
+    def(lua, &m, "SetDynamicImage", |a| {
+        let path = a.string(2)?;
+        let Some(Value::UserData(ud)) = a.get(1) else { return Err(a.bad(1, "IMaterial")) };
+        let fresh = load(a.lua, &path);
+        let mut m = ud.borrow_mut::<LuaMaterial>().map_err(|_| a.bad(1, "IMaterial"))?;
+        *m = fresh;
+        Ok(Value::Nil)
+    })?;
     def(lua, &m, "GetName", |a| text(a, Some(with(a, |m| m.name.clone())?)))?;
     def(lua, &m, "GetShader", |a| text(a, Some(with(a, |m| m.shader.clone())?)))?;
     def(lua, &m, "IsError", |a| Ok(Value::Boolean(with(a, |m| m.error)?)))?;

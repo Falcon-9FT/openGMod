@@ -18,7 +18,7 @@ fn main() {
     let files: gmod_web::Files =
         Arc::new(move |host, path| if host.eq_ignore_ascii_case("garrysmod") { std::fs::read(root.join(path)).ok() } else { None });
     let cache = std::env::temp_dir().join("opengmod-page-shot");
-    let web = gmod_web::Web::start(&cache, files).expect("chromium");
+    let web = gmod_web::Web::start(&cache, &cache.join("chromium.log"), files).expect("chromium");
     let page = web.page(1280, 720).expect("a page");
     page.add_function("lua", "Run");
     page.add_function("lua", "PlaySound");

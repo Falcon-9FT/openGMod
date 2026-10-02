@@ -14,6 +14,7 @@ use gmod_fs::Vfs;
 
 pub mod decode;
 pub mod format;
+pub mod jpeg;
 mod library;
 pub mod png;
 pub mod surfaceprop;

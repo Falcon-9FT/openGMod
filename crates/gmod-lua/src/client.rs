@@ -1131,6 +1131,11 @@ impl crate::Runtime {
         crate::html::take_pictures(&self.lua)
     }
 
+    /// How many pages the HTML panels have, and how many of those drew a picture yet.
+    pub fn page_counts(&self) -> (usize, usize) {
+        crate::html::counts(&self.lua)
+    }
+
     /// The console lines the client sends the server - the commands it does not know itself -
     /// oldest first.
     pub fn take_server_commands(&self) -> Vec<String> {

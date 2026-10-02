@@ -398,27 +398,29 @@ impl Gpu {
         Ok(file)
     }
 
-    fn draw(&mut self, camera: &Camera, client: Option<&gmod_lua::Runtime>, menu: Option<&gmod_lua::Runtime>) {
+    fn draw(&mut self, camera: &Camera, client: Option<&gmod_lua::Runtime>, menu: Option<&gmod_lua::Runtime>) -> bool {
+        // a frame that no longer fits the window as well as it could is still shown, and the
+        // surface made again after it: dropping it each time would leave the window empty
+        let mut suboptimal = false;
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                drop(frame);
-                self.surface.configure(&self.device, &self.config);
-                return;
+                suboptimal = true;
+                frame
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 if let Ok(surface) = self.instance.create_surface(self.window.clone()) {
                     self.surface = surface;
                     self.surface.configure(&self.device, &self.config);
                 }
-                return;
+                return false;
             }
             // hidden, or not ready yet: the next frame
-            _ => return,
+            _ => return false,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.view_format), ..Default::default() });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
@@ -428,6 +430,12 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
         self.queue.present(frame);
+        if suboptimal {
+            let size = self.window.inner_size();
+            self.resize(size.width, size.height);
+            self.surface.configure(&self.device, &self.config);
+        }
+        true
     }
 }
 
@@ -511,6 +519,12 @@ struct App {
     pending_map: Option<String>,
     /// The menu said to quit.
     quit: bool,
+    /// When the menu started, whether Chromium drew it, and whether it was said that it did not.
+    menu_started: Instant,
+    menu_drawn: bool,
+    menu_late: bool,
+    /// Frames drawn since the start.
+    frames_drawn: u64,
 }
 
 impl App {
@@ -712,12 +726,35 @@ impl App {
         }
     }
 
+    /// Says once how long Chromium took to draw the menu, or that it has not after a while:
+    /// what to look at when the menu does not show.
+    fn report_menu(&mut self) {
+        let Some(menu) = &self.menu else { return };
+        if self.menu_drawn {
+            return;
+        }
+        let (pages, drawn) = menu.runtime().page_counts();
+        let seconds = self.menu_started.elapsed().as_secs_f64();
+        if drawn > 0 {
+            self.menu_drawn = true;
+            println!("Chromium drew the main menu in {seconds:.1} s");
+        } else if seconds > 10.0 && !self.menu_late {
+            self.menu_late = true;
+            println!(
+                "Chromium has not drawn the main menu in 10 s ({pages} pages, {} frames drawn); \
+                 its log is in ~/.opengmod/logs/chromium.log. opengmod --no-html goes without it.",
+                self.frames_drawn
+            );
+        }
+    }
+
     /// A frame of the main menu: Chromium's work, the menu's Lua when it shows, and what it
     /// asked of the engine.
     fn menu_frame(&mut self, seconds: f32) {
         if let Some(web) = &self.web {
             web.pump();
         }
+        self.report_menu();
         let Some(menu) = &self.menu else { return };
         if self.menu_shown()
             && let Some(gpu) = &self.gpu
@@ -1086,7 +1123,9 @@ impl ApplicationHandler for App {
                 let menu = self.menu.as_ref().filter(|_| self.menu_shown()).map(menu::Menu::runtime);
                 if let Some(gpu) = &mut self.gpu {
                     let client = self.game.as_ref().map(Game::client);
-                    gpu.draw(&self.camera, client, menu);
+                    if gpu.draw(&self.camera, client, menu) {
+                        self.frames_drawn += 1;
+                    }
                     if std::mem::take(&mut self.screenshot) {
                         match gpu.screenshot(&self.camera, client, menu, &self.name) {
                             Ok(file) => println!("Screenshot: {}", file.display()),
@@ -1323,6 +1362,10 @@ fn main() -> ExitCode {
         web: web.take(),
         pending_map: None,
         quit: false,
+        menu_started: now,
+        menu_drawn: false,
+        menu_late: false,
+        frames_drawn: 0,
     };
     if let Some(map) = map {
         app.enter_map(&map);

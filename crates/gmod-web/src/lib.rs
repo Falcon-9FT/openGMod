@@ -254,7 +254,8 @@ pub struct Web {
 impl Web {
     /// Starts Chromium: its cache in `cache` (which must not be in the game's folder),
     /// `asset://` from `files`. Once a program.
-    pub fn start(cache: &Path, files_from: Files) -> Result<Web, String> {
+    /// Chromium's own log goes to `log`.
+    pub fn start(cache: &Path, log: &Path, files_from: Files) -> Result<Web, String> {
         let _ = files().set(files_from);
         let args = cef::args::Args::new();
         let settings = Settings {
@@ -263,7 +264,8 @@ impl Web {
             no_sandbox: 1,
             root_cache_path: CefString::from(cache.to_string_lossy().as_ref()),
             cache_path: CefString::from(cache.join("default").to_string_lossy().as_ref()),
-            log_severity: LogSeverity::ERROR,
+            log_severity: LogSeverity::WARNING,
+            log_file: CefString::from(log.to_string_lossy().as_ref()),
             background_color: 0,
             // what GMod's pages look for to know they are in the game
             user_agent_product: CefString::from(user_agent_product().as_str()),
@@ -742,13 +744,22 @@ cef::wrap_load_handler! {
             &self,
             _browser: Option<&mut Browser>,
             frame: Option<&mut cef::Frame>,
-            _error_code: cef::Errorcode,
-            _error_text: Option<&CefString>,
-            _failed_url: Option<&CefString>,
+            error_code: cef::Errorcode,
+            error_text: Option<&CefString>,
+            failed_url: Option<&CefString>,
         ) {
-            // what was asked for will not load
+            // what was asked for will not load: the page tells it as an error of its console
             if frame.is_some_and(|f| f.is_main() == 1) {
-                lock(&self.shared).requested = false;
+                let url = failed_url.map(ToString::to_string).unwrap_or_default();
+                let text = error_text.map(ToString::to_string).unwrap_or_default();
+                let mut state = lock(&self.shared);
+                state.requested = false;
+                state.events.push(PageEvent::Console {
+                    message: format!("could not load {url}: {text} ({})", *error_code.as_ref() as i32),
+                    source: url,
+                    line: 0,
+                    level: "error",
+                });
             }
         }
 
