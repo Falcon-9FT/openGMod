@@ -34,6 +34,10 @@ gmod-render = { path = "crates/gmod-render" }
 mlua = { version = "0.12.1", features = ["luajit", "vendored"] }
 # SQLite for Lua's `sql`, built from source; `hooks` for the authorizer that keeps queries in their database
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "hooks"] }
+# Lua's `HTTP`: rustls (ring), certificates checked by the system as a browser does (an antivirus
+# that scans HTTPS adds its root there). Pinned exactly: the resolver that keeps requests off
+# private networks uses ureq's `unversioned` API
+ureq = { version = "=3.4.2", features = ["platform-verifier"] }
 # the GPU: Direct3D 12 and Vulkan only - no OpenGL, no Metal until macOS
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
