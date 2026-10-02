@@ -6,7 +6,7 @@
 //! The program tells the client what happens: the screen's size, keys and buttons going down
 //! and up, the cursor, the view of the local player ([`crate::Runtime::set_view`]).
 //! Commands the client does not know go to the server ([`crate::Runtime::take_server_commands`]),
-//! as a client's console sends them.
+//! as a client's console sends them, and so does its user info ([`crate::Runtime::take_user_info`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -55,6 +55,8 @@ pub(crate) struct Client {
     phrases: RefCell<HashMap<String, String>>,
     /// Console lines for the server.
     pub to_server: RefCell<Vec<String>>,
+    /// User info (ConVars with `FCVAR_USERINFO`) the server has not been told of.
+    pub user_info: RefCell<Vec<(String, String)>>,
     pub frame: Cell<u64>,
     pub real_frame_time: Cell<f64>,
 }
@@ -70,6 +72,7 @@ impl Default for Client {
             binds: RefCell::new(Vec::new()),
             phrases: RefCell::new(HashMap::new()),
             to_server: RefCell::new(Vec::new()),
+            user_info: RefCell::new(Vec::new()),
             frame: Cell::new(0),
             real_frame_time: Cell::new(0.0),
         }
@@ -962,6 +965,8 @@ impl crate::Runtime {
     /// it; the game has the rest (`+attack`, `noclip` ...).
     pub fn button(&self, code: i32, down: bool) -> bool {
         let lua = &self.lua;
+        // a key held down repeats: for the text entries, not the binds
+        let repeat = down && host(lua).client.is_down(code);
         host(lua).client.set_key(code, down);
         let taken = match code {
             107..=111 => crate::vgui::mouse_button(lua, code, down),
@@ -970,6 +975,9 @@ impl crate::Runtime {
         };
         if taken {
             return true;
+        }
+        if repeat {
+            return false;
         }
         let Some(command) = host(lua).client.binding(code) else { return false };
         if down {
@@ -1037,9 +1045,15 @@ impl crate::Runtime {
         Some((image, pixels))
     }
 
-    /// The console lines the client sends the server - commands it does not know itself, and
-    /// the user info that changed (`gmod_toolmode weld`) - oldest first.
+    /// The console lines the client sends the server - the commands it does not know itself -
+    /// oldest first.
     pub fn take_server_commands(&self) -> Vec<String> {
         std::mem::take(&mut *host(&self.lua).client.to_server.borrow_mut())
+    }
+
+    /// The user info the client tells the server (`gmod_toolmode`, `cl_playermodel`): all of
+    /// it the first time, then what changed.
+    pub fn take_user_info(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *host(&self.lua).client.user_info.borrow_mut())
     }
 }

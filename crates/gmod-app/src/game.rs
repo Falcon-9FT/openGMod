@@ -1,7 +1,10 @@
 //! The game in the window: the Lua of the server - `includes/init.lua`, autorun, the `sandbox`
 //! gamemode and the addons, as Garry's Mod starts them - running the map, and the player of a
-//! single-player game moved through it by the keys and the mouse. What the game prints goes to
-//! the terminal, and lines typed there are the player's console (`give weapon_crowbar`,
+//! single-player game moved through it by the keys and the mouse. Beside it the Lua of the
+//! player's client: it has what the server has of the entities every frame, draws the HUD and
+//! the menus (Q, C), takes the keys and the mouse first, and sends the server what it asks for
+//! (`gm_spawn` from the spawn menu, the tool chosen). What the game prints goes to the terminal,
+//! and lines typed there are the player's console (`give weapon_crowbar`,
 //! `gm_spawn models/props_c17/oildrum001.mdl`, `lua_run`, the commands of the addons). The
 //! models of the entities the player sees are read the first time one shows ([`Models`]).
 
@@ -77,6 +80,8 @@ pub struct Shown {
 
 pub struct Game {
     runtime: Runtime,
+    /// The player's client.
+    client: Runtime,
     player: EntityHandle,
     console: Receiver<String>,
     /// The impulse for the next command (the flashlight).
@@ -86,23 +91,79 @@ pub struct Game {
 impl Game {
     /// Starts the Lua of the server on the game's files with the map, and lets the player join.
     pub fn start(vfs: Arc<Vfs>, map: &Map) -> Result<Game, String> {
-        let runtime = Runtime::new(Realm::Server, vfs).map_err(|e| format!("LuaJIT could not be started: {e}"))?;
-        runtime.set_output(|output| match output {
-            Output::Text(text) => {
-                print!("{text}");
-                let _ = std::io::stdout().flush();
+        let new = |realm: Realm| -> Result<Runtime, String> {
+            let runtime = Runtime::new(realm, vfs.clone()).map_err(|e| format!("LuaJIT could not be started: {e}"))?;
+            runtime.set_output(|output| match output {
+                Output::Text(text) => {
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
+                }
+                Output::Error(error) => eprintln!("{error}"),
+            });
+            if let Some(dir) = gmod_fs::UserDir::default_root().and_then(|root| gmod_fs::UserDir::open(root, None).ok()) {
+                runtime.set_data_dir(dir);
             }
-            Output::Error(error) => eprintln!("{error}"),
-        });
-        if let Some(dir) = gmod_fs::UserDir::default_root().and_then(|root| gmod_fs::UserDir::open(root, None).ok()) {
-            runtime.set_data_dir(dir);
-        }
+            Ok(runtime)
+        };
+        let runtime = new(Realm::Server)?;
         runtime.start("sandbox");
         runtime.spawn_map(map);
         let player = runtime.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() }).ok_or("no player could join the game")?;
-        let errors = runtime.errors().len();
-        println!("Lua: {} files, {errors} errors; type commands here (give weapon_crowbar, gm_spawn <model>)", runtime.files_loaded());
-        Ok(Game { runtime, player, console: console(), impulse: 0 })
+        let client = new(Realm::Client)?;
+        client.start("sandbox");
+        client.spawn_map(map);
+        client.set_local_player(player);
+        client.apply_snapshot(&runtime.snapshot());
+        let errors = runtime.errors().len() + client.errors().len();
+        println!(
+            "Lua: {} files, {errors} errors; type commands here (give weapon_crowbar, gm_spawn <model>)",
+            runtime.files_loaded() + client.files_loaded()
+        );
+        let game = Game { runtime, client, player, console: console(), impulse: 0 };
+        game.send_client_commands();
+        Ok(game)
+    }
+
+    /// What the client asked of the server since the last time: its user info, its commands.
+    fn send_client_commands(&self) {
+        for (name, value) in self.client.take_user_info() {
+            self.runtime.set_user_info(self.player, &name, &value);
+        }
+        for line in self.client.take_server_commands() {
+            self.command(&line);
+        }
+    }
+
+    /// A key or mouse button of the game's (`KEY_*`, `MOUSE_*`) went down or up: whether the
+    /// client took it - a menu, a text entry, a command of its own (`+menu`).
+    pub fn button(&self, code: i32, down: bool) -> bool {
+        self.client.button(code, down)
+    }
+
+    /// Text typed, for the text entry that has the keyboard: whether one took it.
+    pub fn type_text(&self, text: &str) -> bool {
+        self.client.type_text(text)
+    }
+
+    /// The cursor moved over the window, to a pixel of it.
+    pub fn cursor_moved(&self, x: i32, y: i32) {
+        self.client.set_cursor(x, y);
+    }
+
+    /// Whether the client shows the cursor (a menu is open): the mouse does not turn the view.
+    pub fn cursor_visible(&self) -> bool {
+        self.client.cursor_visible()
+    }
+
+    /// Draws the client's 2D for a screen of this size: the HUD, the menus.
+    pub fn paint(&self, width: u32, height: u32, seconds: f64) {
+        self.client.set_screen_size(width, height);
+        self.client.paint(seconds);
+    }
+
+    /// The client's runtime: what [`paint`](Self::paint) drew, and its images.
+    pub fn client(&self) -> &Runtime {
+        &self.client
     }
 
     /// Runs a console command as the player.
@@ -122,12 +183,17 @@ impl Game {
         let mut cmd = command(keys, buttons, pitch, yaw);
         cmd.impulse = std::mem::take(&mut self.impulse);
         self.runtime.set_input(self.player, cmd);
+        self.send_client_commands();
         while let Ok(line) = self.console.try_recv() {
             self.command(&line);
         }
         self.runtime.think(seconds);
+        // the client has what the server has now, and thinks
+        self.client.apply_snapshot(&self.runtime.snapshot());
         let view = self.runtime.view(self.player)?;
         let eye = between(view.previous_eye, view.eye, self.runtime.tick_fraction());
+        self.client.set_view(gmod_lua::client::View { origin: Vector::new(eye[0], eye[1], eye[2]), angles: view.angles, fov: view.fov });
+        self.client.think(seconds);
         let turned = (angle_apart(view.angles.p, pitch) || angle_apart(view.angles.y, yaw)).then_some((view.angles.p, view.angles.y));
         Some(Shown { eye, turned, view })
     }

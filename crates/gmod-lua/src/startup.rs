@@ -13,7 +13,7 @@
 //! 4. the hooks `PreGamemodeLoaded` (before 2), `OnGamemodeLoaded` and `PostGamemodeLoaded`
 //!    (after 3), `CreateTeams` and `Initialize`.
 
-use mlua::{Function, Lua, MultiValue, Table, Value};
+use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::args::Args;
 use crate::engine;
@@ -190,6 +190,12 @@ pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
     let lua = runtime.lua();
     let realm = runtime.realm();
     if realm == Realm::Client {
+        // the engine's client has `notification` before any of the game's Lua uses it
+        if lua.globals().get::<Option<Table>>("notification").ok().flatten().is_none()
+            && let Ok(require) = lua.globals().get::<Function>("require")
+        {
+            let _ = crate::files::call_reporting(lua, require, "notification".into_lua_multi(lua).unwrap_or_default());
+        }
         include_from_engine(lua, "derma/init.lua");
     }
     run_folder(lua, "autorun");

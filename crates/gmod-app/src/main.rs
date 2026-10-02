@@ -189,6 +189,8 @@ struct Gpu {
     /// The surface's format with sRGB encoding: shaders give linear colour.
     view_format: wgpu::TextureFormat,
     renderer: gmod_render::Renderer,
+    /// The client's 2D over the world: the HUD, the menus.
+    overlay: gmod_render::Overlay,
 }
 
 impl Gpu {
@@ -241,7 +243,8 @@ impl Gpu {
         if !renderer.failed_textures.is_empty() {
             println!("Textures that could not be shown: {}", renderer.failed_textures.len());
         }
-        Ok(Gpu { window, instance, surface, device, queue, config, view_format, renderer })
+        let overlay = gmod_render::Overlay::new(&device, &queue, view_format);
+        Ok(Gpu { window, instance, surface, device, queue, config, view_format, renderer, overlay })
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -252,9 +255,25 @@ impl Gpu {
         }
     }
 
+    /// Draws the frame the client painted over the world: the atlas's new glyphs and the new
+    /// images go to the GPU first.
+    fn draw_2d(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, client: &gmod_lua::Runtime) {
+        let (device, queue, overlay) = (&self.device, &self.queue, &mut self.overlay);
+        let missing = client.with_canvas(|canvas, fonts| {
+            overlay.update_glyphs(device, queue, fonts);
+            overlay.missing_images(canvas)
+        });
+        for id in missing {
+            let pixels = client.image(id).and_then(|(_, pixels)| pixels);
+            overlay.set_image(device, queue, id, pixels.as_ref().map(|p| (p.width, p.height, p.pixels.as_slice())));
+        }
+        let size = (self.config.width, self.config.height);
+        client.with_canvas(|canvas, _| overlay.render(device, queue, encoder, view, size, canvas));
+    }
+
     /// Draws one more frame into a texture of its own and saves it as a PNG in
     /// `~/.opengmod/screenshots`.
-    fn screenshot(&mut self, camera: &Camera, name: &str) -> Result<PathBuf, String> {
+    fn screenshot(&mut self, camera: &Camera, client: Option<&gmod_lua::Runtime>, name: &str) -> Result<PathBuf, String> {
         let bgra = matches!(self.view_format, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm);
         let rgba = matches!(self.view_format, wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Rgba8Unorm);
         if !bgra && !rgba {
@@ -275,6 +294,9 @@ impl Gpu {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("screenshot") });
         self.renderer.render(&self.device, &self.queue, &mut encoder, &view, (width, height), camera);
+        if let Some(client) = client {
+            self.draw_2d(&mut encoder, &view, client);
+        }
         // copies out of a texture go in rows of a multiple of 256 bytes
         let row = (width * 4).div_ceil(256) * 256;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -310,7 +332,7 @@ impl Gpu {
         Ok(file)
     }
 
-    fn draw(&mut self, camera: &Camera) {
+    fn draw(&mut self, camera: &Camera, client: Option<&gmod_lua::Runtime>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -335,6 +357,9 @@ impl Gpu {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.view_format), ..Default::default() });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         self.renderer.render(&self.device, &self.queue, &mut encoder, &view, (self.config.width, self.config.height), camera);
+        if let Some(client) = client {
+            self.draw_2d(&mut encoder, &view, client);
+        }
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
         self.queue.present(frame);
@@ -368,6 +393,11 @@ struct App {
     /// The physics gun holds something: the wheel and, with E, the mouse are its.
     holding: bool,
     captured: bool,
+    /// The window has the keyboard.
+    focused: bool,
+    /// The game's menus show the cursor (Q, C); and whether the mouse was captured before.
+    ui_cursor: bool,
+    captured_before_ui: bool,
     last_frame: Instant,
     frames: u32,
     counting_since: Instant,
@@ -456,17 +486,17 @@ impl App {
 
     /// Moves the camera by the keys held, for the time since the last frame: the game runs
     /// with the player in it, or the player walks, or the camera flies.
-    fn advance(&mut self) {
+    fn advance(&mut self) -> f32 {
         let now = Instant::now();
         let seconds = (now - self.last_frame).as_secs_f32().min(0.25);
         self.last_frame = now;
         if self.game.is_some() {
             self.play(seconds);
-            return;
+            return seconds;
         }
         let Some(mut walker) = self.walker.take() else {
             self.fly(seconds.min(0.1));
-            return;
+            return seconds;
         };
         let command = self.movement_keys().command(self.camera.pitch, self.camera.yaw);
         self.camera.eye = walker.advance(&self.collision, &self.settings, &command, seconds);
@@ -474,6 +504,28 @@ impl App {
         // fell out of the map
         if self.camera.eye[2] < self.collision.mins[2] - 1024.0 {
             self.respawn();
+        }
+        seconds
+    }
+
+    /// The game's menus show the cursor or hide it again: the mouse is let go and taken back.
+    fn follow_ui_cursor(&mut self) {
+        let visible = self.game.as_ref().is_some_and(Game::cursor_visible);
+        if visible == self.ui_cursor {
+            return;
+        }
+        self.ui_cursor = visible;
+        if visible {
+            self.captured_before_ui = self.captured;
+            self.capture(false);
+            // the cursor starts in the middle, as the game puts it
+            if let (Some(gpu), Some(game)) = (&self.gpu, &self.game) {
+                let (x, y) = (gpu.config.width / 2, gpu.config.height / 2);
+                let _ = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y));
+                game.cursor_moved(x as i32, y as i32);
+            }
+        } else if self.captured_before_ui && self.focused {
+            self.capture(true);
         }
     }
 
@@ -587,12 +639,35 @@ impl ApplicationHandler for App {
                     gpu.resize(size.width, size.height);
                 }
             }
-            WindowEvent::Focused(false) => {
-                self.keys.clear();
-                self.capture(false);
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.keys.clear();
+                    self.capture(false);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(game) = &self.game {
+                    game.cursor_moved(position.x as i32, position.y as i32);
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
+                // the game's menus have the mouse while they show the cursor
+                if let Some(game) = &self.game
+                    && self.ui_cursor
+                {
+                    let code = match button {
+                        MouseButton::Left => MOUSE_LEFT,
+                        MouseButton::Right => MOUSE_LEFT + 1,
+                        MouseButton::Middle => MOUSE_LEFT + 2,
+                        MouseButton::Back => MOUSE_LEFT + 3,
+                        MouseButton::Forward => MOUSE_LEFT + 4,
+                        MouseButton::Other(_) => return,
+                    };
+                    game.button(code, pressed);
+                    return;
+                }
                 let index = match button {
                     MouseButton::Left => 0,
                     MouseButton::Right => 1,
@@ -613,6 +688,12 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
                 };
                 if let Some(game) = &self.game
+                    && self.ui_cursor
+                {
+                    let code = if up { MOUSE_WHEEL_UP } else { MOUSE_WHEEL_UP + 1 };
+                    game.button(code, true);
+                    game.button(code, false);
+                } else if let Some(game) = &self.game
                     && self.captured
                 {
                     if self.holding {
@@ -622,8 +703,21 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(key), state, repeat, .. }, .. } => {
-                if state == ElementState::Pressed {
+            WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(key), state, repeat, text, .. }, .. } => {
+                let pressed = state == ElementState::Pressed;
+                // the game's client first: its menus, its text entries, its own commands (Q, C)
+                if let Some(game) = &self.game
+                    && key != KeyCode::Escape
+                {
+                    let mut taken = gmod_key(key).is_some_and(|code| game.button(code, pressed));
+                    if pressed && let Some(text) = &text {
+                        taken |= game.type_text(text);
+                    }
+                    if taken && pressed {
+                        return;
+                    }
+                }
+                if pressed {
                     match key {
                         KeyCode::Escape => self.capture(false),
                         _ if !repeat && self.game_key(key) => {}
@@ -643,12 +737,17 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.advance();
+                let seconds = self.advance();
                 self.show_entities();
+                if let (Some(game), Some(gpu)) = (&self.game, &self.gpu) {
+                    game.paint(gpu.config.width, gpu.config.height, f64::from(seconds));
+                }
+                self.follow_ui_cursor();
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.draw(&self.camera);
+                    let client = self.game.as_ref().map(Game::client);
+                    gpu.draw(&self.camera, client);
                     if std::mem::take(&mut self.screenshot) {
-                        match gpu.screenshot(&self.camera, &self.name) {
+                        match gpu.screenshot(&self.camera, client, &self.name) {
                             Ok(file) => println!("Screenshot: {}", file.display()),
                             Err(e) => println!("No screenshot: {e}"),
                         }
@@ -673,6 +772,74 @@ impl ApplicationHandler for App {
             }
         }
     }
+}
+
+/// `MOUSE_LEFT` and `MOUSE_WHEEL_UP`; the other buttons follow them.
+const MOUSE_LEFT: i32 = 107;
+const MOUSE_WHEEL_UP: i32 = 112;
+
+/// The game's number of a key (`KEY_*`), by where it is on the keyboard.
+fn gmod_key(key: KeyCode) -> Option<i32> {
+    use KeyCode::*;
+    const DIGITS: [KeyCode; 10] = [Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9];
+    const LETTERS: [KeyCode; 26] = [
+        KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV,
+        KeyW, KeyX, KeyY, KeyZ,
+    ];
+    const PAD: [KeyCode; 10] = [Numpad0, Numpad1, Numpad2, Numpad3, Numpad4, Numpad5, Numpad6, Numpad7, Numpad8, Numpad9];
+    const F: [KeyCode; 12] = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
+    let find = |list: &[KeyCode], first: i32| list.iter().position(|&k| k == key).map(|i| first + i as i32);
+    if let Some(code) = find(&DIGITS, 1).or_else(|| find(&LETTERS, 11)).or_else(|| find(&PAD, 37)).or_else(|| find(&F, 92)) {
+        return Some(code);
+    }
+    Some(match key {
+        NumpadDivide => 47,
+        NumpadMultiply => 48,
+        NumpadSubtract => 49,
+        NumpadAdd => 50,
+        NumpadEnter => 51,
+        NumpadDecimal => 52,
+        BracketLeft => 53,
+        BracketRight => 54,
+        Semicolon => 55,
+        Quote => 56,
+        Backquote => 57,
+        Comma => 58,
+        Period => 59,
+        Slash => 60,
+        Backslash => 61,
+        Minus => 62,
+        Equal => 63,
+        Enter => 64,
+        Space => 65,
+        Backspace => 66,
+        Tab => 67,
+        CapsLock => 68,
+        NumLock => 69,
+        Escape => 70,
+        ScrollLock => 71,
+        Insert => 72,
+        Delete => 73,
+        Home => 74,
+        End => 75,
+        PageUp => 76,
+        PageDown => 77,
+        Pause => 78,
+        ShiftLeft => 79,
+        ShiftRight => 80,
+        AltLeft => 81,
+        AltRight => 82,
+        ControlLeft => 83,
+        ControlRight => 84,
+        SuperLeft => 85,
+        SuperRight => 86,
+        ContextMenu => 87,
+        ArrowUp => 88,
+        ArrowLeft => 89,
+        ArrowDown => 90,
+        ArrowRight => 91,
+        _ => return None,
+    })
 }
 
 /// Whether Windows Explorer started the program (no shell around it): then the window of a
@@ -744,6 +911,9 @@ fn main() -> ExitCode {
         mouse_moved: [0.0; 2],
         holding: false,
         captured: false,
+        focused: true,
+        ui_cursor: false,
+        captured_before_ui: false,
         last_frame: now,
         frames: 0,
         counting_since: now,
@@ -787,6 +957,19 @@ mod tests {
         assert!(parse(&["-h"]).unwrap().is_none());
         assert!(parse(&["a", "b"]).is_err());
         assert!(parse(&["--frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn keys_have_the_games_numbers() {
+        assert_eq!(gmod_key(KeyCode::Digit0), Some(1));
+        assert_eq!(gmod_key(KeyCode::KeyA), Some(11));
+        assert_eq!(gmod_key(KeyCode::KeyQ), Some(27));
+        assert_eq!(gmod_key(KeyCode::KeyZ), Some(36));
+        assert_eq!(gmod_key(KeyCode::Numpad9), Some(46));
+        assert_eq!(gmod_key(KeyCode::Enter), Some(64));
+        assert_eq!(gmod_key(KeyCode::ArrowRight), Some(91));
+        assert_eq!(gmod_key(KeyCode::F12), Some(103));
+        assert_eq!(gmod_key(KeyCode::MediaPlayPause), None);
     }
 
     #[test]

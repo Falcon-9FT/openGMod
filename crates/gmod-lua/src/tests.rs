@@ -2015,6 +2015,17 @@ fn panels_are_laid_out_painted_and_clicked() {
     let red = drawn_in(&g, [255, 0, 0, 255]);
     assert!(red.contains(&[10.0, 10.0]) && red.contains(&[210.0, 110.0]), "{red:?}");
 
+    // a label wrapped to its width is as tall as its lines
+    assert!(g.eval::<bool>(
+        "surface.CreateFont('Default', { font = 'Tahoma', size = 13 })
+         local text = 'one two three four five six seven eight'
+         local L = vgui.Create('Label') L:SetText(text)
+         local W = vgui.Create('Label') W:SetSize(60, 20) W:SetWrap(true) W:SetText(text)
+         local lw, lh = L:GetContentSize() local ww, wh = W:GetContentSize()
+         L:Remove() W:Remove()
+         return lw > 60 and ww <= 60 and wh >= 3 * lh"
+    ));
+
     // a click on the button, one beside the panels, which goes to the world
     g.runtime.set_cursor(50, 50);
     assert!(g.eval::<bool>("return vgui.GetHoveredPanel() == B and B.Hovered"));
@@ -2062,8 +2073,9 @@ fn keys_run_what_they_are_bound_to() {
     assert!(g.eval::<bool>("return BLOCKED == 15"));
     // what the client does not know goes to the server, user info too
     g.runtime.think(0.01);
-    assert_eq!(g.runtime.take_server_commands(), ["gmod_toolmode weld", "gm_spawn \"models/a b.mdl\"", "gmod_toolmode rope"]);
+    assert_eq!(g.runtime.take_server_commands(), ["gm_spawn \"models/a b.mdl\""]);
     assert!(g.runtime.take_server_commands().is_empty());
+    assert_eq!(g.runtime.take_user_info(), [("gmod_toolmode".to_string(), "rope".to_string())]);
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
 

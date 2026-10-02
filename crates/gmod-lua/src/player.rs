@@ -1037,13 +1037,17 @@ fn set_user_info(lua: &Lua, handle: EntityHandle, name: &str, args: &[String]) -
         host(lua).print(&format!("\"{name}\" = \"{now}\"\n"));
         return true;
     }
-    let value = args.join(" ");
+    store_user_info(lua, handle, name, &args.join(" "));
+    true
+}
+
+/// A value of a player's user info, as their client says it.
+pub(crate) fn store_user_info(lua: &Lua, handle: EntityHandle, name: &str, value: &str) {
     with_player(lua, handle, |_, p| {
         let own = &mut p.info.user_info;
         own.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
-        own.push((name.to_string(), value));
+        own.push((name.to_string(), value.to_string()));
     });
-    true
 }
 
 /// `noclip`: flying through walls and back, when `PlayerNoClip` allows it.

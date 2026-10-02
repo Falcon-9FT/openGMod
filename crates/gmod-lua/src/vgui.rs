@@ -1515,13 +1515,19 @@ fn four(a: &Args, position: usize) -> mlua::Result<[i32; 4]> {
 
 /// The size of a label's text, inset included.
 fn content_size(lua: &Lua, h: PanelHandle) -> (i32, i32) {
-    let Some((class, text, font, inset, runs, w)) =
-        host(lua).panels.get(h, |n| (n.class, n.text.clone(), n.font.clone(), n.inset, n.runs.clone(), n.w))
+    let Some((class, text, font, inset, runs, w, wrapped)) =
+        host(lua).panels.get(h, |n| (n.class, n.text.clone(), n.font.clone(), n.inset, n.runs.clone(), n.w, n.wrap))
     else {
         return (0, 0);
     };
     let Some(font) = font_of(lua, font.as_deref()) else { return (0, 0) };
     match class {
+        Class::Label if wrapped => {
+            let lines = wrap(lua, font, &shown_text(lua, &text), w - inset.0);
+            let widest = lines.iter().map(|line| text_width(lua, font, line)).max().unwrap_or(0);
+            let tall = host(lua).screen.fonts.borrow().tall(font);
+            (widest + inset.0, tall * lines.len() as i32 + inset.1)
+        }
         Class::Label | Class::Button | Class::TextEntry => {
             let (tw, th) = host(lua).screen.fonts.borrow_mut().text_size(font, &shown_text(lua, &text));
             (tw + inset.0, th + inset.1)

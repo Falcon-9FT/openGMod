@@ -128,6 +128,9 @@ fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> 
         server.think(dt);
         client.apply_snapshot(&server.snapshot());
         client.think(dt);
+        for (name, value) in client.take_user_info() {
+            server.set_user_info(player, &name, &value);
+        }
         for line in client.take_server_commands() {
             server.run_player_command(player, &line);
         }

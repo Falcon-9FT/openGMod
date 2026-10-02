@@ -892,8 +892,29 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         })?;
     }
     globals.raw_set("ents", ents)?;
+    // the networked globals are the world's networked variables: they reach the clients as
+    // its variables do
+    lua.load(GLOBALS).set_name("=globals").exec()?;
     Ok(())
 }
+
+/// `SetGlobalString`, `GetGlobal2Int` and the rest, on the world's `SetNW*`, `SetNW2*`.
+const GLOBALS: &str = r#"
+    local meta = FindMetaTable("Entity")
+    for _, kind in ipairs({ "String", "Int", "Float", "Bool", "Vector", "Angle", "Entity" }) do
+        for _, two in ipairs({ "", "2" }) do
+            local set, get = meta["SetNW" .. two .. kind], meta["GetNW" .. two .. kind]
+            _G["SetGlobal" .. two .. kind] = function(key, value) set(Entity(0), key, value) end
+            _G["GetGlobal" .. two .. kind] = function(key, default) return get(Entity(0), key, default) end
+        end
+    end
+    for _, name in ipairs({ "SetGlobalVar", "SetGlobal2Var" }) do
+        _G[name] = function(key, value) meta.SetNW2Var(Entity(0), key, value) end
+    end
+    for _, name in ipairs({ "GetGlobalVar", "GetGlobal2Var" }) do
+        _G[name] = function(key, default) return meta.GetNW2Var(Entity(0), key, default) end
+    end
+"#;
 
 /// The types of networked variables: how a value is taken and what is there by default.
 #[derive(Clone, Copy)]

@@ -13,6 +13,7 @@ fn validate(name: &str, source: &str) {
 fn shaders_are_valid() {
     validate("world.wgsl", include_str!("world.wgsl"));
     validate("sky.wgsl", include_str!("sky.wgsl"));
+    validate("ui.wgsl", include_str!("ui.wgsl"));
 }
 
 /// A GPU for the test: a real one, else a software one (WARP on Windows). Most machines that
@@ -69,6 +70,11 @@ fn draw(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, camera: &Came
 
 /// Draws what `renderer` has from `camera` into a 64 x 64 picture, rows of 256 bytes.
 fn picture(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut Renderer, camera: &Camera) -> Vec<u8> {
+    read_back(device, queue, |encoder, view| renderer.render(device, queue, encoder, view, (64, 64), camera))
+}
+
+/// A 64 x 64 picture of what `draw` draws, rows of 256 bytes.
+fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, draw: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)) -> Vec<u8> {
     let (width, height) = (64u32, 64u32);
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("picture"),
@@ -82,7 +88,7 @@ fn picture(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut Renderer, 
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test") });
-    renderer.render(device, queue, &mut encoder, &view, (width, height), camera);
+    draw(&mut encoder, &view);
     // rows of 256 bytes: what copies out of a texture need
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -188,4 +194,51 @@ fn draws_models_where_the_entities_are() {
     renderer.set_entities(Vec::new());
     let pixels = picture(&device, &queue, &mut renderer, &above);
     assert!((0..64 * 64).all(|i| !purple(at(&pixels, i % 64, i / 64))), "a model is drawn with no entity");
+}
+
+#[test]
+fn draws_the_2d_over_the_picture() {
+    use gmod_ui::{Canvas, Clip, Texture};
+    let Some((device, queue)) = device_or_skip() else { return };
+    let mut overlay = Overlay::new(&device, &queue, FORMAT);
+    let mut canvas = Canvas::new(64, 64);
+    // a red square at the top left; a green one at the top right, cut by the GPU to a quarter
+    canvas.rect(0.0, 0.0, 32.0, 32.0, [255, 0, 0, 255]);
+    canvas.clip = Some(Clip::new(32, 0, 16, 16));
+    let square = [[32.0, 0.0, 0.0, 0.0], [64.0, 0.0, 0.0, 0.0], [64.0, 32.0, 0.0, 0.0], [32.0, 32.0, 0.0, 0.0]];
+    canvas.polygon(Texture::White, false, &square, [0, 255, 0, 255]);
+    canvas.clip = None;
+    // an image at the bottom left; red light added at the bottom right
+    canvas.image(Texture::Image(7), false, [0.0, 32.0, 32.0, 32.0], [0.0, 0.0, 1.0, 1.0], [255; 4]);
+    canvas.image(Texture::White, true, [32.0, 32.0, 32.0, 32.0], [0.0, 0.0, 1.0, 1.0], [255, 0, 0, 128]);
+    assert_eq!(overlay.missing_images(&canvas), [7]);
+    overlay.set_image(&device, &queue, 7, Some((1, 1, &[0, 0, 255, 255])));
+    assert!(overlay.missing_images(&canvas).is_empty());
+
+    let pixels = read_back(&device, &queue, |encoder, view| {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        drop(pass);
+        overlay.render(&device, &queue, encoder, view, (64, 64), &canvas);
+    });
+    assert!(red(at(&pixels, 8, 8)), "{:?}", at(&pixels, 8, 8));
+    let green = |p: &[u8]| p[1] > 200 && p[0] < 40 && p[2] < 40;
+    assert!(green(at(&pixels, 40, 8)), "{:?}", at(&pixels, 40, 8));
+    assert_eq!(&at(&pixels, 56, 8)[..3], [0, 0, 0], "the clip was not kept");
+    assert_eq!(&at(&pixels, 40, 24)[..3], [0, 0, 0], "the clip was not kept");
+    let blue = at(&pixels, 8, 40);
+    assert!(blue[2] > 200 && blue[0] < 40 && blue[1] < 40, "{blue:?}");
+    let added = at(&pixels, 40, 40);
+    assert!(added[0] > 100 && added[0] < 255 && added[1] < 40, "{added:?}");
 }

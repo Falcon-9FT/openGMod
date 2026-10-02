@@ -511,6 +511,12 @@ impl Runtime {
         player::console(&self.lua, player, line);
     }
 
+    /// A player's client says a value of its user info (`gmod_toolmode`), which `GetInfo`
+    /// reads.
+    pub fn set_user_info(&self, player: EntityHandle, name: &str, value: &str) {
+        player::store_user_info(&self.lua, player, name, value);
+    }
+
     /// What to show of a player: where they see from, their health, the weapon in hand.
     pub fn view(&self, player: EntityHandle) -> Option<PlayerView> {
         player::view(&self.lua, player)

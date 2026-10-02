@@ -177,7 +177,9 @@ fn create(lua: &Lua, name: &str, default: &str, help: &str, flags: i64, min: Opt
 fn send_user_info(lua: &Lua, name: &str, value: &str) {
     let host = host(lua);
     if host.realm == crate::Realm::Client {
-        host.client.to_server.borrow_mut().push(format!("{name} {}", quoted(value)));
+        let mut user_info = host.client.user_info.borrow_mut();
+        user_info.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+        user_info.push((name.to_string(), value.to_string()));
     }
 }
 

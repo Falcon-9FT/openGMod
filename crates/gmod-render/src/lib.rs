@@ -7,7 +7,7 @@
 //! ([`Renderer::set_entities`]), lit from above by their turned normals. [`Renderer::render`]
 //! draws a frame: the sky box, the opaque surfaces of the world and the entities, then the
 //! translucent ones - the world's from the farthest, then the entities'. Depth runs from 1 at
-//! the eye to 0 at infinity.
+//! the eye to 0 at infinity. Over it an [`Overlay`] draws the 2D of the HUD and the panels.
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +16,10 @@ use std::num::NonZeroU64;
 
 use gmod_world::gpu::{self, Camera, Draw, PixelFormat, TextureData};
 use gmod_world::{Texture, World};
+
+mod ui;
+
+pub use ui::Overlay;
 
 /// Runs a future to its end on this thread: what setting up a GPU needs, without a runtime.
 pub fn block_on<F: Future>(future: F) -> F::Output {

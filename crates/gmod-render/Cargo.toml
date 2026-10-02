@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Draws a map on the GPU with wgpu: Direct3D 12, Vulkan as the fallback"
 
 [dependencies]
+gmod-ui.workspace = true
 gmod-world.workspace = true
 wgpu.workspace = true
 
