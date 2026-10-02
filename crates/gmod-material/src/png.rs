@@ -44,7 +44,7 @@ pub fn decode(data: &[u8]) -> io::Result<Rgba> {
         let body = data.get(at + 8..at + 8 + len).ok_or_else(|| invalid("a chunk runs past the end"))?;
         match kind {
             b"IHDR" => header = Some(body.try_into().map_err(|_| invalid("IHDR is not 13 bytes"))?),
-            b"PLTE" => palette = body.chunks_exact(3).map(|c| [c[0], c[1], c[2], 255]).collect(),
+            b"PLTE" => palette = body.as_chunks::<3>().0.iter().map(|&[r, g, b]| [r, g, b, 255]).collect(),
             b"tRNS" => transparent = Some(body.to_vec()),
             b"IDAT" => compressed.extend_from_slice(body),
             b"IEND" => break,

@@ -730,7 +730,7 @@ fn describe_file(path: &Path) -> Vec<Description> {
         let tables = usize::from(u16::from_be_bytes([head[4], head[5]])).min(512);
         let Some(directory) = read(&mut file, start + 12, tables * 16) else { continue };
         let table = |tag: &[u8; 4], file: &mut File| -> Option<Vec<u8>> {
-            let record = directory.chunks_exact(16).find(|r| &r[..4] == tag)?;
+            let record = directory.as_chunks::<16>().0.iter().find(|r| &r[..4] == tag)?;
             let (offset, len) = (u32_at(record, 8), u32_at(record, 12));
             if len > 4 << 20 {
                 return None;
