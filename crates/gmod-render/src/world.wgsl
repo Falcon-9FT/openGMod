@@ -10,6 +10,14 @@ struct Camera {
     ambient: array<vec4<f32>, 6>,
     light_dir: array<vec4<f32>, 2>,
     light_color: array<vec4<f32>, 2>,
+    // the lights of the moment, in the same space as the vertices: points (xyz, radius - 0
+    // for none) and their light, then a cone: position and reach, direction and the cosine
+    // of its edge, light and the cosine where it starts to fade (reach 0 for none)
+    point_pos: array<vec4<f32>, 4>,
+    point_color: array<vec4<f32>, 4>,
+    spot_pos: vec4<f32>,
+    spot_dir: vec4<f32>,
+    spot_color: vec4<f32>,
 };
 
 struct Surface {
@@ -45,7 +53,35 @@ struct VertexOutput {
     @location(1) lightmap_uv: vec2<f32>,
     @location(2) alpha: f32,
     @location(3) light: vec3<f32>,
+    @location(4) position: vec3<f32>,
+    @location(5) normal: vec3<f32>,
 };
+
+/// The lights of the moment on a point facing `n`.
+fn moment_light(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    var light = vec3<f32>(0.0);
+    for (var i = 0; i < 4; i++) {
+        let radius = camera.point_pos[i].w;
+        if (radius > 0.0) {
+            let to = camera.point_pos[i].xyz - p;
+            let d = length(to);
+            let fall = clamp(1.0 - d / radius, 0.0, 1.0);
+            let facing = select(1.0, max(dot(n, to / max(d, 1e-3)), 0.0), length(n) > 0.5);
+            light += camera.point_color[i].rgb * fall * fall * facing;
+        }
+    }
+    let far = camera.spot_pos.w;
+    if (far > 0.0) {
+        let to = p - camera.spot_pos.xyz;
+        let d = length(to);
+        let along = dot(to / max(d, 1e-3), camera.spot_dir.xyz);
+        let cone = smoothstep(camera.spot_dir.w, camera.spot_color.w, along);
+        let fall = clamp(1.0 - d / far, 0.0, 1.0);
+        let facing = select(1.0, max(dot(n, -to / max(d, 1e-3)), 0.0), length(n) > 0.5);
+        light += camera.spot_color.rgb * cone * fall * facing;
+    }
+    return light;
+}
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
@@ -55,6 +91,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.lightmap_uv = input.lightmap_uv;
     output.alpha = input.alpha;
     output.light = input.light;
+    output.position = input.position;
+    output.normal = input.normal;
     if (camera.ambient[0].w > 0.5) {
         // the cube, each side by the square of the normal along it, and the lights that face it
         let n = input.normal / max(length(input.normal), 1e-6);
@@ -93,6 +131,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         light = input.light;
     } else if (surface.options.y > 0.5) {
         light = mapped;
+    }
+    if (surface.options.y > 0.5) {
+        let n = input.normal / max(length(input.normal), 1e-6);
+        light += moment_light(input.position, n);
     }
     return vec4<f32>(albedo.rgb * surface.tint.rgb * light, albedo.a * surface.tint.a);
 }

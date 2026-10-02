@@ -226,6 +226,68 @@ pub fn key_code(name: &str) -> Option<i32> {
     KEY_NAMES.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|(c, _)| *c)
 }
 
+/// The registry's table of `DynamicLight`s, by number (an `elight`'s negative).
+fn dynamic_lights_table(lua: &Lua) -> mlua::Result<Table> {
+    const KEY: &str = "opengmod.dynamic_lights";
+    if let Some(table) = lua.named_registry_value::<Option<Table>>(KEY)? {
+        return Ok(table);
+    }
+    let table = lua.create_table()?;
+    lua.set_named_registry_value(KEY, &table)?;
+    Ok(table)
+}
+
+/// A light of the client's for a moment (`DynamicLight`): a point light that falls off to
+/// nothing at its size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicLight {
+    pub position: Vector,
+    /// Linear light: the colour over 255 times 2 to the power of `Brightness`.
+    pub color: [f32; 3],
+    /// How far it reaches.
+    pub radius: f32,
+    /// It lights the world (not `noworld`), and models (not `nomodel`).
+    pub world: bool,
+    pub models: bool,
+}
+
+/// The `DynamicLight`s that still shine: those whose `DieTime` has not come, with a size.
+/// Those gone are let go.
+pub(crate) fn dynamic_lights(lua: &Lua) -> Vec<DynamicLight> {
+    let Ok(lights) = dynamic_lights_table(lua) else { return Vec::new() };
+    let now = host(lua).clock.cur_time.get();
+    let mut shining = Vec::new();
+    let mut gone = Vec::new();
+    for pair in lights.pairs::<Value, Table>() {
+        let Ok((key, light)) = pair else { continue };
+        let number = |name: &str| light.raw_get::<Option<f64>>(name).ok().flatten();
+        if number("DieTime").is_none_or(|t| t < now) {
+            gone.push(key);
+            continue;
+        }
+        let Some(Value::UserData(pos)) = light.raw_get::<Value>("Pos").ok() else { continue };
+        let Ok(position) = pos.borrow::<Vector>().map(|p| *p) else { continue };
+        let radius = number("Size").unwrap_or(0.0) as f32;
+        if radius <= 0.0 {
+            continue;
+        }
+        let scale = 2f32.powf(number("Brightness").unwrap_or(0.0) as f32) / 255.0;
+        let channel = |name: &str| number(name).unwrap_or(0.0) as f32 * scale;
+        let flag = |name: &str| matches!(light.raw_get::<Value>(name), Ok(Value::Boolean(true)));
+        shining.push(DynamicLight {
+            position,
+            color: [channel("r"), channel("g"), channel("b")],
+            radius,
+            world: !flag("noworld"),
+            models: !flag("nomodel"),
+        });
+    }
+    for key in gone {
+        let _ = lights.raw_set(key, Value::Nil);
+    }
+    shining
+}
+
 /// Reads the default key bindings (`bind "q" "+menu"`), and the phrases of the language.
 pub(crate) fn load(lua: &Lua) {
     let host = host(lua);
@@ -514,7 +576,20 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     def(lua, &globals, "CreateMaterial", |a| crate::material::push_named(a.lua, &a.string(1)?))?;
     def(lua, &globals, "GetRenderTarget", |a| crate::material::push_texture(a.lua, &a.string(1)?))?;
     def(lua, &globals, "GetRenderTargetEx", |a| crate::material::push_texture(a.lua, &a.string(1)?))?;
-    def(lua, &globals, "DynamicLight", |a| Ok(Value::Table(a.lua.create_table()?)))?;
+    // a light of the client's for a moment: one table a number, which Lua fills each frame
+    def(lua, &globals, "DynamicLight", |a| {
+        let index = a.number(1)? as i64;
+        let elight = matches!(a.get(2), Some(Value::Boolean(true)));
+        let lights = dynamic_lights_table(a.lua)?;
+        let key = if elight { -index - 1 } else { index };
+        if let Some(light) = lights.raw_get::<Option<Table>>(key)? {
+            return Ok(Value::Table(light));
+        }
+        let light = a.lua.create_table()?;
+        light.raw_set("key", index)?;
+        lights.raw_set(key, &light)?;
+        Ok(Value::Table(light))
+    })?;
     def(lua, &globals, "LoadPresets", load_presets)?;
     def(lua, &globals, "SavePresets", save_presets)?;
     // the engine's half of `spawnmenu`: `includes/modules/spawnmenu.lua` keeps it and makes the

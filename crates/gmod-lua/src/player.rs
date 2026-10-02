@@ -1018,6 +1018,8 @@ pub struct PlayerView {
     /// The physics gun holds something: the mouse wheel takes it farther or nearer rather
     /// than choosing a weapon, and the mouse turns it while E is down.
     pub holding: bool,
+    /// The flashlight is on (`EF_DIMLIGHT`).
+    pub flashlight: bool,
 }
 
 /// The weapon in a player's hands.
@@ -1043,7 +1045,8 @@ pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
         WeaponView { class: ent.class.clone(), name: data.print_name, clip, ammo }
     });
     let holding = crate::physgun::holding(lua, handle).is_some();
-    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon, holding })
+    let flashlight = host(lua).entities.get(handle).is_some_and(|ent| ent.effects & EF_DIMLIGHT != 0);
+    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon, holding, flashlight })
 }
 
 /// The engine's commands a player types into the console: `noclip`, `kill` and `explode`,

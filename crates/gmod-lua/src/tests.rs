@@ -2314,3 +2314,25 @@ fn footsteps_and_impacts_sound_their_surfaces() {
     assert!(waves(&g).contains(&"sound/hard.wav".to_string()));
     assert!(g.eval::<bool>("return HIT and HIT > 250"));
 }
+
+#[test]
+fn dynamic_lights_shine_until_they_die() {
+    let g = client_game(&[]);
+    g.runtime
+        .run_string(
+            "local l = DynamicLight(7) l.Pos = Vector(1, 2, 3) l.r, l.g, l.b = 255, 128, 0 l.Brightness = 2 l.Size = 256
+             l.DieTime = CurTime() + 0.5 l.nomodel = true
+             SAME = DynamicLight(7) == l
+             local dark = DynamicLight(8) dark.Pos = Vector() dark.Size = 100 dark.DieTime = CurTime() - 1",
+            "lights",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("return SAME"));
+    let lights = g.runtime.dynamic_lights();
+    assert_eq!(lights.len(), 1, "{lights:?}");
+    let l = lights[0];
+    assert_eq!((l.position.z, l.radius, l.world, l.models), (3.0, 256.0, true, false));
+    assert!((l.color[0] - 4.0).abs() < 1e-5 && (l.color[1] - 128.0 * 4.0 / 255.0).abs() < 1e-5 && l.color[2] == 0.0);
+    g.runtime.think(1.0);
+    assert!(g.runtime.dynamic_lights().is_empty());
+}

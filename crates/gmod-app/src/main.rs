@@ -557,6 +557,22 @@ impl App {
         if shown.view.alive && !self.collision.is_empty() && shown.eye[2] < self.collision.mins[2] - 1024.0 {
             game.command("kill");
         }
+        // the lights of the moment: the client's, and the flashlight from the eyes
+        if let Some(gpu) = &mut self.gpu {
+            let points = game
+                .dynamic_lights()
+                .iter()
+                .map(|l| gmod_render::PointLight {
+                    position: [l.position.x, l.position.y, l.position.z],
+                    color: l.color,
+                    radius: l.radius,
+                    world: l.world,
+                    models: l.models,
+                })
+                .collect();
+            let spot = shown.view.flashlight.then(|| flashlight(&self.camera));
+            gpu.renderer.set_lights(points, spot);
+        }
         // what the game played this frame, heard from the eyes
         if let Some(audio) = &mut self.audio {
             audio.handle(game.take_sounds(), |entity| game.entity_position(entity));
@@ -795,6 +811,22 @@ impl ApplicationHandler for App {
                 self.camera.pitch = (self.camera.pitch + dy as f32 * MOUSE_DEGREES).clamp(-89.0, 89.0);
             }
         }
+    }
+}
+
+/// The flashlight, as the engine's: from just below and right of the eyes along the view, a
+/// cone of 45 degrees (`r_flashlightfov`) reaching 750 units (`r_flashlightfar`).
+fn flashlight(camera: &Camera) -> gmod_render::SpotLight {
+    let forward = camera.forward();
+    let right = camera.right();
+    let position = std::array::from_fn(|i| camera.eye[i] + right[i] * 6.0 - if i == 2 { 4.0 } else { 0.0 });
+    gmod_render::SpotLight {
+        position,
+        direction: forward,
+        color: [2.5, 2.5, 2.3],
+        far: 750.0,
+        outer: 22.5f32.to_radians().cos(),
+        inner: 15f32.to_radians().cos(),
     }
 }
 

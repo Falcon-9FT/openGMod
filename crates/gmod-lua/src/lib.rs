@@ -582,6 +582,11 @@ impl Runtime {
         std::mem::take(&mut *host(&self.lua).sounds.events.borrow_mut())
     }
 
+    /// The client's `DynamicLight`s that shine now.
+    pub fn dynamic_lights(&self) -> Vec<client::DynamicLight> {
+        client::dynamic_lights(&self.lua)
+    }
+
     /// Where an entity is in the world now, if it is still there: for its sounds to follow.
     pub fn entity_position(&self, entity: entity::EntityHandle) -> Option<vector::Vector> {
         host(&self.lua).entities.transform(entity).map(|(pos, _)| pos)

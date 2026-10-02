@@ -218,6 +218,25 @@ fn draws_models_where_the_entities_are() {
     let pixels = picture(&device, &queue, &mut renderer, &above);
     assert_eq!(blue_pixels(&pixels), 0, "a lamp below");
     assert!(!red(at(&pixels, 32, 32)), "the black model still hides the floor");
+    // the lights of the moment: a light near it lights it; one for the world only does not;
+    // a flashlight from above does
+    renderer.set_entities(lit(gmod_world::light::ModelLight { ambient: [[0.0; 3]; 6], lights: Vec::new() }));
+    let point = |models| PointLight { position: [64.0, 64.0, 64.0], color: [0.0, 0.0, 4.0], radius: 200.0, world: true, models };
+    renderer.set_lights(vec![point(true)], None);
+    assert!(blue_pixels(&picture(&device, &queue, &mut renderer, &above)) > 16 * 16 / 4, "a light of the moment");
+    renderer.set_lights(vec![point(false)], None);
+    assert_eq!(blue_pixels(&picture(&device, &queue, &mut renderer, &above)), 0, "a light not for models");
+    let flashlight = SpotLight {
+        position: [64.0, 64.0, 150.0],
+        direction: [0.0, 0.0, -1.0],
+        color: [0.0, 0.0, 4.0],
+        far: 750.0,
+        outer: 0.9,
+        inner: 0.95,
+    };
+    renderer.set_lights(Vec::new(), Some(flashlight));
+    assert!(blue_pixels(&picture(&device, &queue, &mut renderer, &above)) > 16 * 16 / 4, "the flashlight");
+    renderer.set_lights(Vec::new(), None);
     renderer.set_entities(lit(Default::default()));
 
     // from below it is turned away, like the floor; with no entities it is gone

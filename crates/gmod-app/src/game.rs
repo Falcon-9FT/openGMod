@@ -169,6 +169,11 @@ impl Game {
         sounds
     }
 
+    /// The client's `DynamicLight`s that shine now.
+    pub fn dynamic_lights(&self) -> Vec<gmod_lua::client::DynamicLight> {
+        self.client.dynamic_lights()
+    }
+
     /// Where an entity is now (the client has the server's entities by the same handles).
     pub fn entity_position(&self, entity: gmod_lua::entity::EntityHandle) -> Option<Vector> {
         self.runtime.entity_position(entity)
@@ -403,6 +408,7 @@ mod tests {
             armor: 0,
             weapon: Some(gmod_lua::WeaponView { class: "weapon_pistol".into(), name: "#HL2_Pistol".into(), clip: 12, ammo: 36 }),
             holding: false,
+            flashlight: false,
         };
         assert_eq!(status(&view), "health 80 - weapon_pistol 12/36");
         view.weapon = None;

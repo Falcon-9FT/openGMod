@@ -49,9 +49,9 @@ const PARAMS_STRIDE: u64 = 256;
 /// Bytes of a surface's parameters.
 const PARAMS_SIZE: u64 = 48;
 /// Bytes of a camera for the shaders: its matrix, its eye, where the light of models comes from.
-const CAMERA_SIZE: u64 = 240;
+const CAMERA_SIZE: u64 = 416;
 /// Bytes between two cameras in their buffer: the world's, then one for each entity drawn.
-const CAMERA_STRIDE: u64 = 256;
+const CAMERA_STRIDE: u64 = 512;
 
 /// Which pipeline a surface needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +106,80 @@ pub struct Placed {
     pub light: gmod_world::light::ModelLight,
 }
 
+/// The most lights of the moment a surface takes, besides the flashlight.
+pub const MAX_POINT_LIGHTS: usize = 4;
+
+/// A light of the moment (`DynamicLight`): it falls off to nothing at its radius.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointLight {
+    pub position: [f32; 3],
+    /// Linear light at its middle.
+    pub color: [f32; 3],
+    pub radius: f32,
+    /// It lights the world, and the models of entities.
+    pub world: bool,
+    pub models: bool,
+}
+
+/// A cone of light: the flashlight.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpotLight {
+    pub position: [f32; 3],
+    /// Where it points, of length 1.
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    /// How far it reaches, falling off to nothing there.
+    pub far: f32,
+    /// The cosines of the cone's edge, where it is gone, and of where it starts to fade.
+    pub outer: f32,
+    pub inner: f32,
+}
+
+/// The lights of the moment in a space of their own: a model's, by its placement (origin,
+/// axes, scale); the world's is the identity.
+fn lights_bytes(
+    points: &[PointLight],
+    spot: Option<&SpotLight>,
+    models: bool,
+    origin: [f32; 3],
+    axes: [[f32; 3]; 3],
+    scale: f32,
+) -> Vec<f32> {
+    let into = |p: [f32; 3]| {
+        let d = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+        let s = 1.0 / scale.max(1e-6);
+        axes.map(|a| (a[0] * d[0] + a[1] * d[1] + a[2] * d[2]) * s)
+    };
+    let turn = |d: [f32; 3]| axes.map(|a| a[0] * d[0] + a[1] * d[1] + a[2] * d[2]);
+    let lit: Vec<&PointLight> = points.iter().filter(|p| if models { p.models } else { p.world }).take(MAX_POINT_LIGHTS).collect();
+    let mut values = Vec::with_capacity(4 * (2 * MAX_POINT_LIGHTS + 3));
+    for i in 0..MAX_POINT_LIGHTS {
+        match lit.get(i) {
+            Some(p) => {
+                values.extend(into(p.position));
+                values.push(p.radius / scale.max(1e-6));
+            }
+            None => values.extend([0.0; 4]),
+        }
+    }
+    for i in 0..MAX_POINT_LIGHTS {
+        let color = lit.get(i).map_or([0.0; 3], |p| p.color);
+        values.extend([color[0], color[1], color[2], 0.0]);
+    }
+    match spot {
+        Some(s) => {
+            values.extend(into(s.position));
+            values.push(s.far / scale.max(1e-6));
+            values.extend(turn(s.direction));
+            values.push(s.outer);
+            values.extend(s.color);
+            values.push(s.inner);
+        }
+        None => values.extend([0.0; 12]),
+    }
+    values
+}
+
 /// An uploaded texture and which sampler it takes; none when it could not be uploaded.
 type Uploaded = Option<(wgpu::TextureView, usize)>;
 
@@ -134,6 +208,9 @@ pub struct Renderer {
     /// Textures by name, the world's and the models', each uploaded once.
     textures: HashMap<String, Uploaded>,
     entities: Vec<Placed>,
+    /// The lights of the moment: the game's `DynamicLight`s, and the flashlight.
+    points: Vec<PointLight>,
+    spot: Option<SpotLight>,
     sky_vertices: Option<wgpu::Buffer>,
     sky_groups: Vec<wgpu::BindGroup>,
     depth: Option<(wgpu::TextureView, (u32, u32))>,
@@ -282,7 +359,7 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
 /// its light in the model's space - the ambient cube (w 1 on the first side; 0 for the world,
 /// lit as it was baked), then the directions towards its lights (w 1 for a light) and their
 /// light.
-fn camera_bytes(matrix: [f32; 16], eye: [f32; 3], light: Option<&gmod_world::light::ModelLight>) -> Vec<u8> {
+fn camera_bytes(matrix: [f32; 16], eye: [f32; 3], light: Option<&gmod_world::light::ModelLight>, moment: &[f32]) -> Vec<u8> {
     let mut values: Vec<f32> = matrix.iter().chain(&eye).copied().collect();
     values.push(1.0);
     match light {
@@ -304,6 +381,7 @@ fn camera_bytes(matrix: [f32; 16], eye: [f32; 3], light: Option<&gmod_world::lig
         }
         None => values.resize(values.len() + 4 * (6 + 2 * gmod_world::light::MAX_LIGHTS), 0.0),
     }
+    values.extend(moment);
     let mut bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     bytes.resize(CAMERA_STRIDE as usize, 0);
     bytes
@@ -666,6 +744,8 @@ impl Renderer {
             models: Vec::new(),
             textures: by_name,
             entities: Vec::new(),
+            points: Vec::new(),
+            spot: None,
             sky_vertices,
             sky_groups,
             depth: None,
@@ -696,6 +776,13 @@ impl Renderer {
     }
 
     /// The models to draw from now on, and where.
+    /// The lights of the moment from now on: points (the first [`MAX_POINT_LIGHTS`] that
+    /// light each kind of thing) and a cone.
+    pub fn set_lights(&mut self, points: Vec<PointLight>, spot: Option<SpotLight>) {
+        self.points = points;
+        self.spot = spot;
+    }
+
     pub fn set_entities(&mut self, entities: Vec<Placed>) {
         self.entities = entities.into_iter().filter(|e| e.model.0 < self.models.len()).collect();
     }
@@ -741,15 +828,19 @@ impl Renderer {
             self.camera_buffer = camera_buffer(device, self.camera_slots);
             self.camera_group = camera_group(device, &self.shared.layouts.camera, &self.camera_buffer);
         }
-        let mut cameras = camera_bytes(view_projection, camera.eye, None);
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let world_lights = lights_bytes(&self.points, self.spot.as_ref(), false, [0.0; 3], identity, 1.0);
+        let mut cameras = camera_bytes(view_projection, camera.eye, None, &world_lights);
         for placed in &self.entities {
             let (mut matrix, _) = gpu::placement(placed.origin, placed.angles);
-            let light = gmod_world::light::in_model_space(&placed.light, gmod_world::axes(placed.angles));
+            let axes = gmod_world::axes(placed.angles);
+            let light = gmod_world::light::in_model_space(&placed.light, axes);
+            let moment = lights_bytes(&self.points, self.spot.as_ref(), true, placed.origin, axes, placed.scale);
             matrix[..12].iter_mut().for_each(|v| *v *= placed.scale);
-            cameras.extend(camera_bytes(gpu::multiply(&view_projection, &matrix), camera.eye, Some(&light)));
+            cameras.extend(camera_bytes(gpu::multiply(&view_projection, &matrix), camera.eye, Some(&light), &moment));
         }
         queue.write_buffer(&self.camera_buffer, 0, &cameras);
-        queue.write_buffer(&self.sky_camera_buffer, 0, &camera_bytes(camera.sky_projection(aspect), [0.0; 3], None));
+        queue.write_buffer(&self.sky_camera_buffer, 0, &camera_bytes(camera.sky_projection(aspect), [0.0; 3], None, &[]));
         // translucent surfaces from the farthest
         let distance = |draw: &Draw| {
             let d = [draw.center[0] - camera.eye[0], draw.center[1] - camera.eye[1], draw.center[2] - camera.eye[2]];
