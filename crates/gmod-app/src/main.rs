@@ -57,6 +57,7 @@ CONTROLS:
     the physics gun: hold the left button to carry, the wheel to take it farther or
     nearer, E and the mouse to turn it, the right button to freeze it, R to unfreeze
     V to fly through walls (noclip) and back
+    hold Q for the spawn menu, C for the context menu: the mouse works in them
     F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)
 
     Lines typed into this terminal are the game's console: give weapon_crowbar,
