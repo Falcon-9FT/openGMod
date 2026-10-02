@@ -37,6 +37,11 @@ const ENGINE_CONVARS: &[(&str, &str, &str)] = &[
     ("deathmatch", "1", "Running a deathmatch server."),
     ("coop", "0", "Cooperative play."),
     ("crosshair", "1", ""),
+    // the NPC menu of the spawn menu's bar
+    ("ai_disabled", "0", "Disables all NPC thinking"),
+    ("ai_ignoreplayers", "0", "NPCs ignore players"),
+    ("ai_serverragdolls", "0", "Ragdolls of dead NPCs stay on the server, as physics"),
+    ("npc_citizen_auto_player_squad", "1", "Citizens join the player's squad"),
 ];
 
 /// ConVars of a client's engine that the game's Lua reads.
@@ -50,6 +55,8 @@ const CLIENT_CONVARS: &[(&str, &str, &str)] = &[
     ("r_drawviewmodel", "1", ""),
     ("hud_fastswitch", "0", ""),
     ("mat_fullbright", "0", ""),
+    ("r_shadows", "1", ""),
+    ("r_drawdetailprops", "1", ""),
     ("name", "Player", "Current user name"),
 ];
 

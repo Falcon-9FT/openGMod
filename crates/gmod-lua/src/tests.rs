@@ -2153,3 +2153,36 @@ fn the_hud_shows_what_the_player_has() {
     assert!(!boxes.iter().any(|p| health(&p)) && boxes.iter().any(|p| ammo(&p)), "{boxes:?}");
     assert!(client.messages().is_empty(), "{:?}", client.messages());
 }
+
+#[test]
+fn lerps_of_vectors_and_angles() {
+    let g = game(Realm::Server, &[]);
+    assert!(g.eval::<bool>("return LerpVector(0.25, Vector(0, 0, 0), Vector(4, 8, -12)) == Vector(1, 2, -3)"));
+    // the short way round: from 170 to -170 through 180
+    assert!(g.eval::<bool>("local a = LerpAngle(0.5, Angle(0, 170, 0), Angle(10, -170, 0)) return math.abs(a.p - 5) < 1e-3 and math.abs(math.abs(a.y) - 180) < 1e-3"));
+}
+
+#[test]
+fn the_engine_fields_of_an_entity() {
+    let g = entity_game(Realm::Server);
+    // the sun's light comes down at 60 degrees along +x: the direction points back up at the sun
+    let (x, y, z) = g.eval::<(f32, f32, f32)>(
+        "local sun = ents.Create('env_sun') sun:SetKeyValue('pitch', '-60') sun:SetKeyValue('angle', '0')
+         sun:SetName('sun')
+         local d = sun:GetInternalVariable('m_vDirection')
+         assert(sun:GetInternalVariable('m_iName') == 'sun' and sun:GetInternalVariable('nonsense') == nil)
+         return d.x, d.y, d.z",
+    );
+    assert!((x + 0.5).abs() < 1e-3 && y.abs() < 1e-3 && (z - 0.866).abs() < 1e-3, "{x} {y} {z}");
+}
+
+#[test]
+fn text_of_a_token_is_its_phrase() {
+    let g = client_game(&[("resource/localization/en/test.properties", "test.hello=Hello there\n")]);
+    let (token, phrase, raw) = g.eval::<(i64, i64, i64)>(
+        "surface.CreateFont('T', { font = 'Arial', size = 20 }) surface.SetFont('T')
+         return surface.GetTextSize('#test.hello'), surface.GetTextSize('Hello there'), surface.GetTextSize('test.hello')",
+    );
+    assert_eq!(token, phrase);
+    assert_ne!(token, raw);
+}

@@ -340,6 +340,11 @@ pub(crate) fn load_fonts(lua: &Lua) {
     }
 }
 
+/// Text as the engine draws and measures it: a `#token` is the phrase of the game's language.
+fn localized(lua: &Lua, text: String) -> String {
+    if text.starts_with('#') { host(lua).client.phrase(&text) } else { text }
+}
+
 /// One variant of a scheme font: `name`, `tall`, `weight`, the effects, and `yres`.
 fn scheme_variant(block: &gmod_kv::Block) -> (Option<(u32, u32)>, FontSpec) {
     let number = |key: &str| block.str(key).and_then(|v| v.trim().parse::<f64>().ok());
@@ -488,7 +493,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         Ok(Value::Nil)
     })?;
     def_many(lua, &s, "GetTextSize", |a| {
-        let text = a.string(1)?;
+        let text = localized(a.lua, a.string(1)?);
         let screen = &host(a.lua).screen;
         let font = screen.pen.borrow().font.or_else(|| screen.font("Default"));
         let (w, h) = match font {
@@ -513,7 +518,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         two(a, x, y)
     })?;
     def(lua, &s, "DrawText", |a| {
-        let text = a.string(1)?;
+        let text = localized(a.lua, a.string(1)?);
         let screen = &host(a.lua).screen;
         let (font, (x, y), color) = {
             let pen = screen.pen.borrow();

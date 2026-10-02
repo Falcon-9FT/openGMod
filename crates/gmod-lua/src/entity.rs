@@ -1153,6 +1153,29 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         crate::ents::key_value(a.lua, handle, &key, &value);
         Ok(Value::Nil)
     })?;
+    // the engine's own fields of an entity, by their names in its data map; those Lua reads
+    def("GetInternalVariable", |a| {
+        let handle = this(a, 1)?;
+        let name = a.string(2)?;
+        let (_, angles) = host(a.lua).entities.transform(handle).expect("checked above");
+        let ent = host(a.lua).entities.get(handle).expect("checked above").clone();
+        let number = |key: &str| ent.keyvalue(key).and_then(|v| v.trim().parse::<f32>().ok());
+        Ok(match name.as_str() {
+            // towards the sun: the light's direction as Source sets it up from a yaw (`angle`,
+            // else the angles') and a `pitch` (negative is down, else the angles'), turned round
+            "m_vDirection" => {
+                let yaw = number("angle").filter(|y| *y != -1.0).unwrap_or(angles.y).to_radians();
+                let pitch = number("pitch").unwrap_or(-angles.p).to_radians();
+                let light = Vector::new(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin());
+                vector(a.lua, Vector::new(-light.x, -light.y, -light.z))?
+            }
+            "m_iName" => Value::String(a.lua.create_string(&ent.name)?),
+            "m_ModelName" => Value::String(a.lua.create_string(&ent.model)?),
+            "m_nSkin" => Value::Integer(ent.skin),
+            "m_spawnflags" => Value::Integer(ent.spawn_flags),
+            _ => Value::Nil,
+        })
+    })?;
     def("GetKeyValues", |a| {
         let handle = this(a, 1)?;
         let (pos, angles) = host(a.lua).entities.transform(handle).expect("checked above");
