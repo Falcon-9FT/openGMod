@@ -305,25 +305,54 @@ pub(crate) fn create(lua: &Lua, class: &str, map_creation_id: Option<i32>) -> ml
             }
         }
     };
-    let ud = userdata(lua, handle).expect("made above");
     if let Some((_, script)) = script {
-        let table = entity::table_of(&ud)?.expect("every entity has a table");
-        let module = if script == Script::Sent { "scripted_ents" } else { "weapons" };
-        let get: Function = lua.globals().get::<Table>(module)?.get("Get")?;
-        let _ =
-            files::call_reporting(lua, get, MultiValue::from_iter([Value::String(lua.create_string(class)?), Value::Table(table.clone())]));
-        table.raw_set("Entity", &ud)?;
-        if script == Script::Swep {
-            table.raw_set("Weapon", &ud)?;
-        }
-        call_method(lua, &ud, "InstallDataTable", MultiValue::new());
-        call_method(lua, &ud, "SetupDataTables", MultiValue::new());
+        set_up_script(lua, handle, class, script)?;
     }
     if kind == Kind::Weapon {
         crate::weapon::setup(lua, handle);
     }
     announce(lua, handle);
     Ok(Some(handle))
+}
+
+/// Gives a scripted entity its class's table (`scripted_ents.Get`, `weapons.Get`) and its
+/// data tables (`SetupDataTables`).
+fn set_up_script(lua: &Lua, handle: EntityHandle, class: &str, script: Script) -> mlua::Result<()> {
+    let ud = userdata(lua, handle).expect("a valid entity");
+    let table = entity::table_of(&ud)?.expect("every entity has a table");
+    let module = if script == Script::Sent { "scripted_ents" } else { "weapons" };
+    let get: Function = lua.globals().get::<Table>(module)?.get("Get")?;
+    let _ = files::call_reporting(lua, get, MultiValue::from_iter([Value::String(lua.create_string(class)?), Value::Table(table.clone())]));
+    table.raw_set("Entity", &ud)?;
+    if script == Script::Swep {
+        table.raw_set("Weapon", &ud)?;
+    }
+    call_method(lua, &ud, "InstallDataTable", MultiValue::new());
+    call_method(lua, &ud, "SetupDataTables", MultiValue::new());
+    Ok(())
+}
+
+/// A client receives an entity of the server's (put in place already, its variables not yet):
+/// a scripted one takes its class's table, as on the server.
+pub(crate) fn received(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
+    let Some((class, scripted)) = host(lua).entities.get(handle).map(|ent| (ent.class.clone(), ent.scripted)) else { return Ok(()) };
+    if scripted && let Some((_, script)) = script_of(lua, &class)? {
+        set_up_script(lua, handle, &class, script)?;
+    }
+    Ok(())
+}
+
+/// A received entity comes into being on the client: `OnEntityCreated`, then a scripted
+/// entity's `Initialize`.
+pub(crate) fn arrived(lua: &Lua, handle: EntityHandle) {
+    announce(lua, handle);
+    let scripted = host(lua).entities.get(handle).is_some_and(|ent| ent.scripted);
+    if scripted && let Some(ud) = userdata(lua, handle) {
+        call_method(lua, &ud, "Initialize", MultiValue::new());
+    }
+    if let Some(ud) = userdata(lua, handle) {
+        crate::call_hook(lua, "NetworkEntityCreated", MultiValue::from_iter([Value::UserData(ud)]));
+    }
 }
 
 /// Makes an entity of one of the engine's own classes that scripts do not make themselves
@@ -628,8 +657,14 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
         *host.world.collision.borrow_mut() = map.collision.clone();
         *host.world.textures.borrow_mut() = map.textures.clone();
     }
-    crate::physics::load_world(lua, map.collision.as_deref());
     let world = EntityHandle::WORLD;
+    // a client has the world to trace against; the entities come from the server
+    if host(lua).realm != Realm::Server {
+        host(lua).entities.with_mut(world, |ent| ent.model = format!("maps/{}.bsp", map.name));
+        crate::call_hook(lua, "InitPostEntity", MultiValue::new());
+        return;
+    }
+    crate::physics::load_world(lua, map.collision.as_deref());
     let world_bounds = model_bounds(lua, "*0").unwrap_or_default();
     host(lua).entities.with_mut(world, |ent| {
         ent.model = format!("maps/{}.bsp", map.name);

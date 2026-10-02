@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
-use mlua::{Lua, MultiValue, Table, Value};
+use mlua::{IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::args::Args;
 use crate::host;
@@ -120,6 +120,42 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     })?;
     lua.globals().raw_set("util", util)?;
     lua.globals().raw_set("PrecacheParticleSystem", lua.create_function(|_, _: MultiValue| Ok(()))?)?;
+    let globals = lua.globals();
+    let def = |name: &'static str, f: fn(&Args) -> mlua::Result<MultiValue>| -> mlua::Result<()> {
+        globals.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
+    };
+    def("ColorToHSV", |a| {
+        let [r, g, b, _] = crate::surface::color_table(&a.table(1)?)?.map(|c| f64::from(c) / 255.0);
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let delta = max - min;
+        let hue = if delta == 0.0 {
+            0.0
+        } else if max == r {
+            60.0 * ((g - b) / delta).rem_euclid(6.0)
+        } else if max == g {
+            60.0 * ((b - r) / delta + 2.0)
+        } else {
+            60.0 * ((r - g) / delta + 4.0)
+        };
+        let saturation = if max == 0.0 { 0.0 } else { delta / max };
+        (hue, saturation, max).into_lua_multi(a.lua)
+    })?;
+    def("HSVToColor", |a| {
+        let (hue, saturation, value) = (a.number(1)?.rem_euclid(360.0), a.number(2)?.clamp(0.0, 1.0), a.number(3)?.clamp(0.0, 1.0));
+        let chroma = value * saturation;
+        let x = chroma * (1.0 - ((hue / 60.0).rem_euclid(2.0) - 1.0).abs());
+        let (r, g, b) = match (hue / 60.0) as u32 {
+            0 => (chroma, x, 0.0),
+            1 => (x, chroma, 0.0),
+            2 => (0.0, chroma, x),
+            3 => (0.0, x, chroma),
+            4 => (x, 0.0, chroma),
+            _ => (chroma, 0.0, x),
+        };
+        let m = value - chroma;
+        let channel = |c: f64| ((c + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+        crate::surface::push_color(a.lua, [channel(r), channel(g), channel(b), 255]).map(|v| MultiValue::from_iter([v]))
+    })?;
     Ok(())
 }
 

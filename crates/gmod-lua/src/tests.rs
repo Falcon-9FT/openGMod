@@ -1958,3 +1958,186 @@ fn what_scripts_ask_of_entities() {
     ));
     assert_eq!(g.messages(), ["on purpose"]);
 }
+
+// --- the client ---------------------------------------------------------------------------
+
+/// The client's half of the game's Lua, cut down: [`ENTITY_LUA`], and commands of Lua on the
+/// table `COMMANDS` as `concommand` keeps them.
+const CLIENT_LUA: &str = r#"
+    COMMANDS = {}
+    concommand = {
+        Add = function(name, f) COMMANDS[name:lower()] = f AddConsoleCommand(name) end,
+        Run = function(p, name, args, line)
+            local f = COMMANDS[name:lower()]
+            if f then f(p, name, args, line) return true end
+            return false
+        end,
+    }
+"#;
+
+/// A client runtime with [`ENTITY_LUA`] and [`CLIENT_LUA`] run, on a screen 640 by 480.
+fn client_game(files: &[(&str, &str)]) -> Game {
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let mut all = vec![("lua/includes/init.lua", init.as_str()), ("scripts/weapons/weapon_pistol.txt", PISTOL)];
+    all.extend_from_slice(files);
+    let g = game(Realm::Client, &all);
+    g.runtime.init();
+    g.runtime.set_screen_size(640, 480);
+    g
+}
+
+/// The vertices drawn in a colour.
+fn drawn_in(g: &Game, color: [u8; 4]) -> Vec<[f32; 2]> {
+    g.runtime.with_canvas(|canvas, _| canvas.vertices().iter().filter(|v| v.color == color).map(|v| v.pos).collect())
+}
+
+#[test]
+fn panels_are_laid_out_painted_and_clicked() {
+    let g = client_game(&[]);
+    g.runtime
+        .run_string(
+            "P = vgui.Create('Panel') P:SetPos(10, 10) P:SetSize(200, 100) P:MakePopup()
+             function P:Paint(w, h) surface.SetDrawColor(255, 0, 0, 255) surface.DrawRect(0, 0, w, h) end
+             B = vgui.Create('Button', P) B:Dock(FILL) B:DockMargin(5, 5, 5, 5)
+             function B:DoClick() CLICKED = (CLICKED or 0) + 1 end
+             Q = vgui.Create('Panel') Q:SetPos(300, 10) Q:SetSize(100, 40) Q:MakePopup()
+             T = vgui.Create('TextEntry', Q) T:Dock(FILL)
+             HOOKS.GUIMousePressed = function(code, aim) PRESSED = code end",
+            "panels",
+        )
+        .unwrap();
+    assert!(g.runtime.cursor_visible());
+    g.runtime.paint(0.016);
+    // docked inside its parent, less the margin
+    assert!(g.eval::<bool>(
+        "local x, y = B:GetPos() local w, h = B:GetSize() return x == 5 and y == 5 and w == 190 and h == 90 and B:GetParent() == P"
+    ));
+    let red = drawn_in(&g, [255, 0, 0, 255]);
+    assert!(red.contains(&[10.0, 10.0]) && red.contains(&[210.0, 110.0]), "{red:?}");
+
+    // a click on the button, one beside the panels, which goes to the world
+    g.runtime.set_cursor(50, 50);
+    assert!(g.eval::<bool>("return vgui.GetHoveredPanel() == B and B.Hovered"));
+    assert!(g.runtime.button(107, true) && g.runtime.button(107, false));
+    g.runtime.set_cursor(500, 300);
+    assert!(g.runtime.button(107, true) && g.runtime.button(107, false));
+    assert!(g.eval::<bool>("return CLICKED == 1 and PRESSED == MOUSE_LEFT and not B.Hovered"));
+
+    // typing into the text entry clicked
+    g.runtime.set_cursor(320, 20);
+    g.runtime.button(107, true);
+    g.runtime.button(107, false);
+    assert!(g.runtime.type_text("hey"));
+    assert!(g.runtime.button(66, true) && g.runtime.button(66, false));
+    assert!(g.eval::<bool>("return vgui.GetKeyboardFocus() == T and T:GetValue() == 'he'"));
+
+    // gone at the end of the frame, and with them the cursor
+    g.runtime.run_string("P:Remove() Q:Remove()", "remove").unwrap();
+    g.runtime.paint(0.016);
+    assert!(!g.runtime.cursor_visible());
+    assert!(g.eval::<bool>("return not P:IsValid() and not T:IsValid()"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn keys_run_what_they_are_bound_to() {
+    let g = client_game(&[("cfg/config_default.cfg", "bind \"q\" \"+menu\"\nbind \"v\" \"noclip\"\nbind \"e\" \"+use\"\n")]);
+    g.runtime
+        .run_string(
+            "concommand.Add('+menu', function() MENU = true end)
+             concommand.Add('-menu', function() MENU = false end)
+             HOOKS.PlayerBindPress = function(p, bind, pressed, code) if bind == '+use' then BLOCKED = code return true end end
+             CreateConVar('gmod_toolmode', 'weld', FCVAR_USERINFO or 512)
+             RunConsoleCommand('gm_spawn', 'models/a b.mdl') RunConsoleCommand('gmod_toolmode', 'rope')",
+            "binds",
+        )
+        .unwrap();
+    // Q is the client's own; V is the server's; E is taken by Lua
+    assert!(g.runtime.button(27, true));
+    assert!(g.eval::<bool>("return MENU == true and input.IsKeyDown(KEY_Q or 27)"));
+    assert!(g.runtime.button(27, false));
+    assert!(g.eval::<bool>("return MENU == false"));
+    assert!(!g.runtime.button(32, true));
+    assert!(g.runtime.button(15, true));
+    assert!(g.eval::<bool>("return BLOCKED == 15"));
+    // what the client does not know goes to the server, user info too
+    g.runtime.think(0.01);
+    assert_eq!(g.runtime.take_server_commands(), ["gmod_toolmode weld", "gm_spawn \"models/a b.mdl\"", "gmod_toolmode rope"]);
+    assert!(g.runtime.take_server_commands().is_empty());
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn the_client_has_the_servers_entities() {
+    const SENT: &str = "scripted_ents.Register({ Type = 'anim',
+        Initialize = function(self) INIT = (INIT or 0) + 1 end,
+        OnRemove = function(self) REMOVED = true end }, 'sent_test')";
+    let server = player_game();
+    server.runtime.run_string(SENT, "sent").unwrap();
+    let alice = server.runtime.join(alice()).unwrap();
+    server
+        .runtime
+        .run_string(
+            "E = ents.Create('prop_physics') E:SetModel('models/box.mdl') E:SetPos(Vector(30, 0, 0)) E:Spawn()
+             E:SetNWInt('n', 7) E:SetNWEntity('who', Entity(1)) E:SetNW2Vector('v', Vector(1, 2, 3))
+             S = ents.Create('sent_test') S:Spawn()",
+            "props",
+        )
+        .unwrap();
+    server.runtime.think(0.02);
+
+    let client = client_game(&[]);
+    client.runtime.run_string(SENT, "sent").unwrap();
+    client.runtime.spawn_map(&player_map());
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.set_local_player(alice);
+    assert!(client.eval::<bool>(
+        "local p, e = LocalPlayer(), ents.FindByClass('prop_physics')[1]
+         return p:IsPlayer() and p:Nick() == 'Alice' and p:Health() == 100 and p:GetActiveWeapon():GetClass() == 'weapon_pistol'
+             and e:GetPos() == Vector(30, 0, 0) and e:GetModel() == 'models/box.mdl' and e:GetNWInt('n') == 7
+             and e:GetNWEntity('who') == p and e:GetNW2Vector('v') == Vector(1, 2, 3)
+             and #ents.FindByClass('info_player_start') == 0 and INIT == 1 and ents.FindByClass('sent_test')[1].Initialize ~= nil"
+    ));
+    let clip = server.eval::<i64>("return Entity(1):GetActiveWeapon():Clip1()");
+    assert_eq!(client.eval::<i64>("return LocalPlayer():GetActiveWeapon():Clip1()"), clip);
+
+    // what goes on the server goes on the client; the same entity stays the same
+    server.runtime.run_string("S:Remove() E:SetPos(Vector(40, 0, 0))", "move").unwrap();
+    server.runtime.think(0.02);
+    client.runtime.run_string("PROP = ents.FindByClass('prop_physics')[1]", "keep").unwrap();
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    assert!(client.eval::<bool>(
+        "return REMOVED and INIT == 1 and #ents.FindByClass('sent_test') == 0 and PROP:IsValid() and PROP:GetPos() == Vector(40, 0, 0)"
+    ));
+    assert!(server.messages().is_empty(), "{:?}", server.messages());
+    assert!(client.messages().is_empty(), "{:?}", client.messages());
+}
+
+#[test]
+fn the_hud_shows_what_the_player_has() {
+    let server = player_game();
+    let alice = server.runtime.join(alice()).unwrap();
+    server.runtime.think(0.02);
+    let client = client_game(&[]);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.set_local_player(alice);
+    client.runtime.run_string("ASKED = {} HOOKS.HUDShouldDraw = function(name) ASKED[name] = true end", "hud").unwrap();
+    client.runtime.paint(0.016);
+    // health and ammo, no suit without armour, no second ammo for the pistol
+    assert!(client.eval::<bool>(
+        "return ASKED.CHudHealth and ASKED.CHudAmmo and ASKED.CHudCrosshair and ASKED.CHudGMod
+             and not ASKED.CHudBattery and not ASKED.CHudSecondaryAmmo"
+    ));
+    // the boxes, at the bottom left and right of a screen 480 tall
+    let boxes = drawn_in(&client, [0, 0, 0, 90]);
+    let health = |p: &&[f32; 2]| (16.0..=118.0).contains(&p[0]) && (432.0..=468.0).contains(&p[1]);
+    let ammo = |p: &&[f32; 2]| (490.0..=626.0).contains(&p[0]) && (432.0..=468.0).contains(&p[1]);
+    assert!(boxes.iter().any(|p| health(&p)) && boxes.iter().any(|p| ammo(&p)), "{boxes:?}");
+
+    // Lua hides an element
+    client.runtime.run_string("HOOKS.HUDShouldDraw = function(name) return name ~= 'CHudHealth' end", "hide").unwrap();
+    client.runtime.paint(0.016);
+    let boxes = drawn_in(&client, [0, 0, 0, 90]);
+    assert!(!boxes.iter().any(|p| health(&p)) && boxes.iter().any(|p| ammo(&p)), "{boxes:?}");
+    assert!(client.messages().is_empty(), "{:?}", client.messages());
+}

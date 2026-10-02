@@ -1,5 +1,7 @@
 //! `gmod-check lua`: starts the Lua of the game in one realm, as the engine would, and lists
-//! what failed - above all the functions of the engine that are not there yet.
+//! what failed - above all the functions of the engine that are not there yet. A client plays
+//! a second of frames with a server behind it, the HUD and the panels painted, and opens the
+//! spawn menu (Q) and the context menu (C) on the way.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -24,7 +26,8 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
         }
     };
     let started = Instant::now();
-    let runtime = match Runtime::new(realm, Arc::new(vfs)) {
+    let vfs = Arc::new(vfs);
+    let runtime = match Runtime::new(realm, vfs.clone()) {
         Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("LuaJIT could not be started: {e}");
@@ -49,14 +52,19 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
         runtime.set_data_dir(dir);
     }
     runtime.start("sandbox");
-    if let Some(map) = map.filter(|_| realm == Realm::Server) {
-        runtime.spawn_map(map);
-        // and the player of a single-player game joins
-        runtime.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() });
-    }
-    // one second of game time: the timers and hooks of the first frames
-    for _ in 0..60 {
-        runtime.think(1.0 / 60.0);
+    let mut client_report = None;
+    if realm == Realm::Client {
+        client_report = Some(play_client(&runtime, vfs, map));
+    } else {
+        if let Some(map) = map.filter(|_| realm == Realm::Server) {
+            runtime.spawn_map(map);
+            // and the player of a single-player game joins
+            runtime.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() });
+        }
+        // one second of game time: the timers and hooks of the first frames
+        for _ in 0..60 {
+            runtime.think(1.0 / 60.0);
+        }
     }
 
     for line in printed.borrow().lines() {
@@ -75,6 +83,9 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
         out.line(format!("Map {}: {} entities.", map.name, runtime.entity_count()));
         out.line(player_report(&runtime));
     }
+    if let Some(report) = client_report {
+        out.line(report);
+    }
     let missing = missing_globals(&errors);
     if !missing.is_empty() {
         out.line("Missing in openGMOD (global, errors it caused):");
@@ -84,6 +95,64 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
     }
     print_coverage(&runtime, all, out);
     if errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// `KEY_Q` and `KEY_C`, which open the spawn menu and the context menu.
+const KEY_Q: i32 = 27;
+const KEY_C: i32 = 13;
+
+/// A second of a client's frames, with a server of its own behind it (on the map, if one is
+/// given): what the server has comes to the client every frame, what the client sends goes to
+/// the server, the HUD and the panels are painted; Q is held from the 10th frame to the
+/// 30th, C from the 35th to the 50th. What showed, and how the server did.
+fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> String {
+    let server = match Runtime::new(Realm::Server, vfs) {
+        Ok(server) => server,
+        Err(e) => return format!("The server could not be started: {e}"),
+    };
+    server.set_output(|_| {});
+    server.start("sandbox");
+    if let Some(map) = map {
+        server.spawn_map(map);
+        client.spawn_map(map);
+    }
+    let Some(player) = server.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() }) else {
+        return "No player could join the server.".to_string();
+    };
+    client.set_screen_size(1280, 720);
+    client.set_local_player(player);
+    let (mut most_panels, mut spawn_menu, mut context_menu) = (0, 0, 0);
+    let mut vertices = 0;
+    for frame in 0..60 {
+        let dt = 1.0 / 60.0;
+        server.think(dt);
+        client.apply_snapshot(&server.snapshot());
+        client.think(dt);
+        for line in client.take_server_commands() {
+            server.run_player_command(player, &line);
+        }
+        match frame {
+            10 => client.button(KEY_Q, true),
+            30 => client.button(KEY_Q, false),
+            35 => client.button(KEY_C, true),
+            50 => client.button(KEY_C, false),
+            _ => false,
+        };
+        client.paint(dt);
+        vertices = vertices.max(client.with_canvas(|canvas, _| canvas.vertices().len()));
+        let shown = client.lua().load("return #vgui.GetAll()").eval::<usize>().unwrap_or(0);
+        most_panels = most_panels.max(shown);
+        match frame {
+            29 => spawn_menu = shown,
+            49 => context_menu = shown,
+            _ => {}
+        }
+    }
+    format!(
+        "Client: 60 frames, at most {most_panels} panels and {vertices} vertices; {spawn_menu} panels with the spawn menu open, \
+         {context_menu} with the context menu. Server behind it: {} errors.",
+        server.errors().len()
+    )
 }
 
 /// Where the player got to in the first second, and what they hold.

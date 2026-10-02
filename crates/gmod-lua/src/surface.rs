@@ -61,6 +61,21 @@ struct SchemeFont {
 }
 
 impl SchemeFont {
+    /// The variant for a screen `height` pixels tall, as the engine's HUD asks for it: one
+    /// made for that height as it is, else the one for any height grown from a screen 480
+    /// pixels tall to this one.
+    fn proportional(&self, height: u32) -> Option<FontSpec> {
+        if let Some((_, spec)) = self.variants.iter().find(|(range, _)| range.is_some_and(|(lo, hi)| (lo..=hi).contains(&height))) {
+            return Some(spec.clone());
+        }
+        let mut spec = self.variants.iter().find(|(range, _)| range.is_none()).or_else(|| self.variants.first())?.1.clone();
+        let scale = |n: u32| if n == 0 { 0 } else { ((n as f32 * height as f32 / 480.0).round() as u32).max(1) };
+        spec.size = scale(spec.size);
+        spec.blur = scale(spec.blur);
+        spec.scanlines = scale(spec.scanlines);
+        Some(spec)
+    }
+
     fn for_height(&self, height: u32) -> Option<&FontSpec> {
         self.variants
             .iter()
@@ -140,6 +155,13 @@ impl Screen {
         Some(self.fonts.borrow_mut().font(&spec))
     }
 
+    /// A font of the schemes the way the engine's HUD asks for them: proportional, as big
+    /// on any screen ([`SchemeFont::proportional`]).
+    pub fn proportional_font(&self, name: &str) -> Option<FontId> {
+        let spec = self.scheme.borrow().get(&name.to_lowercase())?.proportional(self.size.get().1)?;
+        Some(self.fonts.borrow_mut().font(&spec))
+    }
+
     pub fn create_font(&self, name: &str, spec: &FontSpec) {
         let font = self.fonts.borrow_mut().font(spec);
         self.named.borrow_mut().insert(name.to_lowercase(), font);
@@ -210,7 +232,7 @@ fn measure(lua: &Lua, image: &Image) -> Option<(u32, u32)> {
     let material = gmod_material::load_material(&vfs, &image.name).ok()?;
     let texture = material.params().iter().find(|(k, _)| k == "$basetexture").map(|(_, v)| v.clone())?;
     let vtf = gmod_material::load_texture(&vfs, &texture).ok()?;
-    Some((u32::from(vtf.width), u32::from(vtf.height)))
+    Some((vtf.width, vtf.height))
 }
 
 /// Width and height from a PNG's or JPEG's header.
@@ -244,34 +266,34 @@ pub(crate) fn image_size(data: &[u8]) -> Option<(u32, u32)> {
 /// texture, read once.
 pub(crate) fn pixels(lua: &Lua, name: &str, is_texture: bool) -> Option<Rc<Rgba>> {
     let key = format!("{}:{}", u8::from(is_texture), name.replace('\\', "/").to_lowercase());
-    let screen = &host(lua).screen;
-    if let Some(found) = screen.pixels.borrow().get(&key) {
+    if let Some(found) = host(lua).screen.pixels.borrow().get(&key) {
         return found.clone();
     }
+    let image = decode(lua, name, is_texture).map(Rc::new);
+    host(lua).screen.pixels.borrow_mut().insert(key, image.clone());
+    image
+}
+
+/// Reads the pixels of an image file (`.png`), a texture (`is_texture`) or a material's base
+/// texture: its first frame, at full size.
+pub(crate) fn decode(lua: &Lua, name: &str, is_texture: bool) -> Option<Rgba> {
     let vfs = host(lua).vfs.clone();
     let lower = name.replace('\\', "/").to_lowercase();
-    let image = if lower.ends_with(".png") {
-        [format!("materials/{lower}"), lower.clone()]
+    if lower.ends_with(".png") {
+        return [format!("materials/{lower}"), lower.clone()]
             .iter()
             .find_map(|p| vfs.read(p, "GAME").ok())
-            .and_then(|data| gmod_material::png::decode(&data).ok())
+            .and_then(|data| gmod_material::png::decode(&data).ok());
+    }
+    let texture = if is_texture {
+        Some(lower)
     } else {
-        let texture = if is_texture {
-            Some(lower.clone())
-        } else {
-            gmod_material::load_material(&vfs, name)
-                .ok()
-                .and_then(|m| m.params().iter().find(|(k, _)| k == "$basetexture").map(|(_, v)| v.clone()))
-        };
-        texture.and_then(|t| gmod_material::load_texture(&vfs, &t).ok()).and_then(|vtf| vtf.rgba8(0, 0, 0, 0)).map(|image| Rgba {
-            width: image.width,
-            height: image.height,
-            pixels: image.rgba,
-        })
+        gmod_material::load_material(&vfs, name)
+            .ok()
+            .and_then(|m| m.params().iter().find(|(k, _)| k == "$basetexture").map(|(_, v)| v.clone()))
     };
-    let image = image.map(Rc::new);
-    screen.pixels.borrow_mut().insert(key, image.clone());
-    image
+    let image = gmod_material::load_texture(&vfs, &texture?).ok()?.rgba8(0, 0, 0, 0)?;
+    Some(Rgba { width: image.width, height: image.height, pixels: image.rgba })
 }
 
 /// The size of an image by number, measured once.
@@ -650,11 +672,4 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     })?;
     globals.raw_set("surface", s)?;
     Ok(())
-}
-
-/// What `surface.GetTextSize` would say, from Rust: none when the font is not there.
-pub(crate) fn text_size(lua: &Lua, font: &str, text: &str) -> Option<(i32, i32)> {
-    let screen = &host(lua).screen;
-    let font = screen.font(font)?;
-    Some(screen.fonts.borrow_mut().text_size(font, text))
 }

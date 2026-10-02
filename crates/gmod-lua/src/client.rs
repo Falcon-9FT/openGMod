@@ -913,3 +913,133 @@ fn install_render(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     globals.raw_set("cam", cam)?;
     Ok(())
 }
+
+// --- the program's side --------------------------------------------------------------------
+
+/// `MOUSE_WHEEL_UP`, `MOUSE_WHEEL_DOWN`.
+const MOUSE_WHEEL_UP: i32 = 112;
+const MOUSE_WHEEL_DOWN: i32 = 113;
+
+/// The client's half of the program: what it is told of the screen and the player, the keys
+/// and the cursor, and the frame of 2D it draws.
+impl crate::Runtime {
+    /// The size of the screen in pixels; Lua hears of a change (`OnScreenSizeChanged`).
+    pub fn set_screen_size(&self, width: u32, height: u32) {
+        let size = (width.max(1), height.max(1));
+        let old = host(&self.lua).screen.size.replace(size);
+        if old != size {
+            let args = (old.0, old.1, size.0, size.1).into_lua_multi(&self.lua).unwrap_or_default();
+            self.call_hook("OnScreenSizeChanged", args);
+        }
+    }
+
+    /// The player this client plays: `LocalPlayer()`.
+    pub fn set_local_player(&self, player: EntityHandle) {
+        host(&self.lua).client.local_player.set(player);
+    }
+
+    /// Where the local player sees from this frame.
+    pub fn set_view(&self, view: View) {
+        host(&self.lua).client.view.set(view);
+    }
+
+    /// The cursor moved, to a pixel of the screen.
+    pub fn set_cursor(&self, x: i32, y: i32) {
+        host(&self.lua).client.cursor.set((x, y));
+        crate::vgui::cursor_moved(&self.lua);
+    }
+
+    /// Whether the cursor is out - a menu that takes the mouse shows, or Lua asked for it
+    /// (`gui.EnableScreenClicker`) - so the mouse does not turn the view.
+    pub fn cursor_visible(&self) -> bool {
+        let host = host(&self.lua);
+        host.panels.cursor_visible(host.client.screen_clicker.get())
+    }
+
+    /// A key or mouse button (`KEY_*`, `MOUSE_*`) went down or up. The panels have it first;
+    /// then `PlayerBindPress` hears of the command bound to it, and a command of the client's
+    /// own runs (`+menu` with the key down, `-menu` with it up). True when the client took
+    /// it; the game has the rest (`+attack`, `noclip` ...).
+    pub fn button(&self, code: i32, down: bool) -> bool {
+        let lua = &self.lua;
+        host(lua).client.set_key(code, down);
+        let taken = match code {
+            107..=111 => crate::vgui::mouse_button(lua, code, down),
+            MOUSE_WHEEL_UP | MOUSE_WHEEL_DOWN => down && crate::vgui::mouse_wheel(lua, if code == MOUSE_WHEEL_UP { 1 } else { -1 }),
+            _ => crate::vgui::key(lua, code, down),
+        };
+        if taken {
+            return true;
+        }
+        let Some(command) = host(lua).client.binding(code) else { return false };
+        if down {
+            let player = entity::push(lua, host(lua).client.local_player.get()).unwrap_or(Value::Nil);
+            let args = (player, command.as_str(), true, code).into_lua_multi(lua).unwrap_or_default();
+            if matches!(crate::call_hook(lua, "PlayerBindPress", args).front(), Some(Value::Boolean(true))) {
+                return true;
+            }
+        }
+        let line = match command.strip_prefix('+') {
+            Some(rest) if !down => format!("-{rest}"),
+            _ if down => command,
+            _ => return false,
+        };
+        let commands = crate::convar::split_commands(&line);
+        if commands.is_empty() || !commands.iter().all(|words| crate::convar::is_known(lua, &words[0])) {
+            return false;
+        }
+        for words in commands {
+            crate::convar::execute(lua, &words);
+        }
+        true
+    }
+
+    /// Text was typed (what the keys made, after the keyboard's layout): it goes into the text
+    /// entry that has the keyboard. True when one took it.
+    pub fn type_text(&self, text: &str) -> bool {
+        crate::vgui::text_typed(&self.lua, text)
+    }
+
+    /// Draws the frame's 2D: the panels think and are laid out, then the HUD - the engine's
+    /// and Lua's - and the panels are painted, and `PostRenderVGUI` and `DrawOverlay` draw
+    /// over them. [`with_canvas`](Self::with_canvas) has what was drawn.
+    pub fn paint(&self, real_frame_time: f64) {
+        let lua = &self.lua;
+        {
+            let host = host(lua);
+            host.client.real_frame_time.set(real_frame_time);
+            host.client.frame.set(host.client.frame.get() + 1);
+            host.screen.begin();
+        }
+        crate::vgui::think(lua);
+        crate::vgui::layout(lua);
+        crate::hud::paint(lua);
+        crate::vgui::paint(lua);
+        self.call_hook("PostRenderVGUI", MultiValue::new());
+        self.call_hook("DrawOverlay", MultiValue::new());
+        crate::vgui::remove_doomed(lua);
+        host(lua).client.end_frame();
+    }
+
+    /// The frame [`paint`](Self::paint) drew, and the font atlas its text is cut from.
+    pub fn with_canvas<R>(&self, f: impl FnOnce(&gmod_ui::Canvas, &mut gmod_ui::Fonts) -> R) -> R {
+        let host = host(&self.lua);
+        let canvas = host.screen.canvas.borrow();
+        let mut fonts = host.screen.fonts.borrow_mut();
+        f(&canvas, &mut fonts)
+    }
+
+    /// An image the frame draws ([`gmod_ui::Texture::Image`]): its name, and its pixels, read
+    /// from a PNG file or a material's base texture. None when there is no such image.
+    pub fn image(&self, id: u32) -> Option<(crate::surface::Image, Option<gmod_material::png::Rgba>)> {
+        let image = host(&self.lua).screen.image(id)?;
+        let pixels = crate::surface::decode(&self.lua, &image.name, false);
+        Some((image, pixels))
+    }
+
+    /// The console lines the client sends the server - commands it does not know itself, and
+    /// the user info that changed (`gmod_toolmode weld`) - oldest first.
+    pub fn take_server_commands(&self) -> Vec<String> {
+        std::mem::take(&mut *host(&self.lua).client.to_server.borrow_mut())
+    }
+}

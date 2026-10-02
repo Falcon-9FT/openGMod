@@ -103,11 +103,8 @@ pub fn decode(data: &[u8]) -> io::Result<Rgba> {
         }
     };
     let mut offset = 0;
-    let layout: Vec<(u32, u32, u32, u32, u32, u32)> = if interlaced {
-        passes(width, height).to_vec()
-    } else {
-        vec![(0, 0, width, height, 1, 1)]
-    };
+    let layout: Vec<(u32, u32, u32, u32, u32, u32)> =
+        if interlaced { passes(width, height).to_vec() } else { vec![(0, 0, width, height, 1, 1)] };
     for (x0, y0, w, h, dx, dy) in layout {
         if w == 0 || h == 0 {
             continue;

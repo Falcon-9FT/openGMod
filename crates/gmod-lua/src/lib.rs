@@ -65,6 +65,7 @@ pub mod ents;
 pub mod files;
 pub mod filesystem;
 pub mod http;
+pub mod hud;
 pub mod inputs;
 pub mod material;
 pub mod matrix;
@@ -75,6 +76,7 @@ pub mod physgun;
 pub mod physics;
 pub mod player;
 pub mod sandbox;
+pub mod snapshot;
 pub mod sound;
 pub mod sql;
 mod startup;
@@ -95,6 +97,7 @@ pub use ents::{Drawn, Map};
 pub use mlua;
 pub use movedata::UserCmd;
 pub use player::{PlayerInfo, PlayerView, WeaponView};
+pub use snapshot::{NetValue, Snapshot};
 
 /// Which of GMod's Lua states a [`Runtime`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -248,6 +251,8 @@ pub(crate) struct Host {
     pub client: client::Client,
     /// The client's panels.
     pub panels: vgui::Panels,
+    /// The engine's HUD: where its elements go, its colours.
+    pub hud: RefCell<hud::Hud>,
 }
 
 impl Host {
@@ -323,6 +328,7 @@ impl Runtime {
             screen: surface::Screen::default(),
             client: client::Client::default(),
             panels: vgui::Panels::default(),
+            hud: RefCell::new(hud::Hud::default()),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -358,6 +364,7 @@ impl Runtime {
             vgui::install(&lua)?;
             surface::load_fonts(&lua);
             client::load(&lua);
+            hud::load(&lua);
         }
         Ok(Runtime { lua })
     }
@@ -448,12 +455,16 @@ impl Runtime {
         convar::run_buffer(&self.lua);
         http::deliver(&self.lua);
         timer::run_timers(&self.lua);
+        // a client does not simulate: what moves comes from the server
+        let server = self.realm() == Realm::Server;
         for tick in 1..=ticks {
             host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::TICK_INTERVAL).min(end));
-            player::tick_all(&self.lua);
-            physgun::think(&self.lua);
-            physics::simulate(&self.lua);
-            inputs::service(&self.lua);
+            if server {
+                player::tick_all(&self.lua);
+                physgun::think(&self.lua);
+                physics::simulate(&self.lua);
+                inputs::service(&self.lua);
+            }
             ents::think(&self.lua);
             self.call_hook("Tick", mlua::MultiValue::new());
         }

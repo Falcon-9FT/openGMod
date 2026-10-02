@@ -295,6 +295,18 @@ impl Entities {
         Some(EntityHandle { index: Some(index as u32), serial: slot.serial, kind })
     }
 
+    /// Puts an entity at an index under a serial number given: a client's copy of the
+    /// server's entity there. What was at the index is gone.
+    pub(crate) fn put(&self, index: u32, serial: u32, ent: Ent) -> EntityHandle {
+        let mut slots = self.slots.borrow_mut();
+        while slots.len() <= index as usize {
+            slots.push(Slot { serial: 0, ent: None });
+        }
+        let kind = ent.kind;
+        slots[index as usize] = Slot { serial, ent: Some(ent) };
+        EntityHandle { index: Some(index), serial, kind }
+    }
+
     /// Frees an index: the handles to what was there become NULL.
     pub(crate) fn free(&self, handle: EntityHandle) {
         let Some(index) = handle.index else { return };

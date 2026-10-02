@@ -1033,8 +1033,11 @@ fn shown_text(lua: &Lua, text: &str) -> String {
     if text.starts_with('#') { host(lua).client.phrase(text) } else { text.to_string() }
 }
 
+/// Lines of text, each where it goes.
+type Lines = Vec<(String, i32, i32)>;
+
 /// The text of a label in its rectangle, aligned as it says.
-fn label_lines(lua: &Lua, h: PanelHandle) -> Option<(gmod_ui::FontId, Vec<(String, i32, i32)>)> {
+fn label_lines(lua: &Lua, h: PanelHandle) -> Option<(gmod_ui::FontId, Lines)> {
     let (text, font, align, inset, wrapped, w, hh) =
         host(lua).panels.get(h, |n| (n.text.clone(), n.font.clone(), n.align, n.inset, n.wrap, n.w, n.h))?;
     let font = font_of(lua, font.as_deref())?;
@@ -1102,7 +1105,7 @@ fn draw_entry(lua: &Lua, h: PanelHandle, text_color: [u8; 4], highlight: [u8; 4]
     let screen = &host(lua).screen;
     let tall = screen.fonts.borrow().tall(font);
     let focused = panels.focus.get() == Some(h);
-    let blink = (host(lua).started.elapsed().as_secs_f64() * 2.0) as u64 % 2 == 0;
+    let blink = ((host(lua).started.elapsed().as_secs_f64() * 2.0) as u64).is_multiple_of(2);
     // lines with the index of their first character
     let mut lines = Vec::new();
     let mut start = 0;
