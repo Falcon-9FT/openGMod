@@ -19,7 +19,7 @@
 //! * the engine's types and libraries: [`meta`] (`FindMetaTable`, `TYPE_*`), [`vector`]
 //!   (`Vector`, `Angle`), [`matrix`] (`VMatrix`), [`entity`] (`NULL`, the metatables of `Entity`, `Player` ...),
 //!   [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
-//!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`material`] (`Material`), [`engine`] (`game`,
+//!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`] (`Material`), [`engine`] (`game`,
 //!   `engine`, `system`, `gmod`, the enumerations), and [`world`] (`ents`, `player` ... as
 //!   they answer while there are no entities). They grow towards the whole API - `gmod-check
 //!   lua` counts how much of it is there.
@@ -47,6 +47,7 @@ pub mod engine;
 pub mod entity;
 pub mod files;
 pub mod filesystem;
+pub mod http;
 pub mod material;
 pub mod matrix;
 pub mod meta;
@@ -201,6 +202,7 @@ pub(crate) struct Host {
     pub ai_names: world::AiNames,
     pub net: net::Net,
     pub database: sql::Database,
+    pub http: http::Http,
 }
 
 impl Host {
@@ -264,6 +266,7 @@ impl Runtime {
             ai_names: world::AiNames::default(),
             net: net::Net::default(),
             database: sql::Database::default(),
+            http: http::Http::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -280,6 +283,7 @@ impl Runtime {
         material::install(&lua)?;
         world::install(&lua)?;
         sql::install(&lua)?;
+        http::install(&lua)?;
         net::install(&lua, realm)?;
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
@@ -306,6 +310,18 @@ impl Runtime {
         let host = host(&self.lua);
         *host.data_dir.borrow_mut() = Some(dir);
         host.database.close();
+    }
+
+    /// Lets `HTTP` reach private networks (this machine, the local network), as GMod's
+    /// `-allowlocalhttp` does for dedicated servers. Only the server realm takes it.
+    pub fn allow_local_http(&self, allow: bool) {
+        let host = host(&self.lua);
+        host.http.allow_local.set(allow && host.realm == Realm::Server);
+    }
+
+    /// How many `HTTP` requests are still waiting for an answer.
+    pub fn http_in_flight(&self) -> usize {
+        host(&self.lua).http.in_flight()
     }
 
     /// Runs the file the engine starts the realm with ([`Realm::init_file`]). False if it
@@ -342,7 +358,8 @@ impl Runtime {
     }
 
     /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
-    /// timers that are due, the `Tick` hook for every tick that passed, the `Think` hook.
+    /// answers to `HTTP` requests that came in, the timers that are due, the `Tick` hook for
+    /// every tick that passed, the `Think` hook.
     pub fn think(&self, seconds: f64) {
         let ticks = {
             let clock = &host(&self.lua).clock;
@@ -354,6 +371,7 @@ impl Runtime {
             ticks
         };
         convar::run_buffer(&self.lua);
+        http::deliver(&self.lua);
         timer::run_timers(&self.lua);
         for _ in 0..ticks {
             self.call_hook("Tick", mlua::MultiValue::new());

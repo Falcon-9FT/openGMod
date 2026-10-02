@@ -1,5 +1,5 @@
 //! The libraries about the world - `ents`, `player`, `ai`, `motionsensor` - as they answer while
-//! the world is empty, and the engine's service that is not there yet (`HTTP`).
+//! the world is empty.
 //!
 //! Entities come with stage 4: until then the server has no entities and no players, and
 //! these functions say exactly that (`player.GetAll()` is `{}`, `Entity(1)` is `NULL`). What
@@ -112,8 +112,6 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     }
     globals.raw_set("motionsensor", motionsensor)?;
 
-    // no requests go out yet: HTTP says it could not make one
-    def(lua, &globals, "HTTP", no)?;
     Ok(())
 }
 

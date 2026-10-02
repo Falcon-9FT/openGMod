@@ -608,7 +608,6 @@ fn empty_world() {
         "return FindMetaTable('Player').MetaName == 'Player' and FindMetaTable('Player').MetaBaseClass == FindMetaTable('Entity')"
     ));
     assert!(g.eval::<bool>("return FindMetaTable('Panel') == nil"), "panels are the client's");
-    assert!(g.eval::<bool>("return HTTP({}) == false"));
     assert!(g.eval::<bool>("return ai.GetScheduleID('a') == ai.GetScheduleID('a') and ai.GetScheduleID('a') ~= ai.GetScheduleID('b')"));
     let error = g.runtime.lua().load("NULL.x = 1").exec().unwrap_err().to_string();
     assert!(error.contains("Tried to use a NULL entity!"), "{error}");
@@ -655,4 +654,208 @@ fn a_gamemode_starts() {
     );
     assert!(g.eval::<bool>("return GAMEMODE == gamemode.Get('mine') and GM == nil and ENT == nil and SWEP == nil"));
     assert_eq!(g.eval::<String>("return engine.ActiveGamemode()"), "mine");
+}
+
+/// A web server on this machine for `HTTP` to talk to: it answers each request with what it
+/// was asked, one request per connection. `/missing` is a 404; `/slow` answers too late.
+fn web_server() -> String {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    // requests being answered now, and the most there ever were
+    let busy = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                let head_end = loop {
+                    let n = stream.read(&mut buffer).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+                let header = |name: &str| {
+                    head.lines()
+                        .find_map(|line| {
+                            line.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string())
+                        })
+                        .unwrap_or_default()
+                };
+                let length: usize = header("content-length").parse().unwrap_or(0);
+                while request.len() < head_end + length {
+                    let n = stream.read(&mut buffer).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let body = String::from_utf8_lossy(&request[head_end..]).into_owned();
+                let target = head.split(' ').nth(1).unwrap_or("").to_string();
+                let method = head.split(' ').next().unwrap_or("").to_string();
+                let (status, text) = match target.as_str() {
+                    "/missing" => ("404 Not Found", "nope".to_string()),
+                    "/slow" => {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        ("200 OK", "late".to_string())
+                    }
+                    "/busy" => {
+                        let now = busy.0.fetch_add(1, Ordering::SeqCst) + 1;
+                        busy.1.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        busy.0.fetch_sub(1, Ordering::SeqCst);
+                        ("200 OK", "done".to_string())
+                    }
+                    "/peak" => ("200 OK", busy.1.load(Ordering::SeqCst).to_string()),
+                    _ => ("200 OK", format!("{method} {target} [{}] [{}] [{body}]", header("content-type"), header("x-test"))),
+                };
+                let _ =
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nx-echo: yes\r\nConnection: close\r\n\r\n{text}", text.len());
+            });
+        }
+    });
+    format!("http://{address}")
+}
+
+/// Runs frames until no request is waiting.
+fn finish_requests(g: &Game) {
+    let started = std::time::Instant::now();
+    while g.runtime.http_in_flight() > 0 {
+        assert!(started.elapsed().as_secs() < 20, "requests still waiting");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        g.runtime.think(0.01);
+    }
+}
+
+#[test]
+fn http_requests() {
+    let base = web_server();
+    let g = game(Realm::Server, &[]);
+    g.runtime.allow_local_http(true);
+    g.runtime
+        .run_string(
+            &format!(
+                r#"
+                local base = "{base}"
+                local function show(name) return function(code, body, headers) print(name, code, body, headers["X-Echo"]) end end
+                local function fail(name) return function(reason) print(name, reason) end end
+                print(HTTP({{ url = base .. "/get", parameters = {{ q = "a b&c" }}, headers = {{ ["X-Test"] = "t" }}, success = show("get") }}))
+                HTTP({{ url = base .. "/form", method = "post", parameters = {{ k = "v" }}, success = show("form") }})
+                HTTP({{ url = base .. "/raw", method = "PUT", body = "{{}}", type = "application/json", success = show("raw") }})
+                HTTP({{ url = base .. "/missing", success = show("missing") }})
+                HTTP({{ url = base .. "/slow", timeout = 0.3, success = show("slow"), failed = fail("slow") }})
+                HTTP({{ url = "not a url", failed = fail("bad") }})
+                HTTP({{ url = base .. "/x", method = "BREW", failed = fail("brew") }})
+                print(HTTP("not a table"))
+                "#
+            ),
+            "http",
+        )
+        .unwrap();
+    assert_eq!(g.printed(), "true\nfalse\n", "answers come on a later frame");
+    finish_requests(&g);
+    let printed = g.printed();
+    let mut lines: Vec<&str> = printed.lines().skip(2).collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            "bad\tinvalid url",
+            "brew\tunsuccessful",
+            "form\t200\tPOST /form [application/x-www-form-urlencoded] [] [k=v]\tyes",
+            "get\t200\tGET /get?q=a%20b%26c [] [t] []\tyes",
+            "missing\t404\tnope\tyes",
+            "raw\t200\tPUT /raw [application/json] [] [{}]\tyes",
+            "slow\ttimeout",
+        ]
+    );
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+
+    // as in GMod, nothing on this machine or the local network unless the server allows it
+    for realm in [Realm::Server, Realm::Client, Realm::Menu] {
+        let g = game(realm, &[]);
+        g.runtime
+            .run_string(
+                &format!(
+                    r#"HTTP({{ url = "{base}/get", success = function() print("reached") end, failed = function(r) print("refused", r) end }})
+                       HTTP({{ url = "http://localhost:1/", failed = function(r) print("refused", r) end }})"#
+                ),
+                "local",
+            )
+            .unwrap();
+        finish_requests(&g);
+        assert_eq!(g.printed(), "refused\tunsuccessful\nrefused\tunsuccessful\n", "{realm}");
+    }
+    let client = game(Realm::Client, &[]);
+    client.runtime.allow_local_http(true);
+    client.runtime.run_string(&format!(r#"HTTP({{ url = "{base}/get", failed = function(r) print(r) end }})"#), "client").unwrap();
+    finish_requests(&client);
+    assert_eq!(client.printed(), "unsuccessful\n", "only a server may allow it");
+}
+
+#[test]
+fn http_waits_its_turn() {
+    let base = web_server();
+    let g = game(Realm::Server, &[]);
+    g.runtime.allow_local_http(true);
+    g.runtime
+        .run_string(
+            &format!(
+                r#"
+                local done = 0
+                for i = 1, 40 do
+                    HTTP({{ url = "{base}/busy", success = function() done = done + 1 end, failed = print }})
+                end
+                function Finished() return done end
+                "#
+            ),
+            "many",
+        )
+        .unwrap();
+    finish_requests(&g);
+    assert_eq!(g.eval::<u32>("return Finished()"), 40);
+    g.runtime.run_string(&format!(r#"HTTP({{ url = "{base}/peak", success = function(_, body) print(body) end }})"#), "peak").unwrap();
+    finish_requests(&g);
+    let peak: usize = g.printed().trim().parse().unwrap();
+    assert!((1..=http::MAX_PARALLEL).contains(&peak), "{peak} at once");
+}
+
+#[test]
+fn public_addresses() {
+    let public = |text: &str| http::is_public(text.parse().unwrap());
+    for address in ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8", "2002:808:808::1"] {
+        assert!(public(address), "{address}");
+    }
+    for address in [
+        "127.0.0.1",
+        "10.1.2.3",
+        "172.16.0.1",
+        "172.31.255.255",
+        "192.168.1.1",
+        "169.254.169.254",
+        "100.64.0.1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "255.255.255.255",
+        "::1",
+        "::",
+        "fe80::1",
+        "fd00::1",
+        "::ffff:127.0.0.1",
+        "::ffff:192.168.0.1",
+        "64:ff9b::a00:1",
+        "2002:c0a8:101::1",
+        "ff02::1",
+    ] {
+        assert!(!public(address), "{address}");
+    }
 }
