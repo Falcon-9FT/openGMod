@@ -1425,3 +1425,64 @@ fn traces_through_the_world_and_entities() {
     ));
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
+
+#[test]
+fn what_a_player_types_and_what_is_shown_of_them() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime
+        .run_string(
+            "HOOKS.PlayerNoClip = function(p, on) print('noclip', on) return true end
+             ALLOW_SUICIDE = false HOOKS.CanPlayerSuicide = function(p) return ALLOW_SUICIDE end
+             concommand = { Run = function(p, cmd, args, line) print(p:Nick(), cmd, #args, line) end }
+             AddConsoleCommand('whoami')
+             weapons.list.weapon_test = {
+                 PrintName = 'Test', Slot = 3,
+                 Primary = { ClipSize = 5, DefaultClip = 5, Ammo = 'SMG1' }, Secondary = { ClipSize = -1, DefaultClip = -1, Ammo = 'none' },
+             }",
+            "setup",
+        )
+        .unwrap();
+
+    // the commands of Lua get the player who typed them
+    g.runtime.run_player_command(alice, "whoami a b; noclip");
+    assert_eq!(g.printed(), "Alice\twhoami\t2\ta b\nnoclip\ttrue\n");
+    assert!(g.eval::<bool>("return Entity(1):GetMoveType() == MOVETYPE_NOCLIP"));
+    g.runtime.run_player_command(alice, "noclip");
+    assert!(g.eval::<bool>("return Entity(1):GetMoveType() == MOVETYPE_WALK"));
+
+    // what is shown: the eyes, between the ticks, and the weapon in hand
+    g.runtime.run_player_command(alice, "give weapon_test");
+    let view = g.runtime.view(alice).unwrap();
+    assert_eq!(view.eye, g.runtime.position(alice).unwrap() + vector::Vector::new(0.0, 0.0, 64.0));
+    assert!(view.alive && view.health == 100 && view.angles == vector::Angle::new(0.0, 90.0, 0.0));
+    let weapon = view.weapon.unwrap();
+    assert_eq!((weapon.class.as_str(), weapon.name.as_str(), weapon.clip, weapon.ammo), ("weapon_test", "Test", 5, 0));
+    g.runtime.set_input(alice, walking(90.0, 0));
+    g.runtime.think(0.0225);
+    let view = g.runtime.view(alice).unwrap();
+    assert!(view.previous_eye.y < view.eye.y && (view.previous_eye.x - view.eye.x).abs() < 0.001, "{view:?}");
+    assert!((g.runtime.tick_fraction() - 0.5).abs() < 0.01, "{}", g.runtime.tick_fraction());
+    g.runtime.set_input(alice, UserCmd::default());
+
+    // choosing a weapon: by slot, one after another, the last one, by class
+    let active = |g: &Game| g.eval::<String>("return Entity(1):GetActiveWeapon():GetClass()");
+    g.runtime.run_player_command(alice, "invnext");
+    assert_eq!(active(&g), "weapon_pistol");
+    g.runtime.run_player_command(alice, "slot4");
+    assert_eq!(active(&g), "weapon_test");
+    g.runtime.run_player_command(alice, "invprev");
+    assert_eq!(active(&g), "weapon_pistol");
+    g.runtime.run_player_command(alice, "lastinv");
+    assert_eq!(active(&g), "weapon_test");
+    g.runtime.run_player_command(alice, "use weapon_pistol");
+    assert_eq!(active(&g), "weapon_pistol");
+
+    // `kill` asks CanPlayerSuicide
+    g.runtime.run_player_command(alice, "kill");
+    assert!(g.runtime.view(alice).unwrap().alive);
+    g.runtime.run_string("ALLOW_SUICIDE = true", "allow").unwrap();
+    g.runtime.run_player_command(alice, "kill");
+    assert!(!g.runtime.view(alice).unwrap().alive);
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}

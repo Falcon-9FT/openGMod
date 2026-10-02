@@ -260,6 +260,12 @@ pub fn split_commands(text: &str) -> Vec<Vec<String>> {
 
 /// Runs one command now: sets a ConVar, or calls a command of Lua.
 pub(crate) fn execute(lua: &Lua, words: &[String]) {
+    execute_as(lua, words, EntityHandle::NULL);
+}
+
+/// Runs a command typed by `player` (`NULL`: the server's console), whom the commands of
+/// `concommand.Add` get.
+pub(crate) fn execute_as(lua: &Lua, words: &[String], player: EntityHandle) {
     let Some((name, arguments)) = words.split_first() else { return };
     if let Some(handle) = find(lua, name) {
         match arguments.first() {
@@ -280,8 +286,7 @@ pub(crate) fn execute(lua: &Lua, words: &[String]) {
     let run = || -> mlua::Result<Option<(mlua::Function, MultiValue)>> {
         let Some(concommand) = lua.globals().get::<Option<Table>>("concommand")? else { return Ok(None) };
         let Some(run) = concommand.get::<Option<mlua::Function>>("Run")? else { return Ok(None) };
-        let args =
-            (EntityHandle::NULL, name.as_str(), lua.create_sequence_from(arguments.iter().map(String::as_str))?, arguments.join(" "));
+        let args = (player, name.as_str(), lua.create_sequence_from(arguments.iter().map(String::as_str))?, arguments.join(" "));
         Ok(Some((run, mlua::IntoLuaMulti::into_lua_multi(args, lua)?)))
     };
     match run() {

@@ -60,8 +60,16 @@ pub mod key {
     pub const ATTACK: u32 = 1;
     pub const JUMP: u32 = 2;
     pub const DUCK: u32 = 4;
+    pub const FORWARD: u32 = 8;
+    pub const BACK: u32 = 16;
+    pub const USE: u32 = 32;
+    pub const MOVELEFT: u32 = 512;
+    pub const MOVERIGHT: u32 = 1024;
+    pub const ATTACK2: u32 = 2048;
+    pub const RELOAD: u32 = 8192;
     pub const SPEED: u32 = 131072;
     pub const WALK: u32 = 262144;
+    pub const ZOOM: u32 = 524288;
 }
 
 const MOVETYPE_NONE: i64 = 0;
@@ -75,7 +83,7 @@ const EF_DIMLIGHT: i64 = 4;
 const EF_NODRAW: i64 = 32;
 const DEFAULT_FOV: f32 = 75.0;
 /// The impulse that toggles the flashlight.
-const IMPULSE_FLASHLIGHT: u8 = 100;
+pub const IMPULSE_FLASHLIGHT: u8 = 100;
 
 /// The `DMG_` types armor does not take.
 const DMG_NOT_ARMORED: i64 = 32 | 16384 | 131072 | 262144;
@@ -190,6 +198,9 @@ pub struct PlayerState {
     pub view_punch: Angle,
     pub view_punch_velocity: Angle,
     pub render_angles: Angle,
+    /// Where the eyes were when the last tick began, to draw between the ticks; none until a
+    /// tick after a spawn.
+    pub previous_eye: Option<Vector>,
     pub last_hit_group: i64,
     pub activity: i64,
     pub crosshair: bool,
@@ -276,6 +287,7 @@ impl PlayerState {
             view_punch: Angle::default(),
             view_punch_velocity: Angle::default(),
             render_angles: Angle::default(),
+            previous_eye: None,
             last_hit_group: 0,
             activity: 0,
             crosshair: true,
@@ -565,6 +577,7 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         p.view_punch = Angle::default();
         p.view_punch_velocity = Angle::default();
         p.fov = DEFAULT_FOV;
+        p.previous_eye = None;
     });
     if reset.is_none() {
         return;
@@ -685,7 +698,8 @@ pub(crate) fn leave(lua: &Lua, handle: EntityHandle) {
     crate::ents::remove(lua, handle);
 }
 
-/// The command a player sends from now on, every tick.
+/// The command a player sends from now on, every tick; its impulse and mouse wheel only with
+/// the next one.
 pub(crate) fn set_input(lua: &Lua, handle: EntityHandle, cmd: UserCmd) {
     with_player(lua, handle, |_, p| p.input = cmd);
 }
@@ -700,8 +714,14 @@ pub(crate) fn tick_all(lua: &Lua) {
 /// One tick of a player: the command, movement, the weapon.
 fn tick(lua: &Lua, handle: EntityHandle) {
     let tick = host(lua).clock.ticks.get() as i64;
+    if let Some((eye, _)) = eye(lua, handle) {
+        with_player(lua, handle, |_, p| p.previous_eye = Some(eye));
+    }
     let Some(cmd) = with_player(lua, handle, |_, p| {
         p.cmd = CmdData { cmd: p.input, number: p.cmd.number + 1, tick, select: None };
+        // an impulse and the mouse wheel go with one command, not every one after it
+        p.input.impulse = 0;
+        p.input.mouse_wheel = 0;
         p.cmd
     }) else {
         return;
@@ -852,6 +872,132 @@ fn finish_move(lua: &Lua, handle: EntityHandle, mv: &MoveData) {
 
 fn set_flashlight(lua: &Lua, handle: EntityHandle, on: bool) {
     host(lua).entities.with_mut(handle, |ent| if on { ent.effects |= EF_DIMLIGHT } else { ent.effects &= !EF_DIMLIGHT });
+}
+
+// --- what the program shows, and what a player types ---
+
+/// What the program shows of a player: where they see from, how they are, what they hold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerView {
+    /// Where the player sees from after the last tick, and when that tick began: the picture
+    /// goes between the two ([`crate::Runtime::tick_fraction`]).
+    pub eye: Vector,
+    pub previous_eye: Vector,
+    pub angles: Angle,
+    pub fov: f32,
+    pub alive: bool,
+    pub health: i64,
+    pub armor: i64,
+    pub weapon: Option<WeaponView>,
+}
+
+/// The weapon in a player's hands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeaponView {
+    pub class: String,
+    /// `PrintName`, often a `#` phrase of the game's language files.
+    pub name: String,
+    /// Rounds in the primary clip, -1 without one; rounds carried for it.
+    pub clip: i64,
+    pub ammo: i64,
+}
+
+pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
+    let (eye, _) = eye(lua, handle)?;
+    let (previous_eye, angles, fov, alive, armor, active) =
+        state(lua, handle, |_, p| (p.previous_eye.unwrap_or(eye), p.eye_angles, p.fov, p.alive, p.armor, p.active_weapon))?;
+    let health = host(lua).entities.get(handle).map_or(0, |ent| ent.health);
+    let weapon = host(lua).entities.get(active).filter(|ent| !ent.removed).map(|ent| {
+        let data = weapon::data(lua, active).unwrap_or_default();
+        let clip = ent.weapon.as_ref().map_or(-1, |w| w.clip[0]);
+        let ammo = ammo_count(lua, handle, weapon::ammo_id(lua, &data.ammo[0]));
+        WeaponView { class: ent.class.clone(), name: data.print_name, clip, ammo }
+    });
+    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon })
+}
+
+/// The engine's commands a player types into the console: `noclip`, `kill` and `explode`,
+/// `give <class>`, and choosing a weapon - `use <class>`, `lastinv`, `invnext`, `invprev`,
+/// `slot1` to `slot6` (what the weapon selection of the client's HUD would send). Whether
+/// `words` was one of them, which then ran.
+pub(crate) fn command(lua: &Lua, handle: EntityHandle, words: &[String]) -> bool {
+    let Some((name, args)) = words.split_first() else { return false };
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
+        "noclip" => toggle_noclip(lua, handle),
+        "kill" | "explode" => suicide(lua, handle, name == "explode"),
+        "give" => {
+            if let Some(class) = args.first()
+                && let Err(e) = give(lua, handle, class, false)
+            {
+                host(lua).report(crate::ScriptError::from_lua(&e));
+            }
+        }
+        "use" => {
+            if let Some(item) = args.first().and_then(|class| weapon_of(lua, handle, class)) {
+                switch_weapon(lua, handle, item);
+            }
+        }
+        "lastinv" => {
+            let previous = state(lua, handle, |_, p| Some(p.previous_weapon).filter(|w| p.weapons.contains(w)));
+            if let Some(Some(item)) = previous {
+                switch_weapon(lua, handle, item);
+            }
+        }
+        "invnext" => select_weapon(lua, handle, 1, None),
+        "invprev" => select_weapon(lua, handle, -1, None),
+        _ => match name.strip_prefix("slot").and_then(|n| n.parse::<i64>().ok()).filter(|n| (1..=6).contains(n)) {
+            Some(slot) => select_weapon(lua, handle, 1, Some(slot - 1)),
+            None => return false,
+        },
+    }
+    true
+}
+
+/// `noclip`: flying through walls and back, when `PlayerNoClip` allows it.
+fn toggle_noclip(lua: &Lua, handle: EntityHandle) {
+    let Some(move_type) = host(lua).entities.get(handle).filter(|ent| ent.player.is_some()).map(|ent| ent.move_type) else { return };
+    let on = move_type != MOVETYPE_NOCLIP;
+    if truthy(&hook(lua, "PlayerNoClip", [ent_value(lua, handle), Value::Boolean(on)])) {
+        host(lua).entities.with_mut(handle, |ent| ent.move_type = if on { MOVETYPE_NOCLIP } else { MOVETYPE_WALK });
+    }
+}
+
+/// `kill` and `explode`: the player dies by their own hand, unless `CanPlayerSuicide` says no.
+fn suicide(lua: &Lua, handle: EntityHandle, blast: bool) {
+    if state(lua, handle, |_, p| p.alive) != Some(true) {
+        return;
+    }
+    if matches!(hook(lua, "CanPlayerSuicide", [ent_value(lua, handle)]).front(), Some(Value::Boolean(false))) {
+        return;
+    }
+    let health = host(lua).entities.get(handle).map_or(0, |ent| ent.health);
+    let kind = if blast { damage::dmg::BLAST } else { damage::dmg::GENERIC };
+    kill(lua, handle, Death { info: DamageInfo::new(health.max(1) as f32, kind, handle, handle), userdata: None, silent: false });
+}
+
+/// The next weapon (`step` 1) or the one before (-1), in the order of the slots and the
+/// positions in them; only those of `slot` (0 to 5) when it is given.
+fn select_weapon(lua: &Lua, handle: EntityHandle, step: isize, slot: Option<i64>) {
+    let Some((weapons, active)) = state(lua, handle, |_, p| (p.weapons.clone(), p.active_weapon)) else { return };
+    let mut order: Vec<((i64, i64, u32), EntityHandle)> = weapons
+        .into_iter()
+        .filter_map(|w| {
+            let data = weapon::data(lua, w)?;
+            slot.is_none_or(|s| s == data.slot).then_some(((data.slot, data.slot_pos, w.index?), w))
+        })
+        .collect();
+    order.sort_by_key(|(key, _)| *key);
+    let list: Vec<EntityHandle> = order.into_iter().map(|(_, w)| w).collect();
+    let Some(&first) = list.first() else { return };
+    let next = match list.iter().position(|&w| w == active) {
+        Some(i) => list[(i as isize + step).rem_euclid(list.len() as isize) as usize],
+        None if step < 0 => list[list.len() - 1],
+        None => first,
+    };
+    if next != active {
+        switch_weapon(lua, handle, next);
+    }
 }
 
 // --- weapons and ammo ---

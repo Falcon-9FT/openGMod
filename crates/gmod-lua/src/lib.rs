@@ -81,7 +81,7 @@ pub use entity::EntityHandle;
 pub use ents::Map;
 pub use mlua;
 pub use movedata::UserCmd;
-pub use player::PlayerInfo;
+pub use player::{PlayerInfo, PlayerView, WeaponView};
 
 /// Which of GMod's Lua states a [`Runtime`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -442,13 +442,37 @@ impl Runtime {
         player::join(&self.lua, info)
     }
 
+    /// Runs console commands typed by a player, as a client's console sends them: the
+    /// engine's commands for players (`noclip`, `kill`, `give`, choosing a weapon), ConVars, and
+    /// the commands of `concommand.Add`, which get the player.
+    pub fn run_player_command(&self, player: EntityHandle, line: &str) {
+        for words in convar::split_commands(line) {
+            if !player::command(&self.lua, player, &words) {
+                convar::execute_as(&self.lua, &words, player);
+            }
+        }
+    }
+
+    /// What to show of a player: where they see from, their health, the weapon in hand.
+    pub fn view(&self, player: EntityHandle) -> Option<PlayerView> {
+        player::view(&self.lua, player)
+    }
+
+    /// How far game time is into the next tick, 0 to 1: where to draw between where things
+    /// were at the last two ticks.
+    pub fn tick_fraction(&self) -> f32 {
+        let ticks = host(&self.lua).clock.cur_time.get() / timer::TICK_INTERVAL;
+        (ticks - ticks.floor()) as f32
+    }
+
     /// A player leaves the game.
     pub fn leave(&self, player: EntityHandle) {
         player::leave(&self.lua, player);
     }
 
     /// What a player asks for from now on, every tick until told otherwise: the keys held,
-    /// where they look, how they move (as a client sends its commands).
+    /// where they look, how they move (as a client sends its commands). The impulse (100: the
+    /// flashlight) and the mouse wheel go with the next tick only.
     pub fn set_input(&self, player: EntityHandle, cmd: UserCmd) {
         player::set_input(&self.lua, player, cmd);
     }

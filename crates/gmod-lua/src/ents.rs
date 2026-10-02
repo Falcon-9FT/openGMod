@@ -45,6 +45,20 @@ pub struct Map {
     pub textures: Vec<String>,
 }
 
+impl Map {
+    /// The map `bsp` named `name` (`gm_construct`), solid as `collision` says.
+    pub fn from_bsp(name: &str, bsp: &gmod_bsp::Bsp, collision: std::sync::Arc<gmod_bsp::Collision>) -> Map {
+        let texture = |texdata: i32| usize::try_from(texdata).ok().and_then(|i| bsp.materials.get(i)).cloned().unwrap_or_default();
+        Map {
+            name: name.to_string(),
+            entities: bsp.entities.iter().map(|e| e.pairs.clone()).collect(),
+            brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
+            collision: Some(collision),
+            textures: bsp.texinfo.iter().map(|info| texture(info.texdata)).collect(),
+        }
+    }
+}
+
 /// The models entities have, as far as the engine reads them: the bounds of the brush models
 /// of the map, and what `SetModel` takes from a studio model.
 #[derive(Default)]

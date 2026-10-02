@@ -360,14 +360,7 @@ fn lua_map(vfs: &mut Vfs, map: &str, bsp: &gmod_bsp::Bsp) -> Result<gmod_lua::Ma
     if mounted {
         vfs.remove(0);
     }
-    let texture = |texdata: i32| usize::try_from(texdata).ok().and_then(|i| bsp.materials.get(i)).cloned().unwrap_or_default();
-    Ok(gmod_lua::Map {
-        name,
-        entities: bsp.entities.iter().map(|e| e.pairs.clone()).collect(),
-        brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
-        collision: Some(Arc::new(collision)),
-        textures: bsp.texinfo.iter().map(|info| texture(info.texdata)).collect(),
-    })
+    Ok(gmod_lua::Map::from_bsp(&name, bsp, Arc::new(collision)))
 }
 
 /// A map: a file on disk, or a name in the game (`gm_construct`).

@@ -537,6 +537,7 @@ version = "0.2.0"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
+ "gmod-lua",
  "gmod-material",
  "gmod-movement",
  "gmod-render",

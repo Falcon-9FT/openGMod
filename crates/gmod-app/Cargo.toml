@@ -3,7 +3,7 @@ name = "gmod-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "opengmod: opens a Garry's Mod map from your installation to walk and fly around in"
+description = "opengmod: a Garry's Mod map from your installation with the game's Lua and the addons running in it, to walk around in"
 
 [[bin]]
 name = "opengmod"
@@ -13,6 +13,7 @@ path = "src/main.rs"
 gmod-fs.workspace = true
 gmod-bsp.workspace = true
 gmod-world.workspace = true
+gmod-lua.workspace = true
 gmod-material.workspace = true
 gmod-movement.workspace = true
 gmod-render.workspace = true
