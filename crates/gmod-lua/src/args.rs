@@ -111,6 +111,18 @@ impl<'a> Args<'a> {
         }
     }
 
+    /// Changes a userdata of the engine in place.
+    pub fn change<T: 'static>(&self, position: usize, expected: &str, f: impl FnOnce(&mut T)) -> mlua::Result<Value> {
+        match self.get(position) {
+            Some(Value::UserData(ud)) => {
+                let mut value = ud.borrow_mut::<T>().map_err(|_| self.bad(position, expected))?;
+                f(&mut value);
+                Ok(Value::Nil)
+            }
+            _ => Err(self.bad(position, expected)),
+        }
+    }
+
     /// A userdata of the engine, by value.
     pub fn userdata<T: Copy + 'static>(&self, position: usize, expected: &str) -> mlua::Result<T> {
         match self.get(position) {

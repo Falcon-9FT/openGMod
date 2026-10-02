@@ -19,16 +19,21 @@
 //! * the engine's types and libraries: [`meta`] (`FindMetaTable`, `TYPE_*`), [`vector`]
 //!   (`Vector`, `Angle`), [`matrix`] (`VMatrix`), [`entity`] (entities, `NULL`, the methods of
 //!   `Entity`, the metatables of `Player`, `Weapon` ...), [`ents`] (`ents.*`, scripted
-//!   entities, the entities of a map), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars,
-//!   console commands), [`filesystem`] (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite),
-//!   [`http`] (`HTTP`), [`material`] (`Material`), [`engine`] (`game`, `engine`, `system`,
-//!   `gmod`, the enumerations), and [`world`] (`player` ... as they answer while there are no
-//!   players). They grow towards the whole API - `gmod-check lua` counts how much of it is
-//!   there.
+//!   entities, the entities of a map), [`player`] (players: joining, spawning, dying, their
+//!   commands and movement, the `player` library), [`weapon`] (weapons in players' hands,
+//!   ammo types), [`movedata`] (`CMoveData`, `CUserCmd`), [`damage`] (`CTakeDamageInfo`,
+//!   taking damage), [`trace`] (`util.TraceLine` and the like), [`timer`] (`CurTime`,
+//!   `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`] (`file`, `File`),
+//!   [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`] (`Material`),
+//!   [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and [`world`] (`ai`
+//!   and `motionsensor`, as they answer while there are no NPCs). They grow towards the whole
+//!   API - `gmod-check lua` counts how much of it is there.
 //! * starting the game ([`Runtime::start`]): `includes/init.lua`, autorun, the gamemode and
 //!   its bases, scripted entities and weapons, the hooks up to `Initialize`; the entities of
-//!   the map ([`Runtime::spawn_map`]); then [`Runtime::think`] moves time on, runs timers,
-//!   the entities that think and the `Think` hook.
+//!   the map ([`Runtime::spawn_map`]); players joining ([`Runtime::join`]) and what they press
+//!   ([`Runtime::set_input`]); then [`Runtime::think`] moves time on, runs timers, and for
+//!   every tick the players' commands and movement, the entities that think and the `Tick`
+//!   hook; then the `Think` hook.
 //!
 //! Errors in scripts are not errors of the runtime: as in GMod, a file that fails is
 //! reported ([`Output::Error`], [`Runtime::errors`]) and the files around it keep loading.
@@ -46,6 +51,7 @@ use mlua::Lua;
 mod args;
 pub mod console;
 pub mod convar;
+pub mod damage;
 pub mod engine;
 pub mod entity;
 pub mod ents;
@@ -55,20 +61,27 @@ pub mod http;
 pub mod material;
 pub mod matrix;
 pub mod meta;
+pub mod movedata;
 pub mod net;
+pub mod player;
 pub mod sandbox;
 pub mod sql;
 mod startup;
 pub mod timer;
+pub mod trace;
 pub mod util;
 pub mod vector;
+pub mod weapon;
 pub mod world;
 
 #[cfg(test)]
 mod tests;
 
+pub use entity::EntityHandle;
 pub use ents::Map;
 pub use mlua;
+pub use movedata::UserCmd;
+pub use player::PlayerInfo;
 
 /// Which of GMod's Lua states a [`Runtime`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -210,6 +223,9 @@ pub(crate) struct Host {
     pub http: http::Http,
     pub entities: entity::Entities,
     pub models: ents::Models,
+    pub world: trace::World,
+    pub weapons: weapon::Weapons,
+    pub players: player::Players,
 }
 
 impl Host {
@@ -276,6 +292,9 @@ impl Runtime {
             http: http::Http::default(),
             entities: entity::Entities::default(),
             models: ents::Models::default(),
+            world: trace::World::default(),
+            weapons: weapon::Weapons::default(),
+            players: player::Players::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -289,14 +308,19 @@ impl Runtime {
         matrix::install(&lua)?;
         entity::install(&lua, realm)?;
         util::install(&lua)?;
+        trace::install(&lua)?;
         material::install(&lua)?;
         world::install(&lua)?;
         ents::install(&lua, realm)?;
+        damage::install(&lua)?;
+        movedata::install(&lua)?;
+        player::install(&lua, realm)?;
         sql::install(&lua)?;
         http::install(&lua)?;
         net::install(&lua, realm)?;
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
+        weapon::install(&lua)?;
         Ok(Runtime { lua })
     }
 
@@ -369,25 +393,30 @@ impl Runtime {
 
     /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
     /// answers to `HTTP` requests that came in, the timers that are due, for every tick that
-    /// passed the scripted entities that think and the `Tick` hook, the `Think` hook; then
-    /// the entities removed in the frame go.
+    /// passed the players' commands and movement, the scripted entities that think and the
+    /// `Tick` hook, each at its own `CurTime`; the `Think` hook; then the entities removed in
+    /// the frame go.
     pub fn think(&self, seconds: f64) {
-        let ticks = {
+        let (before, end, ticks) = {
             let clock = &host(&self.lua).clock;
             let before = (clock.cur_time.get() / timer::TICK_INTERVAL).floor();
-            clock.cur_time.set(clock.cur_time.get() + seconds);
+            let end = clock.cur_time.get() + seconds;
+            clock.cur_time.set(end);
             clock.frame_time.set(seconds);
-            let ticks = ((clock.cur_time.get() / timer::TICK_INTERVAL).floor() - before).max(0.0) as u64;
+            let ticks = ((end / timer::TICK_INTERVAL).floor() - before).max(0.0) as u64;
             clock.ticks.set(clock.ticks.get() + ticks);
-            ticks
+            (before, end, ticks)
         };
         convar::run_buffer(&self.lua);
         http::deliver(&self.lua);
         timer::run_timers(&self.lua);
-        for _ in 0..ticks {
+        for tick in 1..=ticks {
+            host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::TICK_INTERVAL).min(end));
+            player::tick_all(&self.lua);
             ents::think(&self.lua);
             self.call_hook("Tick", mlua::MultiValue::new());
         }
+        host(&self.lua).clock.cur_time.set(end);
         self.call_hook("Think", mlua::MultiValue::new());
         ents::collect(&self.lua);
     }
@@ -405,6 +434,33 @@ impl Runtime {
         for words in convar::split_commands(line) {
             convar::execute(&self.lua, &words);
         }
+    }
+
+    /// A player joins the game, as a client connecting does, and spawns. None when every
+    /// player slot is taken ([`player::MAX_PLAYERS`]).
+    pub fn join(&self, info: PlayerInfo) -> Option<EntityHandle> {
+        player::join(&self.lua, info)
+    }
+
+    /// A player leaves the game.
+    pub fn leave(&self, player: EntityHandle) {
+        player::leave(&self.lua, player);
+    }
+
+    /// What a player asks for from now on, every tick until told otherwise: the keys held,
+    /// where they look, how they move (as a client sends its commands).
+    pub fn set_input(&self, player: EntityHandle, cmd: UserCmd) {
+        player::set_input(&self.lua, player, cmd);
+    }
+
+    /// The players in the game.
+    pub fn players(&self) -> Vec<EntityHandle> {
+        player::all(&self.lua)
+    }
+
+    /// Where an entity is in the world, if it is there.
+    pub fn position(&self, entity: EntityHandle) -> Option<vector::Vector> {
+        host(&self.lua).entities.transform(entity).map(|(pos, _)| pos)
     }
 
     /// Game time: what `CurTime` returns.

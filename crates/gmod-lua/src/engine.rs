@@ -91,8 +91,8 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     globals.raw_set("gmod", gmod)?;
 
     let game = lua.create_table()?;
-    def(lua, &game, "SinglePlayer", |_| Ok(Value::Boolean(true)))?;
-    def(lua, &game, "MaxPlayers", |_| Ok(Value::Integer(1)))?;
+    def(lua, &game, "SinglePlayer", |_| Ok(Value::Boolean(crate::player::MAX_PLAYERS == 1)))?;
+    def(lua, &game, "MaxPlayers", |_| Ok(Value::Integer(crate::player::MAX_PLAYERS.into())))?;
     def(lua, &game, "IsDedicated", |_| Ok(Value::Boolean(false)))?;
     def(lua, &game, "GetMap", |a| string(a, &host(a.lua).game.map.borrow()))?;
     def(lua, &game, "GetIPAddress", |a| string(a, "loopback"))?;

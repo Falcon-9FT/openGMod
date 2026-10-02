@@ -6,14 +6,17 @@ rust-version.workspace = true
 description = "The Lua runtime: LuaJIT with Garry's Mod's loader (include, require, AddCSLuaFile), realms and the functions GMod implements in C++"
 
 [dependencies]
+gmod-bsp.workspace = true
 gmod-fs.workspace = true
 gmod-kv.workspace = true
 gmod-material.workspace = true
 gmod-model.workspace = true
+gmod-movement.workspace = true
 gmod-glua.workspace = true
 mlua.workspace = true
 rusqlite.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
+gmod-bsp = { workspace = true, features = ["testmap"] }
 gmod-model = { workspace = true, features = ["testmodel"] }

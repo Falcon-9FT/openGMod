@@ -586,11 +586,13 @@ version = "0.2.0"
 name = "gmod-lua"
 version = "0.2.0"
 dependencies = [
+ "gmod-bsp",
  "gmod-fs",
  "gmod-glua",
  "gmod-kv",
  "gmod-material",
  "gmod-model",
+ "gmod-movement",
  "mlua",
  "rusqlite",
  "ureq",

@@ -338,7 +338,7 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
             Err(e) => fail(&e.to_string()),
         },
         "lua" => {
-            let map = match args.map.as_deref().map(|map| read_map(&vfs, map).map(|bsp| lua_map(map, &bsp))).transpose() {
+            let map = match args.map.as_deref().map(|map| read_map(&vfs, map).and_then(|bsp| lua_map(&mut vfs, map, &bsp))).transpose() {
                 Ok(map) => map,
                 Err(e) => return fail(&e),
             };
@@ -350,14 +350,24 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
     }
 }
 
-/// What the Lua runtime needs of a map: its name, entities and brush models.
-fn lua_map(map: &str, bsp: &gmod_bsp::Bsp) -> gmod_lua::Map {
+/// What the Lua runtime needs of a map: its name, entities and brush models, what is solid in
+/// it and the materials of its surfaces. The map's pakfile is mounted in front while the
+/// physics models of its props are read.
+fn lua_map(vfs: &mut Vfs, map: &str, bsp: &gmod_bsp::Bsp) -> Result<gmod_lua::Map, String> {
     let name = Path::new(map).file_stem().map_or_else(|| map.to_string(), |s| s.to_string_lossy().into_owned());
-    gmod_lua::Map {
+    let mounted = gmod_world::mount_pakfile(vfs, bsp).map_err(|e| format!("{}: pakfile: {e}", bsp.label.display()))?;
+    let (collision, _) = gmod_world::collision(vfs, bsp);
+    if mounted {
+        vfs.remove(0);
+    }
+    let texture = |texdata: i32| usize::try_from(texdata).ok().and_then(|i| bsp.materials.get(i)).cloned().unwrap_or_default();
+    Ok(gmod_lua::Map {
         name,
         entities: bsp.entities.iter().map(|e| e.pairs.clone()).collect(),
         brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
-    }
+        collision: Some(Arc::new(collision)),
+        textures: bsp.texinfo.iter().map(|info| texture(info.texdata)).collect(),
+    })
 }
 
 /// A map: a file on disk, or a name in the game (`gm_construct`).

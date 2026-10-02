@@ -111,6 +111,10 @@ pub struct Ent {
     /// When a SENT's `Think` runs next, and the time `NextThink` asked for.
     pub next_think: f64,
     pub think_request: Option<f64>,
+    /// What only players have.
+    pub player: Option<Box<crate::player::PlayerState>>,
+    /// What only weapons have.
+    pub weapon: Option<crate::weapon::WeaponState>,
 }
 
 impl Ent {
@@ -158,6 +162,8 @@ impl Ent {
             body_groups: Vec::new(),
             next_think: 0.0,
             think_request: None,
+            player: None,
+            weapon: None,
         }
     }
 
@@ -566,12 +572,13 @@ pub(crate) fn set_world_angles(lua: &Lua, handle: EntityHandle, angles: Angle) {
 }
 
 /// Sets a model and the collision box it comes with: the hull of a studio model, the bounds
-/// of a brush model of the map (`*3`).
+/// of a brush model of the map (`*3`). A player keeps its hull.
 pub(crate) fn set_model(lua: &Lua, handle: EntityHandle, model: &str) {
     let bounds = crate::ents::model_bounds(lua, model);
     host(lua).entities.with_mut(handle, |ent| {
         ent.model = model.to_string();
-        if let Some((mins, maxs)) = bounds {
+        // a player's box is its hull, whatever the model
+        if let Some((mins, maxs)) = bounds.filter(|_| ent.player.is_none()) {
             ent.mins = mins;
             ent.maxs = maxs;
         }
@@ -693,8 +700,20 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("GetForward", |a| vector(a.lua, transform(a)?.1.vectors().0))?;
     def("GetRight", |a| vector(a.lua, transform(a)?.1.vectors().1))?;
     def("GetUp", |a| vector(a.lua, transform(a)?.1.vectors().2))?;
-    def("EyePos", |a| vector(a.lua, transform(a)?.0))?;
-    def("EyeAngles", |a| angle(a.lua, transform(a)?.1))?;
+    def("EyePos", |a| {
+        let handle = this(a, 1)?;
+        match crate::player::eye(a.lua, handle) {
+            Some((eye, _)) => vector(a.lua, eye),
+            None => vector(a.lua, transform(a)?.0),
+        }
+    })?;
+    def("EyeAngles", |a| {
+        let handle = this(a, 1)?;
+        match crate::player::eye_angles(a.lua, handle) {
+            Some(angles) => angle(a.lua, angles),
+            None => angle(a.lua, transform(a)?.1),
+        }
+    })?;
     def("LocalToWorld", |a| {
         let (pos, angles) = transform(a)?;
         vector(a.lua, pos + a.userdata::<Vector>(2, "Vector")?.rotated(angles))
@@ -713,6 +732,15 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     })?;
     def("GetVelocity", |a| vector(a.lua, read(a, |ent| ent.velocity)?))?;
     def("GetAbsVelocity", |a| vector(a.lua, read(a, |ent| ent.velocity)?))?;
+    // a player is pushed: the velocity is added to what it has
+    def("SetVelocity", |a| {
+        let v = a.userdata::<Vector>(2, "Vector")?;
+        write(a, |ent| ent.velocity = if ent.player.is_some() { ent.velocity + v } else { v })
+    })?;
+    def("SetLocalVelocity", |a| {
+        let v = a.userdata::<Vector>(2, "Vector")?;
+        write(a, |ent| ent.velocity = v)
+    })?;
 
     // its box
     def("OBBMins", |a| vector(a.lua, read(a, |ent| ent.mins)?))?;
@@ -801,6 +829,50 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             None => ent.body_groups.push((id, value)),
         })
     })?;
+    def("GetNumBodyGroups", |a| integer(studio(a)?.map_or(0, |s| s.body_parts.len() as i64)))?;
+    def("GetBodygroupCount", |a| {
+        let id = a.number(2)? as usize;
+        integer(studio(a)?.and_then(|s| s.body_parts.get(id).map(|(_, models)| models.len() as i64)).unwrap_or(0))
+    })?;
+    def("GetBodygroupName", |a| {
+        let id = a.number(2)? as usize;
+        let name = studio(a)?.and_then(|s| s.body_parts.get(id).map(|(name, _)| name.clone())).unwrap_or_default();
+        string(a.lua, &name)
+    })?;
+    def("FindBodygroupByName", |a| {
+        let name = a.string(2)?;
+        let found = studio(a)?.and_then(|s| s.body_parts.iter().position(|(n, _)| n.eq_ignore_ascii_case(&name)));
+        integer(found.map_or(-1, |i| i as i64))
+    })?;
+    def("GetBodyGroups", |a| {
+        let list = a.lua.create_table()?;
+        for (id, (name, models)) in studio(a)?.map(|s| s.body_parts).unwrap_or_default().into_iter().enumerate() {
+            let group = a.lua.create_table()?;
+            group.raw_set("id", id)?;
+            group.raw_set("name", name)?;
+            group.raw_set("num", models.len())?;
+            let submodels = a.lua.create_table()?;
+            for (i, model) in models.into_iter().enumerate() {
+                submodels.raw_set(i, model)?;
+            }
+            group.raw_set("submodels", submodels)?;
+            list.raw_push(group)?;
+        }
+        Ok(Value::Table(list))
+    })?;
+    // one character a body group: 0-9, then a-z for 10 to 35
+    def("SetBodyGroups", |a| {
+        let values: Vec<i64> = a.string(2)?.chars().map(|c| c.to_digit(36).map_or(0, i64::from)).collect();
+        write(a, |ent| {
+            for (id, value) in values.into_iter().enumerate() {
+                match ent.body_groups.iter_mut().find(|(i, _)| *i == id as i64) {
+                    Some(group) => group.1 = value,
+                    None => ent.body_groups.push((id as i64, value)),
+                }
+            }
+        })
+    })?;
+    def("SkinCount", |a| integer(studio(a)?.map_or(0, |s| s.skins as i64)))?;
     def("GetModelScale", |a| Ok(Value::Number(read(a, |ent| ent.model_scale)? as f64)))?;
     def("SetModelScale", |a| {
         let scale = a.number(2)? as f32;
@@ -950,13 +1022,10 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("IsOnGround", |a| Ok(Value::Boolean(read(a, |ent| ent.flags & 1 != 0)?)))?;
     def("OnGround", |a| Ok(Value::Boolean(read(a, |ent| ent.flags & 1 != 0)?)))?;
     def("WaterLevel", |a| {
-        read(a, |_| ())?;
-        integer(0)
+        let handle = this(a, 1)?;
+        integer(crate::player::water_level(a.lua, handle).unwrap_or(0).into())
     })?;
-    def("IsInWorld", |a| {
-        read(a, |_| ())?;
-        Ok(Value::Boolean(true))
-    })?;
+    def("IsInWorld", |a| Ok(Value::Boolean(crate::trace::in_world(a.lua, transform(a)?.0))))?;
     // no physics yet: initialising it fails, as for a model without a physics model; the
     // entity is SOLID_VPHYSICS and MOVETYPE_VPHYSICS (6) all the same
     def("PhysicsInit", |a| {
@@ -1047,9 +1116,30 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         this(a, 1)?;
         Ok(Value::Nil)
     })?;
+    // players leave rather than go
     def("Remove", |a| {
         let handle = this(a, 1)?;
-        crate::ents::remove(a.lua, handle);
+        if handle.kind != Kind::Player {
+            crate::ents::remove(a.lua, handle);
+        }
+        Ok(Value::Nil)
+    })?;
+    def("DeleteOnRemove", |a| {
+        let other = this(a, 2)?;
+        let list = deleted_with(a)?;
+        if !list.sequence_values::<Value>().flatten().any(|v| handle_of(Some(&v)) == Some(other)) {
+            list.raw_push(push(a.lua, other)?)?;
+        }
+        Ok(Value::Nil)
+    })?;
+    def("DontDeleteOnRemove", |a| {
+        let other = this(a, 2)?;
+        let list = deleted_with(a)?;
+        let kept: Vec<Value> = list.sequence_values::<Value>().flatten().filter(|v| handle_of(Some(v)) != Some(other)).collect();
+        list.clear()?;
+        for value in kept {
+            list.raw_push(value)?;
+        }
         Ok(Value::Nil)
     })?;
     // callbacks by hook name, each a list of functions under IDs from 1
@@ -1089,6 +1179,20 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     })?;
 
     crate::ents::install_variables(def)
+}
+
+/// The entities removed with this one (`DeleteOnRemove`).
+fn deleted_with(a: &Args) -> mlua::Result<Table> {
+    match a.get(1) {
+        Some(Value::UserData(ud)) => store_of(a.lua, ud, "delete-on-remove"),
+        _ => Err(a.bad(1, "Entity")),
+    }
+}
+
+/// What the model of the entity in argument 1 is made of.
+fn studio(a: &Args) -> mlua::Result<Option<crate::ents::Studio>> {
+    let model = read(a, |ent| ent.model.clone())?;
+    Ok(crate::ents::studio(a.lua, &model))
 }
 
 /// The entity's table of callbacks (`AddCallback`).

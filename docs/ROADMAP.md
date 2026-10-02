@@ -77,8 +77,18 @@
     `ents.Create`/`Find*`, SENT (`Initialize`, `Think`, `KeyValue`, `OnRemove`,
     `SetupDataTables`), NW/NW2/DT-переменные, энтити карты с ключами, родителями и
     `InitPostEntity`; `gmod-check lua --map` грузит энтити карты.
-  * Дальше: игроки (`Player`, хуки спавна, движение через `CMoveData`), оружие, NPC, поведение
-    энтити движка (двери, триггеры, ввод-вывод `Fire`).
+  * Игроки ✅ — `gmod-lua::player`: игрок — энтити с индексом 1, вход как в движке
+    (`PlayerConnect`, `PlayerAuthed`, `PlayerInitialSpawn`), спавн через `PlayerSelectSpawn` и
+    `PlayerSpawn`, смерть (`DoPlayerDeath`, `PlayerDeath`, `PlayerSilentDeath`,
+    `PostPlayerDeath`, `PlayerDeathThink`), все методы `Player` по вики и библиотека `player`.
+    Каждый тик — команда (`StartCommand`, `KeyPress`), движение через `CMoveData` и хуки
+    `SetupMove`/`Move`/`FinishMove` на `gmod-movement`, оружие в руках.
+  * Оружие ✅ — `gmod-lua::weapon`: оружие движка по `scripts/weapons/*.txt` и SWEP, обоймы и
+    патроны, выдача, переключение (`Holster`/`Deploy`), выстрелы и перезарядка, выброс при
+    смерти, типы патронов движка и `game.BuildAmmoTypes`.
+  * Урон ✅ — `CTakeDamageInfo`, `EntityTakeDamage`, броня, `PlayerHurt`, `OnTakeDamage` у SENT.
+  * Дальше: подбор оружия касанием, NPC, поведение энтити движка (двери, триггеры, ввод-вывод
+    `Fire`), рэгдоллы трупов.
 * Физика на Jolt ([PHYSICS.md](PHYSICS.md)):
   * пропы с формами из `.phy` (формы читаются ✅ — `gmod-model::phy`; статические пропы уже
     твёрдые для трассировок и игрока);
@@ -88,9 +98,11 @@
   * рэгдоллы.
 * Трассировки как в Source — `gmod-bsp::collision` ✅: луч и коробка по брашам мира,
   дисплейсментам, брашевым энтити и статическим пропам, маски и содержимое как в Lua GMod,
-  `gmod-check trace` для сверки с игрой. По подвижным моделям и игрокам — вместе с физикой.
+  `gmod-check trace` для сверки с игрой. В Lua ✅ — `util.TraceLine`, `util.TraceHull`,
+  `GetEyeTrace`: мир карты и коробки твёрдых энтити, фильтры и группы коллизий как в HL2
+  (игрок проходит сквозь оружие и обломки). Формы моделей — вместе с физикой.
 * Движение игрока — `gmod-movement` ✅, ходьба в `opengmod`: трение и разгон, бег, ступеньки,
-  склоны, скольжение по стенам, прыжок, приседание, плавание, лестницы-браши. Дальше —
+  склоны, скольжение по стенам, прыжок, приседание, плавание, лестницы-браши, noclip. Дальше —
   лестницы HL2 по кнопке E (`func_useableladder`), движущиеся опоры, толчки конвейеров и
   триггеров, сверка чисел с игрой.
 * Анимации моделей (кости, последовательности, позы), рэгдоллы.

@@ -226,4 +226,6 @@ pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
     runtime.call_hook("PostGamemodeLoaded", MultiValue::new());
     runtime.call_hook("CreateTeams", MultiValue::new());
     runtime.call_hook("Initialize", MultiValue::new());
+    // what `game.AddAmmoType` added by now is what there is
+    crate::weapon::freeze_ammo(runtime.lua());
 }

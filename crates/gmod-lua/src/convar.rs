@@ -20,6 +20,13 @@ use crate::{ScriptError, files, host};
 const ENGINE_CONVARS: &[(&str, &str, &str)] = &[
     ("sv_cheats", "0", "Allow cheats on server"),
     ("sv_gravity", "600", "World gravity."),
+    ("sv_friction", "8", "World friction."),
+    ("sv_stopspeed", "10", "Minimum stopping speed when on ground."),
+    ("sv_accelerate", "10", "Linear acceleration amount (old value is 5.6)"),
+    ("sv_airaccelerate", "10", ""),
+    ("sv_maxvelocity", "3500", "Maximum speed any ballistically moving object is allowed to attain per axis."),
+    ("sv_noclipspeed", "5", ""),
+    ("sv_noclipaccelerate", "5", ""),
     ("sv_lan", "0", "Server is a lan server (no heartbeat, no authentication, no non-class C addresses)"),
     ("hostname", "openGMOD", "Hostname for server."),
     ("sv_password", "", "Server password for entry into multiplayer games"),
