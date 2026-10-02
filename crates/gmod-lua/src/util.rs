@@ -150,7 +150,7 @@ fn kv_scalar(lua: &Lua, text: &str) -> mlua::Result<Value> {
     Ok(Value::String(lua.create_string(text)?))
 }
 
-fn kv_block(lua: &Lua, block: &gmod_kv::Block, ordered: bool, keep_case: bool) -> mlua::Result<Table> {
+pub(crate) fn kv_block(lua: &Lua, block: &gmod_kv::Block, ordered: bool, keep_case: bool) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     for pair in block {
         let key = if keep_case { pair.key.clone() } else { pair.key.to_lowercase() };
@@ -209,7 +209,7 @@ fn scalar_text(lua: &Lua, value: &Value) -> mlua::Result<Option<String>> {
     })
 }
 
-fn write_keyvalues(lua: &Lua, out: &mut String, name: &str, table: &Table, depth: usize) -> mlua::Result<()> {
+pub(crate) fn write_keyvalues(lua: &Lua, out: &mut String, name: &str, table: &Table, depth: usize) -> mlua::Result<()> {
     let indent = "\t".repeat(depth);
     let _ = writeln!(out, "{indent}{}", quote_kv(name));
     let _ = writeln!(out, "{indent}{{");

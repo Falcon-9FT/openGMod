@@ -654,8 +654,8 @@ fn a_gamemode_starts() {
     assert_eq!(
         g.printed(),
         "autorun\nautorun server\nhook\tPreGamemodeLoaded\tfalse\nbase\tbase\tgamemodes/base\ngamemode\tbase\tnil\ngamemode\tmine\tbase\n\
-         hook\tOnGamemodeLoaded\ttrue\nentity\tbase_anim\tbase/entities/entities/base_anim\tnil\n\
-         entity\tthing\tmine/entities/entities/thing\tbase_anim\nweapon\tgun\ttrue\nhook\tPostGamemodeLoaded\ttrue\n\
+         entity\tbase_anim\tbase/entities/entities/base_anim\tnil\nentity\tthing\tmine/entities/entities/thing\tbase_anim\n\
+         weapon\tgun\ttrue\nhook\tOnGamemodeLoaded\ttrue\nhook\tPostGamemodeLoaded\ttrue\n\
          hook\tCreateTeams\ttrue\ninitialize\tmine\n"
     );
     assert!(g.eval::<bool>("return GAMEMODE == gamemode.Get('mine') and GM == nil and ENT == nil and SWEP == nil"));

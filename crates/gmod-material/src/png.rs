@@ -1,10 +1,205 @@
-//! Writing PNG images: previews and, later, screenshots.
+//! PNG images: reading the ones addons draw with (`icon16/add.png`, Derma's skin), writing
+//! previews and, later, screenshots.
 //!
-//! 8 bits a channel, RGB or RGBA. Each row gets the filter that leaves the smallest sum of
-//! absolute differences (the usual choice), then all rows are compressed with zlib.
+//! Reading takes every kind there is: grey, RGB, palette, with or without alpha, 1 to 16 bits,
+//! interlaced or not; what comes out is 8-bit RGBA.
+//!
+//! Writing is 8 bits a channel, RGB or RGBA. Each row gets the filter that leaves the smallest
+//! sum of absolute differences (the usual choice), then all rows are compressed with zlib.
+
+use std::io;
 
 use gmod_fs::crc32;
 use gmod_fs::deflate::zlib;
+use gmod_fs::inflate::inflate;
+
+/// The largest image read: 16384 pixels a side.
+const MAX_SIDE: u32 = 16384;
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("PNG: {message}"))
+}
+
+/// A decoded image: `width` x `height` pixels of RGBA, rows top to bottom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rgba {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Reads a PNG file into 8-bit RGBA.
+pub fn decode(data: &[u8]) -> io::Result<Rgba> {
+    if !data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(invalid("not a PNG file"));
+    }
+    let mut at = 8;
+    let mut header: Option<[u8; 13]> = None;
+    let mut palette: Vec<[u8; 4]> = Vec::new();
+    let mut transparent: Option<Vec<u8>> = None;
+    let mut compressed = Vec::new();
+    while at + 8 <= data.len() {
+        let len = u32::from_be_bytes(data[at..at + 4].try_into().expect("4 bytes")) as usize;
+        let kind = &data[at + 4..at + 8];
+        let body = data.get(at + 8..at + 8 + len).ok_or_else(|| invalid("a chunk runs past the end"))?;
+        match kind {
+            b"IHDR" => header = Some(body.try_into().map_err(|_| invalid("IHDR is not 13 bytes"))?),
+            b"PLTE" => palette = body.chunks_exact(3).map(|c| [c[0], c[1], c[2], 255]).collect(),
+            b"tRNS" => transparent = Some(body.to_vec()),
+            b"IDAT" => compressed.extend_from_slice(body),
+            b"IEND" => break,
+            _ => {}
+        }
+        at += 12 + len;
+    }
+    let header = header.ok_or_else(|| invalid("no IHDR"))?;
+    let width = u32::from_be_bytes(header[0..4].try_into().expect("4 bytes"));
+    let height = u32::from_be_bytes(header[4..8].try_into().expect("4 bytes"));
+    let (depth, color, interlaced) = (header[8], header[9], header[12] == 1);
+    if width == 0 || height == 0 || width > MAX_SIDE || height > MAX_SIDE {
+        return Err(invalid("size out of range"));
+    }
+    let channels = match (color, depth) {
+        (0, 1 | 2 | 4 | 8 | 16) | (3, 1 | 2 | 4 | 8) => 1,
+        (2 | 6 | 4, 8 | 16) => match color {
+            2 => 3,
+            6 => 4,
+            _ => 2,
+        },
+        _ => return Err(invalid("unknown colour type or bit depth")),
+    };
+    if let Some(trns) = &transparent
+        && color == 3
+    {
+        for (entry, alpha) in palette.iter_mut().zip(trns) {
+            entry[3] = *alpha;
+        }
+    }
+    if compressed.len() < 2 {
+        return Err(invalid("no image data"));
+    }
+    let bits_per_pixel = channels * usize::from(depth);
+    let row_bytes = |w: u32| (w as usize * bits_per_pixel).div_ceil(8);
+    let expected: usize = if interlaced {
+        passes(width, height).iter().filter(|p| p.2 > 0 && p.3 > 0).map(|p| (row_bytes(p.2) + 1) * p.3 as usize).sum()
+    } else {
+        (row_bytes(width) + 1) * height as usize
+    };
+    // zlib: two bytes of header before the DEFLATE stream
+    let raw = inflate(&compressed[2..], expected, expected as u64 + 1)?;
+    if raw.len() < expected {
+        return Err(invalid("image data is short"));
+    }
+    let bpp = bits_per_pixel.div_ceil(8);
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    let mut put = |x: u32, y: u32, rgba: [u8; 4]| {
+        let i = (y as usize * width as usize + x as usize) * 4;
+        pixels[i..i + 4].copy_from_slice(&rgba);
+    };
+    let key = |sample: u16| -> bool {
+        match (&transparent, color) {
+            (Some(t), 0) if t.len() >= 2 => sample == u16::from_be_bytes([t[0], t[1]]),
+            _ => false,
+        }
+    };
+    let mut offset = 0;
+    let layout: Vec<(u32, u32, u32, u32, u32, u32)> = if interlaced {
+        passes(width, height).to_vec()
+    } else {
+        vec![(0, 0, width, height, 1, 1)]
+    };
+    for (x0, y0, w, h, dx, dy) in layout {
+        if w == 0 || h == 0 {
+            continue;
+        }
+        let stride = row_bytes(w);
+        let mut previous = vec![0u8; stride];
+        for row in 0..h {
+            let filter = raw[offset];
+            let mut line = raw[offset + 1..offset + 1 + stride].to_vec();
+            offset += stride + 1;
+            unfilter(filter, &mut line, &previous, bpp)?;
+            for col in 0..w {
+                let sample = |index: usize| -> u16 {
+                    match depth {
+                        16 => u16::from_be_bytes([line[index * 2], line[index * 2 + 1]]),
+                        8 => u16::from(line[index]),
+                        _ => {
+                            let bit = index * usize::from(depth);
+                            let byte = line[bit / 8];
+                            let shift = 8 - usize::from(depth) - bit % 8;
+                            u16::from((byte >> shift) & ((1u8 << depth) - 1))
+                        }
+                    }
+                };
+                let to8 = |v: u16| -> u8 {
+                    match depth {
+                        16 => (v >> 8) as u8,
+                        8 => v as u8,
+                        _ => (u32::from(v) * 255 / ((1u32 << depth) - 1)) as u8,
+                    }
+                };
+                let base = col as usize * channels;
+                let rgba = match color {
+                    0 => {
+                        let v = sample(base);
+                        let g = to8(v);
+                        [g, g, g, if key(v) { 0 } else { 255 }]
+                    }
+                    2 => {
+                        let (r, g, b) = (sample(base), sample(base + 1), sample(base + 2));
+                        let keyed = match &transparent {
+                            Some(t) if t.len() >= 6 => {
+                                let k = |i: usize| u16::from_be_bytes([t[i], t[i + 1]]);
+                                (r, g, b) == (k(0), k(2), k(4))
+                            }
+                            _ => false,
+                        };
+                        [to8(r), to8(g), to8(b), if keyed { 0 } else { 255 }]
+                    }
+                    3 => palette.get(usize::from(sample(base))).copied().unwrap_or([0, 0, 0, 255]),
+                    4 => {
+                        let g = to8(sample(base));
+                        [g, g, g, to8(sample(base + 1))]
+                    }
+                    _ => [to8(sample(base)), to8(sample(base + 1)), to8(sample(base + 2)), to8(sample(base + 3))],
+                };
+                put(x0 + col * dx, y0 + row * dy, rgba);
+            }
+            previous = line;
+        }
+    }
+    Ok(Rgba { width, height, pixels })
+}
+
+/// Adam7: each pass's first pixel, size and step.
+fn passes(width: u32, height: u32) -> [(u32, u32, u32, u32, u32, u32); 7] {
+    let pass = |x0: u32, y0: u32, dx: u32, dy: u32| {
+        let w = if width > x0 { (width - x0).div_ceil(dx) } else { 0 };
+        let h = if height > y0 { (height - y0).div_ceil(dy) } else { 0 };
+        (x0, y0, w, h, dx, dy)
+    };
+    [pass(0, 0, 8, 8), pass(4, 0, 8, 8), pass(0, 4, 4, 8), pass(2, 0, 4, 4), pass(0, 2, 2, 4), pass(1, 0, 2, 2), pass(0, 1, 1, 2)]
+}
+
+/// Undoes a row's filter, given the row above.
+fn unfilter(filter: u8, line: &mut [u8], above: &[u8], bpp: usize) -> io::Result<()> {
+    for x in 0..line.len() {
+        let a = if x >= bpp { line[x - bpp] } else { 0 };
+        let b = above[x];
+        let c = if x >= bpp { above[x - bpp] } else { 0 };
+        let predicted = match filter {
+            0 => 0,
+            1 => a,
+            2 => b,
+            3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
+            4 => paeth(a, b, c),
+            _ => return Err(invalid("unknown row filter")),
+        };
+        line[x] = line[x].wrapping_add(predicted);
+    }
+    Ok(())
+}
 
 /// Encodes `pixels` (rows top to bottom, `channels` bytes a pixel: 3 for RGB, 4 for RGBA).
 ///

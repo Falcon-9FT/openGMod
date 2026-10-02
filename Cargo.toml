@@ -11,6 +11,7 @@ members = [
     "crates/gmod-world",
     "crates/gmod-movement",
     "crates/gmod-physics",
+    "crates/gmod-ui",
     "crates/gmod-render",
     "crates/gmod-app",
     "tools/gmod-check",
@@ -33,6 +34,7 @@ gmod-model = { path = "crates/gmod-model" }
 gmod-world = { path = "crates/gmod-world" }
 gmod-movement = { path = "crates/gmod-movement" }
 gmod-physics = { path = "crates/gmod-physics" }
+gmod-ui = { path = "crates/gmod-ui" }
 gmod-render = { path = "crates/gmod-render" }
 # LuaJIT 2.1, built from source with the crate
 mlua = { version = "0.12.1", features = ["luajit", "vendored"] }
@@ -44,6 +46,9 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 ureq = { version = "=3.4.2", features = ["platform-verifier"] }
 # physics of props: pure Rust, no C++ to build
 rapier3d = "0.36.0"
+# fonts: the rasterizer, and the tables of font files (names, weights, Windows metrics)
+fontdue = "0.9.4"
+ttf-parser = "0.25.1"
 # the GPU: Direct3D 12 and Vulkan only - no OpenGL, no Metal until macOS
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }

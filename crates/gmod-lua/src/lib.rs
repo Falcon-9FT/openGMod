@@ -53,6 +53,7 @@ use gmod_fs::Vfs;
 use mlua::Lua;
 
 mod args;
+pub mod client;
 pub mod console;
 pub mod constraint;
 pub mod convar;
@@ -77,10 +78,12 @@ pub mod sandbox;
 pub mod sound;
 pub mod sql;
 mod startup;
+pub mod surface;
 pub mod timer;
 pub mod trace;
 pub mod util;
 pub mod vector;
+pub mod vgui;
 pub mod weapon;
 pub mod world;
 
@@ -239,6 +242,12 @@ pub(crate) struct Host {
     pub physics: physics::World,
     pub physgun: physgun::Guns,
     pub inputs: inputs::Queue,
+    /// The 2D frame `surface` draws, and its fonts; the client and the menu have one.
+    pub screen: surface::Screen,
+    /// What the player sees and presses; the client's.
+    pub client: client::Client,
+    /// The client's panels.
+    pub panels: vgui::Panels,
 }
 
 impl Host {
@@ -311,6 +320,9 @@ impl Runtime {
             physics: physics::World::default(),
             physgun: physgun::Guns::default(),
             inputs: inputs::Queue::default(),
+            screen: surface::Screen::default(),
+            client: client::Client::default(),
+            panels: vgui::Panels::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -340,6 +352,13 @@ impl Runtime {
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
         weapon::install(&lua)?;
+        if realm != Realm::Server {
+            surface::install(&lua)?;
+            client::install(&lua)?;
+            vgui::install(&lua)?;
+            surface::load_fonts(&lua);
+            client::load(&lua);
+        }
         Ok(Runtime { lua })
     }
 

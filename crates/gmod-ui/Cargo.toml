@@ -1,0 +1,10 @@
+[package]
+name = "gmod-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "What Garry's Mod draws on the screen in 2D: fonts as VGUI makes them, and the list of shapes, images and text a frame of HUD and panels is drawn from"
+
+[dependencies]
+fontdue.workspace = true
+ttf-parser.workspace = true

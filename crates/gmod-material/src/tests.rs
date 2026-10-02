@@ -460,3 +460,64 @@ fn patch_materials() {
     assert_eq!(material_path("Concrete\\Floor.VMT").as_deref(), Some("materials/concrete/floor.vmt"));
     assert_eq!(texture_path("../x"), None);
 }
+
+/// A PNG of raw scanlines (each with its filter byte already in front).
+fn png_file(width: u32, height: u32, depth: u8, color: u8, interlaced: bool, extra: &[(&[u8; 4], &[u8])], rows: &[u8]) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&gmod_fs::crc32::update(gmod_fs::crc32::crc32(kind), data).to_be_bytes());
+    };
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[depth, color, 0, 0, u8::from(interlaced)]);
+    chunk(b"IHDR", &header);
+    for (kind, data) in extra {
+        chunk(kind, data);
+    }
+    chunk(b"IDAT", &gmod_fs::deflate::zlib(rows));
+    chunk(b"IEND", &[]);
+    out
+}
+
+#[test]
+fn png_files_are_read_as_written() {
+    let pixels: Vec<u8> = (0..5 * 3 * 4).map(|i| (i * 37 % 256) as u8).collect();
+    let image = png::decode(&png::encode(5, 3, 4, &pixels)).unwrap();
+    assert_eq!((image.width, image.height), (5, 3));
+    assert_eq!(image.pixels, pixels);
+
+    let rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i * 11 % 256) as u8).collect();
+    let image = png::decode(&png::encode(4, 4, 3, &rgb)).unwrap();
+    let expected: Vec<u8> = rgb.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+    assert_eq!(image.pixels, expected);
+    assert!(png::decode(b"GIF89a").is_err());
+}
+
+#[test]
+fn png_palettes_grey_and_interlacing() {
+    // 2-bit palette, 3 x 2: indices 0 1 2 / 2 1 0; the first colour is half transparent
+    let palette = [255, 0, 0, 0, 255, 0, 0, 0, 255];
+    let rows = [0, 0b00_01_10_00, 0, 0b10_01_00_00];
+    let file = png_file(3, 2, 2, 3, false, &[(b"PLTE", &palette), (b"tRNS", &[128])], &rows);
+    let image = png::decode(&file).unwrap();
+    let px = |i: usize| &image.pixels[i * 4..i * 4 + 4];
+    assert_eq!(px(0), [255, 0, 0, 128]);
+    assert_eq!(px(1), [0, 255, 0, 255]);
+    assert_eq!(px(2), [0, 0, 255, 255]);
+    assert_eq!(px(3), [0, 0, 255, 255]);
+
+    // 16-bit grey with alpha, the second row "up"-filtered
+    let rows = [0, 0x80, 0x00, 0xFF, 0xFF, 2, 0x10, 0, 0x00, 0];
+    let image = png::decode(&png_file(1, 2, 16, 4, false, &[], &rows)).unwrap();
+    assert_eq!(image.pixels, [0x80, 0x80, 0x80, 0xFF, 0x90, 0x90, 0x90, 0xFF]);
+
+    // interlaced 8-bit grey, 2 x 2: pass 1 has (0,0), pass 6 (1,0), pass 7 the bottom row
+    let rows = [0, 10, 0, 20, 0, 30, 40];
+    let image = png::decode(&png_file(2, 2, 8, 0, true, &[], &rows)).unwrap();
+    let grey: Vec<u8> = image.pixels.chunks(4).map(|p| p[0]).collect();
+    assert_eq!(grey, [10, 20, 30, 40]);
+}

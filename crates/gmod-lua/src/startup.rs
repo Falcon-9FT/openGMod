@@ -1,6 +1,8 @@
 //! Starting the game as the engine does, after `includes/init.lua`:
 //!
 //! 1. autorun: `lua/autorun/*.lua`, then `lua/autorun/server/*.lua` or `lua/autorun/client/*.lua`;
+//!    a client loads Derma before (`lua/derma/init.lua`) and its controls after:
+//!    `lua/postprocess/`, `lua/vgui/`, `lua/matproxy/`, `lua/skins/`;
 //! 2. the gamemode: its base first (the `"base"` of `<name>.txt`, or what `DeriveGamemode`
 //!    names), each loaded into a fresh `GM` table and handed to `gamemode.Register`;
 //!    `GAMEMODE` is the result;
@@ -8,8 +10,8 @@
 //!    chain, base first, then those of `lua/`; each into a fresh `ENT`, `SWEP` or `EFFECT`
 //!    and registered with `scripted_ents`, `weapons` or `effects`, whose `OnLoaded` then
 //!    runs (it fills the base classes `DEFINE_BASECLASS` hands out);
-//! 4. the hooks `PreGamemodeLoaded` (before 2), `OnGamemodeLoaded`, `PostGamemodeLoaded`,
-//!    `CreateTeams` and `Initialize`.
+//! 4. the hooks `PreGamemodeLoaded` (before 2), `OnGamemodeLoaded` and `PostGamemodeLoaded`
+//!    (after 3), `CreateTeams` and `Initialize`.
 
 use mlua::{Function, Lua, MultiValue, Table, Value};
 
@@ -187,8 +189,18 @@ fn run_folder(lua: &Lua, folder: &str) {
 pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
     let lua = runtime.lua();
     let realm = runtime.realm();
+    if realm == Realm::Client {
+        include_from_engine(lua, "derma/init.lua");
+    }
     run_folder(lua, "autorun");
     run_folder(lua, if realm == Realm::Server { "autorun/server" } else { "autorun/client" });
+    if realm == Realm::Client {
+        // Derma's controls and skins come after autorun: an addon's autorun cannot make a
+        // `DFrame` as it loads, as in GMod
+        for folder in ["postprocess", "vgui", "matproxy", "skins"] {
+            run_folder(lua, folder);
+        }
+    }
 
     *host(lua).game.gamemode_name.borrow_mut() = gamemode.to_string();
     runtime.call_hook("PreGamemodeLoaded", MultiValue::new());
@@ -198,7 +210,6 @@ pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
         let _ = lua.globals().raw_set("GAMEMODE", gm);
     }
     *host(lua).game.gamemode.borrow_mut() = active;
-    runtime.call_hook("OnGamemodeLoaded", MultiValue::new());
 
     let chain = host(lua).game.chain.borrow().clone();
     let mut kinds = vec![Kind::Entity, Kind::Weapon];
@@ -223,6 +234,8 @@ pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
             let _ = files::call_reporting(lua, f, MultiValue::new());
         }
     }
+    // after the entities and weapons: sandbox makes its spawn menu then, of what is loaded
+    runtime.call_hook("OnGamemodeLoaded", MultiValue::new());
     runtime.call_hook("PostGamemodeLoaded", MultiValue::new());
     runtime.call_hook("CreateTeams", MultiValue::new());
     runtime.call_hook("Initialize", MultiValue::new());
