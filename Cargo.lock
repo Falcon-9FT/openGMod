@@ -590,6 +590,7 @@ dependencies = [
  "gmod-glua",
  "gmod-kv",
  "gmod-material",
+ "gmod-model",
  "mlua",
  "rusqlite",
  "ureq",

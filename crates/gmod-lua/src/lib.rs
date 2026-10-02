@@ -17,15 +17,18 @@
 //! * the console ([`console`]): `print`, `Msg`, `MsgN`, `MsgC`, `ErrorNoHalt` and the error
 //!   reports GMod prints when a script fails, handed to the program through [`Output`].
 //! * the engine's types and libraries: [`meta`] (`FindMetaTable`, `TYPE_*`), [`vector`]
-//!   (`Vector`, `Angle`), [`matrix`] (`VMatrix`), [`entity`] (`NULL`, the metatables of `Entity`, `Player` ...),
-//!   [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
-//!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`] (`Material`), [`engine`] (`game`,
-//!   `engine`, `system`, `gmod`, the enumerations), and [`world`] (`ents`, `player` ... as
-//!   they answer while there are no entities). They grow towards the whole API - `gmod-check
-//!   lua` counts how much of it is there.
+//!   (`Vector`, `Angle`), [`matrix`] (`VMatrix`), [`entity`] (entities, `NULL`, the methods of
+//!   `Entity`, the metatables of `Player`, `Weapon` ...), [`ents`] (`ents.*`, scripted
+//!   entities, the entities of a map), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars,
+//!   console commands), [`filesystem`] (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite),
+//!   [`http`] (`HTTP`), [`material`] (`Material`), [`engine`] (`game`, `engine`, `system`,
+//!   `gmod`, the enumerations), and [`world`] (`player` ... as they answer while there are no
+//!   players). They grow towards the whole API - `gmod-check lua` counts how much of it is
+//!   there.
 //! * starting the game ([`Runtime::start`]): `includes/init.lua`, autorun, the gamemode and
-//!   its bases, scripted entities and weapons, the hooks up to `Initialize`; then
-//!   [`Runtime::think`] moves time on, runs timers and the `Think` hook.
+//!   its bases, scripted entities and weapons, the hooks up to `Initialize`; the entities of
+//!   the map ([`Runtime::spawn_map`]); then [`Runtime::think`] moves time on, runs timers,
+//!   the entities that think and the `Think` hook.
 //!
 //! Errors in scripts are not errors of the runtime: as in GMod, a file that fails is
 //! reported ([`Output::Error`], [`Runtime::errors`]) and the files around it keep loading.
@@ -45,6 +48,7 @@ pub mod console;
 pub mod convar;
 pub mod engine;
 pub mod entity;
+pub mod ents;
 pub mod files;
 pub mod filesystem;
 pub mod http;
@@ -63,6 +67,7 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
+pub use ents::Map;
 pub use mlua;
 
 /// Which of GMod's Lua states a [`Runtime`] is.
@@ -203,6 +208,8 @@ pub(crate) struct Host {
     pub net: net::Net,
     pub database: sql::Database,
     pub http: http::Http,
+    pub entities: entity::Entities,
+    pub models: ents::Models,
 }
 
 impl Host {
@@ -267,6 +274,8 @@ impl Runtime {
             net: net::Net::default(),
             database: sql::Database::default(),
             http: http::Http::default(),
+            entities: entity::Entities::default(),
+            models: ents::Models::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -282,6 +291,7 @@ impl Runtime {
         util::install(&lua)?;
         material::install(&lua)?;
         world::install(&lua)?;
+        ents::install(&lua, realm)?;
         sql::install(&lua)?;
         http::install(&lua)?;
         net::install(&lua, realm)?;
@@ -358,8 +368,9 @@ impl Runtime {
     }
 
     /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
-    /// answers to `HTTP` requests that came in, the timers that are due, the `Tick` hook for
-    /// every tick that passed, the `Think` hook.
+    /// answers to `HTTP` requests that came in, the timers that are due, for every tick that
+    /// passed the scripted entities that think and the `Tick` hook, the `Think` hook; then
+    /// the entities removed in the frame go.
     pub fn think(&self, seconds: f64) {
         let ticks = {
             let clock = &host(&self.lua).clock;
@@ -374,9 +385,18 @@ impl Runtime {
         http::deliver(&self.lua);
         timer::run_timers(&self.lua);
         for _ in 0..ticks {
+            ents::think(&self.lua);
             self.call_hook("Tick", mlua::MultiValue::new());
         }
         self.call_hook("Think", mlua::MultiValue::new());
+        ents::collect(&self.lua);
+    }
+
+    /// Loads the entities of a map, as the server does when the map starts (after
+    /// [`start`](Self::start)): the world takes the `worldspawn` key-values, every other
+    /// entity is made and spawned, and the `InitPostEntity` hook runs.
+    pub fn spawn_map(&self, map: &ents::Map) {
+        ents::spawn_map(&self.lua, map);
     }
 
     /// Runs console commands now, as typed into the server's console (`sv_gravity 300;
@@ -396,23 +416,7 @@ impl Runtime {
     /// returned, or nothing when it failed (the error is reported) or the `hook` library is
     /// not loaded.
     pub fn call_hook(&self, name: &str, args: mlua::MultiValue) -> mlua::MultiValue {
-        let call = || -> mlua::Result<Option<(mlua::Function, mlua::MultiValue)>> {
-            let Some(hook) = self.lua.globals().get::<Option<mlua::Table>>("hook")? else { return Ok(None) };
-            let Some(call) = hook.get::<Option<mlua::Function>>("Call")? else { return Ok(None) };
-            let mut full = mlua::MultiValue::new();
-            full.push_back(mlua::Value::String(self.lua.create_string(name)?));
-            full.push_back(engine::gamemode(&self.lua)?);
-            full.extend(args);
-            Ok(Some((call, full)))
-        };
-        match call() {
-            Ok(Some((call, args))) => files::call_reporting(&self.lua, call, args).unwrap_or_default(),
-            Ok(None) => mlua::MultiValue::new(),
-            Err(e) => {
-                host(&self.lua).report(ScriptError::from_lua(&e));
-                mlua::MultiValue::new()
-            }
-        }
+        call_hook(&self.lua, name, args)
     }
 
     /// The `net` messages sent since the last call, oldest first.
@@ -428,6 +432,11 @@ impl Runtime {
         }
     }
 
+    /// How many entities there are, the world included.
+    pub fn entity_count(&self) -> usize {
+        host(&self.lua).entities.handles().len()
+    }
+
     /// Every error reported so far.
     pub fn errors(&self) -> Vec<ScriptError> {
         host(&self.lua).errors.borrow().clone()
@@ -441,5 +450,27 @@ impl Runtime {
     /// How many Lua files have been loaded.
     pub fn files_loaded(&self) -> usize {
         host(&self.lua).files_loaded.get()
+    }
+}
+
+/// `hook.Call(name, GAMEMODE, ...)`, as the engine calls hooks: what the hook returned, or
+/// nothing when it failed (the error is reported) or the `hook` library is not loaded.
+pub(crate) fn call_hook(lua: &Lua, name: &str, args: mlua::MultiValue) -> mlua::MultiValue {
+    let call = || -> mlua::Result<Option<(mlua::Function, mlua::MultiValue)>> {
+        let Some(hook) = lua.globals().get::<Option<mlua::Table>>("hook")? else { return Ok(None) };
+        let Some(call) = hook.get::<Option<mlua::Function>>("Call")? else { return Ok(None) };
+        let mut full = mlua::MultiValue::new();
+        full.push_back(mlua::Value::String(lua.create_string(name)?));
+        full.push_back(engine::gamemode(lua)?);
+        full.extend(args);
+        Ok(Some((call, full)))
+    };
+    match call() {
+        Ok(Some((call, args))) => files::call_reporting(lua, call, args).unwrap_or_default(),
+        Ok(None) => mlua::MultiValue::new(),
+        Err(e) => {
+            host(lua).report(ScriptError::from_lua(&e));
+            mlua::MultiValue::new()
+        }
     }
 }

@@ -252,7 +252,9 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     })?;
     def(lua, &net, "WriteEntity", |a| {
         let index = match a.get(1) {
-            Some(Value::UserData(ud)) => ud.borrow::<EntityHandle>().ok().and_then(|e| e.index).unwrap_or(0),
+            Some(Value::UserData(ud)) => {
+                ud.borrow::<EntityHandle>().ok().filter(|e| host(a.lua).entities.is_valid(**e)).and_then(|e| e.index).unwrap_or(0)
+            }
             _ => 0,
         };
         write(a, |b| b.push(index.into(), 16))
@@ -315,9 +317,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     })?;
     def(lua, &net, "ReadEntity", |a| {
         let index = read(a, |r| r.take(16) as u32).unwrap_or(0);
-        // only the world exists yet
-        let handle = if index == 0 { EntityHandle { index: Some(0) } } else { EntityHandle::NULL };
-        Ok(Value::UserData(a.lua.create_userdata(handle)?))
+        crate::entity::push_index(a.lua, index)
     })?;
 
     if realm == Realm::Server {

@@ -54,11 +54,16 @@ impl Game {
 
 /// A runtime of `realm` on a game folder with these files.
 fn game(realm: Realm, files: &[(&str, &str)]) -> Game {
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(path, text)| (*path, text.as_bytes())).collect();
+    game_with(realm, &files)
+}
+
+fn game_with(realm: Realm, files: &[(&str, &[u8])]) -> Game {
     let dir = TempDir::new();
-    for (path, text) in files {
+    for (path, bytes) in files {
         let path = dir.0.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
+        std::fs::write(path, bytes).unwrap();
     }
     let mut vfs = Vfs::new();
     vfs.push(Mount::new(&["GAME"], Backing::Dir(DirMount::new(&dir.0))));
@@ -602,8 +607,9 @@ fn materials() {
 #[test]
 fn empty_world() {
     let g = game(Realm::Server, &[]);
-    assert!(g.eval::<bool>("return #player.GetAll() == 0 and #ents.GetAll() == 0 and Entity(1) == NULL and not NULL:IsValid()"));
+    assert!(g.eval::<bool>("return #player.GetAll() == 0 and #ents.GetAll() == 1 and Entity(1) == NULL and not NULL:IsValid()"));
     assert!(g.eval::<bool>("return game.GetWorld():IsValid() and game.GetWorld():IsWorld() and tostring(NULL) == '[NULL Entity]'"));
+    assert!(g.eval::<bool>("return ents.GetAll()[1] == game.GetWorld() and tostring(Entity(0)) == 'Entity [0][worldspawn]'"));
     assert!(g.eval::<bool>(
         "return FindMetaTable('Player').MetaName == 'Player' and FindMetaTable('Player').MetaBaseClass == FindMetaTable('Entity')"
     ));
@@ -858,4 +864,183 @@ fn public_addresses() {
     ] {
         assert!(!public(address), "{address}");
     }
+}
+
+/// What the game's Lua gives entities, cut down: `scripted_ents` and `weapons` to register
+/// scripts in, `hook.Call` on the table `HOOKS`, and `Entity.__index` as
+/// `includes/extensions/entity.lua` has it.
+const ENTITY_LUA: &str = r#"
+    scripted_ents = { list = {} }
+    function scripted_ents.Register(t, name) scripted_ents.list[name] = { t = t, type = t.Type } t.ClassName = name end
+    function scripted_ents.GetStored(name) return scripted_ents.list[name] end
+    function scripted_ents.GetType(name) local s = scripted_ents.list[name] return s and s.type end
+    function scripted_ents.Get(name, t) t = t or {} for k, v in pairs(scripted_ents.list[name].t) do t[k] = v end return t end
+    weapons = { list = {} }
+    function weapons.GetStored(name) return weapons.list[name] end
+    function weapons.Get(name, t) t = t or {} for k, v in pairs(weapons.list[name]) do t[k] = v end return t end
+    HOOKS = {}
+    hook = { Call = function(name, gm, ...) if HOOKS[name] then return HOOKS[name](...) end end }
+    local meta = FindMetaTable('Entity')
+    function meta:__index(key)
+        local val = meta[key]
+        if val ~= nil then return val end
+        local tab = meta.GetTable(self)
+        if tab then return tab[key] end
+    end
+    function close(a, b) return (a - b):Length() < 0.001 end
+"#;
+
+/// A runtime with [`ENTITY_LUA`] run, and a model `models/box.mdl` 16 units wide and high.
+fn entity_game(realm: Realm) -> Game {
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let g = game_with(realm, &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/box.mdl", &mdl)]);
+    g.runtime.init();
+    g
+}
+
+#[test]
+fn entities_are_made_and_found() {
+    let g = entity_game(Realm::Server);
+    assert!(g.eval::<bool>(
+        "local e = ents.Create('prop_physics') E = e
+         return tostring(e) == 'Entity [2][prop_physics]' and e:EntIndex() == 2 and rawequal(e, Entity(2))
+             and ({ [e] = true })[Entity(2)] and e:GetClass() == 'prop_physics' and not e:IsWeapon()"
+    ));
+    assert!(g.eval::<bool>("return ents.Create('nope') == NULL and Entity(-1) == NULL and Entity(0.5) == NULL"));
+    assert_eq!(g.printed(), "Attempted to create unknown entity type nope!\n");
+    assert!(g.eval::<bool>(
+        "local w = ents.Create('weapon_pistol')
+         return getmetatable(w) == FindMetaTable('Weapon') and w:IsWeapon() and tostring(w):sub(1, 6) == 'Weapon'"
+    ));
+
+    // the entity's own table, behind the metatable
+    assert!(g.eval::<bool>("E.note = 5 return E:GetTable().note == 5 and E.note == 5 and E.GetPos == FindMetaTable('Entity').GetPos"));
+
+    // where it is, and its children
+    assert!(g.eval::<bool>(
+        "E:SetPos(Vector(1, 2, 3)) E:SetAngles(Angle(0, 90, 0))
+         return E:GetPos() == Vector(1, 2, 3) and close(E:LocalToWorld(Vector(10, 0, 0)), Vector(1, 12, 3))
+             and close(E:WorldToLocal(Vector(1, 12, 3)), Vector(10, 0, 0)) and close(E:GetForward(), Vector(0, 1, 0))"
+    ));
+    assert!(g.eval::<bool>(
+        "local p, c = ents.Create('prop_dynamic'), ents.Create('prop_dynamic')
+         p:SetPos(Vector(100, 0, 0)) c:SetPos(Vector(110, 0, 0)) c:SetParent(p) p:SetPos(Vector(200, 0, 0))
+         P, C = p, c
+         return c:GetPos() == Vector(210, 0, 0) and c:GetLocalPos() == Vector(10, 0, 0) and c:GetParent() == p
+             and p:GetChildren()[1] == c and #p:GetChildren() == 1"
+    ));
+    assert!(g.eval::<bool>(
+        "local near = ents.FindInSphere(Vector(205, 0, 0), 6)
+         return #ents.FindByClass('prop_*') == 3 and #ents.FindByClass('PROP_DYNAMIC') == 2 and #near == 2
+             and #ents.FindInBox(Vector(0.5, 0.5, 0.5), Vector(5, 5, 5)) == 1 and #ents.FindInSphere(Vector(205, 0, 0), 4) == 0"
+    ));
+
+    // removed at the end of the frame; the index is used again, the old handle stays NULL
+    assert!(g.eval::<bool>("C:Remove() return IsValid == nil and C:IsValid() and C:IsMarkedForDeletion() and #P:GetChildren() == 0"));
+    g.runtime.think(0.01);
+    assert!(g.eval::<bool>(
+        "local index = 5
+         local new = ents.Create('info_target')
+         return not C:IsValid() and new:EntIndex() == index and C ~= new and tostring(C) == '[NULL Entity]' and #P:GetChildren() == 0"
+    ));
+    let error = g.runtime.lua().load("C:GetPos()").exec().unwrap_err().to_string();
+    assert!(error.contains("Tried to use a NULL entity!"), "{error}");
+
+    // variables kept with it
+    assert!(g.eval::<bool>(
+        "E:SetNWInt('n', 3.7) E:SetNW2String('s', 12) E:SetDTFloat(0, 1.5) E:SetNWEntity('e', P)
+         return E:GetNWInt('n') == 3 and E:GetNWInt('missing', 9) == 9 and E:GetNWString('missing') == ''
+             and E:GetNW2String('s') == '12' and E:GetDTFloat(0) == 1.5 and E:GetDTBool(1) == false
+             and E:GetNWEntity('e') == P and E:GetNWEntity('missing') == NULL and E:GetNWVarTable().n == 3"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn scripted_entities_live_and_think() {
+    let g = entity_game(Realm::Server);
+    g.runtime
+        .run_string(
+            "local ENT = { Type = 'anim' }
+             function ENT:SetupDataTables() print('setup', self:GetClass()) end
+             function ENT:Initialize() print('initialize', self.Entity == self) self:SetModel('models/box.mdl') end
+             function ENT:Think() self.thoughts = (self.thoughts or 0) + 1 if self.fast then self:NextThink(CurTime()) return true end end
+             function ENT:OnRemove() print('removed', self:GetName()) end
+             function ENT:KeyValue(k, v) print('key', k, v) if k == 'secret' then return true end end
+             scripted_ents.Register(ENT, 'sent_test')
+             HOOKS.OnEntityCreated = function(e) print('created', e:GetClass()) end
+             HOOKS.EntityRemoved = function(e) print('hook removed', e:GetClass(), e:IsValid()) end
+             SLOW = ents.Create('sent_test') SLOW:SetKeyValue('secret', 1) SLOW:SetKeyValue('targetname', 'slow') SLOW:Spawn()
+             FAST = ents.Create('sent_test') FAST.fast = true FAST:Spawn()",
+            "sent",
+        )
+        .unwrap();
+    assert_eq!(
+        g.printed(),
+        "setup\tsent_test\ncreated\tsent_test\nkey\tsecret\t1\nkey\ttargetname\tslow\ninitialize\ttrue\n\
+         setup\tsent_test\ncreated\tsent_test\ninitialize\ttrue\n"
+    );
+    assert!(g.eval::<bool>(
+        "return SLOW:GetName() == 'slow' and SLOW:GetKeyValues().secret == nil and SLOW:IsScripted()
+             and SLOW:OBBMaxs() == Vector(8, 8, 16) and SLOW:OBBMins() == Vector(-8, -8, 0) and SLOW:GetModel() == 'models/box.mdl'"
+    ));
+    // a second and a half: every tick for one, every 0.2 s for the other
+    for _ in 0..100 {
+        g.runtime.think(0.015);
+    }
+    let (slow, fast): (u32, u32) = g.eval("return SLOW.thoughts, FAST.thoughts");
+    assert!((7..=9).contains(&slow), "{slow}");
+    assert!((98..=102).contains(&fast), "{fast}");
+
+    g.printed.borrow_mut().clear();
+    g.runtime.run_string("SLOW:Remove() SLOW:Remove()", "remove").unwrap();
+    assert_eq!(g.printed(), "removed\tslow\nhook removed\tsent_test\ttrue\n", "once, while it is still valid");
+    g.runtime.think(0.015);
+    assert!(g.eval::<bool>("return not SLOW:IsValid() and FAST:IsValid() and #ents.FindByClass('sent_test') == 1"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn map_entities() {
+    let g = entity_game(Realm::Server);
+    g.runtime
+        .run_string(
+            "local ENT = { Type = 'point' }
+             function ENT:KeyValue(k, v) if k == 'code' then self.code = v end end
+             function ENT:Initialize() RunString(self.code) end
+             scripted_ents.Register(ENT, 'sent_runner')
+             HOOKS.EntityKeyValue = function(e, k, v) if k == 'skin' then return '3' end end
+             HOOKS.InitPostEntity = function() print('post', #ents.GetAll()) end",
+            "map",
+        )
+        .unwrap();
+    let pairs = |list: &[(&str, &str)]| list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    let map = Map {
+        name: "gm_test".into(),
+        entities: vec![
+            pairs(&[("classname", "worldspawn"), ("skyname", "sky_day01_01")]),
+            pairs(&[("classname", "info_player_start"), ("origin", "0 0 16"), ("angles", "0 90 0")]),
+            pairs(&[("classname", "prop_physics"), ("targetname", "barrel"), ("origin", "100 0 0"), ("skin", "1")]),
+            pairs(&[("classname", "func_door"), ("model", "*1"), ("parentname", "barrel"), ("targetname", "door")]),
+            pairs(&[("classname", "sent_runner"), ("code", "print('runner', ents.FindByName('door')[1]:GetParent():GetName())")]),
+            pairs(&[("classname", "some_class_of_another_game"), ("origin", "1 2 3")]),
+        ],
+        brush_models: vec![([-512.0, -512.0, -64.0], [512.0, 512.0, 0.0]), ([0.0, 0.0, 0.0], [64.0, 8.0, 96.0])],
+    };
+    g.runtime.spawn_map(&map);
+    assert_eq!(g.printed(), "runner\tbarrel\npost\t6\n", "parents are set before anything spawns");
+    assert!(g.eval::<bool>(
+        "local world, start = Entity(0), ents.FindByClass('info_player_start')[1]
+         return game.GetMap() == 'gm_test' and world:GetModel() == 'maps/gm_test.bsp' and world:OBBMaxs() == Vector(512, 512, 0)
+             and world:GetKeyValues().skyname == 'sky_day01_01' and world:MapCreationID() == 1234
+             and start:GetPos() == Vector(0, 0, 16) and start:GetAngles() == Angle(0, 90, 0)
+             and start:CreatedByMap() and start:MapCreationID() == 1235 and ents.GetMapCreatedEntity(1235) == start"
+    ));
+    assert!(g.eval::<bool>(
+        "local barrel, door = ents.FindByName('barrel')[1], ents.FindByName('door')[1]
+         return barrel:GetSkin() == 3 and door:GetParent() == barrel and door:OBBMaxs() == Vector(64, 8, 96)
+             and door:GetPos() == Vector(0, 0, 0) and not ents.Create('info_target'):CreatedByMap()
+             and ents.FindByClass('some_class_of_another_game')[1]:GetPos() == Vector(1, 2, 3)"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
