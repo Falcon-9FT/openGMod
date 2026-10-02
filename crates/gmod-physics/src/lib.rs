@@ -9,13 +9,19 @@
 //!
 //! A body is frozen (`EnableMotion(false)`) by making it fixed: it stays where it is and others
 //! still hit it. One without collisions (`EnableCollisions(false)`) falls through everything.
+//!
+//! Bodies are held together by [`Joint`]s - welds, ropes, hinges, what the constraints of GMod
+//! are made of - to each other or to the world ([`Physics::ground`]); a joint given a strength
+//! breaks when pulled harder than that.
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+
 use rapier3d::math::{Mat3, Pose, Rotation, Vector};
 use rapier3d::prelude::{
-    ColliderBuilder, ColliderHandle, InteractionGroups, PhysicsWorld, QueryFilter, Ray, RigidBodyBuilder, RigidBodyHandle, RigidBodyType,
-    SharedShape,
+    ColliderBuilder, ColliderHandle, GenericJoint, GenericJointBuilder, ImpulseJointHandle, InteractionGroups, JointAxesMask, JointAxis,
+    PhysicsWorld, QueryFilter, Ray, RigidBodyBuilder, RigidBodyHandle, RigidBodyType, SharedShape, SpringJointBuilder,
 };
 
 pub type Vec3 = [f32; 3];
@@ -142,9 +148,41 @@ pub struct Hit {
     pub normal: Vec3,
 }
 
+/// How two bodies are held together. Points and axes are in the world, as the bodies are when
+/// they are joined.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Joint {
+    /// As they are to each other: a weld.
+    Weld,
+    /// Turning any way about a point: a ball and socket.
+    Ball { point: Vec3 },
+    /// Turning about the line through `point` along `axis`: a hinge.
+    Hinge { point: Vec3, axis: Vec3 },
+    /// Sliding along the line through `point` along `axis`, not turning.
+    Slider { point: Vec3, axis: Vec3 },
+    /// A point of each, `start` of the first and `end` of the second, no farther apart than
+    /// `length` units; no nearer either when `rigid`.
+    Rope { start: Vec3, end: Vec3, length: f32, rigid: bool },
+    /// A point of each pulled towards `length` units apart, with `stiffness` (kilograms per
+    /// second squared) and `damping` (kilograms per second).
+    Spring { start: Vec3, end: Vec3, length: f32, stiffness: f32, damping: f32 },
+    /// Nothing held: the two only go through each other.
+    NoCollide,
+}
+
+/// A joint in a [`Physics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JointId(ImpulseJointHandle);
+
 /// The world and the bodies in it.
 pub struct Physics {
     world: PhysicsWorld,
+    /// What never moves and has no shape: the world, for joints.
+    ground: RigidBodyHandle,
+    /// The joints that break, and the force and torque they take: newtons, newton metres.
+    strengths: HashMap<JointId, [f32; 2]>,
+    /// Joints broken since they were last asked for.
+    broken: Vec<JointId>,
 }
 
 impl Default for Physics {
@@ -158,7 +196,13 @@ impl Physics {
     pub fn new() -> Physics {
         let mut world = PhysicsWorld::new();
         world.gravity = metres([0.0, 0.0, -DEFAULT_GRAVITY]);
-        Physics { world }
+        let ground = world.insert_body(RigidBodyBuilder::fixed());
+        Physics { world, ground, strengths: HashMap::new(), broken: Vec::new() }
+    }
+
+    /// The world as a body, to join bodies to: it never moves.
+    pub fn ground(&self) -> BodyId {
+        BodyId(self.ground)
     }
 
     /// Gravity from now on: `sv_gravity`, units/s² down.
@@ -451,13 +495,100 @@ impl Physics {
         self.world.active_bodies().map(|(handle, _)| BodyId(handle)).collect()
     }
 
-    /// Moves time on by `seconds`.
+    /// Joins two bodies, as they are now. They go through each other unless `collide`. A joint
+    /// with a strength - the kilograms whose weight breaks it, and the kilograms whose weight
+    /// on a lever of a unit twists it apart; 0 for never - breaks when pulled harder
+    /// ([`Physics::broken`]). None when a body is not there, or a rope or spring has no length.
+    pub fn join(&mut self, a: BodyId, b: BodyId, joint: Joint, collide: bool, strength: [f32; 2]) -> Option<JointId> {
+        let first = *self.world.bodies.get(a.0)?.position();
+        let second = *self.world.bodies.get(b.0)?.position();
+        // a frame of the world, as each body sees it
+        let frames = |builder: GenericJointBuilder, frame: Pose| builder.local_frame1(first.inverse() * frame).local_frame2(second.inverse() * frame);
+        let along = |point: Vec3, axis: Vec3| {
+            let axis = Vector::from(axis).normalize_or(Vector::X);
+            Pose::from_parts(metres(point), Rotation::from_rotation_arc(Vector::X, axis))
+        };
+        let at = |point: Vec3| Pose::from_parts(metres(point), Rotation::IDENTITY);
+        let data: GenericJoint = match joint {
+            Joint::Weld => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_FIXED_AXES), first).build(),
+            Joint::Ball { point } => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_SPHERICAL_AXES), at(point)).build(),
+            Joint::Hinge { point, axis } => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_REVOLUTE_AXES), along(point, axis)).build(),
+            Joint::Slider { point, axis } => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_PRISMATIC_AXES), along(point, axis)).build(),
+            Joint::Rope { start, end, length, rigid } => {
+                let length = length * METRES_PER_UNIT;
+                if length <= 0.0 {
+                    return None;
+                }
+                GenericJointBuilder::new(JointAxesMask::empty())
+                    .coupled_axes(JointAxesMask::LIN_AXES)
+                    .limits(JointAxis::LinX, [if rigid { length } else { 0.0 }, length])
+                    .local_anchor1(first.inverse_transform_point(metres(start)))
+                    .local_anchor2(second.inverse_transform_point(metres(end)))
+                    .build()
+            }
+            Joint::Spring { start, end, length, stiffness, damping } => {
+                SpringJointBuilder::new((length * METRES_PER_UNIT).max(0.0), stiffness.max(0.0), damping.max(0.0))
+                    .local_anchor1(first.inverse_transform_point(metres(start)))
+                    .local_anchor2(second.inverse_transform_point(metres(end)))
+                    .build()
+                    .data
+            }
+            Joint::NoCollide => GenericJointBuilder::new(JointAxesMask::empty()).build(),
+        };
+        let mut data = data;
+        data.set_contacts_enabled(collide && joint != Joint::NoCollide);
+        let id = JointId(self.world.insert_impulse_joint(a.0, b.0, data));
+        // the weight of a kilogram as the game falls, on a lever of a unit
+        let weight = DEFAULT_GRAVITY * METRES_PER_UNIT;
+        let [force, torque] = strength;
+        if force > 0.0 || torque > 0.0 {
+            self.strengths.insert(id, [force.max(0.0) * weight, torque.max(0.0) * weight * METRES_PER_UNIT]);
+        }
+        Some(id)
+    }
+
+    /// Takes a joint away.
+    pub fn unjoin(&mut self, id: JointId) {
+        self.world.remove_impulse_joint(id.0);
+        self.strengths.remove(&id);
+    }
+
+    /// Whether a joint holds: it was not taken away, broken, or lost with a body.
+    pub fn joined(&self, id: JointId) -> bool {
+        self.world.impulse_joints.get(id.0).is_some()
+    }
+
+    /// The joints that broke since this was last asked.
+    pub fn broken(&mut self) -> Vec<JointId> {
+        std::mem::take(&mut self.broken)
+    }
+
+    /// Moves time on by `seconds`. Joints pulled harder than they take break.
     pub fn step(&mut self, seconds: f32) {
         if seconds <= 0.0 {
             return;
         }
         self.world.integration_parameters.dt = seconds;
         self.world.step();
+        let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
+        let joints = &self.world.impulse_joints;
+        let mut snapped = Vec::new();
+        self.strengths.retain(|id, [force, torque]| {
+            let Some(joint) = joints.get(id.0) else { return false };
+            // the impulses of the last of the solver's substeps
+            let i = joint.impulses;
+            let pulled = Vector::new(i[0], i[1], i[2]).length() / substep;
+            let twisted = Vector::new(i[3], i[4], i[5]).length() / substep;
+            let breaks = (*force > 0.0 && pulled > *force) || (*torque > 0.0 && twisted > *torque);
+            if breaks {
+                snapped.push(*id);
+            }
+            !breaks
+        });
+        for id in snapped {
+            self.world.remove_impulse_joint(id.0);
+            self.broken.push(id);
+        }
     }
 }
 

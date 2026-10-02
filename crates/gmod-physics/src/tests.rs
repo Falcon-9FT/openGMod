@@ -182,3 +182,79 @@ fn steered_where_it_should_be() {
     }
     assert!(physics.pose(body).unwrap().0[2] > 10.0, "{:?}", physics.pose(body));
 }
+
+#[test]
+fn joined_to_the_world_and_to_each_other() {
+    let mut physics = floor();
+    let ground = physics.ground();
+    // welded to the world it stays in the air, and what is welded to it stays with it
+    let held = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
+    let hanging = physics.add(&crate_body([0.0, 0.0, 160.0])).unwrap();
+    physics.join(held, ground, Joint::Weld, true, [0.0; 2]).unwrap();
+    let weld = physics.join(hanging, held, Joint::Weld, true, [0.0; 2]).unwrap();
+    run(&mut physics, 1.0);
+    assert!(near(physics.pose(held).unwrap().0, [0.0, 0.0, 200.0], 0.5) && near(physics.pose(hanging).unwrap().0, [0.0, 0.0, 160.0], 0.5));
+    // let go of the world, they fall together, as they were
+    physics.unjoin(weld);
+    assert!(!physics.joined(weld));
+    physics.join(hanging, held, Joint::Weld, true, [0.0; 2]).unwrap();
+    let both = physics.add(&crate_body([300.0, 0.0, 300.0])).unwrap();
+    let other = physics.add(&crate_body([340.0, 0.0, 300.0])).unwrap();
+    physics.join(both, other, Joint::Weld, false, [0.0; 2]).unwrap();
+    run(&mut physics, 3.0);
+    let (a, b) = (physics.pose(both).unwrap().0, physics.pose(other).unwrap().0);
+    assert!((a[2] - 16.0).abs() < 1.0 && (b[2] - 16.0).abs() < 1.0 && (b[0] - a[0] - 40.0).abs() < 1.0, "{a:?} {b:?}");
+}
+
+#[test]
+fn ropes_hinges_springs_and_sliders() {
+    let mut physics = Physics::new();
+    let ground = physics.ground();
+    // on a rope of 100 from the top of the crate it hangs 100 below the hook
+    let rope = physics.add(&crate_body([0.0, 0.0, 100.0])).unwrap();
+    physics.join(rope, ground, Joint::Rope { start: [0.0, 0.0, 116.0], end: [0.0, 0.0, 200.0], length: 100.0, rigid: false }, true, [0.0; 2]).unwrap();
+    // on a hinge along y at its side it swings down under the hinge
+    let door = physics.add(&crate_body([500.0, 0.0, 0.0])).unwrap();
+    physics.join(door, ground, Joint::Hinge { point: [532.0, 0.0, 0.0], axis: [0.0, 1.0, 0.0] }, true, [0.0; 2]).unwrap();
+    // on a slider along x it does not fall
+    let slider = physics.add(&crate_body([-500.0, 0.0, 0.0])).unwrap();
+    physics.join(slider, ground, Joint::Slider { point: [-500.0, 0.0, 0.0], axis: [1.0, 0.0, 0.0] }, true, [0.0; 2]).unwrap();
+    physics.set_velocity(slider, [50.0, 0.0, 0.0]);
+    // on a spring it hangs where its weight stretches it: m g / k
+    let spring = physics.add(&crate_body([0.0, 500.0, 0.0])).unwrap();
+    let (stiffness, damping) = (30.0 * 100.0, 30.0 * 20.0);
+    physics.join(spring, ground, Joint::Spring { start: [0.0, 500.0, 16.0], end: [0.0, 500.0, 100.0], length: 50.0, stiffness, damping }, true, [0.0; 2]).unwrap();
+    run(&mut physics, 4.0);
+    let z = physics.pose(rope).unwrap().0[2];
+    assert!((z - (200.0 - 100.0 - 16.0)).abs() < 2.0, "rope {z}");
+    let (door_at, _) = physics.pose(door).unwrap();
+    let swing = ((door_at[0] - 532.0).powi(2) + door_at[2].powi(2)).sqrt();
+    assert!((swing - 32.0).abs() < 1.0 && door_at[2] < -20.0, "hinge {door_at:?}");
+    let (slid, slid_angles) = physics.pose(slider).unwrap();
+    assert!(slid[2].abs() < 0.5 && slid[0] > -400.0 && near(slid_angles, [0.0; 3], 0.5), "slider {slid:?}");
+    let stretch = (DEFAULT_GRAVITY * METRES_PER_UNIT) * 30.0 / stiffness / METRES_PER_UNIT;
+    let hangs = physics.pose(spring).unwrap().0[2];
+    assert!((hangs - (100.0 - 50.0 - stretch - 16.0)).abs() < 3.0, "spring {hangs} {stretch}");
+}
+
+#[test]
+fn what_breaks_and_what_goes_through() {
+    let mut physics = floor();
+    let ground = physics.ground();
+    // 30 kg on a weld that takes 10 breaks; on one that takes 100 it stays
+    let weak = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
+    let strong = physics.add(&crate_body([200.0, 0.0, 200.0])).unwrap();
+    let snaps = physics.join(weak, ground, Joint::Weld, true, [10.0, 0.0]).unwrap();
+    physics.join(strong, ground, Joint::Weld, true, [100.0, 0.0]).unwrap();
+    run(&mut physics, 3.0);
+    assert_eq!(physics.broken(), vec![snaps]);
+    assert!(!physics.joined(snaps) && physics.broken().is_empty());
+    assert!((physics.pose(weak).unwrap().0[2] - 16.0).abs() < 1.0 && (physics.pose(strong).unwrap().0[2] - 200.0).abs() < 1.0);
+    // what does not collide with the frozen crate falls through it to the floor
+    let frozen = physics.add(&crate_body([-200.0, 0.0, 100.0])).unwrap();
+    physics.set_motion(frozen, false);
+    let through = physics.add(&crate_body([-200.0, 0.0, 200.0])).unwrap();
+    physics.join(through, frozen, Joint::NoCollide, false, [0.0; 2]).unwrap();
+    run(&mut physics, 3.0);
+    assert!((physics.pose(through).unwrap().0[2] - 16.0).abs() < 1.0, "{:?}", physics.pose(through));
+}
