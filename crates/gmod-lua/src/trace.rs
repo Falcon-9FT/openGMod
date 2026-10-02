@@ -7,8 +7,11 @@
 //! entities whose group does not collide with it (`should_collide`) are not hit; debris only
 //! by a mask with `CONTENTS_DEBRIS`.
 //!
-//! Not yet: the shapes of models (physics, stage 4), hit boxes and hit groups, surface
-//! properties (`MatType` is `MAT_DEFAULT`, `SurfaceProps` 0), the `ShouldCollide` hook.
+//! What was hit is made of a surface ([`crate::surfaceprops`]): the map's material's
+//! `$surfaceprop`, an entity's body's; `SurfaceProps` is its number, `MatType` its `MAT_*`.
+//!
+//! Not yet: the shapes of models (physics, stage 4), hit boxes and hit groups, the
+//! `ShouldCollide` hook.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -22,7 +25,7 @@ use crate::entity::{self, EntityHandle, Kind};
 use crate::vector::Vector;
 use crate::{files, host};
 
-/// `MAT_DEFAULT`: what every surface is until surface properties are read.
+/// `MAT_DEFAULT`: what is hit when it has no surface of its own.
 const MAT_DEFAULT: i64 = 88;
 /// How far a trace goes for `GetEyeTrace`: `4096 * 8`, as `util.GetPlayerTrace`.
 pub const EYE_TRACE_LENGTH: f32 = 32768.0;
@@ -401,11 +404,23 @@ pub(crate) fn result(lua: &Lua, sweep: &Sweep, hit: &Hit, out: Option<Table>) ->
     t.raw_set("HitSky", hit.surface_flags & surf::SKY != 0)?;
     t.raw_set("HitTexture", hit.texture.as_str())?;
     t.raw_set("HitWorld", hit.hit() && world)?;
-    t.raw_set("MatType", if hit.hit() { MAT_DEFAULT } else { 0 })?;
+    let surface = if !hit.hit() {
+        None
+    } else if world && !hit.texture.starts_with("**") {
+        Some(crate::surfaceprops::of_material(lua, &hit.texture))
+    } else {
+        crate::physics::material_of(lua, hit.entity).map(|name| crate::surfaceprops::named(lua, &name))
+    };
+    let mat_type = match &surface {
+        Some((_, prop)) => i64::from(prop.game_material),
+        None if hit.hit() => MAT_DEFAULT,
+        None => 0,
+    };
+    t.raw_set("MatType", mat_type)?;
     t.raw_set("Normal", entity::vector(lua, (sweep.end - sweep.start).normalized())?)?;
     t.raw_set("PhysicsBone", 0)?;
     t.raw_set("StartPos", entity::vector(lua, sweep.start)?)?;
-    t.raw_set("SurfaceProps", 0)?;
+    t.raw_set("SurfaceProps", surface.map_or(0, |(index, _)| index as i64))?;
     t.raw_set("StartSolid", hit.start_solid)?;
     t.raw_set("AllSolid", hit.all_solid)?;
     t.raw_set("SurfaceFlags", hit.surface_flags)?;

@@ -34,6 +34,11 @@ pub const DEFAULT_GRAVITY: f32 = 600.0;
 pub const DEFAULT_DENSITY: f32 = 2000.0;
 /// How much what slides along something holds back, when nothing says otherwise.
 pub const DEFAULT_FRICTION: f32 = 0.8;
+/// The least change of speed a contact makes to count as an [`Impact`], in units/s: less is
+/// a body at rest, or one sliding along.
+pub const MIN_IMPACT_SPEED: f32 = 50.0;
+/// How long, in seconds, after an impact a body makes no other.
+const IMPACT_PAUSE: f32 = 0.08;
 
 fn metres(v: Vec3) -> Vector {
     Vector::new(v[0], v[1], v[2]) * METRES_PER_UNIT
@@ -183,6 +188,30 @@ pub struct Physics {
     strengths: HashMap<JointId, [f32; 2]>,
     /// Joints broken since they were last asked for.
     broken: Vec<JointId>,
+    /// Impacts since they were last asked for, and when each body last made one.
+    impacts: Vec<Impact>,
+    last_impact: HashMap<RigidBodyHandle, f32>,
+    /// Seconds stepped.
+    clock: f32,
+}
+
+/// A body hit something hard enough to be heard, as Source tells its entities
+/// (`PhysicsCollide`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Impact {
+    pub body: BodyId,
+    /// The body's caller value (its entity).
+    pub user: u64,
+    /// What it hit: another body; `None` for the world.
+    pub other_body: Option<BodyId>,
+    /// And its caller value.
+    pub other: Option<u64>,
+    /// How much the contact changed its speed, in units/s: how fast it went into what it hit.
+    pub speed: f32,
+    /// Where, in the world.
+    pub point: Vec3,
+    /// From the body towards what it hit.
+    pub normal: Vec3,
 }
 
 impl Default for Physics {
@@ -197,7 +226,15 @@ impl Physics {
         let mut world = PhysicsWorld::new();
         world.gravity = metres([0.0, 0.0, -DEFAULT_GRAVITY]);
         let ground = world.insert_body(RigidBodyBuilder::fixed());
-        Physics { world, ground, strengths: HashMap::new(), broken: Vec::new() }
+        Physics {
+            world,
+            ground,
+            strengths: HashMap::new(),
+            broken: Vec::new(),
+            impacts: Vec::new(),
+            last_impact: HashMap::new(),
+            clock: 0.0,
+        }
     }
 
     /// The world as a body, to join bodies to: it never moves.
@@ -579,6 +616,58 @@ impl Physics {
         std::mem::take(&mut self.broken)
     }
 
+    /// The impacts since this was last asked, oldest first.
+    pub fn impacts(&mut self) -> Vec<Impact> {
+        std::mem::take(&mut self.impacts)
+    }
+
+    /// The impacts of the step just made: what the contacts pushed apart, as the change of
+    /// speed of each body that moves (the impulse over its mass).
+    fn find_impacts(&mut self) {
+        let world = &self.world;
+        for pair in world.narrow_phase.contact_pairs() {
+            if !pair.has_any_active_contact() {
+                continue;
+            }
+            let impulse = pair.total_impulse_magnitude();
+            if impulse <= 0.0 {
+                continue;
+            }
+            let (_, normal) = pair.max_impulse();
+            let point = pair
+                .find_deepest_contact()
+                .and_then(|(_, contact)| world.colliders.get(pair.collider1).map(|c| units(c.position() * contact.local_p1)));
+            let body = |collider| world.colliders.get(collider).and_then(|c| c.parent());
+            let (one, two) = (body(pair.collider1), body(pair.collider2));
+            for (me, other, towards) in [(one, two, normal), (two, one, -normal)] {
+                let Some(handle) = me else { continue };
+                let Some(rb) = world.bodies.get(handle) else { continue };
+                if !rb.is_dynamic() || rb.mass() <= 0.0 {
+                    continue;
+                }
+                let speed = impulse / rb.mass() / METRES_PER_UNIT;
+                if speed < MIN_IMPACT_SPEED || self.last_impact.get(&handle).is_some_and(|&t| self.clock - t < IMPACT_PAUSE) {
+                    continue;
+                }
+                self.last_impact.insert(handle, self.clock);
+                // the world's solids have no body; joints' ground is no thing to hit
+                let other = other.filter(|&h| h != self.ground);
+                self.impacts.push(Impact {
+                    body: BodyId(handle),
+                    user: rb.user_data as u64,
+                    other_body: other.map(BodyId),
+                    other: other.and_then(|h| world.bodies.get(h)).map(|b| b.user_data as u64),
+                    speed,
+                    point: point.unwrap_or_else(|| units(rb.translation())),
+                    normal: towards.to_array(),
+                });
+            }
+        }
+        // bodies gone make no more impacts
+        let bodies = &world.bodies;
+        self.last_impact.retain(|handle, _| bodies.get(*handle).is_some());
+    }
+
     /// Moves time on by `seconds`. Joints pulled harder than they take break.
     pub fn step(&mut self, seconds: f32) {
         if seconds <= 0.0 {
@@ -586,6 +675,8 @@ impl Physics {
         }
         self.world.integration_parameters.dt = seconds;
         self.world.step();
+        self.clock += seconds;
+        self.find_impacts();
         let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
         let joints = &self.world.impulse_joints;
         let mut snapped = Vec::new();

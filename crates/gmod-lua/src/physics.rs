@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use gmod_physics::{Body, BodyId, Physics, Shape};
-use mlua::{Lua, MultiValue, Value};
+use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::args::{self, Args};
 use crate::entity::{self, EntityHandle, PhysObjHandle};
@@ -243,12 +243,27 @@ pub(crate) fn wake(lua: &Lua, handle: EntityHandle) {
     }
 }
 
+/// A body hit something: what Lua hears of it.
+struct Collision {
+    entity: EntityHandle,
+    material: String,
+    /// What it hit: the world, or another entity with a body.
+    other: EntityHandle,
+    other_material: Option<String>,
+    speed: f32,
+    point: Vector,
+    normal: Vector,
+    velocity: Vector,
+    other_velocity: Vector,
+}
+
 /// One tick: the bodies move on, gravity as `sv_gravity` says, and the entities of those awake
 /// go where their bodies are - unless they have a parent, which takes them along. Then the
-/// constraints that broke go.
+/// constraints that broke go, and the bodies that hit something make their sounds and tell
+/// Lua.
 pub(crate) fn simulate(lua: &Lua) {
     let gravity = crate::convar::value(lua, "sv_gravity").and_then(|g| g.trim().parse::<f32>().ok()).unwrap_or(600.0);
-    let broken = {
+    let (broken, collisions) = {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
         physics.set_gravity(gravity);
@@ -266,9 +281,87 @@ pub(crate) fn simulate(lua: &Lua) {
                 ent.velocity = velocity;
             });
         }
-        physics.broken()
+        let collisions: Vec<Collision> = physics
+            .impacts()
+            .into_iter()
+            .filter_map(|impact| {
+                let kept = bodies.get(&impact.body)?;
+                let other = impact.other_body.and_then(|id| bodies.get(&id).map(|k| (id, k)));
+                Some(Collision {
+                    entity: kept.entity,
+                    material: kept.material.clone(),
+                    other: other.map_or(EntityHandle::WORLD, |(_, k)| k.entity),
+                    other_material: other.map(|(_, k)| k.material.clone()),
+                    speed: impact.speed,
+                    point: vector(impact.point),
+                    normal: vector(impact.normal),
+                    velocity: vector(physics.velocity(impact.body)),
+                    other_velocity: other.map_or(Vector::default(), |(id, _)| vector(physics.velocity(id))),
+                })
+            })
+            .collect();
+        (physics.broken(), collisions)
     };
     crate::constraint::broken(lua, &broken);
+    for collision in &collisions {
+        if host(lua).entities.is_valid(collision.entity) {
+            collided(lua, collision);
+        }
+    }
+}
+
+/// An impact: the body's surface sounds it, as Source does - from 70 units/s, as loud as the
+/// square of the speed up to 320, hard from 300 - and Lua hears of it: `ENT:PhysicsCollide`
+/// and the entity's `PhysicsCollide` callbacks.
+fn collided(lua: &Lua, c: &Collision) {
+    if c.speed >= 70.0 {
+        let (_, surface) = crate::surfaceprops::named(lua, &c.material);
+        let name = if c.speed >= 300.0 { &surface.impact_hard } else { &surface.impact_soft };
+        let volume = (c.speed * c.speed / (320.0 * 320.0)).min(1.0);
+        crate::sound::emit_scaled(lua, name, c.entity, volume);
+    }
+    let Ok(Value::UserData(ud)) = entity::push(lua, c.entity) else { return };
+    let data = (|| -> mlua::Result<Table> {
+        let t = lua.create_table()?;
+        let (our, _) = crate::surfaceprops::named(lua, &c.material);
+        let (their, _) = crate::surfaceprops::named(lua, c.other_material.as_deref().unwrap_or("default"));
+        t.raw_set("HitPos", entity::vector(lua, c.point)?)?;
+        t.raw_set("HitEntity", entity::push(lua, c.other)?)?;
+        t.raw_set("HitNormal", entity::vector(lua, c.normal)?)?;
+        t.raw_set("Speed", c.speed)?;
+        t.raw_set("HitSpeed", entity::vector(lua, c.normal * c.speed)?)?;
+        // before the impact it went into what it hit as fast as the impact took away
+        t.raw_set("OurOldVelocity", entity::vector(lua, c.velocity + c.normal * c.speed)?)?;
+        t.raw_set("OurNewVelocity", entity::vector(lua, c.velocity)?)?;
+        t.raw_set("TheirOldVelocity", entity::vector(lua, c.other_velocity)?)?;
+        t.raw_set("TheirNewVelocity", entity::vector(lua, c.other_velocity)?)?;
+        t.raw_set("PhysObject", push(lua, c.entity)?)?;
+        t.raw_set("HitObject", push(lua, c.other)?)?;
+        t.raw_set("OurSurfaceProps", our as i64)?;
+        t.raw_set("TheirSurfaceProps", their as i64)?;
+        t.raw_set("DeltaTime", timer::TICK_INTERVAL)?;
+        Ok(t)
+    })();
+    let Ok(data) = data else { return };
+    let phys = push(lua, c.entity).unwrap_or(Value::Nil);
+    crate::ents::call_method(lua, &ud, "PhysicsCollide", MultiValue::from_iter([Value::Table(data.clone()), phys]));
+    if let Ok(callbacks) = entity::store_of(lua, &ud, "callbacks")
+        && let Ok(Some(list)) = callbacks.raw_get::<Option<Table>>("PhysicsCollide")
+    {
+        for function in list.sequence_values::<mlua::Function>().filter_map(Result::ok) {
+            let _ = crate::files::call_reporting(
+                lua,
+                function,
+                MultiValue::from_iter([Value::UserData(ud.clone()), Value::Table(data.clone())]),
+            );
+        }
+    }
+}
+
+/// The surface an entity's body is made of (`PhysObj:GetMaterial`), if it has a body.
+pub(crate) fn material_of(lua: &Lua, handle: EntityHandle) -> Option<String> {
+    let id = body(lua, handle)?;
+    host(lua).physics.bodies.borrow().get(&id).map(|kept| kept.material.clone())
 }
 
 /// The `PhysObj` of an entity: valid while the entity has a body.

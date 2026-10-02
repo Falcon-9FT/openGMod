@@ -81,6 +81,7 @@ pub mod sound;
 pub mod sql;
 mod startup;
 pub mod surface;
+mod surfaceprops;
 pub mod timer;
 pub mod trace;
 pub mod util;
@@ -255,6 +256,8 @@ pub(crate) struct Host {
     pub hud: RefCell<hud::Hud>,
     /// The sounds Lua played, for the program.
     pub sounds: sound::Sounds,
+    /// What surfaces are made of.
+    pub surfaces: surfaceprops::Surfaces,
 }
 
 impl Host {
@@ -332,6 +335,7 @@ impl Runtime {
             panels: vgui::Panels::default(),
             hud: RefCell::new(hud::Hud::default()),
             sounds: sound::Sounds::default(),
+            surfaces: surfaceprops::Surfaces::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;

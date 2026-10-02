@@ -16,11 +16,13 @@ pub mod decode;
 pub mod format;
 mod library;
 pub mod png;
+pub mod surfaceprop;
 pub mod vmt;
 pub mod vtf;
 
 pub use format::Format;
 pub use library::Library;
+pub use surfaceprop::{SurfaceProp, SurfaceProps};
 pub use vmt::{Material, Patch, Vmt};
 pub use vtf::{Image, Vtf};
 

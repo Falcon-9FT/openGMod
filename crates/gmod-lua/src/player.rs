@@ -216,6 +216,9 @@ pub struct PlayerState {
     pub draw_view_model: bool,
     pub draw_world_model: bool,
     pub dsp: i64,
+    /// Milliseconds to the next footstep, and whether it is the right foot's.
+    pub step_time: f32,
+    pub step_right: bool,
 }
 
 impl PlayerState {
@@ -303,6 +306,8 @@ impl PlayerState {
             draw_view_model: true,
             draw_world_model: true,
             dsp: 0,
+            step_time: 0.0,
+            step_right: false,
         }
     }
 
@@ -813,6 +818,7 @@ fn tick(lua: &Lua, handle: EntityHandle) {
         let mv = mv_ud.borrow::<MoveData>().map(|m| *m).unwrap_or(mv);
         finish_move(lua, handle, &mv);
     }
+    footsteps(lua, handle, &ply);
     hook(lua, "PlayerTick", [Value::UserData(ply.clone()), Value::UserData(mv_ud)]);
 
     // the weapon in hand
@@ -898,6 +904,96 @@ fn finish_move(lua: &Lua, handle: EntityHandle, mv: &MoveData) {
         set(&mut ent.flags, fl::INWATER, p.moving.water_level > 0);
         (ent.mins, ent.maxs) = if p.moving.ducked { p.duck_hull } else { p.hull };
     });
+}
+
+/// Footsteps, as Source makes them (`UpdateStepSound`): on the ground or a ladder and moving,
+/// one every `PlayerStepSoundTime` milliseconds (the gamemode's hook; 400 walking, 300
+/// running, 100 more ducked), left and right in turn, the sound of the surface underfoot -
+/// or of the water waded in - as loud as the pace. `PlayerFootstep` returning true keeps one
+/// quiet.
+fn footsteps(lua: &Lua, handle: EntityHandle, ply: &AnyUserData) {
+    const TICK_MS: f32 = (crate::timer::TICK_INTERVAL * 1000.0) as f32;
+    let Some((moving, ducked_speed, origin, wait)) = with_player(lua, handle, |ent, p| {
+        p.step_time = (p.step_time - TICK_MS).max(0.0);
+        let walking = ent.move_type == MOVETYPE_WALK;
+        (walking.then_some(p.moving), p.moving.ducked, ent.local_pos, p.step_time)
+    }) else {
+        return;
+    };
+    let Some(moving) = moving else { return };
+    let ladder = moving.ladder.is_some();
+    if wait > 0.0 || !(moving.on_ground || ladder) {
+        return;
+    }
+    let [vx, vy, vz] = moving.velocity;
+    let speed = if ladder { (vx * vx + vy * vy + vz * vz).sqrt() } else { (vx * vx + vy * vy).sqrt() };
+    // the engine plays a step at any pace once the last one's time is up; what drifts is not
+    // a pace
+    let run = if ducked_speed || ladder { 80.0 } else { 220.0 };
+    if speed < 10.0 {
+        return;
+    }
+    let walking = speed < run;
+    let kind = match moving.water_level {
+        _ if ladder => 1,
+        2 => 2,
+        1 => 3,
+        _ => 0,
+    };
+    let default_time = if walking { 400.0 } else { 300.0 };
+    let time = match hook(lua, "PlayerStepSoundTime", [Value::UserData(ply.clone()), Value::Integer(kind), Value::Boolean(walking)]).front()
+    {
+        Some(Value::Number(ms)) => *ms as f32,
+        Some(Value::Integer(ms)) => *ms as f32,
+        _ => default_time,
+    } + if ducked_speed { 100.0 } else { 0.0 };
+    // the surface: the water waded in, else what is underfoot
+    let surface = match moving.water_level {
+        2.. => crate::surfaceprops::named(lua, "wade").1,
+        1 => crate::surfaceprops::named(lua, "water").1,
+        _ => {
+            let down = Vector::new(origin.x, origin.y, origin.z - 64.0);
+            let up = Vector::new(origin.x, origin.y, origin.z + 1.0);
+            let hit = trace::trace(lua, &Sweep::line(up, down, Filter::Entities(vec![handle])));
+            if hit.entity == EntityHandle::WORLD && !hit.texture.starts_with("**") {
+                crate::surfaceprops::of_material(lua, &hit.texture).1
+            } else {
+                let body = crate::physics::material_of(lua, hit.entity).unwrap_or_else(|| "default".to_string());
+                crate::surfaceprops::named(lua, &body).1
+            }
+        }
+    };
+    let right = with_player(lua, handle, |_, p| {
+        p.step_time = time;
+        p.step_right = !p.step_right;
+        !p.step_right
+    })
+    .unwrap_or(false);
+    let sound = if right { &surface.step_right } else { &surface.step_left };
+    let mut volume = if walking { 0.2 } else { 0.5 };
+    if ducked_speed {
+        volume *= 0.65;
+    }
+    let pos = entity::vector(lua, origin).unwrap_or(Value::Nil);
+    let quiet = hook(
+        lua,
+        "PlayerFootstep",
+        [
+            Value::UserData(ply.clone()),
+            pos,
+            Value::Integer(i64::from(right)),
+            Value::String(match lua.create_string(sound) {
+                Ok(s) => s,
+                Err(_) => return,
+            }),
+            Value::Number(f64::from(volume)),
+            Value::Nil,
+        ],
+    );
+    if !truthy(&quiet) {
+        // a script's volume is the loudest a step is; walking is quieter
+        crate::sound::emit_scaled(lua, sound, handle, volume * 2.0);
+    }
 }
 
 fn set_flashlight(lua: &Lua, handle: EntityHandle, on: bool) {

@@ -521,3 +521,20 @@ fn png_palettes_grey_and_interlacing() {
     let grey: Vec<u8> = image.pixels.chunks(4).map(|p| p[0]).collect();
     assert_eq!(grey, [10, 20, 30, 40]);
 }
+
+#[test]
+fn surface_properties_inherit_from_their_base() {
+    let mut props = crate::SurfaceProps::default();
+    props.add_file(
+        r#""default" { "density" "2000" "stepleft" "Default.StepLeft" "gamematerial" "C" }
+        "wood" { "base" "default" "density" "700" "stepleft" "Wood.StepLeft" "impacthard" "Wood.ImpactHard" "gamematerial" "W" }
+        "wood_crate" { "base" "wood" "impacthard" "Wood_Crate.ImpactHard" }"#,
+    );
+    let crate_ = props.get("Wood_Crate").unwrap();
+    assert_eq!((crate_.density, crate_.step_left.as_str(), crate_.impact_hard.as_str()), (700.0, "Wood.StepLeft", "Wood_Crate.ImpactHard"));
+    assert_eq!(crate_.game_material, b'W');
+    assert_eq!((props.index("default"), props.index("wood"), props.index("wood_crate")), (Some(0), Some(1), Some(2)));
+    // what is not there is the default
+    assert_eq!(props.or_default("nonsense").name, "default");
+    assert_eq!(props.get("default").unwrap().impact_soft, "Default.ImpactSoft");
+}

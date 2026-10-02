@@ -248,6 +248,15 @@ fn play(
     }));
 }
 
+/// A sound an entity makes, as loud as `scale` makes what its script says (an impact's).
+pub(crate) fn emit_scaled(lua: &Lua, name: &str, entity: EntityHandle, scale: f32) {
+    let before = host(lua).sounds.events.borrow().len();
+    play(lua, name, Some(entity), None, 1.0, 100.0, 75.0, 0, None);
+    if let Some(SoundEvent::Play(play)) = host(lua).sounds.events.borrow_mut().get_mut(before) {
+        play.volume *= scale.clamp(0.0, 1.0);
+    }
+}
+
 /// `surface.PlaySound`: a sound of the interface, in both ears.
 pub(crate) fn play_ui(lua: &Lua, name: &str) {
     play(lua, name, None, None, 1.0, 100.0, 0.0, 0, None);

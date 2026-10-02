@@ -273,3 +273,22 @@ fn what_breaks_and_what_goes_through() {
     run(&mut physics, 3.0);
     assert!((physics.pose(through).unwrap().0[2] - 16.0).abs() < 1.0, "{:?}", physics.pose(through));
 }
+
+#[test]
+fn a_falling_crate_hits_the_floor_once() {
+    let mut physics = floor();
+    let body = physics.add(&Body { user: 7, ..crate_body([0.0, 0.0, 16.0 + 150.0]) }).unwrap();
+    // it falls 150 units: it hits at sqrt(2 g h), about 424 units/s
+    run(&mut physics, 0.8);
+    let impacts = physics.impacts();
+    let first = impacts.first().copied().unwrap_or_else(|| panic!("no impact: {:?}", physics.pose(body)));
+    assert_eq!((first.user, first.other), (7, None));
+    assert!(first.speed > 250.0 && first.speed < 650.0, "{first:?}");
+    assert!(first.normal[2] < -0.9 && first.point[2].abs() < 2.0, "down into the floor: {first:?}");
+    // lying there it makes no more
+    run(&mut physics, 2.0);
+    let resting = physics.impacts();
+    assert!(resting.iter().all(|i| i.speed < first.speed / 4.0), "{resting:?}");
+    run(&mut physics, 1.0);
+    assert!(physics.impacts().is_empty());
+}

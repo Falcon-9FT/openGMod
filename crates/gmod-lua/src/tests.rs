@@ -2234,3 +2234,83 @@ fn sounds_are_what_lua_asks_for() {
     assert_eq!(&events[5..], [SoundEvent::ChangePatch { patch: id, volume: 1.0, pitch: 1.5 }, SoundEvent::StopPatch(id)]);
     assert!(g.runtime.take_sounds().is_empty());
 }
+
+#[test]
+fn footsteps_and_impacts_sound_their_surfaces() {
+    use crate::sound::SoundEvent;
+    use gmod_model::testmodel::{self, TestConvex};
+    let mdl = testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let phy = testmodel::phy(
+        1,
+        &[vec![TestConvex::cuboid([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0])]],
+        false,
+        "solid { \"index\" \"0\" \"mass\" \"25\" \"surfaceprop\" \"wood\" }",
+    );
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/box.mdl", &mdl),
+            ("models/crate.mdl", &mdl),
+            ("models/crate.phy", &phy),
+            ("scripts/weapons/weapon_pistol.txt", PISTOL.as_bytes()),
+            ("scripts/surfaceproperties_manifest.txt", b"\"surfaces\" { \"file\" \"scripts/surfaceproperties.txt\" }"),
+            (
+                "scripts/surfaceproperties.txt",
+                b"\"default\" { \"stepleft\" \"Default.StepLeft\" \"stepright\" \"Default.StepRight\" }
+                  \"wood\" { \"base\" \"default\" \"stepleft\" \"Wood.StepLeft\" \"stepright\" \"Wood.StepRight\"
+                             \"impacthard\" \"Wood.ImpactHard\" \"impactsoft\" \"Wood.ImpactSoft\" \"gamematerial\" \"W\" }",
+            ),
+            // the floor of the map is wood
+            ("materials/dev/dev_measuregeneric01.vmt", b"\"LightmappedGeneric\" { \"$surfaceprop\" \"wood\" }"),
+            ("scripts/game_sounds_manifest.txt", b"\"game_sounds_manifest\" { \"precache_file\" \"scripts/game_sounds_test.txt\" }"),
+            (
+                "scripts/game_sounds_test.txt",
+                b"\"Wood.StepLeft\" { \"wave\" \"step_l.wav\" } \"Wood.StepRight\" { \"wave\" \"step_r.wav\" }
+                  \"Wood.ImpactHard\" { \"wave\" \"hard.wav\" } \"Wood.ImpactSoft\" { \"wave\" \"soft.wav\" }",
+            ),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    g.runtime.spawn_map(&player_map());
+    let alice = g.runtime.join(alice()).unwrap();
+    let waves = |g: &Game| -> Vec<String> {
+        g.runtime.take_sounds().into_iter().filter_map(|e| if let SoundEvent::Play(p) = e { Some(p.wave) } else { None }).collect()
+    };
+    waves(&g);
+
+    // a second's walk on wood: a step every 400 ms, left and right in turn
+    g.runtime.set_input(alice, walking(90.0, 0));
+    g.runtime.think(1.0);
+    let steps = waves(&g);
+    assert!((2..=3).contains(&steps.len()), "{steps:?}");
+    assert!(
+        steps.windows(2).all(|w| w[0] != w[1]) && steps.iter().all(|w| w == "sound/step_l.wav" || w == "sound/step_r.wav"),
+        "{steps:?}"
+    );
+    // the gamemode keeps them quiet
+    g.runtime.run_string("HOOKS.PlayerFootstep = function(ply, pos, foot, sound, volume) LAST = sound return true end", "quiet").unwrap();
+    g.runtime.think(1.0);
+    assert!(waves(&g).is_empty());
+    assert!(g.eval::<bool>("return LAST == 'Wood.StepLeft' or LAST == 'Wood.StepRight'"));
+
+    // what traces hit is wood
+    assert!(g.eval::<bool>(
+        "local t = util.TraceLine({ start = Vector(0, -500, 50), endpos = Vector(0, -500, -50) })
+         return t.MatType == MAT_WOOD and t.SurfaceProps == 1"
+    ));
+
+    // a crate dropped from 150 units hits the floor hard, and tells Lua
+    g.runtime.set_input(alice, UserCmd::default());
+    g.runtime
+        .run_string(
+            "local c = ents.Create('prop_physics') c:SetModel('models/crate.mdl') c:SetPos(Vector(-300, -300, 150)) c:Spawn()
+             c:AddCallback('PhysicsCollide', function(ent, data) HIT = HIT or data.Speed end)",
+            "crate",
+        )
+        .unwrap();
+    g.runtime.think(1.5);
+    assert!(waves(&g).contains(&"sound/hard.wav".to_string()));
+    assert!(g.eval::<bool>("return HIT and HIT > 250"));
+}
