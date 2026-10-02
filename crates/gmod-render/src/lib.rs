@@ -4,7 +4,10 @@
 //! one index buffer, the textures (DXT stays compressed as BC1-BC3 where the GPU takes it),
 //! a light map per brush model. Models of entities are uploaded the same way when they are
 //! first needed ([`Renderer::add_model`]) and drawn where the entities are
-//! ([`Renderer::set_entities`]), lit from above by their turned normals. [`Renderer::render`]
+//! ([`Renderer::set_entities`]), lit by the light of the map where they stand
+//! ([`gmod_world::light`]): the ambient cube and the lights that see them. The lights of the
+//! moment - the game's `DynamicLight`s and the flashlight ([`Renderer::set_lights`]) - light
+//! the world and the models over their baked light. [`Renderer::render`]
 //! draws a frame: the sky box, the opaque surfaces of the world and the entities, then the
 //! translucent ones - the world's from the farthest, then the entities'. Depth runs from 1 at
 //! the eye to 0 at infinity. Over it an [`Overlay`] draws the 2D of the HUD and the panels.
