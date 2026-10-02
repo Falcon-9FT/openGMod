@@ -2,7 +2,6 @@
 name = "gmod-material"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
 description = "Source engine textures (.vtf 7.0-7.5: every pixel format, DXT decoding, cube maps) and materials (.vmt: shader parameters, patch materials)"
 
