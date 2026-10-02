@@ -1,0 +1,12 @@
+[package]
+name = "gmod-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Web pages as Garry's Mod shows them: Chromium (CEF) drawing off screen, what Lua and the page say to each other, and the game's files under asset://"
+
+[dependencies]
+cef.workspace = true
+
+[dev-dependencies]
+gmod-material.workspace = true

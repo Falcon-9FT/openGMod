@@ -13,6 +13,7 @@ members = [
     "crates/gmod-physics",
     "crates/gmod-ui",
     "crates/gmod-audio",
+    "crates/gmod-web",
     "crates/gmod-render",
     "crates/gmod-app",
     "tools/gmod-check",
@@ -37,6 +38,7 @@ gmod-movement = { path = "crates/gmod-movement" }
 gmod-physics = { path = "crates/gmod-physics" }
 gmod-ui = { path = "crates/gmod-ui" }
 gmod-audio = { path = "crates/gmod-audio" }
+gmod-web = { path = "crates/gmod-web" }
 gmod-render = { path = "crates/gmod-render" }
 # LuaJIT 2.1, built from source with the crate
 mlua = { version = "0.12.1", features = ["luajit", "vendored"] }
@@ -48,6 +50,8 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 ureq = { version = "=3.4.2", features = ["platform-verifier"] }
 # sounds: WAV (PCM, ADPCM), MP3 and OGG decoded in pure Rust
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "pcm", "adpcm", "mp3", "ogg", "vorbis"] }
+# web pages (HTML panels, the main menu): Chromium, its build downloaded when built (CEF)
+cef = "154.3.0"
 # the sound card: WASAPI on Windows (Linux and macOS later)
 cpal = "0.18.2"
 # physics of props: pure Rust, no C++ to build
