@@ -19,7 +19,7 @@
 //! * the engine's types and libraries: [`meta`] (`FindMetaTable`, `TYPE_*`), [`vector`]
 //!   (`Vector`, `Angle`), [`entity`] (`NULL`, the metatables of `Entity`, `Player` ...),
 //!   [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
-//!   (`file`, `File`), [`util`], [`net`], [`material`] (`Material`), [`engine`] (`game`,
+//!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`material`] (`Material`), [`engine`] (`game`,
 //!   `engine`, `system`, `gmod`, the enumerations), and [`world`] (`ents`, `player` ... as
 //!   they answer while there are no entities). They grow towards the whole API - `gmod-check
 //!   lua` counts how much of it is there.
@@ -51,6 +51,7 @@ pub mod material;
 pub mod meta;
 pub mod net;
 pub mod sandbox;
+pub mod sql;
 mod startup;
 pub mod timer;
 pub mod util;
@@ -198,6 +199,7 @@ pub(crate) struct Host {
     pub network_strings: util::NetworkStrings,
     pub ai_names: world::AiNames,
     pub net: net::Net,
+    pub database: sql::Database,
 }
 
 impl Host {
@@ -260,6 +262,7 @@ impl Runtime {
             network_strings: util::NetworkStrings::default(),
             ai_names: world::AiNames::default(),
             net: net::Net::default(),
+            database: sql::Database::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -275,6 +278,7 @@ impl Runtime {
         material::install(&lua)?;
         world::install(&lua)?;
         net::install(&lua, realm)?;
+        sql::install(&lua)?;
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
         Ok(Runtime { lua })

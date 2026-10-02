@@ -479,7 +479,7 @@ fn empty_world() {
         "return FindMetaTable('Player').MetaName == 'Player' and FindMetaTable('Player').MetaBaseClass == FindMetaTable('Entity')"
     ));
     assert!(g.eval::<bool>("return FindMetaTable('Panel') == nil"), "panels are the client's");
-    assert!(g.eval::<bool>("return sql.Query('SELECT 1') == false and sql.m_strError ~= nil and HTTP({}) == false"));
+    assert!(g.eval::<bool>("return HTTP({}) == false"));
     assert!(g.eval::<bool>("return ai.GetScheduleID('a') == ai.GetScheduleID('a') and ai.GetScheduleID('a') ~= ai.GetScheduleID('b')"));
     let error = g.runtime.lua().load("NULL.x = 1").exec().unwrap_err().to_string();
     assert!(error.contains("Tried to use a NULL entity!"), "{error}");
@@ -526,4 +526,42 @@ fn a_gamemode_starts() {
     );
     assert!(g.eval::<bool>("return GAMEMODE == gamemode.Get('mine') and GM == nil and ENT == nil and SWEP == nil"));
     assert_eq!(g.eval::<String>("return engine.ActiveGamemode()"), "mine");
+}
+
+#[test]
+fn sqlite() {
+    let g = game(Realm::Server, &[]);
+    let home = TempDir::new();
+    g.runtime.set_data_dir(gmod_fs::UserDir::open(&home.0, None).unwrap());
+    g.runtime
+        .run_string(
+            r#"
+            print(sql.Query("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, note TEXT); INSERT INTO t VALUES (1, 'a', 1.5, NULL)"))
+            local rows = sql.Query("SELECT * FROM t; SELECT 2 AS id, 0.1 AS score, 3.0 AS whole")
+            print(#rows, rows[1].id, type(rows[1].id), rows[1].name, rows[1].score, rows[1].note, rows[2].id, rows[2].score, rows[2].whole)
+            print(sql.Query("SELEC nonsense"), sql.m_strError)
+            local typed = sql.QueryTyped("SELECT id, name, score, note, ? AS big, ? AS flag FROM t WHERE name = ?", "9007199254740993", true, "a")
+            print(#typed, typed[1].id, type(typed[1].id), typed[1].score, typed[1].note, typed[1].big, typed[1].flag)
+            print(#sql.QueryTyped("SELECT * FROM t WHERE id = ?", 5), sql.QueryTyped("SELECT ?", 1, 2), sql.m_strError)
+            print(sql.QueryTyped("INSERT INTO t (id, name) VALUES (?, ?)", 2, "b\0c") ~= false, #sql.QueryTyped("SELECT * FROM t"))
+            "#,
+            "sql",
+        )
+        .unwrap();
+    assert_eq!(
+        g.printed(),
+        "nil
+2	1	string	a	1.5	NULL	2	0.1	3.0
+false	near \"SELEC\": syntax error
+\
+         1	1	number	1.5	nil	9007199254740993	1
+0	false	2 parameters given, the query has 1
+true	2
+"
+    );
+    assert!(home.0.join("sv.db").is_file(), "the server's database is sv.db in openGMOD's folder");
+    assert_eq!(sql::real_text(1e20), "1.0e+20");
+    assert_eq!(sql::real_text(-0.000012), "-1.2e-05");
+    assert_eq!(sql::real_text(123456.789), "123456.789");
+    assert_eq!(sql::real_text(0.1 + 0.2), "0.30000000000000004");
 }

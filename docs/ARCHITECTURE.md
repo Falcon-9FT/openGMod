@@ -112,7 +112,7 @@ cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, з
 | аддоны и воркшоп: подписки Steam, `appworkshop_4000.acf`, `addons/*.gma`, распаковка `.bin` (LZMA) | `gmod-fs::workshop` | готово; не учитывается ещё выключение аддона в меню |
 | KeyValues | `gmod-kv` | готово; `#base`/`#include` пока только распознаются |
 | диалект Lua | `gmod-glua` | готово |
-| Lua-рантайм: LuaJIT, `include`, `AddCSLuaFile`, `hook`, `timer`, реалмы | `gmod-lua` | сервер запускает `sandbox` без ошибок; нет SQLite, HTTP, мира (энтити — этап 4), клиентских библиотек (этап 5) |
+| Lua-рантайм: LuaJIT, `include`, `AddCSLuaFile`, `hook`, `timer`, реалмы | `gmod-lua` | сервер запускает `sandbox` без ошибок; есть SQLite; нет HTTP, мира (энтити — этап 4), клиентских библиотек (этап 5) |
 | zip (pakfile карт): без сжатия, DEFLATE, LZMA | `gmod-fs::zip` | готово |
 | карты BSP v19–21: LZMA-лампы, дисплейсменты, статические пропы, pakfile, PVS | `gmod-bsp` | чтение и сетка мира готовы; PVS — этап 2 |
 | материалы VMT, текстуры VTF | `gmod-material` | чтение готово; рендер — этап 2 |

@@ -33,6 +33,8 @@ gmod-world = { path = "crates/gmod-world" }
 gmod-render = { path = "crates/gmod-render" }
 # LuaJIT 2.1, built from source with the crate
 mlua = { version = "0.12.1", features = ["luajit", "vendored"] }
+# SQLite for Lua's sql library, built from source with the crate
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 # the GPU: Direct3D 12 and Vulkan only - no OpenGL, no Metal until macOS
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }

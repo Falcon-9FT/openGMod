@@ -24,7 +24,7 @@ Linux и macOS — позже.
 | [`gmod-fs`](crates/gmod-fs) | находит GMod (указанная папка, `GMOD_ROOT`, библиотеки Steam), читает VPK и GMA и собирает файловую систему так же, как GMod: `gameinfo.txt`, подписки воркшопа (включая старые сжатые `.bin`), аддоны из `garrysmod/addons`, игры из `cfg/mount.cfg` |
 | [`gmod-kv`](crates/gmod-kv) | KeyValues: материалы `.vmt`, скрипты, VGUI `.res`, локализация, файлы Steam |
 | [`gmod-glua`](crates/gmod-glua) | диалект Lua из GMod (`!=`, `!`, `&&`, `\|\|`, `//`, `/* */`, `continue`, `DEFINE_BASECLASS`) → обычный LuaJIT, строка в строку |
-| [`gmod-lua`](crates/gmod-lua) | Lua-рантайм: LuaJIT 2.1, реалмы, загрузчик GMod (`include`, `require`, `AddCSLuaFile`), песочница без байткода, запуск геймода, библиотеки движка (`Vector`, `Angle`, `timer`, ConVar'ы, `file`, `util`, `net`...) |
+| [`gmod-lua`](crates/gmod-lua) | Lua-рантайм: LuaJIT 2.1, реалмы, загрузчик GMod (`include`, `require`, `AddCSLuaFile`), песочница без байткода, запуск геймода, библиотеки движка (`Vector`, `Angle`, `timer`, ConVar'ы, `file`, `util`, `net`, `sql` на SQLite...) |
 | [`gmod-bsp`](crates/gmod-bsp) | карты BSP v19–21: все нужные для отрисовки лампы, дисплейсменты, статические пропы, pakfile; сетка мира с атласом световых карт |
 | [`gmod-material`](crates/gmod-material) | текстуры VTF 7.0–7.5 (все 30 форматов пикселей, DXT, кубмапы, анимация) и материалы VMT (параметры шейдеров, условия, патч-материалы) |
 | [`gmod-model`](crates/gmod-model) | модели MDL + VVD + VTX: кости, скины, бодигруппы, сетки для отрисовки; запечённый свет статических пропов (VHV) |
@@ -95,7 +95,7 @@ KeyValues, весь Lua, текстуры, материалы, модели и �
 `sandbox` с базовым, энтити и оружие, хуки до `Initialize` и секунду игрового времени. Он
 печатает ошибки скриптов (как консоль GMod), глобальные функции, которых не хватило, и сколько
 функций API из вики GMod уже есть в этом реалме. Файлы, которые Lua пишет (`file.Write`),
-попадают в `~/.opengmod/data`.
+попадают в `~/.opengmod/data`, база `sql` сервера — в `~/.opengmod/sv.db`.
 
 `render` рисует карту на процессоре и сохраняет PNG — то же, что видно в `opengmod`, но без
 видеокарты: для проверки и для машин без DirectX 12 и Vulkan. Без `--from` камера встаёт на
@@ -110,8 +110,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Внешние зависимости есть у рендера и окна (`gmod-render`, `gmod-app`: wgpu и winit) и у
-Lua-рантайма (`gmod-lua`: mlua, LuaJIT собирается из исходников компилятором C, на Windows —
-MSVC). Остальные crate'ы обходятся стандартной библиотекой. Физика добавит Jolt (C++,
+Lua-рантайма (`gmod-lua`: mlua и rusqlite; LuaJIT и SQLite собираются из исходников
+компилятором C, на Windows — MSVC). Остальные crate'ы обходятся стандартной библиотекой. Физика добавит Jolt (C++,
 собирается через CMake).
 
 ## Устройство репозитория
