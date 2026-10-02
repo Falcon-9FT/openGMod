@@ -36,8 +36,8 @@
   прежде чем по ним что-то выделяется.
 * **Сборка одной командой** (Cargo), CI на каждый коммит. Сейчас платформа одна — Windows; код к ней
   не привязан, Linux и macOS добавятся позже.
-* **Экосистема:** wgpu и winit (рендер и окна), mlua (LuaJIT), cpal (звук). Производительность
-  на уровне C++.
+* **Экосистема:** wgpu и winit (рендер и окна), mlua (LuaJIT), Symphonia и cpal (звук).
+  Производительность на уровне C++.
 
 Рассмотрены и отклонены:
 
@@ -96,8 +96,8 @@ openGMOD по своему протоколу. Воспроизводится т
 
 Derma — это Lua из установки. openGMOD реализует базовые панели, которые в GMod написаны на
 C++ (`Panel`, `Label`, `TextEntry`, `RichText`, `HTML`...), и 2D-вывод (`surface`, `draw`,
-`render`). HTML-панелям (главное меню, `DHTML`, MOTD) нужен встроенный браузер; выбор отложен
-до этапа интерфейса.
+`render`). HTML-панелям (главное меню, `DHTML`, MOTD) нужен встроенный браузер: это будет
+Chromium через CEF, как в самой GMod (страницы рисуются вне экрана в текстуру).
 
 Как это устроено:
 
@@ -167,8 +167,20 @@ Entity(1):GetJumpPower(), Entity(1):GetStepSize())`. Дальше — замер
 
 ### Звук
 
-cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, звуковые скрипты, саундскейпы,
-3D-позиционирование. DSP Source — позже.
+`gmod-audio`: файлы декодирует Symphonia (WAV PCM и ADPCM, MP3, OGG; чистый Rust), петлю WAV
+задаёт его точка `cue`, как в Source. Звуковые скрипты (`scripts/game_sounds_manifest.txt`) —
+каналы, разброс громкости и высоты, уровень в децибелах, `rndwave`, префиксы волн. Микшер свой и
+ставит звук так же, как Source: на полной громкости в пределах `36 × 10^((уровень − 60) / 20)`
+юнитов, дальше — обратно расстоянию; уровень 0 слышен везде; панорама — от того, куда смотрит
+камера; новый звук на канале энтити обрывает старый (кроме `CHAN_AUTO` и `CHAN_STATIC`).
+
+Звук делает Lua (`EmitSound`, `sound.Play`, `surface.PlaySound`, `CSoundPatch`) — события уходят
+программе (`Runtime::take_sounds`); сам движок звучит шагами игрока (`UpdateStepSound`: время
+шага из `PlayerStepSoundTime`, хук `PlayerFootstep`) и ударами пропов (импульс контакта над
+массой — скорость удара; `impactsoft` или `impacthard` поверхности из
+`scripts/surfaceproperties*.txt`, хук `PhysicsCollide`). Вывод — cpal: WASAPI на Windows; на
+Linux и macOS пока без вывода. Дальше — саундскейпы и `ambient_generic` карт, звуки скольжения
+(`scrape*`) и поломки, DSP Source.
 
 ## Подсистемы
 
@@ -190,7 +202,7 @@ cpal и свой микшер, как в openOMSI: WAV (PCM/ADPCM), MP3, OGG, з
 | физика: тела из `.phy`, мир из BSP, `PhysObj`, физган, констрейнты | `gmod-physics` (Rapier), `gmod-lua::physics`, `gmod-lua::physgun`, `gmod-lua::constraint` | пропы падают, сталкиваются и ложатся, пропы карты, `PhysObj`, физган, констрейнты тулгана готовы; моторы, блоки, плавучесть, рэгдоллы — этап 4 |
 | сущности: энтити движка, SENT, SWEP, метатаблицы | `gmod-lua::entity`, `gmod-lua::ents`, `gmod-lua::player`, `gmod-lua::weapon` | энтити, SENT, `ents.*`, энтити карты, игроки, оружие и урон готовы; NPC и поведение классов движка — этап 4 |
 | ввод, HUD, VGUI/Derma, 2D | `gmod-ui`, `gmod-lua::surface`, `gmod-lua::vgui`, `gmod-lua::hud`, `gmod-render::Overlay` | шрифты, 2D, панели движка, HUD, клавиши, мышь и бинды готовы; Derma, меню спавна (со спавном щелчком) и контекстное меню работают; свои иконки моделей, чат, HTML-панели — этап 5 |
-| звук | `gmod-audio` | этап 5 |
+| звук: файлы, звуковые скрипты, микшер, шаги, удары | `gmod-audio`, `gmod-lua::sound`, `gmod-material::surfaceprop` | готово; вывод пока только на Windows; саундскейпы, `ambient_generic`, DSP — дальше |
 | сеть: `net`, `NWVars`, сервер | `gmod-net` | этап 6 |
 | приложение `opengmod` | `gmod-app` | открывает карту с игрой: Lua сервера, `sandbox` и аддоны, игрок с оружием, модели энтити, Lua клиента с HUD и меню (Q, C), консоль в терминале |
 
