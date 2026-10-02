@@ -254,8 +254,11 @@ impl Physics {
         Some(BodyId(handle))
     }
 
+    /// Takes a body away, and its joints. The ground stays.
     pub fn remove(&mut self, id: BodyId) {
-        self.world.remove_body(id.0);
+        if id.0 != self.ground {
+            self.world.remove_body(id.0);
+        }
     }
 
     pub fn contains(&self, id: BodyId) -> bool {
@@ -273,8 +276,11 @@ impl Physics {
         Some((units(body.translation()), angles(*body.rotation())))
     }
 
-    /// Moves a body there at once, waking it.
+    /// Moves a body there at once, waking it. The ground does not move.
     pub fn set_pose(&mut self, id: BodyId, origin: Vec3, angles: Vec3) {
+        if id.0 == self.ground {
+            return;
+        }
         if let Some(body) = self.world.bodies.get_mut(id.0) {
             body.set_position(Pose::from_parts(metres(origin), rotation(angles)), true);
         }
@@ -352,7 +358,11 @@ impl Physics {
         self.world.bodies.get(id.0).is_some_and(|b| b.is_dynamic())
     }
 
+    /// Freezes a body or lets it move; the ground never moves.
     pub fn set_motion(&mut self, id: BodyId, moves: bool) {
+        if id.0 == self.ground {
+            return;
+        }
         if let Some(body) = self.world.bodies.get_mut(id.0) {
             let kind = if moves { RigidBodyType::Dynamic } else { RigidBodyType::Fixed };
             if body.body_type() != kind {
@@ -503,7 +513,9 @@ impl Physics {
         let first = *self.world.bodies.get(a.0)?.position();
         let second = *self.world.bodies.get(b.0)?.position();
         // a frame of the world, as each body sees it
-        let frames = |builder: GenericJointBuilder, frame: Pose| builder.local_frame1(first.inverse() * frame).local_frame2(second.inverse() * frame);
+        let frames = |builder: GenericJointBuilder, frame: Pose| {
+            builder.local_frame1(first.inverse() * frame).local_frame2(second.inverse() * frame)
+        };
         let along = |point: Vec3, axis: Vec3| {
             let axis = Vector::from(axis).normalize_or(Vector::X);
             Pose::from_parts(metres(point), Rotation::from_rotation_arc(Vector::X, axis))
@@ -512,8 +524,12 @@ impl Physics {
         let data: GenericJoint = match joint {
             Joint::Weld => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_FIXED_AXES), first).build(),
             Joint::Ball { point } => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_SPHERICAL_AXES), at(point)).build(),
-            Joint::Hinge { point, axis } => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_REVOLUTE_AXES), along(point, axis)).build(),
-            Joint::Slider { point, axis } => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_PRISMATIC_AXES), along(point, axis)).build(),
+            Joint::Hinge { point, axis } => {
+                frames(GenericJointBuilder::new(JointAxesMask::LOCKED_REVOLUTE_AXES), along(point, axis)).build()
+            }
+            Joint::Slider { point, axis } => {
+                frames(GenericJointBuilder::new(JointAxesMask::LOCKED_PRISMATIC_AXES), along(point, axis)).build()
+            }
             Joint::Rope { start, end, length, rigid } => {
                 let length = length * METRES_PER_UNIT;
                 if length <= 0.0 {

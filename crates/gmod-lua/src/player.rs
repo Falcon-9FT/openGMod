@@ -18,7 +18,13 @@
 //!
 //! The server has one slot ([`MAX_PLAYERS`]): openGMOD is a single-player game until stage 6.
 //! Not yet: fall damage, using things (`+use`), vehicles, animations, the client's side of
-//! anything (`SendLua`, `ConCommand` go to a client that is not there).
+//! anything (`SendLua` goes to a client that is not there).
+//!
+//! Until the client is there, the server stands in for the user info a client sends: what the
+//! program gave ([`PlayerInfo::user_info`]), then [`DEFAULT_USER_INFO`], then the settings of
+//! sandbox's tools (`TOOL.ClientConVar`, which a client makes of the same scripts). A player
+//! sets them in their console (`gmod_toolmode weld`), as with a client's own ConVars, and
+//! `ply:ConCommand` runs a line as typed by the player.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -100,6 +106,7 @@ pub const DEFAULT_USER_INFO: &[(&str, &str)] = &[
     ("cl_weaponcolor", "0.30 1.80 2.10"),
     ("cl_playerskin", "0"),
     ("cl_playerbodygroups", "0"),
+    ("gmod_toolmode", "rope"),
 ];
 
 /// What the server keeps about players across joins.
@@ -975,9 +982,67 @@ pub(crate) fn command(lua: &Lua, handle: EntityHandle, words: &[String]) -> bool
         "invprev" => select_weapon(lua, handle, -1, None),
         _ => match name.strip_prefix("slot").and_then(|n| n.parse::<i64>().ok()).filter(|n| (1..=6).contains(n)) {
             Some(slot) => select_weapon(lua, handle, 1, Some(slot - 1)),
-            None => return false,
+            None => return set_user_info(lua, handle, &name, args),
         },
     }
+    true
+}
+
+/// Runs a line of console commands as typed by a player: the engine's commands for players,
+/// their user info, ConVars and the commands of `concommand.Add`.
+pub(crate) fn console(lua: &Lua, handle: EntityHandle, line: &str) {
+    for words in convar::split_commands(line) {
+        if !command(lua, handle, &words) {
+            convar::execute_as(lua, &words, handle);
+        }
+    }
+}
+
+/// A player's user info, as their client would send it: none when there is no such setting.
+pub(crate) fn user_info(lua: &Lua, handle: EntityHandle, name: &str) -> Option<String> {
+    state(lua, handle, |_, p| p.user_info(name)).flatten().or_else(|| tool_setting(lua, name))
+}
+
+/// The setting of one of sandbox's tools that a client makes of `TOOL.ClientConVar`, as
+/// `weld_forcelimit`: its default.
+fn tool_setting(lua: &Lua, name: &str) -> Option<String> {
+    let stored: Table = lua.globals().get::<Table>("weapons").ok()?.get::<mlua::Function>("GetStored").ok()?.call("gmod_tool").ok()?;
+    let tools: Table = stored.get("Tool").ok()?;
+    for (mode, tool) in tools.pairs::<String, Value>().flatten() {
+        let Value::Table(tool) = tool else { continue };
+        let setting =
+            name.get(..mode.len()).filter(|start| start.eq_ignore_ascii_case(&mode)).and_then(|_| name[mode.len()..].strip_prefix('_'));
+        let Some(setting) = setting else { continue };
+        let Ok(Some(convars)) = tool.get::<Option<Table>>("ClientConVar") else { continue };
+        for (key, value) in convars.pairs::<String, Value>().flatten() {
+            if key.eq_ignore_ascii_case(setting) {
+                return match value {
+                    Value::String(s) => Some(s.to_string_lossy()),
+                    Value::Integer(n) => Some(n.to_string()),
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::Boolean(b) => Some(if b { "1" } else { "0" }.to_string()),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+/// `name value` typed by a player, when `name` is in their user info: it is set, as a client's
+/// ConVar would be; `name` alone says what it is. Whether `name` was such.
+fn set_user_info(lua: &Lua, handle: EntityHandle, name: &str, args: &[String]) -> bool {
+    let Some(now) = user_info(lua, handle, name) else { return false };
+    if args.is_empty() {
+        host(lua).print(&format!("\"{name}\" = \"{now}\"\n"));
+        return true;
+    }
+    let value = args.join(" ");
+    with_player(lua, handle, |_, p| {
+        let own = &mut p.info.user_info;
+        own.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+        own.push((name.to_string(), value));
+    });
     true
 }
 
@@ -1460,6 +1525,17 @@ pub(crate) fn install(lua: &Lua, realm: crate::Realm) -> mlua::Result<()> {
     install_weapons(&def)?;
     install_view(&def)?;
     install_rest(&def)?;
+    let many = |name: &'static str, f: fn(&Args) -> mlua::Result<MultiValue>| -> mlua::Result<()> {
+        meta.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
+    };
+    many("GetHull", |a| {
+        let (mins, maxs) = read(a, |_, p| p.hull)?;
+        Ok(MultiValue::from_iter([entity::vector(a.lua, mins)?, entity::vector(a.lua, maxs)?]))
+    })?;
+    many("GetHullDuck", |a| {
+        let (mins, maxs) = read(a, |_, p| p.duck_hull)?;
+        Ok(MultiValue::from_iter([entity::vector(a.lua, mins)?, entity::vector(a.lua, maxs)?]))
+    })?;
     Ok(())
 }
 
@@ -1520,15 +1596,12 @@ fn install_identity(def: &entity::Def) -> mlua::Result<()> {
     })?;
     def("GetInfo", |a| {
         let name = a.string(2)?;
-        let value = read(a, |_, p| p.user_info(&name))?;
-        match value {
-            Some(v) => string(a.lua, &v),
-            None => Ok(Value::Nil),
-        }
+        let value = user_info(a.lua, this(a)?, &name);
+        string(a.lua, value.as_deref().unwrap_or(""))
     })?;
     def("GetInfoNum", |a| {
         let (name, default) = (a.string(2)?, a.number(3)?);
-        let value = read(a, |_, p| p.user_info(&name))?;
+        let value = user_info(a.lua, this(a)?, &name);
         Ok(Value::Number(value.and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(default)))
     })?;
     def("GetPlayerInfo", |a| {
@@ -1733,14 +1806,6 @@ fn install_movement(def: &entity::Def) -> mlua::Result<()> {
         def(name, nothing)?;
     }
     def("Crouching", |a| boolean(read(a, |ent, _| ent.flags & fl::DUCKING != 0)?))?;
-    def("GetHull", |a| {
-        let (mins, maxs) = read(a, |_, p| p.hull)?;
-        Ok(Value::Table(a.lua.create_sequence_from([entity::vector(a.lua, mins)?, entity::vector(a.lua, maxs)?])?))
-    })?;
-    def("GetHullDuck", |a| {
-        let (mins, maxs) = read(a, |_, p| p.duck_hull)?;
-        Ok(Value::Table(a.lua.create_sequence_from([entity::vector(a.lua, mins)?, entity::vector(a.lua, maxs)?])?))
-    })?;
     def("SetHull", |a| {
         let hull = (a.userdata::<Vector>(2, "Vector")?, a.userdata::<Vector>(3, "Vector")?);
         write(a, |ent, p| {
@@ -2132,7 +2197,12 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
         Ok(Value::Nil)
     })?;
     // for the player's client, which is not there yet
-    for name in ["SendLua", "ConCommand", "SendHint", "SuppressHint", "ScreenFade", "LagCompensation", "PlayStepSound", "SprayDecal"] {
+    def("ConCommand", |a| {
+        let (handle, line) = (this(a)?, a.string(2)?);
+        console(a.lua, handle, &line);
+        Ok(Value::Nil)
+    })?;
+    for name in ["SendLua", "SendHint", "SuppressHint", "ScreenFade", "LagCompensation", "PlayStepSound", "SprayDecal"] {
         def(name, nothing)?;
     }
     def("AllowImmediateDecalPainting", nothing)?;
@@ -2149,6 +2219,7 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
         "DoCustomAnimEvent",
         "DoReloadEvent",
         "DoSecondaryAttack",
+        "SetAnimation",
     ] {
         def(name, nothing)?;
     }

@@ -7,6 +7,8 @@
 //! `loadstring` and every loader of this crate take source only. Source in GMod's dialect is
 //! translated by [`gmod_glua`], as GMod's own parser would accept it.
 //!
+//! `table.insert` gives back where it put the value, as GMod's does.
+//!
 //! The `debug` library is GMod's, cut to what cannot reach into the runtime's own values:
 //! upvalues and environments only of Lua functions, metatables only of what is not userdata,
 //! no locals and no registry (GMod's `util.lua` replaces `debug.getregistry` anyway).
@@ -71,8 +73,34 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     only_preload.raw_set(1, preload)?;
     package.raw_set("loaders", only_preload)?;
 
+    let table: Table = globals.get("table")?;
+    table.raw_set("insert", lua.create_function(table_insert)?)?;
+
     install_debug(lua)?;
     Ok(())
+}
+
+/// `table.insert(t, [pos,] value)`, as LuaJIT's, giving back the position.
+fn table_insert(lua: &Lua, args: MultiValue) -> mlua::Result<i64> {
+    let a = crate::args::Args::new(lua, args.clone(), "insert");
+    let t = a.table(1)?;
+    let end = t.raw_len() as i64 + 1;
+    match args.len() {
+        2 => {
+            t.raw_set(end, args[1].clone())?;
+            Ok(end)
+        }
+        3 => {
+            let pos = a.number(2)? as i64;
+            // the elements from `pos` move up one
+            for i in (pos + 1..=end.max(pos)).rev() {
+                t.raw_set(i, t.raw_get::<Value>(i - 1)?)?;
+            }
+            t.raw_set(pos, args[2].clone())?;
+            Ok(pos)
+        }
+        _ => Err(mlua::Error::runtime("wrong number of arguments to 'insert'")),
+    }
 }
 
 fn check_date_format(format: &[u8]) -> mlua::Result<()> {

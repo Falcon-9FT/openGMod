@@ -22,9 +22,11 @@
 //!   entities, the entities of a map), [`player`] (players: joining, spawning, dying, their
 //!   commands and movement, the `player` library), [`weapon`] (weapons in players' hands,
 //!   ammo types), [`movedata`] (`CMoveData`, `CUserCmd`), [`damage`] (`CTakeDamageInfo`,
-//!   taking damage), [`effect`] (`EffectData`, `util.Effect`), [`trace`] (`util.TraceLine` and
-//!   the like), [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`),
-//!   [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
+//!   taking damage), [`effect`] (`EffectData`, `util.Effect`), [`sound`] (`EmitSound`,
+//!   `CreateSound`, the `sound` library, all quiet), [`trace`] (`util.TraceLine` and the like),
+//!   [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`),
+//!   [`constraint`] (welds, ropes, axes ... as joints), [`inputs`] (`Entity:Input`,
+//!   `Entity:Fire`), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
 //!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`]
 //!   (`Material`), [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and
 //!   [`world`] (`ai` and `motionsensor`, as they answer while there are no NPCs). They grow towards the whole
@@ -33,8 +35,8 @@
 //!   its bases, scripted entities and weapons, the hooks up to `Initialize`; the entities of
 //!   the map ([`Runtime::spawn_map`]); players joining ([`Runtime::join`]) and what they press
 //!   ([`Runtime::set_input`]); then [`Runtime::think`] moves time on, runs timers, and for
-//!   every tick the players' commands and movement, the bodies of physics, the entities that
-//!   think and the `Tick` hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`])
+//!   every tick the players' commands and movement, the bodies of physics, the inputs fired,
+//!   the entities that think and the `Tick` hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`])
 //!   and the models of the entities they see ([`Runtime::drawn`]).
 //!
 //! Errors in scripts are not errors of the runtime: as in GMod, a file that fails is
@@ -52,6 +54,7 @@ use mlua::Lua;
 
 mod args;
 pub mod console;
+pub mod constraint;
 pub mod convar;
 pub mod damage;
 pub mod effect;
@@ -61,6 +64,7 @@ pub mod ents;
 pub mod files;
 pub mod filesystem;
 pub mod http;
+pub mod inputs;
 pub mod material;
 pub mod matrix;
 pub mod meta;
@@ -70,6 +74,7 @@ pub mod physgun;
 pub mod physics;
 pub mod player;
 pub mod sandbox;
+pub mod sound;
 pub mod sql;
 mod startup;
 pub mod timer;
@@ -233,6 +238,7 @@ pub(crate) struct Host {
     pub players: player::Players,
     pub physics: physics::World,
     pub physgun: physgun::Guns,
+    pub inputs: inputs::Queue,
 }
 
 impl Host {
@@ -304,6 +310,7 @@ impl Runtime {
             players: player::Players::default(),
             physics: physics::World::default(),
             physgun: physgun::Guns::default(),
+            inputs: inputs::Queue::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -319,6 +326,8 @@ impl Runtime {
         util::install(&lua)?;
         trace::install(&lua)?;
         effect::install(&lua)?;
+        constraint::install(&lua)?;
+        sound::install(&lua)?;
         material::install(&lua)?;
         world::install(&lua)?;
         ents::install(&lua, realm)?;
@@ -403,8 +412,8 @@ impl Runtime {
 
     /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
     /// answers to `HTTP` requests that came in, the timers that are due, for every tick that
-    /// passed the players' commands and movement, the bodies of physics, the scripted entities
-    /// that think and the `Tick` hook, each at its own `CurTime`; the `Think` hook; then the
+    /// passed the players' commands and movement, the bodies of physics, the inputs fired, the
+    /// scripted entities that think and the `Tick` hook, each at its own `CurTime`; the `Think` hook; then the
     /// entities removed in the frame go.
     pub fn think(&self, seconds: f64) {
         let (before, end, ticks) = {
@@ -425,6 +434,7 @@ impl Runtime {
             player::tick_all(&self.lua);
             physgun::think(&self.lua);
             physics::simulate(&self.lua);
+            inputs::service(&self.lua);
             ents::think(&self.lua);
             self.call_hook("Tick", mlua::MultiValue::new());
         }
@@ -455,8 +465,9 @@ impl Runtime {
     }
 
     /// Runs console commands typed by a player, as a client's console sends them: the
-    /// engine's commands for players (`noclip`, `kill`, `give`, choosing a weapon), ConVars, and
-    /// the commands of `concommand.Add`, which get the player. The host of the game - the
+    /// engine's commands for players (`noclip`, `kill`, `give`, choosing a weapon), their user
+    /// info (`gmod_toolmode weld`), ConVars, and the commands of `concommand.Add`, which get
+    /// the player. The host of the game - the
     /// first player - also has `lua_run`, the rest of the line being the code.
     pub fn run_player_command(&self, player: EntityHandle, line: &str) {
         let trimmed = line.trim_start();
@@ -467,11 +478,7 @@ impl Runtime {
             let _ = self.run_string(code, "lua_run");
             return;
         }
-        for words in convar::split_commands(line) {
-            if !player::command(&self.lua, player, &words) {
-                convar::execute_as(&self.lua, &words, player);
-            }
-        }
+        player::console(&self.lua, player, line);
     }
 
     /// What to show of a player: where they see from, their health, the weapon in hand.

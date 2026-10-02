@@ -75,6 +75,12 @@ pub(crate) struct Studio {
     pub body_parts: Vec<(String, Vec<String>)>,
     /// How many skins it has.
     pub skins: usize,
+    /// The bones: the name of each, and its parent's number (-1 for none).
+    pub bones: Vec<(String, i32)>,
+    /// The names of the attachments, numbered from 1.
+    pub attachments: Vec<String>,
+    /// The names of the flexes.
+    pub flexes: Vec<String>,
 }
 
 /// A studio model, read once.
@@ -97,6 +103,9 @@ pub(crate) fn studio(lua: &Lua, model: &str) -> Option<Studio> {
                 .map(|part| (part.name.clone(), part.models.iter().map(|m| m.name.clone()).collect()))
                 .collect(),
             skins: mdl.skins.len().max(1),
+            bones: mdl.bones.iter().map(|b| (b.name.clone(), b.parent)).collect(),
+            attachments: mdl.attachments.iter().map(|a| a.name.clone()).collect(),
+            flexes: mdl.flexes.clone(),
         }
     });
     host.models.studio.borrow_mut().insert(path, studio.clone());
@@ -244,7 +253,7 @@ fn userdata(lua: &Lua, handle: EntityHandle) -> Option<AnyUserData> {
 
 /// Calls `ent:name(...)` if the entity has such a function: what it returned, or nothing
 /// when it has none or it failed (the error is reported).
-fn call_method(lua: &Lua, ud: &AnyUserData, name: &str, args: MultiValue) -> Option<MultiValue> {
+pub(crate) fn call_method(lua: &Lua, ud: &AnyUserData, name: &str, args: MultiValue) -> Option<MultiValue> {
     let function = match ud.get::<Value>(name) {
         Ok(Value::Function(f)) => f,
         Ok(_) => return None,
@@ -384,6 +393,11 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
     }
 }
 
+/// `ent:Activate()`, after `Spawn`: a constraint takes hold ([`crate::constraint`]).
+pub(crate) fn activate(lua: &Lua, handle: EntityHandle) {
+    crate::constraint::activate(lua, handle);
+}
+
 /// `ent:Remove()`: `OnRemove` and the `EntityRemoved` hook now, the entities it was to take
 /// with it (`DeleteOnRemove`) go too, and it is taken out of its parent's children and its
 /// children out of it - and out of any player's hands; the entity itself goes at the end of
@@ -409,6 +423,7 @@ pub(crate) fn remove(lua: &Lua, handle: EntityHandle) {
     crate::call_hook(lua, "EntityRemoved", MultiValue::from_iter([Value::UserData(ud.clone())]));
     invalidate_cache(lua, kind == Kind::Player);
     crate::player::forget(lua, handle);
+    crate::constraint::removed(lua, handle);
     crate::physics::destroy(lua, handle);
     if let Ok(Some(list)) = ud.named_user_value::<Option<Table>>("delete-on-remove") {
         for other in list.sequence_values::<Value>().flatten() {
@@ -520,7 +535,7 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
 }
 
 /// Parses `1 2 3` as the engine does: what is missing is 0.
-fn three(text: &str) -> [f32; 3] {
+pub(crate) fn three(text: &str) -> [f32; 3] {
     let mut parts = text.split_whitespace().map(|p| crate::convar::atof(p) as f32);
     [parts.next().unwrap_or(0.0), parts.next().unwrap_or(0.0), parts.next().unwrap_or(0.0)]
 }
@@ -589,6 +604,7 @@ fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
             }
             "renderamt" => ent.color[3] = number().clamp(0.0, 255.0) as u8,
             "rendermode" => ent.render_mode = number() as i64,
+            "renderfx" => ent.render_fx = number() as i64,
             "modelscale" => ent.model_scale = number() as f32,
             _ => {}
         }
@@ -601,8 +617,8 @@ fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
 
 /// Loads a map's entities as the server does when the map starts: the world takes the
 /// `worldspawn` key-values, every other entity is made with its key-values, parents are set
-/// (`parentname`), all are spawned, parents before their children, and the `InitPostEntity`
-/// hook runs.
+/// (`parentname`), all are spawned, parents before their children, then activated, and the
+/// `InitPostEntity` hook runs.
 pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     {
         let host = host(lua);
@@ -670,6 +686,10 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     for &handle in &made {
         spawn(lua, handle);
     }
+    // once all are there: the constraints take hold of what they name
+    for &handle in &made {
+        activate(lua, handle);
+    }
     crate::call_hook(lua, "InitPostEntity", MultiValue::new());
 }
 
@@ -679,6 +699,11 @@ fn names_match(pattern: &str, name: &str) -> bool {
         Some(prefix) => name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()),
         None => pattern.eq_ignore_ascii_case(name),
     }
+}
+
+/// The first entity with a name (Source's matching: a trailing `*` matches any end).
+pub(crate) fn named(lua: &Lua, name: &str) -> Option<EntityHandle> {
+    find(lua, |ent| names_match(name, &ent.name)).into_iter().next()
 }
 
 /// The entities that are not being removed and pass a test, in index order.

@@ -204,6 +204,11 @@ fn joined_to_the_world_and_to_each_other() {
     run(&mut physics, 3.0);
     let (a, b) = (physics.pose(both).unwrap().0, physics.pose(other).unwrap().0);
     assert!((a[2] - 16.0).abs() < 1.0 && (b[2] - 16.0).abs() < 1.0 && (b[0] - a[0] - 40.0).abs() < 1.0, "{a:?} {b:?}");
+    // the ground is not moved, let move, or taken away
+    physics.set_motion(ground, true);
+    physics.set_pose(ground, [0.0, 0.0, 50.0], [0.0; 3]);
+    physics.remove(ground);
+    assert!(physics.contains(ground) && !physics.motion(ground) && physics.pose(ground) == Some(([0.0; 3], [0.0; 3])));
 }
 
 #[test]
@@ -212,7 +217,9 @@ fn ropes_hinges_springs_and_sliders() {
     let ground = physics.ground();
     // on a rope of 100 from the top of the crate it hangs 100 below the hook
     let rope = physics.add(&crate_body([0.0, 0.0, 100.0])).unwrap();
-    physics.join(rope, ground, Joint::Rope { start: [0.0, 0.0, 116.0], end: [0.0, 0.0, 200.0], length: 100.0, rigid: false }, true, [0.0; 2]).unwrap();
+    physics
+        .join(rope, ground, Joint::Rope { start: [0.0, 0.0, 116.0], end: [0.0, 0.0, 200.0], length: 100.0, rigid: false }, true, [0.0; 2])
+        .unwrap();
     // on a hinge along y at its side it swings down under the hinge
     let door = physics.add(&crate_body([500.0, 0.0, 0.0])).unwrap();
     physics.join(door, ground, Joint::Hinge { point: [532.0, 0.0, 0.0], axis: [0.0, 1.0, 0.0] }, true, [0.0; 2]).unwrap();
@@ -223,7 +230,15 @@ fn ropes_hinges_springs_and_sliders() {
     // on a spring it hangs where its weight stretches it: m g / k
     let spring = physics.add(&crate_body([0.0, 500.0, 0.0])).unwrap();
     let (stiffness, damping) = (30.0 * 100.0, 30.0 * 20.0);
-    physics.join(spring, ground, Joint::Spring { start: [0.0, 500.0, 16.0], end: [0.0, 500.0, 100.0], length: 50.0, stiffness, damping }, true, [0.0; 2]).unwrap();
+    physics
+        .join(
+            spring,
+            ground,
+            Joint::Spring { start: [0.0, 500.0, 16.0], end: [0.0, 500.0, 100.0], length: 50.0, stiffness, damping },
+            true,
+            [0.0; 2],
+        )
+        .unwrap();
     run(&mut physics, 4.0);
     let z = physics.pose(rope).unwrap().0[2];
     assert!((z - (200.0 - 100.0 - 16.0)).abs() < 2.0, "rope {z}");

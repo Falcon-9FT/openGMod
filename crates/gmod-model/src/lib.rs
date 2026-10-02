@@ -23,7 +23,7 @@ pub mod vhv;
 pub mod vtx;
 pub mod vvd;
 
-pub use mdl::{BodyPart, Bone, Mdl, SubModel};
+pub use mdl::{Attachment, BodyPart, Bone, Mdl, SubModel};
 pub use mesh::{Batch, StaticMesh};
 pub use phy::{Convex, Phy, RagdollConstraint, Solid};
 pub use vhv::Vhv;

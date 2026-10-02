@@ -119,6 +119,43 @@ pub struct Ent {
     pub weapon: Option<crate::weapon::WeaponState>,
     /// Its body, when it has physics ([`crate::physics`]).
     pub physics: Option<gmod_physics::BodyId>,
+    /// What a constraint holds together, as `SetPhysConstraintObjects` gave it: the owners of
+    /// the two bodies ([`crate::constraint`]).
+    pub constrained: Option<[EntityHandle; 2]>,
+    /// The joint a constraint made.
+    pub joint: Option<gmod_physics::JointId>,
+    /// Entities given for keys (`SetEntity`): a rope's ends.
+    pub links: Vec<(String, EntityHandle)>,
+    /// Whether it shows the effect of being spawned (`SetSpawnEffect`).
+    pub spawn_effect: bool,
+    /// How it is drawn changing (`kRenderFx`): pulsing, fading, a hologram.
+    pub render_fx: i64,
+    /// Materials in place of the model's own, by slot (`SetSubMaterial`).
+    pub sub_materials: Vec<(i64, String)>,
+    /// How much its flexes move (`SetFlexScale`), and how far each is moved.
+    pub flex_scale: f32,
+    pub flex_weights: Vec<(i64, f32)>,
+    /// Bones moved, turned and scaled from where the model has them (`ManipulateBone*`).
+    pub bone_manipulations: Vec<BoneManipulation>,
+}
+
+/// How a bone is moved from where its model has it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoneManipulation {
+    pub bone: i64,
+    pub position: Vector,
+    pub angles: Angle,
+    pub scale: Vector,
+}
+
+impl BoneManipulation {
+    fn new(bone: i64) -> BoneManipulation {
+        BoneManipulation { bone, position: Vector::default(), angles: Angle::default(), scale: Vector::new(1.0, 1.0, 1.0) }
+    }
+
+    fn is_none(&self) -> bool {
+        *self == BoneManipulation::new(self.bone)
+    }
 }
 
 impl Ent {
@@ -170,6 +207,15 @@ impl Ent {
             player: None,
             weapon: None,
             physics: None,
+            constrained: None,
+            joint: None,
+            links: Vec::new(),
+            spawn_effect: false,
+            render_fx: 0,
+            sub_materials: Vec::new(),
+            flex_scale: 1.0,
+            flex_weights: Vec::new(),
+            bone_manipulations: Vec::new(),
         }
     }
 
@@ -314,6 +360,11 @@ pub fn unrotated(v: Vector, angle: Angle) -> Vector {
 pub fn decompose(outer: Angle, world: Angle) -> Angle {
     let (forward, _, up) = world.vectors();
     unrotated(forward, outer).angle_with_up(unrotated(up, outer))
+}
+
+/// `AlignAngles`: `angles` turned as `from` would have to turn to be `to`.
+pub fn align(angles: Angle, from: Angle, to: Angle) -> Angle {
+    compose(to, decompose(from, angles))
 }
 
 /// The axis-aligned box around a box turned by `angles`.
@@ -658,10 +709,34 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         entity.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
     };
     install_methods(&def)?;
+    let many = |name: &'static str, f: fn(&Args) -> mlua::Result<MultiValue>| -> mlua::Result<()> {
+        entity.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
+    };
+    install_many(&many)?;
     Ok(())
 }
 
 pub(crate) type Def<'a> = dyn Fn(&'static str, fn(&Args) -> mlua::Result<Value>) -> mlua::Result<()> + 'a;
+/// Defines a method that gives more than one value.
+pub(crate) type DefMany<'a> = dyn Fn(&'static str, fn(&Args) -> mlua::Result<MultiValue>) -> mlua::Result<()> + 'a;
+
+/// The methods that give more than one value.
+fn install_many(def: &DefMany) -> mlua::Result<()> {
+    def("GetCollisionBounds", |a| {
+        let (mins, maxs) = read(a, |ent| (ent.mins, ent.maxs))?;
+        Ok(MultiValue::from_iter([vector(a.lua, mins)?, vector(a.lua, maxs)?]))
+    })?;
+    def("GetModelBounds", |a| {
+        let model = read(a, |ent| ent.model.clone())?;
+        let (mins, maxs) = crate::ents::model_bounds(a.lua, &model).unwrap_or_default();
+        Ok(MultiValue::from_iter([vector(a.lua, mins)?, vector(a.lua, maxs)?]))
+    })?;
+    def("GetColor4Part", |a| {
+        let color = read(a, |ent| ent.color)?;
+        Ok(color.into_iter().map(|part| Value::Integer(part.into())).collect())
+    })?;
+    crate::constraint::install_many(def)
+}
 
 fn install_methods(def: &Def) -> mlua::Result<()> {
     // what it is
@@ -691,6 +766,14 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             Some(Value::UserData(ud)) => Ok(table_of(ud)?.map_or(Value::Nil, Value::Table)),
             _ => Ok(Value::Nil),
         }
+    })?;
+    def("SetTable", |a| {
+        let handle = this(a, 1)?;
+        let table = a.table(2)?;
+        if let Value::UserData(ud) = push(a.lua, handle)? {
+            ud.set_named_user_value("table", table)?;
+        }
+        Ok(Value::Nil)
     })?;
     def("IsPlayer", |a| is_kind(a, Kind::Player))?;
     def("IsNPC", |a| is_kind(a, Kind::Npc))?;
@@ -765,6 +848,10 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         let (_, angles) = transform(a)?;
         angle(a.lua, decompose(angles, a.userdata::<Angle>(2, "Angle")?))
     })?;
+    def("AlignAngles", |a| {
+        let (_, angles) = transform(a)?;
+        angle(a.lua, align(angles, a.userdata::<Angle>(2, "Angle")?, a.userdata::<Angle>(3, "Angle")?))
+    })?;
     def("GetVelocity", |a| vector(a.lua, read(a, |ent| ent.velocity)?))?;
     def("GetAbsVelocity", |a| vector(a.lua, read(a, |ent| ent.velocity)?))?;
     // a player is pushed: the velocity is added to what it has
@@ -781,10 +868,14 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("OBBMins", |a| vector(a.lua, read(a, |ent| ent.mins)?))?;
     def("OBBMaxs", |a| vector(a.lua, read(a, |ent| ent.maxs)?))?;
     def("OBBCenter", |a| vector(a.lua, read(a, |ent| (ent.mins + ent.maxs) * 0.5)?))?;
-    def("GetCollisionBounds", |a| {
+    // the point of its box nearest to a point of the world
+    def("NearestPoint", |a| {
+        let point = a.userdata::<Vector>(2, "Vector")?;
+        let (pos, angles) = transform(a)?;
         let (mins, maxs) = read(a, |ent| (ent.mins, ent.maxs))?;
-        let list = a.lua.create_sequence_from([vector(a.lua, mins)?, vector(a.lua, maxs)?])?;
-        Ok(Value::Table(list))
+        let local = unrotated(point - pos, angles);
+        let clamped = Vector::new(local.x.clamp(mins.x, maxs.x), local.y.clamp(mins.y, maxs.y), local.z.clamp(mins.z, maxs.z));
+        vector(a.lua, pos + clamped.rotated(angles))
     })?;
     def("SetCollisionBounds", |a| {
         let (mins, maxs) = (a.userdata::<Vector>(2, "Vector")?, a.userdata::<Vector>(3, "Vector")?);
@@ -799,12 +890,6 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         vector(a.lua, pos + center.rotated(angles))
     })?;
     def("BoundingRadius", |a| Ok(Value::Number(read(a, |ent| ((ent.maxs - ent.mins) * 0.5).length())? as f64)))?;
-    def("GetModelBounds", |a| {
-        let model = read(a, |ent| ent.model.clone())?;
-        let (mins, maxs) = crate::ents::model_bounds(a.lua, &model).unwrap_or_default();
-        let list = a.lua.create_sequence_from([vector(a.lua, mins)?, vector(a.lua, maxs)?])?;
-        Ok(Value::Table(list))
-    })?;
 
     // how it looks
     def("GetModel", |a| {
@@ -830,14 +915,66 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         let material = a.opt_string(2)?.unwrap_or_default();
         write(a, |ent| ent.material = material)
     })?;
-    def("GetColor4Part", |a| {
-        let [r, g, b, alpha] = read(a, |ent| ent.color)?;
-        let list = a.lua.create_sequence_from([r, g, b, alpha])?;
-        Ok(Value::Table(list))
-    })?;
     def("SetColor4Part", |a| {
         let color = [color_part(a, 2)?, color_part(a, 3)?, color_part(a, 4)?, color_part(a, 5)?];
         write(a, |ent| ent.color = color)
+    })?;
+    // nothing for the first argument: every slot back to the model's
+    def("SetSubMaterial", |a| {
+        let slot = a.opt_number(2).ok().flatten().map(|n| n as i64);
+        let material = a.opt_string(3).ok().flatten().unwrap_or_default();
+        write(a, |ent| match slot {
+            None => ent.sub_materials.clear(),
+            Some(slot) => {
+                ent.sub_materials.retain(|(s, _)| *s != slot);
+                if !material.is_empty() {
+                    ent.sub_materials.push((slot, material));
+                }
+            }
+        })
+    })?;
+    def("GetSubMaterial", |a| {
+        let slot = a.number(2)? as i64;
+        let material = read(a, |ent| ent.sub_materials.iter().find(|(s, _)| *s == slot).map(|(_, m)| m.clone()))?;
+        string(a.lua, material.as_deref().unwrap_or(""))
+    })?;
+    def("GetFlexScale", |a| Ok(Value::Number(f64::from(read(a, |ent| ent.flex_scale)?))))?;
+    def("SetFlexScale", |a| {
+        let scale = a.number(2)? as f32;
+        write(a, |ent| ent.flex_scale = scale)
+    })?;
+    def("GetFlexWeight", |a| {
+        let flex = a.number(2)? as i64;
+        let weight = read(a, |ent| ent.flex_weights.iter().find(|(f, _)| *f == flex).map_or(0.0, |&(_, w)| w))?;
+        Ok(Value::Number(f64::from(weight)))
+    })?;
+    def("SetFlexWeight", |a| {
+        let (flex, weight) = (a.number(2)? as i64, a.number(3)? as f32);
+        write(a, |ent| {
+            ent.flex_weights.retain(|(f, _)| *f != flex);
+            ent.flex_weights.push((flex, weight));
+        })
+    })?;
+    def("ManipulateBonePosition", |a| {
+        let (bone, position) = (a.number(2)? as i64, a.userdata::<Vector>(3, "Vector")?);
+        manipulate(a, bone, |m| m.position = position)
+    })?;
+    def("ManipulateBoneAngles", |a| {
+        let (bone, angles) = (a.number(2)? as i64, a.userdata::<Angle>(3, "Angle")?);
+        manipulate(a, bone, |m| m.angles = angles)
+    })?;
+    def("ManipulateBoneScale", |a| {
+        let (bone, scale) = (a.number(2)? as i64, a.userdata::<Vector>(3, "Vector")?);
+        manipulate(a, bone, |m| m.scale = scale)
+    })?;
+    def("GetManipulateBonePosition", |a| vector(a.lua, manipulation(a)?.position))?;
+    def("GetManipulateBoneAngles", |a| angle(a.lua, manipulation(a)?.angles))?;
+    def("GetManipulateBoneScale", |a| vector(a.lua, manipulation(a)?.scale))?;
+    def("HasBoneManipulations", |a| Ok(Value::Boolean(read(a, |ent| !ent.bone_manipulations.is_empty())?)))?;
+    def("GetRenderFX", |a| integer(read(a, |ent| ent.render_fx)?))?;
+    def("SetRenderFX", |a| {
+        let fx = a.number(2)? as i64;
+        write(a, |ent| ent.render_fx = fx)
     })?;
     def("GetRenderMode", |a| integer(read(a, |ent| ent.render_mode)?))?;
     def("SetRenderMode", |a| {
@@ -908,6 +1045,63 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         })
     })?;
     def("SkinCount", |a| integer(studio(a)?.map_or(0, |s| s.skins as i64)))?;
+    // decals and eyes are drawn by clients, which are not there yet
+    def("RemoveAllDecals", |a| write(a, |_| ()))?;
+    def("SetEyeTarget", |a| write(a, |_| ()))?;
+    // what was not spawned from a Workshop addon has no ID
+    def("GetWorkshopID", |a| this(a, 1).map(|_| Value::Nil))?;
+    def("SetSpawnEffect", |a| {
+        let on = a.boolean(2);
+        write(a, |ent| ent.spawn_effect = on)
+    })?;
+    def("GetSpawnEffect", |a| Ok(Value::Boolean(read(a, |ent| ent.spawn_effect)?)))?;
+    // bones, attachments and flexes, as the model has them
+    def("GetBoneCount", |a| integer(studio(a)?.map_or(0, |s| s.bones.len() as i64)))?;
+    def("LookupBone", |a| {
+        let name = a.string(2)?;
+        let found = studio(a)?.and_then(|s| s.bones.iter().position(|(n, _)| n.eq_ignore_ascii_case(&name)));
+        found.map_or(Ok(Value::Nil), |i| integer(i as i64))
+    })?;
+    def("GetBoneName", |a| {
+        let bone = a.number(2)? as i64;
+        let name = studio(a)?.and_then(|s| usize::try_from(bone).ok().and_then(|b| s.bones.get(b).map(|(n, _)| n.clone())));
+        string(a.lua, name.as_deref().unwrap_or("__INVALIDBONE__"))
+    })?;
+    def("GetBoneParent", |a| {
+        let bone = a.number(2)? as i64;
+        let parent = studio(a)?.and_then(|s| usize::try_from(bone).ok().and_then(|b| s.bones.get(b).map(|&(_, p)| p)));
+        integer(parent.map_or(-1, i64::from))
+    })?;
+    // 0 for none, -1 without a model
+    def("LookupAttachment", |a| {
+        let name = a.string(2)?;
+        match studio(a)? {
+            Some(s) => integer(s.attachments.iter().position(|n| n.eq_ignore_ascii_case(&name)).map_or(0, |i| i as i64 + 1)),
+            None => integer(-1),
+        }
+    })?;
+    def("GetAttachments", |a| {
+        let list = a.lua.create_table()?;
+        for (i, name) in studio(a)?.map(|s| s.attachments).unwrap_or_default().into_iter().enumerate() {
+            let attachment = a.lua.create_table()?;
+            attachment.raw_set("id", i + 1)?;
+            attachment.raw_set("name", name)?;
+            list.raw_push(attachment)?;
+        }
+        Ok(Value::Table(list))
+    })?;
+    def("GetFlexNum", |a| integer(studio(a)?.map_or(0, |s| s.flexes.len() as i64)))?;
+    def("GetFlexName", |a| {
+        let flex = a.number(2)? as i64;
+        let name = studio(a)?.and_then(|s| usize::try_from(flex).ok().and_then(|f| s.flexes.get(f).cloned()));
+        name.map_or(Ok(Value::Nil), |n| string(a.lua, &n))
+    })?;
+    def("GetFlexIDByName", |a| {
+        let name = a.string(2)?;
+        let found = studio(a)?.and_then(|s| s.flexes.iter().position(|n| n.eq_ignore_ascii_case(&name)));
+        found.map_or(Ok(Value::Nil), |i| integer(i as i64))
+    })?;
+    def("HasFlexManipulatior", |a| Ok(Value::Boolean(studio(a)?.is_some_and(|s| !s.flexes.is_empty()))))?;
     def("GetModelScale", |a| Ok(Value::Number(read(a, |ent| ent.model_scale)? as f64)))?;
     def("SetModelScale", |a| {
         let scale = a.number(2)? as f32;
@@ -927,6 +1121,15 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("HasSpawnFlags", |a| {
         let flags = a.number(2)? as i64;
         Ok(Value::Boolean(read(a, |ent| ent.spawn_flags & flags != 0)?))
+    })?;
+    // an entity for a key, as a rope's ends (`StartEntity`, `EndEntity`)
+    def("SetEntity", |a| {
+        let key = a.string(2)?;
+        let other = handle_of(a.get(3)).unwrap_or(EntityHandle::NULL);
+        write(a, |ent| {
+            ent.links.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
+            ent.links.push((key, other));
+        })
     })?;
     def("SetKeyValue", |a| {
         let handle = this(a, 1)?;
@@ -1196,7 +1399,7 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         Ok(Value::Nil)
     })?;
     def("Activate", |a| {
-        this(a, 1)?;
+        crate::ents::activate(a.lua, this(a, 1)?);
         Ok(Value::Nil)
     })?;
     // players leave rather than go
@@ -1261,6 +1464,9 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         write(a, |ent| ent.think_request = Some(time))
     })?;
 
+    crate::inputs::install_methods(def)?;
+    crate::constraint::install_methods(def)?;
+    crate::sound::install_methods(def)?;
     crate::ents::install_variables(def)
 }
 
@@ -1273,6 +1479,24 @@ fn deleted_with(a: &Args) -> mlua::Result<Table> {
 }
 
 /// What the model of the entity in argument 1 is made of.
+/// Changes how a bone of the entity in argument 1 is moved; one moved nowhere is forgotten.
+fn manipulate(a: &Args, bone: i64, f: impl FnOnce(&mut BoneManipulation)) -> mlua::Result<Value> {
+    write(a, |ent| {
+        let mut m = ent.bone_manipulations.iter().find(|m| m.bone == bone).copied().unwrap_or(BoneManipulation::new(bone));
+        f(&mut m);
+        ent.bone_manipulations.retain(|other| other.bone != bone);
+        if !m.is_none() {
+            ent.bone_manipulations.push(m);
+        }
+    })
+}
+
+/// How the bone in argument 2 of the entity in argument 1 is moved.
+fn manipulation(a: &Args) -> mlua::Result<BoneManipulation> {
+    let bone = a.number(2)? as i64;
+    read(a, |ent| ent.bone_manipulations.iter().find(|m| m.bone == bone).copied().unwrap_or(BoneManipulation::new(bone)))
+}
+
 fn studio(a: &Args) -> mlua::Result<Option<crate::ents::Studio>> {
     let model = read(a, |ent| ent.model.clone())?;
     Ok(crate::ents::studio(a.lua, &model))

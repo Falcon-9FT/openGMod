@@ -36,7 +36,17 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     globals.raw_set("CompileFile", lua.create_function(compile_file)?)?;
     globals.raw_set("RunString", lua.create_function(run_string)?)?;
     globals.raw_set("RunStringEx", lua.create_function(run_string)?)?;
+    globals.raw_set("ProtectedCall", lua.create_function(protected_call)?)?;
     Ok(())
+}
+
+/// `ProtectedCall(f, ...)`: calls `f`, reporting an error it raises rather than passing it on.
+/// Whether it ran through.
+fn protected_call(lua: &Lua, mut values: MultiValue) -> mlua::Result<bool> {
+    match values.pop_front() {
+        Some(Value::Function(f)) => Ok(call_reporting(lua, f, values).is_ok()),
+        other => Err(crate::args::bad(lua, 1, "ProtectedCall", "function", other.as_ref())),
+    }
 }
 
 /// Compiles a chunk the way `CompileString` names it.

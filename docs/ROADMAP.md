@@ -88,15 +88,20 @@
     патроны, выдача, переключение (`Holster`/`Deploy`), выстрелы и перезарядка, выброс при
     смерти, типы патронов движка и `game.BuildAmmoTypes`.
   * Урон ✅ — `CTakeDamageInfo`, `EntityTakeDamage`, броня, `PlayerHurt`, `OnTakeDamage` у SENT.
-  * Дальше: подбор оружия касанием, NPC, поведение энтити движка (двери, триггеры, ввод-вывод
-    `Fire`), рэгдоллы трупов.
+  * Ввод энтити ✅ — `Entity:Input`, `Entity:Fire` с задержкой, хук `AcceptInput` и
+    `ENT:AcceptInput`, `Kill`, `KillHierarchy`, `AddOutput`, `SetParent`, `Color`, `Alpha`,
+    `Skin`, входы констрейнтов.
+  * Дальше: подбор оружия касанием, NPC, поведение энтити движка (двери, триггеры, выводы
+    `OnTrigger`... и `AddOutput` с ними), рэгдоллы трупов.
 * Игра в `opengmod` ✅: при запуске карты работает Lua сервера с `sandbox` и аддонами
   воркшопа, игрок одиночной игры ходит через хуки геймода, мышь и клавиши — его команды
   (`IN_ATTACK`, `IN_RELOAD`, выбор оружия, фонарик, noclip, `gmod_undo`), терминал — консоль
   игры от лица игрока (и `lua_run`). Модели энтити видны ✅: пропы, SENT, NPC, оружие на
   земле — всё, что не спрятано (`SetNoDraw`, `EF_NODRAW`), кроме самого игрока и того, что
-  он несёт (`Runtime::drawn`). Пропы падают и ложатся ✅, физган ✅. Дальше, чтобы играть с
-  модами: тулган, оружие в руках (вью-модели), анимация моделей, интерфейс (этап 5).
+  он несёт (`Runtime::drawn`). Пропы падают и ложатся ✅, физган ✅, тулган ✅ (все 37
+  инструментов sandbox отрабатывают без ошибок; режим и настройки — из консоли, пока нет меню).
+  Дальше, чтобы играть с модами: оружие в руках (вью-модели), анимация моделей, интерфейс
+  (этап 5).
 * Физика — `gmod-physics` на Rapier (чистый Rust, без C++ в сборке):
   * пропы с формами из `.phy` ✅: масса, затухание и материал из модели; `PhysicsInit`,
     `PhysicsInitBox`, `PhysicsInitSphere`, `PhysicsInitConvex`, `PhysObj` в Lua
@@ -108,7 +113,14 @@
     заморозка на правую кнопку, разморозка на R; хуки `PhysgunPickup`, `OnPhysgunPickup`,
     `PhysgunDrop`, `OnPhysgunFreeze`, `OnPhysgunReload`, как их ждёт sandbox;
   * контроллеры движения (`StartMotionController`, тени `PhysicsInitShadow`);
-  * все констрейнты `constraint.lua` — для тулгана;
+  * констрейнты ✅ — `gmod-lua::constraint`: `phys_constraint` (сварка), `phys_ballsocket`,
+    `phys_hinge` (ось), `phys_slideconstraint`, `phys_lengthconstraint` (верёвка), `phys_spring`
+    (резинка), `logic_collision_pair` (no-collide) — суставы Rapier к пропам и к миру, предел
+    силы и кручения (`forcelimit`, `torquelimit`), `Break`, `TurnOn`/`TurnOff`, констрейнты карт
+    по именам (`attach1`, `attach2`). Дальше: моторы (`phys_torque`), `phys_keepupright`, блоки
+    (`phys_pulleyconstraint`), пределы `phys_ragdollconstraint`, трение осей, резинка «только на
+    растяжение», лебёдки и гидравлика (`gmod_winch_controller`), видимые верёвки
+    (`keyframe_rope`);
   * игрок толкает пропы и встаёт на них, трассировки по формам пропов;
   * плавучесть, звуки ударов, поломка пропов;
   * рэгдоллы.

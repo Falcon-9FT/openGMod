@@ -15,6 +15,8 @@
 //! | 212 | texture folders: count, offset of a table of string offsets |
 //! | 220 | skins: textures per skin, skin count, offset of a `u16` table |
 //! | 232 | body parts: count, offset (16-byte records) |
+//! | 240 | attachments: count, offset (92-byte records) |
+//! | 260 | flex controllers' descriptions: count, offset (4-byte records, a name each) |
 //! | 308 | surface property name, key values (offset, size), mass |
 //!
 //! A body part lists models, one of which is shown (chosen by the body group); a model has
@@ -25,12 +27,23 @@ use std::io;
 use crate::reader::{Reader, invalid};
 
 const BONE_SIZE: usize = 216;
+const ATTACHMENT_SIZE: usize = 92;
+const FLEX_SIZE: usize = 4;
 const TEXTURE_SIZE: usize = 64;
 const BODY_PART_SIZE: usize = 16;
 const MODEL_SIZE: usize = 148;
 const MESH_SIZE: usize = 116;
 /// Bytes of one vertex in the `.vvd`; models give their first vertex as a byte offset.
 pub(crate) const VERTEX_SIZE: usize = 48;
+
+/// A point fixed to a bone, where things are attached: a muzzle, a hand, the eyes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub name: String,
+    pub bone: usize,
+    /// Where it is in the bone's space: a 3×4 matrix, rotation and translation.
+    pub local: [[f32; 4]; 3],
+}
 
 /// A bone of the skeleton, in its rest position.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +108,9 @@ pub struct Mdl {
     /// For each skin, which texture each texture slot shows.
     pub skins: Vec<Vec<usize>>,
     pub body_parts: Vec<BodyPart>,
+    pub attachments: Vec<Attachment>,
+    /// The names of what moves the face (flexes).
+    pub flexes: Vec<String>,
     pub surface_prop: String,
     /// The `$keyvalues` of the model (`prop_data` and others), as text.
     pub key_values: String,
@@ -193,6 +209,32 @@ impl Mdl {
             body_parts.push(BodyPart { name: r.string(r.offset(at, at)?)?, base: r.count(at + 8, "body part base")?.max(1), models });
         }
 
+        let attachment_count = r.count(240, "attachment")?;
+        let attachment_at = r.offset(0, 244)?;
+        r.table(attachment_at, attachment_count, ATTACHMENT_SIZE, "attachments")?;
+        let attachments = (0..attachment_count)
+            .map(|i| {
+                let at = attachment_at + i * ATTACHMENT_SIZE;
+                let mut local = [[0.0; 4]; 3];
+                for (row, values) in local.iter_mut().enumerate() {
+                    for (column, value) in values.iter_mut().enumerate() {
+                        *value = r.f32(at + 12 + (row * 4 + column) * 4)?;
+                    }
+                }
+                Ok(Attachment { name: r.string(r.offset(at, at)?)?, bone: r.count(at + 8, "attachment bone")?, local })
+            })
+            .collect::<io::Result<Vec<Attachment>>>()?;
+
+        let flex_count = r.count(260, "flex")?;
+        let flex_at = r.offset(0, 264)?;
+        r.table(flex_at, flex_count, FLEX_SIZE, "flexes")?;
+        let flexes = (0..flex_count)
+            .map(|i| {
+                let at = flex_at + i * FLEX_SIZE;
+                r.string(r.offset(at, at)?)
+            })
+            .collect::<io::Result<Vec<String>>>()?;
+
         let surface_prop = match r.i32(308)? {
             0 => String::new(),
             _ => r.string(r.offset(0, 308)?)?,
@@ -220,6 +262,8 @@ impl Mdl {
             texture_folders,
             skins,
             body_parts,
+            attachments,
+            flexes,
             surface_prop,
             key_values,
             mass: r.f32(328)?,

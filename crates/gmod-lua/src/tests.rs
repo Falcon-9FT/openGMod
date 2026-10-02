@@ -1789,3 +1789,172 @@ fn effects_and_persistence() {
         "local p = ents.Create('prop_physics') local was = p:GetPersistent() p:SetPersistent(true) return not was and p:GetPersistent()"
     ));
 }
+
+#[test]
+fn constraints_hold_bodies_together() {
+    // a crate of the map welded to the world by name
+    let g = physics_game(&[
+        &[("classname", "prop_physics"), ("targetname", "hung"), ("model", "models/crate.mdl"), ("origin", "-300 300 100")],
+        &[("classname", "phys_constraint"), ("attach1", "hung"), ("origin", "-300 300 100")],
+    ]);
+    // the world's body is there to join to, and does not move
+    assert!(g.eval::<bool>(
+        "local world = game.GetWorld() WPHYS = world:GetPhysicsObject() WPHYS:EnableMotion(true) WPHYS:SetPos(Vector(0, 0, 50))
+         return WPHYS:IsValid() and WPHYS:GetEntity() == world and world:GetPhysicsObjectNum(0) == WPHYS and not WPHYS:IsMoveable()
+             and WPHYS:GetPos() == Vector(0, 0, 0)"
+    ));
+    // welded to the world a crate stays in the air, and one on a rope from it hangs below;
+    // a weld that takes 5 kg breaks under 25, one that takes 100 does not
+    assert!(g.eval::<bool>(
+        "local function crate(pos) local c = ents.Create('prop_physics') c:SetModel('models/crate.mdl') c:SetPos(pos) c:Spawn() return c end
+         local function constraint(class, first, second, keys, pos)
+             local c = ents.Create(class) if pos then c:SetPos(pos) end
+             for k, v in pairs(keys) do c:SetKeyValue(k, v) end
+             c:SetPhysConstraintObjects(first:GetPhysicsObject(), second:GetPhysicsObject()) c:Spawn() c:Activate()
+             return c
+         end
+         local world = game.GetWorld()
+         A = crate(Vector(-200, 0, 100)) B = crate(Vector(-200, 0, 60))
+         WELD = constraint('phys_constraint', world, A, {})
+         ROPE = constraint('phys_lengthconstraint', A, B, { attachpoint = tostring(Vector(-200, 0, 76)), length = 40 }, Vector(-200, 0, 100))
+         C = crate(Vector(-100, -300, 100)) WEAK = constraint('phys_constraint', world, C, { forcelimit = 5 })
+         D = crate(Vector(-100, -200, 100)) STRONG = constraint('phys_constraint', world, D, { forcelimit = 100 })
+         local first, second = WELD:GetConstrainedEntities()
+         return WELD:IsConstraint() and ROPE:IsConstraint() and first == world and second == A
+             and not ents.Create('info_target'):IsConstraint()"
+    ));
+    g.runtime.think(2.0);
+    assert!(g.eval::<bool>(
+        "return A:GetPos():IsEqualTol(Vector(-200, 0, 100), 0.5) and B:GetPos():IsEqualTol(Vector(-200, 0, 44), 1)
+             and ents.FindByName('hung')[1]:GetPos():IsEqualTol(Vector(-300, 300, 100), 0.5)
+             and not WEAK:IsValid() and C:GetPos().z < 1 and STRONG:IsValid() and D:GetPos():IsEqualTol(Vector(-100, -200, 100), 0.5)"
+    ));
+    // broken, the weld is gone and they fall together; two that do not collide go through
+    // each other
+    assert!(g.eval::<bool>(
+        "local function crate(pos) local c = ents.Create('prop_physics') c:SetModel('models/crate.mdl') c:SetPos(pos) c:Spawn() return c end
+         WELD:Fire('Break')
+         F = crate(Vector(-100, 300, 0)) F:GetPhysicsObject():EnableMotion(false)
+         G = crate(Vector(-100, 300, 50))
+         local pair = ents.Create('logic_collision_pair') pair:SetKeyValue('startdisabled', 1)
+         pair:SetPhysConstraintObjects(F:GetPhysicsObject(), G:GetPhysicsObject()) pair:Spawn() pair:Activate() pair:Input('DisableCollisions')
+         return WELD:IsValid()"
+    ));
+    g.runtime.think(2.0);
+    assert!(g.eval::<bool>(
+        "return not WELD:IsValid() and ROPE:IsValid() and A:GetPos().z < 50 and B:GetPos().z < 1 and math.abs(G:GetPos().z) < 1"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn inputs_of_entities() {
+    let g = entity_game(Realm::Server);
+    assert!(g.eval::<bool>(
+        "HOOKS.AcceptInput = function(e, input, activator, caller, value)
+             print('input', e:GetName(), input, value, activator == CALLER)
+             if e:GetName() == 'kept' and input == 'Kill' then return true end
+         end
+         CALLER = ents.Create('info_target')
+         A = ents.Create('info_target') A:SetName('a')
+         KEPT = ents.Create('info_target') KEPT:SetName('kept')
+         CHILD = ents.Create('info_target') CHILD:SetParent(A)
+         A:Input('AddOutput', CALLER, CALLER, 'targetname renamed')
+         A:Fire('Color', '255 0 0')
+         KEPT:Fire('Kill')
+         A:Fire('KillHierarchy', nil, 0.5)
+         local r, g, b = A:GetColor4Part()
+         return A:GetName() == 'renamed' and g == 255"
+    ));
+    assert_eq!(g.printed(), "input\ta\tAddOutput\ttargetname renamed\ttrue\n");
+    g.runtime.think(0.02);
+    assert!(g.eval::<bool>(
+        "local r, g, b, a = A:GetColor4Part() return r == 255 and g == 0 and b == 0 and a == 255 and KEPT:IsValid() and A:IsValid()"
+    ));
+    g.runtime.think(0.6);
+    assert!(g.eval::<bool>("return not A:IsValid() and not CHILD:IsValid() and KEPT:IsValid()"));
+    assert_eq!(
+        g.printed(),
+        "input\ta\tAddOutput\ttargetname renamed\ttrue\ninput\trenamed\tColor\t255 0 0\tfalse\ninput\tkept\tKill\t\tfalse\n\
+         input\trenamed\tKillHierarchy\t\tfalse\n"
+    );
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn what_a_players_client_would_say() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    // what a client has not set is the default, or the default of a sandbox tool's setting
+    assert!(g.eval::<bool>(
+        "weapons.list.gmod_tool = { Tool = { weld = { ClientConVar = { forcelimit = '0', nocollide = 1 } }, rope = {} } }
+         local p = Entity(1)
+         return p:GetInfo('gmod_toolmode') == 'rope' and p:GetInfo('weld_forcelimit') == '0' and p:GetInfoNum('weld_nocollide', 5) == 1
+             and p:GetInfo('nope') == '' and p:GetInfoNum('nope', 5) == 5"
+    ));
+    // typed in the console, or run by `ConCommand`, it is set
+    g.runtime.run_player_command(alice, "gmod_toolmode weld; weld_forcelimit 1000; gmod_toolmode");
+    g.runtime.run_string("Entity(1):ConCommand('cl_playerskin 3; finger_0 1 2')", "concommand").unwrap();
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetInfo('gmod_toolmode') == 'weld' and p:GetInfoNum('weld_forcelimit', 0) == 1000 and p:GetInfoNum('cl_playerskin', 0) == 3"
+    ));
+    assert_eq!(g.printed(), "\"gmod_toolmode\" = \"weld\"\nUnknown command \"finger_0\"\n");
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn what_scripts_ask_of_entities() {
+    let g = entity_game(Realm::Server);
+    // GMod's `table.insert` says where; `ProtectedCall` reports and goes on
+    assert!(g.eval::<bool>(
+        "local t = {} local first, second = table.insert(t, 'a'), table.insert(t, 1, 'b')
+         local ok, err = pcall(table.insert, t)
+         return first == 1 and second == 1 and t[1] == 'b' and t[2] == 'a' and not ok and tostring(err):find('wrong number', 1, true)
+             and ProtectedCall(function(a) assert(a == 1) end, 1) and not ProtectedCall(error, 'on purpose')"
+    ));
+    assert_eq!(g.messages(), ["on purpose"]);
+    // the methods that give more than one value; the world's spaces
+    assert!(g.eval::<bool>(
+        "local e = ents.Create('prop_physics') e:SetModel('models/box.mdl') e:SetPos(Vector(10, 0, 0)) e:SetAngles(Angle(0, 90, 0)) E = e
+         local mins, maxs = e:GetCollisionBounds()
+         local lo, hi = e:GetModelBounds()
+         e:SetColor4Part(1, 2, 3, 4)
+         local r, g, b, a = e:GetColor4Part()
+         local pos, ang = LocalToWorld(Vector(1, 0, 0), Angle(0, 10, 0), Vector(10, 0, 0), Angle(0, 90, 0))
+         local back, back_ang = WorldToLocal(pos, ang, Vector(10, 0, 0), Angle(0, 90, 0))
+         local small, big = Vector(1, 5, -1), Vector(2, -5, 3) OrderVectors(small, big)
+         return mins == Vector(-8, -8, 0) and maxs == Vector(8, 8, 16) and lo == mins and hi == maxs and r == 1 and g == 2 and b == 3 and a == 4
+             and pos:IsEqualTol(Vector(10, 1, 0), 0.001) and ang:IsEqualTol(Angle(0, 100, 0), 0.01)
+             and back:IsEqualTol(Vector(1, 0, 0), 0.001) and back_ang:IsEqualTol(Angle(0, 10, 0), 0.01)
+             and small == Vector(1, -5, -1) and big == Vector(2, 5, 3)
+             and e:NearestPoint(Vector(10, 100, 8)):IsEqualTol(Vector(10, 8, 8), 0.001)
+             and e:AlignAngles(Angle(0, 90, 0), Angle(0, 0, 0)):IsEqualTol(Angle(0, 0, 0), 0.01)"
+    ));
+    // what is kept of how it looks: bones, attachments and flexes as the model has them
+    assert!(g.eval::<bool>(
+        "local e = E
+         e:SetSubMaterial(0, 'models/debug/debugwhite') e:SetSubMaterial(1, 'a') e:SetSubMaterial(1, '')
+         local sub = e:GetSubMaterial(0) == 'models/debug/debugwhite' and e:GetSubMaterial(1) == ''
+         e:SetSubMaterial() local cleared = e:GetSubMaterial(0) == ''
+         e:ManipulateBonePosition(0, Vector(1, 2, 3)) local moved = e:HasBoneManipulations() and e:GetManipulateBonePosition(0) == Vector(1, 2, 3)
+         e:ManipulateBonePosition(0, Vector(0, 0, 0)) local back = not e:HasBoneManipulations() and e:GetManipulateBoneScale(0) == Vector(1, 1, 1)
+         e:SetFlexScale(2) e:SetFlexWeight(3, 0.5) e:SetRenderFX(kRenderFxHologram or 16) e:SetSpawnEffect(true)
+         local t = { Type = 'Weld' } e:SetTable(t)
+         return sub and cleared and moved and back and e:GetFlexScale() == 2 and e:GetFlexWeight(3) == 0.5 and e:GetRenderFX() == 16
+             and e:GetSpawnEffect() and e:GetTable() == t and e.Type == 'Weld'
+             and e:GetBoneCount() == 0 and e:LookupBone('root') == nil and e:LookupAttachment('muzzle') == 0 and e:GetFlexNum() == 0
+             and ents.Create('info_target'):LookupAttachment('muzzle') == -1 and e:GetWorkshopID() == nil"
+    ));
+    // sounds are taken and kept quiet
+    assert!(g.eval::<bool>(
+        "E:EmitSound('Weapon_Pistol.Single') E:StopSound('Weapon_Pistol.Single') EmitSound('a.wav', Vector(), 0)
+         sound.Add({ name = 'Test.Sound', sound = 'test.wav', level = 80 })
+         local patch = CreateSound(E, 'Test.Sound')
+         patch:PlayEx(0.5, 120) local playing = patch:IsPlaying() and patch:GetVolume() == 0.5 and patch:GetPitch() == 120
+         patch:Stop()
+         return playing and not patch:IsPlaying() and sound.GetProperties('test.sound').level == 80 and sound.GetTable()[1] == 'Test.Sound'
+             and E:StartLoopingSound('a.wav') == 1 and E:StartLoopingSound('b.wav') == 2"
+    ));
+    assert_eq!(g.messages(), ["on purpose"]);
+}

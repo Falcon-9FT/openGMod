@@ -6,8 +6,12 @@
 //! props (`prop_physics` ...) get theirs when they spawn, frozen when the map says "motion
 //! disabled". The world is the map's: its brushes, displacements and static props.
 //!
-//! Every tick the bodies move on, and the entities of those awake go where their bodies are.
-//! Moving an entity (`SetPos`, `SetAngles`) moves its body.
+//! The world entity's body is the ground of [`gmod_physics`]: it has no shape (the map's
+//! solids are apart from it) and never moves, and constraints join bodies to it.
+//!
+//! Every tick the bodies move on, and the entities of those awake go where their bodies are;
+//! constraints pulled too hard break ([`crate::constraint`]). Moving an entity (`SetPos`,
+//! `SetAngles`) moves its body.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -92,11 +96,35 @@ pub(crate) fn load_world(lua: &Lua, collision: Option<&gmod_bsp::Collision>) {
         let shapes = collision.solid_shapes(gmod_bsp::mask::SOLID_BRUSHONLY);
         physics.add_world(&shapes.hulls, &shapes.vertices, &shapes.triangles);
     }
-    let host = host(lua);
-    *host.physics.physics.borrow_mut() = physics;
-    for (_, kept) in host.physics.bodies.borrow_mut().drain() {
-        host.entities.with_mut(kept.entity, |ent| ent.physics = None);
+    {
+        let host = host(lua);
+        *host.physics.physics.borrow_mut() = physics;
+        for (_, kept) in host.physics.bodies.borrow_mut().drain() {
+            host.entities.with_mut(kept.entity, |ent| ent.physics = None);
+        }
     }
+    attach_world(lua);
+}
+
+/// Gives the world entity its body: the ground.
+fn attach_world(lua: &Lua) {
+    let host = host(lua);
+    let world = EntityHandle::WORLD;
+    if !host.entities.is_valid(world) {
+        return;
+    }
+    let ground = host.physics.physics.borrow().ground();
+    let kept = Kept {
+        entity: world,
+        material: "default".to_string(),
+        mins: Vector::default(),
+        maxs: Vector::default(),
+        game_flags: 0,
+        contents: 0,
+        drag: false,
+    };
+    host.physics.bodies.borrow_mut().insert(ground, kept);
+    host.entities.with_mut(world, |ent| ent.physics = Some(ground));
 }
 
 /// The physics model of a studio model, read once.
@@ -176,8 +204,11 @@ pub(crate) fn init_shape(lua: &Lua, handle: EntityHandle, shape: Shape) -> bool 
     init(lua, handle, shape, None)
 }
 
-/// Takes an entity's body away.
+/// Takes an entity's body away. The world keeps its own.
 pub(crate) fn destroy(lua: &Lua, handle: EntityHandle) {
+    if handle.index == Some(0) {
+        return;
+    }
     let host = host(lua);
     if let Some(id) = host.entities.with_mut(handle, |ent| ent.physics.take()).flatten() {
         host.physics.physics.borrow_mut().remove(id);
@@ -213,26 +244,31 @@ pub(crate) fn wake(lua: &Lua, handle: EntityHandle) {
 }
 
 /// One tick: the bodies move on, gravity as `sv_gravity` says, and the entities of those awake
-/// go where their bodies are - unless they have a parent, which takes them along.
+/// go where their bodies are - unless they have a parent, which takes them along. Then the
+/// constraints that broke go.
 pub(crate) fn simulate(lua: &Lua) {
     let gravity = crate::convar::value(lua, "sv_gravity").and_then(|g| g.trim().parse::<f32>().ok()).unwrap_or(600.0);
-    let host = host(lua);
-    let mut physics = host.physics.physics.borrow_mut();
-    physics.set_gravity(gravity);
-    physics.step(timer::TICK_INTERVAL as f32);
-    let bodies = host.physics.bodies.borrow();
-    for id in physics.awake() {
-        let Some(kept) = bodies.get(&id) else { continue };
-        let Some((origin, angles)) = physics.pose(id) else { continue };
-        let velocity = vector(physics.velocity(id));
-        host.entities.with_mut(kept.entity, |ent| {
-            if ent.parent.index.is_none() {
-                ent.local_pos = vector(origin);
-                ent.local_angles = angle(angles);
-            }
-            ent.velocity = velocity;
-        });
-    }
+    let broken = {
+        let host = host(lua);
+        let mut physics = host.physics.physics.borrow_mut();
+        physics.set_gravity(gravity);
+        physics.step(timer::TICK_INTERVAL as f32);
+        let bodies = host.physics.bodies.borrow();
+        for id in physics.awake() {
+            let Some(kept) = bodies.get(&id) else { continue };
+            let Some((origin, angles)) = physics.pose(id) else { continue };
+            let velocity = vector(physics.velocity(id));
+            host.entities.with_mut(kept.entity, |ent| {
+                if ent.parent.index.is_none() {
+                    ent.local_pos = vector(origin);
+                    ent.local_angles = angle(angles);
+                }
+                ent.velocity = velocity;
+            });
+        }
+        physics.broken()
+    };
+    crate::constraint::broken(lua, &broken);
 }
 
 /// The `PhysObj` of an entity: valid while the entity has a body.
@@ -280,6 +316,7 @@ fn pose(a: &Args) -> mlua::Result<(Vector, Angle)> {
 }
 
 pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
+    attach_world(lua);
     let phys = meta::meta_table(lua, "PhysObj", type_id::PHYSOBJ)?;
     let def = |name: &'static str, f: fn(&Args) -> mlua::Result<Value>| -> mlua::Result<()> {
         phys.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
@@ -407,6 +444,15 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let v = a.userdata::<Vector>(2, "Vector")?;
         let (pos, angles) = pose(a)?;
         vector_value(a.lua, entity::unrotated(v - pos, angles))
+    })?;
+    // about an axis of the world through its origin: the angles it would have
+    def("RotateAroundAxis", |a| {
+        let (axis, degrees) = (a.userdata::<Vector>(2, "Vector")?, a.number(3)? as f32);
+        entity::angle(a.lua, pose(a)?.1.rotated_about(axis, degrees))
+    })?;
+    def("AlignAngles", |a| {
+        let (from, to) = (a.userdata::<Angle>(2, "Angle")?, a.userdata::<Angle>(3, "Angle")?);
+        entity::angle(a.lua, entity::align(pose(a)?.1, from, to))
     })?;
     def("LocalToWorldVector", |a| {
         let v = a.userdata::<Vector>(2, "Vector")?;
