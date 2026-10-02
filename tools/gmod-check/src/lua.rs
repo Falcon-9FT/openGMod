@@ -1,7 +1,7 @@
 //! `gmod-check lua`: starts the Lua of the game in one realm, as the engine would, and lists
 //! what failed - above all the functions of the engine that are not there yet. A client plays
 //! a second of frames with a server behind it, the HUD and the panels painted, and opens the
-//! spawn menu (Q) and the context menu (C) on the way.
+//! spawn menu (Q) and the context menu (C) on the way, clicking the first prop of the spawn menu.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -104,7 +104,8 @@ const KEY_C: i32 = 13;
 /// A second of a client's frames, with a server of its own behind it (on the map, if one is
 /// given): what the server has comes to the client every frame, what the client sends goes to
 /// the server, the HUD and the panels are painted; Q is held from the 10th frame to the
-/// 30th, C from the 35th to the 50th. What showed, and how the server did.
+/// 30th, and the first prop of the spawn menu clicked on the way; C is held from the 35th to
+/// the 50th. What showed, whether the click spawned the prop, and how the server did.
 fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> String {
     let server = match Runtime::new(Realm::Server, vfs) {
         Ok(server) => server,
@@ -123,6 +124,8 @@ fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> 
     client.set_local_player(player);
     let (mut most_panels, mut spawn_menu, mut context_menu) = (0, 0, 0);
     let mut vertices = 0;
+    // the first prop of the spawn list that shows, which is clicked
+    let mut clicked: Option<String> = None;
     for frame in 0..60 {
         let dt = 1.0 / 60.0;
         server.think(dt);
@@ -134,8 +137,17 @@ fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> 
         for line in client.take_server_commands() {
             server.run_player_command(player, &line);
         }
+        if frame == 20 {
+            let icon = client.lua().load(FIRST_ICON).eval::<(Option<String>, Option<i32>, Option<i32>)>();
+            if let Ok((Some(model), Some(x), Some(y))) = icon {
+                client.set_cursor(x, y);
+                clicked = Some(model);
+            }
+        }
         match frame {
             10 => client.button(KEY_Q, true),
+            21 if clicked.is_some() => client.button(MOUSE_LEFT, true),
+            22 if clicked.is_some() => client.button(MOUSE_LEFT, false),
             30 => client.button(KEY_Q, false),
             35 => client.button(KEY_C, true),
             50 => client.button(KEY_C, false),
@@ -151,12 +163,39 @@ fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> 
             _ => {}
         }
     }
+    let click = match clicked {
+        None => "The spawn menu showed no prop to click.".to_string(),
+        Some(model) => {
+            let spawned = server.lua().load(SPAWNED).call::<Option<String>>(model.as_str()).ok().flatten();
+            match spawned {
+                Some(class) => format!("A click on {model} in the spawn menu spawned a {class} on the server."),
+                None => format!("A click on {model} in the spawn menu spawned nothing on the server (is the model in the game?)."),
+            }
+        }
+    };
     format!(
         "Client: 60 frames, at most {most_panels} panels and {vertices} vertices; {spawn_menu} panels with the spawn menu open, \
-         {context_menu} with the context menu. Server behind it: {} errors.",
+         {context_menu} with the context menu. {click} Server behind it: {} errors.",
         server.errors().len()
     )
 }
+
+/// `MOUSE_LEFT`.
+const MOUSE_LEFT: i32 = 107;
+
+/// The first spawn icon that shows: its model and the middle of it on the screen.
+const FIRST_ICON: &str = "for _, p in ipairs(vgui.GetAll()) do
+        if p.ClassName == 'SpawnIcon' and p:IsVisible() then
+            local x, y = p:LocalToScreen(p:GetWide() / 2, p:GetTall() / 2)
+            return p:GetModelName(), math.floor(x), math.floor(y)
+        end
+    end";
+
+/// The class of an entity of the server with this model, if there is one.
+const SPAWNED: &str = "local model = string.lower(...)
+    for _, e in ipairs(ents.GetAll()) do
+        if string.lower(e:GetModel() or '') == model then return e:GetClass() end
+    end";
 
 /// Where the player got to in the first second, and what they hold.
 fn player_report(runtime: &Runtime) -> String {
