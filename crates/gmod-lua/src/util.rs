@@ -93,6 +93,15 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let ok = model.ends_with(".mdl") && host(a.lua).vfs.exists(&model, "GAME");
         Ok(Value::Boolean(ok))
     })?;
+    // a prop has a physics model of one solid, a ragdoll one of more
+    def("IsValidProp", |a| {
+        let model = a.string(1)?;
+        Ok(Value::Boolean(crate::physics::solids(a.lua, &model) == 1))
+    })?;
+    def("IsValidRagdoll", |a| {
+        let model = a.string(1)?;
+        Ok(Value::Boolean(crate::physics::solids(a.lua, &model) > 1))
+    })?;
     // precaching is for the renderer and the sound system, which load what they need
     def("PrecacheModel", |_| Ok(Value::Nil))?;
     def("PrecacheSound", |_| Ok(Value::Nil))?;

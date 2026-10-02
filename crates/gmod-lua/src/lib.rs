@@ -22,7 +22,8 @@
 //!   entities, the entities of a map), [`player`] (players: joining, spawning, dying, their
 //!   commands and movement, the `player` library), [`weapon`] (weapons in players' hands,
 //!   ammo types), [`movedata`] (`CMoveData`, `CUserCmd`), [`damage`] (`CTakeDamageInfo`,
-//!   taking damage), [`trace`] (`util.TraceLine` and the like), [`timer`] (`CurTime`,
+//!   taking damage), [`trace`] (`util.TraceLine` and the like), [`physics`] (bodies of
+//!   entities, `PhysObj`), [`timer`] (`CurTime`,
 //!   `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`] (`file`, `File`),
 //!   [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`] (`Material`),
 //!   [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and [`world`] (`ai`
@@ -32,8 +33,8 @@
 //!   its bases, scripted entities and weapons, the hooks up to `Initialize`; the entities of
 //!   the map ([`Runtime::spawn_map`]); players joining ([`Runtime::join`]) and what they press
 //!   ([`Runtime::set_input`]); then [`Runtime::think`] moves time on, runs timers, and for
-//!   every tick the players' commands and movement, the entities that think and the `Tick`
-//!   hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`])
+//!   every tick the players' commands and movement, the bodies of physics, the entities that
+//!   think and the `Tick` hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`])
 //!   and the models of the entities they see ([`Runtime::drawn`]).
 //!
 //! Errors in scripts are not errors of the runtime: as in GMod, a file that fails is
@@ -64,6 +65,7 @@ pub mod matrix;
 pub mod meta;
 pub mod movedata;
 pub mod net;
+pub mod physics;
 pub mod player;
 pub mod sandbox;
 pub mod sql;
@@ -227,6 +229,7 @@ pub(crate) struct Host {
     pub world: trace::World,
     pub weapons: weapon::Weapons,
     pub players: player::Players,
+    pub physics: physics::World,
 }
 
 impl Host {
@@ -296,6 +299,7 @@ impl Runtime {
             world: trace::World::default(),
             weapons: weapon::Weapons::default(),
             players: player::Players::default(),
+            physics: physics::World::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -394,9 +398,9 @@ impl Runtime {
 
     /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
     /// answers to `HTTP` requests that came in, the timers that are due, for every tick that
-    /// passed the players' commands and movement, the scripted entities that think and the
-    /// `Tick` hook, each at its own `CurTime`; the `Think` hook; then the entities removed in
-    /// the frame go.
+    /// passed the players' commands and movement, the bodies of physics, the scripted entities
+    /// that think and the `Tick` hook, each at its own `CurTime`; the `Think` hook; then the
+    /// entities removed in the frame go.
     pub fn think(&self, seconds: f64) {
         let (before, end, ticks) = {
             let clock = &host(&self.lua).clock;
@@ -414,6 +418,7 @@ impl Runtime {
         for tick in 1..=ticks {
             host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::TICK_INTERVAL).min(end));
             player::tick_all(&self.lua);
+            physics::simulate(&self.lua);
             ents::think(&self.lua);
             self.call_hook("Tick", mlua::MultiValue::new());
         }

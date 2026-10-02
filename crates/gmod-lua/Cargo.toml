@@ -12,6 +12,7 @@ gmod-kv.workspace = true
 gmod-material.workspace = true
 gmod-model.workspace = true
 gmod-movement.workspace = true
+gmod-physics.workspace = true
 gmod-glua.workspace = true
 mlua.workspace = true
 rusqlite.workspace = true

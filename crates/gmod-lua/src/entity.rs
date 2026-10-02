@@ -115,6 +115,8 @@ pub struct Ent {
     pub player: Option<Box<crate::player::PlayerState>>,
     /// What only weapons have.
     pub weapon: Option<crate::weapon::WeaponState>,
+    /// Its body, when it has physics ([`crate::physics`]).
+    pub physics: Option<gmod_physics::BodyId>,
 }
 
 impl Ent {
@@ -164,6 +166,7 @@ impl Ent {
             think_request: None,
             player: None,
             weapon: None,
+            physics: None,
         }
     }
 
@@ -328,6 +331,8 @@ pub fn rotated_bounds(mins: Vector, maxs: Vector, angles: Angle) -> (Vector, Vec
 }
 
 const CACHE: &str = "gmod-lua.entities";
+/// `SOLID_VPHYSICS`: the entity collides as its physics body.
+const SOLID_VPHYSICS: i64 = 6;
 const NULL_ENTITY: &str = "gmod-lua.null-entity";
 
 /// The engine's types that are not entities: name, type ID, and whether only clients have it.
@@ -370,10 +375,10 @@ const TYPES: &[(&str, i32, bool)] = {
 const ENTITY_KINDS: &[(&str, bool)] =
     &[("Player", false), ("Weapon", false), ("NPC", false), ("Vehicle", false), ("NextBot", false), ("CSEnt", true)];
 
-/// The physics object of an entity. There is no physics yet (stage 4, Jolt): every one is
-/// invalid, as GMod's is for an entity without a physics model.
-#[derive(Debug, Clone, Copy)]
-pub struct PhysObjHandle;
+/// The physics object of an entity: valid while the entity has a body ([`crate::physics`]).
+/// That of an entity without one holds `NULL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysObjHandle(pub EntityHandle);
 
 impl UserData for PhysObjHandle {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
@@ -383,7 +388,17 @@ impl UserData for PhysObjHandle {
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "PhysObj", key));
-        methods.add_meta_function("__tostring", |_, _: AnyUserData| Ok("[NULL PhysObj]"));
+        methods.add_meta_function("__tostring", |lua, ud: AnyUserData| {
+            let phys = *ud.borrow::<PhysObjHandle>()?;
+            if !crate::physics::valid(lua, phys) {
+                return Ok("[NULL PhysObj]".to_string());
+            }
+            let class = host(lua).entities.get(phys.0).map(|ent| ent.class.clone()).unwrap_or_default();
+            Ok(format!("PhysObject [Entity [{}][{class}]]", phys.0.index.unwrap_or(0)))
+        });
+        methods.add_meta_function("__eq", |_, (a, b): (AnyUserData, AnyUserData)| {
+            Ok(matches!((a.borrow::<PhysObjHandle>(), b.borrow::<PhysObjHandle>()), (Ok(a), Ok(b)) if *a == *b))
+        });
     }
 }
 
@@ -530,6 +545,18 @@ fn write(a: &Args, f: impl FnOnce(&mut Ent)) -> mlua::Result<Value> {
     Ok(Value::Nil)
 }
 
+/// The points of a convex shape, as `PhysicsInitConvex` takes them: a sequence of Vectors.
+fn convex(table: &Table) -> mlua::Result<Vec<[f32; 3]>> {
+    table
+        .sequence_values::<AnyUserData>()
+        .map(|point| {
+            let point = point?;
+            let v = point.borrow::<Vector>()?;
+            Ok([v.x, v.y, v.z])
+        })
+        .collect()
+}
+
 pub(crate) fn vector(lua: &Lua, v: Vector) -> mlua::Result<Value> {
     Ok(Value::UserData(lua.create_userdata(v)?))
 }
@@ -560,6 +587,7 @@ pub(crate) fn set_world_pos(lua: &Lua, handle: EntityHandle, pos: Vector) {
         None => pos,
     };
     entities.with_mut(handle, |ent| ent.local_pos = local);
+    crate::physics::moved(lua, handle);
 }
 
 pub(crate) fn set_world_angles(lua: &Lua, handle: EntityHandle, angles: Angle) {
@@ -569,6 +597,7 @@ pub(crate) fn set_world_angles(lua: &Lua, handle: EntityHandle, angles: Angle) {
         None => angles,
     };
     entities.with_mut(handle, |ent| ent.local_angles = local);
+    crate::physics::moved(lua, handle);
 }
 
 /// Sets a model and the collision box it comes with: the hull of a studio model, the bounds
@@ -620,8 +649,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         host(lua).entities.insert(world, 0);
     }
 
-    let phys = meta::meta_table(lua, "PhysObj", type_id::PHYSOBJ)?;
-    phys.raw_set("IsValid", lua.create_function(|_, _: MultiValue| Ok(false))?)?;
+    crate::physics::install(lua)?;
 
     let def = |name: &'static str, f: fn(&Args) -> mlua::Result<Value>| -> mlua::Result<()> {
         entity.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
@@ -691,11 +719,15 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("GetLocalAngles", |a| angle(a.lua, read(a, |ent| ent.local_angles)?))?;
     def("SetLocalPos", |a| {
         let pos = a.userdata::<Vector>(2, "Vector")?;
-        write(a, |ent| ent.local_pos = pos)
+        write(a, |ent| ent.local_pos = pos)?;
+        crate::physics::moved(a.lua, this(a, 1)?);
+        Ok(Value::Nil)
     })?;
     def("SetLocalAngles", |a| {
         let angles = a.userdata::<Angle>(2, "Angle")?;
-        write(a, |ent| ent.local_angles = angles)
+        write(a, |ent| ent.local_angles = angles)?;
+        crate::physics::moved(a.lua, this(a, 1)?);
+        Ok(Value::Nil)
     })?;
     def("GetForward", |a| vector(a.lua, transform(a)?.1.vectors().0))?;
     def("GetRight", |a| vector(a.lua, transform(a)?.1.vectors().1))?;
@@ -1026,45 +1058,88 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         integer(crate::player::water_level(a.lua, handle).unwrap_or(0).into())
     })?;
     def("IsInWorld", |a| Ok(Value::Boolean(crate::trace::in_world(a.lua, transform(a)?.0))))?;
-    // no physics yet: initialising it fails, as for a model without a physics model; the
-    // entity is SOLID_VPHYSICS and MOVETYPE_VPHYSICS (6) all the same
+    // physics: the entity is SOLID_VPHYSICS and MOVETYPE_VPHYSICS (6) with a body or without
     def("PhysicsInit", |a| {
         let solid = a.number(2)? as i64;
         write(a, |ent| {
             ent.solid = solid;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(false))
+        let handle = this(a, 1)?;
+        let made = solid == SOLID_VPHYSICS && crate::physics::init_model(a.lua, handle);
+        if !made {
+            crate::physics::destroy(a.lua, handle);
+        }
+        Ok(Value::Boolean(made))
+    })?;
+    def("PhysicsInitStatic", |a| {
+        let solid = a.number(2)? as i64;
+        write(a, |ent| ent.solid = solid)?;
+        let handle = this(a, 1)?;
+        let made = crate::physics::init_model(a.lua, handle);
+        crate::physics::set_motion(a.lua, handle, false);
+        Ok(Value::Boolean(made))
+    })?;
+    // a shadow follows where Lua puts it: frozen, for now
+    def("PhysicsInitShadow", |a| {
+        let handle = this(a, 1)?;
+        write(a, |ent| ent.move_type = 6)?;
+        let made = crate::physics::init_model(a.lua, handle);
+        crate::physics::set_motion(a.lua, handle, false);
+        Ok(Value::Boolean(made))
     })?;
     def("PhysicsInitBox", |a| {
         let (mins, maxs) = (a.userdata::<Vector>(2, "Vector")?, a.userdata::<Vector>(3, "Vector")?);
         write(a, |ent| {
             (ent.mins, ent.maxs) = (mins, maxs);
-            ent.solid = 6;
+            ent.solid = SOLID_VPHYSICS;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(false))
+        let shape = gmod_physics::Shape::cuboid([mins.x, mins.y, mins.z], [maxs.x, maxs.y, maxs.z]);
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, shape)))
     })?;
     def("PhysicsInitSphere", |a| {
         let radius = a.number(2)? as f32;
         write(a, |ent| {
             (ent.mins, ent.maxs) = (Vector::new(-radius, -radius, -radius), Vector::new(radius, radius, radius));
-            ent.solid = 6;
+            ent.solid = SOLID_VPHYSICS;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(false))
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Sphere(radius))))
     })?;
-    // without physics objects a motion controller has nothing to move
+    def("PhysicsInitConvex", |a| {
+        let points = convex(&a.table(2)?)?;
+        write(a, |ent| {
+            ent.solid = SOLID_VPHYSICS;
+            ent.move_type = 6;
+        })?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(vec![points]))))
+    })?;
+    def("PhysicsInitMultiConvex", |a| {
+        let hulls = a.table(2)?.sequence_values::<Table>().map(|t| convex(&t?)).collect::<mlua::Result<Vec<_>>>()?;
+        write(a, |ent| {
+            ent.solid = SOLID_VPHYSICS;
+            ent.move_type = 6;
+        })?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(hulls))))
+    })?;
+    def("PhysicsDestroy", |a| {
+        crate::physics::destroy(a.lua, this(a, 1)?);
+        Ok(Value::Nil)
+    })?;
+    def("PhysWake", |a| {
+        crate::physics::wake(a.lua, this(a, 1)?);
+        Ok(Value::Nil)
+    })?;
+    // motion controllers are not simulated yet
     def("StartMotionController", |a| write(a, |_| ()))?;
     def("StopMotionController", |a| write(a, |_| ()))?;
-    def("GetPhysicsObject", |a| {
-        read(a, |_| ())?;
-        Ok(Value::UserData(a.lua.create_userdata(PhysObjHandle)?))
+    def("GetPhysicsObject", |a| crate::physics::push(a.lua, this(a, 1)?))?;
+    def("GetPhysicsObjectNum", |a| {
+        let handle = this(a, 1)?;
+        if a.number(2)? as i64 == 0 { crate::physics::push(a.lua, handle) } else { crate::physics::push(a.lua, EntityHandle::NULL) }
     })?;
-    def("GetPhysicsObjectCount", |a| {
-        read(a, |_| ())?;
-        integer(0)
-    })?;
+    def("GetPhysicsObjectCount", |a| integer(i64::from(crate::physics::body(a.lua, this(a, 1)?).is_some())))?;
 
     // flags
     def("GetFlags", |a| integer(read(a, |ent| ent.flags)?))?;

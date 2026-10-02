@@ -340,21 +340,46 @@ pub(crate) fn announce(lua: &Lua, handle: EntityHandle) {
     crate::call_hook(lua, "OnEntityCreated", MultiValue::from_iter([Value::UserData(ud)]));
 }
 
-/// `ent:Spawn()`: a SENT or SWEP runs its `Initialize`; a player spawns again.
+const SOLID_VPHYSICS: i64 = 6;
+const MOVETYPE_VPHYSICS: i64 = 6;
+
+/// Whether an engine class is a prop of physics: `prop_physics` and its kin
+/// (`prop_physics_multiplayer`, `_override`, `_respawnable`).
+fn is_physics_prop(class: &str) -> bool {
+    class.to_ascii_lowercase().starts_with("prop_physics")
+}
+
+/// `ent:Spawn()`: a SENT or SWEP runs its `Initialize`; a prop of physics takes its body; a
+/// player spawns again.
 pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
     if handle.kind == Kind::Player {
         crate::player::spawn(lua, handle);
         return;
     }
     let now = host(lua).clock.cur_time.get();
-    let scripted = host(lua).entities.with_mut(handle, |ent| {
+    let Some((scripted, prop, flags)) = host(lua).entities.with_mut(handle, |ent| {
         ent.spawned = true;
         ent.next_think = now;
-        ent.scripted
-    });
-    if scripted == Some(true)
-        && let Some(ud) = userdata(lua, handle)
-    {
+        (ent.scripted, !ent.scripted && is_physics_prop(&ent.class), ent.spawn_flags)
+    }) else {
+        return;
+    };
+    // the engine's props take their bodies when they spawn: frozen when the map says "motion
+    // disabled" (8), asleep when it says "start asleep" (1)
+    if prop {
+        host(lua).entities.with_mut(handle, |ent| {
+            ent.solid = SOLID_VPHYSICS;
+            ent.move_type = MOVETYPE_VPHYSICS;
+        });
+        if crate::physics::init_model(lua, handle) {
+            if flags & 8 != 0 {
+                crate::physics::set_motion(lua, handle, false);
+            } else if flags & 1 != 0 {
+                crate::physics::sleep(lua, handle);
+            }
+        }
+    }
+    if scripted && let Some(ud) = userdata(lua, handle) {
         call_method(lua, &ud, "Initialize", MultiValue::new());
     }
 }
@@ -384,6 +409,7 @@ pub(crate) fn remove(lua: &Lua, handle: EntityHandle) {
     crate::call_hook(lua, "EntityRemoved", MultiValue::from_iter([Value::UserData(ud.clone())]));
     invalidate_cache(lua, kind == Kind::Player);
     crate::player::forget(lua, handle);
+    crate::physics::destroy(lua, handle);
     if let Ok(Some(list)) = ud.named_user_value::<Option<Table>>("delete-on-remove") {
         for other in list.sequence_values::<Value>().flatten() {
             if let Some(other) = entity::handle_of(Some(&other)) {
@@ -586,6 +612,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
         *host.world.collision.borrow_mut() = map.collision.clone();
         *host.world.textures.borrow_mut() = map.textures.clone();
     }
+    crate::physics::load_world(lua, map.collision.as_deref());
     let world = EntityHandle::WORLD;
     let world_bounds = model_bounds(lua, "*0").unwrap_or_default();
     host(lua).entities.with_mut(world, |ent| {

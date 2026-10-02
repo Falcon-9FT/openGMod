@@ -1539,3 +1539,157 @@ fn what_is_drawn_of_the_entities() {
     assert_eq!(g.printed(), "openGMOD\t6\n");
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
+
+/// A server with [`ENTITY_LUA`] on [`player_map`] with these entities more, and two models of
+/// a box 16 units wide and high: `models/crate.mdl`, a prop of 25 kg of wood, and
+/// `models/doll.mdl`, a ragdoll of two such boxes.
+fn physics_game(entities: &[&[(&str, &str)]]) -> Game {
+    use gmod_model::testmodel::{self, TestConvex};
+    let mdl = testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let part = || vec![TestConvex::cuboid([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0])];
+    let crate_phy = testmodel::phy(1, &[part()], false, "solid { \"index\" \"0\" \"mass\" \"25\" \"surfaceprop\" \"wood\" }");
+    let doll_phy = testmodel::phy(1, &[part(), part()], false, "");
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/crate.mdl", &mdl),
+            ("models/crate.phy", &crate_phy),
+            ("models/doll.mdl", &mdl),
+            ("models/doll.phy", &doll_phy),
+        ],
+    );
+    g.runtime.init();
+    let mut map = player_map();
+    map.entities.extend(entities.iter().map(|list| list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()));
+    g.runtime.spawn_map(&map);
+    g
+}
+
+#[test]
+fn props_fall_and_come_to_rest() {
+    let g = physics_game(&[]);
+    assert!(g.eval::<bool>(
+        "local p = ents.Create('prop_physics') p:SetModel('models/crate.mdl') p:SetPos(Vector(-200, 0, 100)) p:Spawn() CRATE = p
+         local phys = p:GetPhysicsObject()
+         return phys:IsValid() and phys:GetEntity() == p and math.abs(phys:GetMass() - 25) < 0.01 and phys:GetMaterial() == 'wood'
+             and p:GetSolid() == SOLID_VPHYSICS and p:GetMoveType() == MOVETYPE_VPHYSICS and p:GetPhysicsObjectCount() == 1
+             and tostring(phys):match('^PhysObject %[Entity %[%d+%]%[prop_physics%]%]$') ~= nil and phys == p:GetPhysicsObject()
+             and phys:GetPos() == Vector(-200, 0, 100) and phys:IsMotionEnabled() and not phys:IsAsleep()"
+    ));
+    // a third of a second in it falls as gravity says, v = g t; it then lies on the floor
+    g.runtime.think(1.0 / 3.0);
+    assert!(g.eval::<bool>("return math.abs(CRATE:GetVelocity().z + 200) < 15 and CRATE:GetPos().z < 100"));
+    g.runtime.think(4.0);
+    assert!(g.eval::<bool>(
+        "local phys = CRATE:GetPhysicsObject()
+         return math.abs(CRATE:GetPos().z) < 0.5 and CRATE:GetAngles():IsEqualTol(Angle(0, 0, 0), 0.5) and phys:IsAsleep()"
+    ));
+    // the server's gravity
+    assert!(g.eval::<bool>(
+        "RunConsoleCommand('sv_gravity', '0') CRATE:SetPos(Vector(-200, 0, 100)) CRATE:GetPhysicsObject():Wake() return true"
+    ));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>("return math.abs(CRATE:GetPos().z - 100) < 0.01"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn physics_objects() {
+    let g = physics_game(&[]);
+    assert!(g.eval::<bool>(
+        "local p = ents.Create('prop_physics') p:SetModel('models/crate.mdl') p:SetPos(Vector(-200, 0, 100)) p:Spawn() CRATE = p
+         PHYS = p:GetPhysicsObject()
+         -- the entity moved, the body goes along
+         p:SetPos(Vector(-300, 0, 200)) p:SetAngles(Angle(0, 90, 0))
+         local moved = PHYS:GetPos() == Vector(-300, 0, 200) and PHYS:GetAngles():IsEqualTol(Angle(0, 90, 0), 0.01)
+         PHYS:SetPos(Vector(-300, 0, 150))
+         local back = p:GetPos() == Vector(-300, 0, 150)
+         local mins, maxs = PHYS:GetAABB()
+         PHYS:EnableMotion(false)
+         return moved and back and mins == Vector(-8, -8, 0) and maxs == Vector(8, 8, 16) and not PHYS:IsMotionEnabled()
+             and PHYS:LocalToWorld(Vector(8, 0, 0)):IsEqualTol(Vector(-300, 8, 150), 0.01)
+             and PHYS:WorldToLocal(Vector(-300, 8, 150)):IsEqualTol(Vector(8, 0, 0), 0.01)
+             and math.abs(PHYS:GetVolume() - 16 * 16 * 16) < 1"
+    ));
+    g.runtime.think(1.0);
+    // frozen, it stays; a push of 2500 kg·units/s gives its 25 kg 100 units/s
+    assert!(g.eval::<bool>(
+        "local stayed = CRATE:GetPos() == Vector(-300, 0, 150)
+         PHYS:EnableMotion(true) PHYS:EnableGravity(false) PHYS:Wake()
+         PHYS:ApplyForceCenter(Vector(0, 0, 2500))
+         local pushed = PHYS:GetVelocity():IsEqualTol(Vector(0, 0, 100), 0.01)
+         PHYS:SetVelocity(Vector(10, 0, 0)) PHYS:SetAngleVelocity(Vector(0, 0, 90))
+         return stayed and pushed and not PHYS:IsGravityEnabled() and PHYS:GetVelocity():IsEqualTol(Vector(10, 0, 0), 0.01)
+             and PHYS:GetAngleVelocity():IsEqualTol(Vector(0, 0, 90), 0.01)"
+    ));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>(
+        "return CRATE:GetPos():IsEqualTol(Vector(-290, 0, 150), 0.5) and math.abs(math.abs(CRATE:GetAngles().y) - 180) < 1
+             and CRATE:GetVelocity():IsEqualTol(Vector(10, 0, 0), 0.01)"
+    ));
+    // a box and a ball of Lua's; a prop without a physics model has no body
+    assert!(g.eval::<bool>(
+        "local b = ents.Create('prop_physics') b:SetPos(Vector(-400, 0, 50))
+         local boxed = b:PhysicsInitBox(Vector(-4, -4, -4), Vector(4, 4, 4)) and b:GetPhysicsObject():IsValid()
+         local s = ents.Create('prop_physics') s:SetPos(Vector(-400, 100, 50))
+         local ball = s:PhysicsInitSphere(8) and s:GetPhysicsObject():IsValid()
+         local none = ents.Create('prop_physics') none:SetModel('models/none.mdl') none:Spawn()
+         return boxed and ball and b:GetSolid() == SOLID_VPHYSICS and not none:GetPhysicsObject():IsValid()
+             and not none:PhysicsInit(SOLID_VPHYSICS)"
+    ));
+    // a NULL physics object says so, and one whose entity is gone is NULL
+    assert!(g.eval::<bool>(
+        "local null = ents.Create('info_target'):GetPhysicsObject()
+         local ok, err = pcall(null.GetMass, null)
+         CRATE:Remove()
+         local gone, err2 = pcall(PHYS.Wake, PHYS)
+         return not null:IsValid() and tostring(null) == '[NULL PhysObj]' and not ok and tostring(err):find('Tried to use a NULL physics object!', 1, true)
+             and not PHYS:IsValid() and not gone and tostring(err2):find('NULL physics object', 1, true)"
+    ));
+    // what sandbox asks of a model before it spawns one
+    assert!(g.eval::<bool>(
+        "return util.IsValidProp('models/crate.mdl') and not util.IsValidRagdoll('models/crate.mdl')
+             and util.IsValidRagdoll('models/doll.mdl') and not util.IsValidProp('models/doll.mdl') and not util.IsValidProp('models/none.mdl')"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn props_of_the_map() {
+    let g = physics_game(&[
+        &[
+            ("classname", "prop_physics"),
+            ("targetname", "frozen"),
+            ("model", "models/crate.mdl"),
+            ("origin", "-200 0 100"),
+            ("spawnflags", "8"),
+        ],
+        &[
+            ("classname", "prop_physics_multiplayer"),
+            ("targetname", "asleep"),
+            ("model", "models/crate.mdl"),
+            ("origin", "-300 0 100"),
+            ("spawnflags", "1"),
+        ],
+        &[
+            ("classname", "prop_physics_override"),
+            ("targetname", "falls"),
+            ("model", "models/crate.mdl"),
+            ("origin", "-400 0 100"),
+            ("angles", "0 45 0"),
+        ],
+    ]);
+    g.runtime.think(3.0);
+    assert!(g.eval::<bool>(
+        "local frozen, asleep, falls = ents.FindByName('frozen')[1], ents.FindByName('asleep')[1], ents.FindByName('falls')[1]
+         return frozen:GetPos() == Vector(-200, 0, 100) and not frozen:GetPhysicsObject():IsMotionEnabled()
+             and asleep:GetPos() == Vector(-300, 0, 100) and asleep:GetPhysicsObject():IsAsleep()
+             and math.abs(falls:GetPos().z) < 0.5 and math.abs(falls:GetAngles().y - 45) < 0.5"
+    ));
+    // woken, it falls too
+    g.runtime.run_string("ents.FindByName('asleep')[1]:GetPhysicsObject():Wake()", "wake").unwrap();
+    g.runtime.think(3.0);
+    assert!(g.eval::<bool>("return math.abs(ents.FindByName('asleep')[1]:GetPos().z) < 0.5"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
