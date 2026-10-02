@@ -1,0 +1,9 @@
+[package]
+name = "gmod-physics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Physics of props as Garry's Mod has it, on Rapier: bodies of convex hulls in a world of brushes, in the game's units"
+
+[dependencies]
+rapier3d.workspace = true

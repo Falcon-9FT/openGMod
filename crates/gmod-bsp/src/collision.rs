@@ -289,6 +289,42 @@ struct Static {
     maxs: Vec3,
 }
 
+/// What is solid in a map as shapes for a physics engine, in the world's space.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SolidShapes {
+    /// Convex solids by their corners: each brush, and each hull of a static prop.
+    pub hulls: Vec<Vec<Vec3>>,
+    /// The displacements' triangles, as indices of `vertices`.
+    pub vertices: Vec<Vec3>,
+    pub triangles: Vec<[u32; 3]>,
+}
+
+/// The corners of the solid behind all of `sides`: where three of their planes meet, inside the
+/// rest.
+fn corners(sides: &[Bound]) -> Vec<Vec3> {
+    let mut out: Vec<Vec3> = Vec::new();
+    for (i, a) in sides.iter().enumerate() {
+        for (j, b) in sides.iter().enumerate().skip(i + 1) {
+            for c in &sides[j + 1..] {
+                let det = dot(a.normal, cross(b.normal, c.normal));
+                if det.abs() < 1e-6 {
+                    continue;
+                }
+                let sum = add(
+                    add(scale(cross(b.normal, c.normal), a.dist), scale(cross(c.normal, a.normal), b.dist)),
+                    scale(cross(a.normal, b.normal), c.dist),
+                );
+                let p = scale(sum, 1.0 / det);
+                let inside = sides.iter().all(|s| dot(s.normal, p) <= s.dist + 0.01);
+                if inside && !out.iter().any(|&q| length(sub(p, q)) < 0.01) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// What a sweep found.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Trace {
@@ -610,6 +646,48 @@ impl Collision {
             maxs = std::array::from_fn(|i| maxs[i].max(p[i]));
         }
         self.statics.push(Static { shape, prop, frame, mins, maxs });
+    }
+
+    /// What is solid for `mask` as shapes for a physics engine: the brushes of the world and
+    /// of the solid brush entities where the map puts them, the static props' hulls and the
+    /// displacements' triangles.
+    pub fn solid_shapes(&self, mask: u32) -> SolidShapes {
+        let mut out = SolidShapes::default();
+        for placement in &self.placements {
+            let Some(&head) = self.heads.get(placement.model) else { continue };
+            let mut seen = vec![false; self.brushes.len()];
+            let mut stack = vec![head];
+            while let Some(node) = stack.pop() {
+                let Ok(index) = usize::try_from(node) else {
+                    let leaf = self.leaves[(-1 - node) as usize];
+                    for &b in &self.leaf_brushes[leaf.first_brush as usize..(leaf.first_brush + leaf.brushes) as usize] {
+                        let brush = self.brushes[b as usize];
+                        if std::mem::replace(&mut seen[b as usize], true) || brush.contents & mask == 0 {
+                            continue;
+                        }
+                        let corners = corners(&self.sides[brush.first_side as usize..(brush.first_side + brush.sides) as usize]);
+                        if corners.len() >= 4 {
+                            out.hulls.push(corners.into_iter().map(|p| placement.frame.world_point(p)).collect());
+                        }
+                    }
+                    continue;
+                };
+                stack.extend(self.nodes[index].children);
+            }
+        }
+        for displacement in self.displacements.iter().filter(|d| d.contents & mask != 0) {
+            for triangle in &displacement.triangles {
+                let first = out.vertices.len() as u32;
+                out.vertices.extend(triangle.points);
+                out.triangles.push([first, first + 1, first + 2]);
+            }
+        }
+        for prop in &self.statics {
+            for hull in self.shapes.get(prop.shape).into_iter().flatten() {
+                out.hulls.push(hull.points.iter().map(|&p| prop.frame.world_point(p)).collect());
+            }
+        }
+        out
     }
 
     /// Sweeps a box - `mins` to `maxs` around the point that moves - from `start` to `end`

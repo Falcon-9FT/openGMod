@@ -10,6 +10,7 @@ members = [
     "crates/gmod-model",
     "crates/gmod-world",
     "crates/gmod-movement",
+    "crates/gmod-physics",
     "crates/gmod-render",
     "crates/gmod-app",
     "tools/gmod-check",
@@ -18,7 +19,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 repository = "https://github.com/Falcon-9FT/openGMod"
 
 [workspace.dependencies]
@@ -31,6 +32,7 @@ gmod-material = { path = "crates/gmod-material" }
 gmod-model = { path = "crates/gmod-model" }
 gmod-world = { path = "crates/gmod-world" }
 gmod-movement = { path = "crates/gmod-movement" }
+gmod-physics = { path = "crates/gmod-physics" }
 gmod-render = { path = "crates/gmod-render" }
 # LuaJIT 2.1, built from source with the crate
 mlua = { version = "0.12.1", features = ["luajit", "vendored"] }
@@ -40,6 +42,8 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 # that scans HTTPS adds its root there). Pinned exactly: the resolver that keeps requests off
 # private networks uses ureq's `unversioned` API
 ureq = { version = "=3.4.2", features = ["platform-verifier"] }
+# physics of props: pure Rust, no C++ to build
+rapier3d = "0.36.0"
 # the GPU: Direct3D 12 and Vulkan only - no OpenGL, no Metal until macOS
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }

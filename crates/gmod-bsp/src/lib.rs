@@ -26,7 +26,7 @@ mod math;
 pub mod mesh;
 pub mod props;
 
-pub use collision::{Collision, Trace, mask};
+pub use collision::{Collision, SolidShapes, Trace, mask};
 pub use entities::{Entity, parse_entities};
 pub use lighting::{luxels, rgbe_to_linear};
 pub use lumps::{
