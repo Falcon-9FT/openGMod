@@ -54,6 +54,8 @@ CONTROLS:
     W A S D to walk, Shift to run, Alt to walk slowly, Space to jump, Ctrl to duck
     left and right mouse buttons to fire, R to reload, E to use, F for the flashlight
     1 to 6 and the mouse wheel to choose a weapon, Z to undo
+    the physics gun: hold the left button to carry, the wheel to take it farther or
+    nearer, E and the mouse to turn it, the right button to freeze it, R to unfreeze
     V to fly through walls (noclip) and back
     F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)
 
@@ -360,6 +362,11 @@ struct App {
     keys: HashSet<KeyCode>,
     /// The left and right mouse buttons held, while the mouse is captured.
     mouse: [bool; 2],
+    /// The mouse wheel and the mouse's movement since the last command.
+    wheel: i32,
+    mouse_moved: [f64; 2],
+    /// The physics gun holds something: the wheel and, with E, the mouse are its.
+    holding: bool,
     captured: bool,
     last_frame: Instant,
     frames: u32,
@@ -443,6 +450,7 @@ impl App {
             reload: held(KeyCode::KeyR),
             using: held(KeyCode::KeyE),
             walk: held(KeyCode::AltLeft) || held(KeyCode::AltRight),
+            ..Buttons::default()
         }
     }
 
@@ -471,9 +479,13 @@ impl App {
 
     /// A frame of the game: the player's command, the ticks, and the eyes to see from.
     fn play(&mut self, seconds: f32) {
-        let (keys, buttons) = (self.movement_keys(), self.buttons());
+        let (keys, mut buttons) = (self.movement_keys(), self.buttons());
+        buttons.wheel = std::mem::take(&mut self.wheel);
+        buttons.mouse = self.mouse_moved.map(|counts| counts.trunc() as i32);
+        self.mouse_moved = self.mouse_moved.map(f64::fract);
         let Some(game) = &mut self.game else { return };
         let Some(shown) = game.frame(&keys, &buttons, self.camera.pitch, self.camera.yaw, f64::from(seconds)) else { return };
+        self.holding = shown.view.holding;
         self.camera.eye = shown.eye;
         if let Some((pitch, yaw)) = shown.turned {
             (self.camera.pitch, self.camera.yaw) = (pitch, yaw);
@@ -603,7 +615,11 @@ impl ApplicationHandler for App {
                 if let Some(game) = &self.game
                     && self.captured
                 {
-                    game.command(if up { "invprev" } else { "invnext" });
+                    if self.holding {
+                        self.wheel += if up { 1 } else { -1 };
+                    } else {
+                        game.command(if up { "invprev" } else { "invnext" });
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(key), state, repeat, .. }, .. } => {
@@ -649,8 +665,12 @@ impl ApplicationHandler for App {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
             && self.captured
         {
-            self.camera.yaw -= dx as f32 * MOUSE_DEGREES;
-            self.camera.pitch = (self.camera.pitch + dy as f32 * MOUSE_DEGREES).clamp(-89.0, 89.0);
+            self.mouse_moved = [self.mouse_moved[0] + dx, self.mouse_moved[1] + dy];
+            // E with the physics gun holding something: the mouse turns that, not the view
+            if !(self.holding && self.keys.contains(&KeyCode::KeyE)) {
+                self.camera.yaw -= dx as f32 * MOUSE_DEGREES;
+                self.camera.pitch = (self.camera.pitch + dy as f32 * MOUSE_DEGREES).clamp(-89.0, 89.0);
+            }
         }
     }
 }
@@ -720,6 +740,9 @@ fn main() -> ExitCode {
         error: None,
         keys: HashSet::new(),
         mouse: [false; 2],
+        wheel: 0,
+        mouse_moved: [0.0; 2],
+        holding: false,
         captured: false,
         last_frame: now,
         frames: 0,

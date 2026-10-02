@@ -22,12 +22,12 @@
 //!   entities, the entities of a map), [`player`] (players: joining, spawning, dying, their
 //!   commands and movement, the `player` library), [`weapon`] (weapons in players' hands,
 //!   ammo types), [`movedata`] (`CMoveData`, `CUserCmd`), [`damage`] (`CTakeDamageInfo`,
-//!   taking damage), [`trace`] (`util.TraceLine` and the like), [`physics`] (bodies of
-//!   entities, `PhysObj`), [`timer`] (`CurTime`,
-//!   `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`] (`file`, `File`),
-//!   [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`] (`Material`),
-//!   [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and [`world`] (`ai`
-//!   and `motionsensor`, as they answer while there are no NPCs). They grow towards the whole
+//!   taking damage), [`effect`] (`EffectData`, `util.Effect`), [`trace`] (`util.TraceLine` and
+//!   the like), [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`),
+//!   [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
+//!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`]
+//!   (`Material`), [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and
+//!   [`world`] (`ai` and `motionsensor`, as they answer while there are no NPCs). They grow towards the whole
 //!   API - `gmod-check lua` counts how much of it is there.
 //! * starting the game ([`Runtime::start`]): `includes/init.lua`, autorun, the gamemode and
 //!   its bases, scripted entities and weapons, the hooks up to `Initialize`; the entities of
@@ -54,6 +54,7 @@ mod args;
 pub mod console;
 pub mod convar;
 pub mod damage;
+pub mod effect;
 pub mod engine;
 pub mod entity;
 pub mod ents;
@@ -65,6 +66,7 @@ pub mod matrix;
 pub mod meta;
 pub mod movedata;
 pub mod net;
+pub mod physgun;
 pub mod physics;
 pub mod player;
 pub mod sandbox;
@@ -230,6 +232,7 @@ pub(crate) struct Host {
     pub weapons: weapon::Weapons,
     pub players: player::Players,
     pub physics: physics::World,
+    pub physgun: physgun::Guns,
 }
 
 impl Host {
@@ -300,6 +303,7 @@ impl Runtime {
             weapons: weapon::Weapons::default(),
             players: player::Players::default(),
             physics: physics::World::default(),
+            physgun: physgun::Guns::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -314,6 +318,7 @@ impl Runtime {
         entity::install(&lua, realm)?;
         util::install(&lua)?;
         trace::install(&lua)?;
+        effect::install(&lua)?;
         material::install(&lua)?;
         world::install(&lua)?;
         ents::install(&lua, realm)?;
@@ -418,6 +423,7 @@ impl Runtime {
         for tick in 1..=ticks {
             host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::TICK_INTERVAL).min(end));
             player::tick_all(&self.lua);
+            physgun::think(&self.lua);
             physics::simulate(&self.lua);
             ents::think(&self.lua);
             self.call_hook("Tick", mlua::MultiValue::new());

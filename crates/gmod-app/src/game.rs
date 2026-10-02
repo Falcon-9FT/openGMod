@@ -29,6 +29,10 @@ pub struct Buttons {
     pub using: bool,
     /// Walking slowly (Alt).
     pub walk: bool,
+    /// Notches the mouse wheel turned since the last command, up positive.
+    pub wheel: i32,
+    /// How far the mouse moved since the last command, right and down, in its own counts.
+    pub mouse: [i32; 2],
 }
 
 /// The command the keys make, looking along `pitch` and `yaw`: how the player moves and the
@@ -54,6 +58,9 @@ pub fn command(keys: &Keys, buttons: &Buttons, pitch: f32, yaw: f32) -> UserCmd 
         forward_move: axis(keys.forward, keys.back),
         side_move: axis(keys.right, keys.left),
         buttons: held.iter().filter(|(on, _)| *on).fold(0, |all, (_, bit)| all | bit),
+        mouse_wheel: buttons.wheel,
+        mouse_x: buttons.mouse[0],
+        mouse_y: buttons.mouse[1],
         ..UserCmd::default()
     }
 }
@@ -108,15 +115,16 @@ impl Game {
         self.impulse = IMPULSE_FLASHLIGHT;
     }
 
-    /// One frame of `seconds`: the lines typed into the terminal, then the ticks of the game
-    /// with the command the keys make.
+    /// One frame of `seconds`: the command the keys make, the lines typed into the terminal
+    /// (after it, so that what they do to the player - `SetEyeAngles` - stands), then the
+    /// ticks of the game.
     pub fn frame(&mut self, keys: &Keys, buttons: &Buttons, pitch: f32, yaw: f32, seconds: f64) -> Option<Shown> {
-        while let Ok(line) = self.console.try_recv() {
-            self.command(&line);
-        }
         let mut cmd = command(keys, buttons, pitch, yaw);
         cmd.impulse = std::mem::take(&mut self.impulse);
         self.runtime.set_input(self.player, cmd);
+        while let Ok(line) = self.console.try_recv() {
+            self.command(&line);
+        }
         self.runtime.think(seconds);
         let view = self.runtime.view(self.player)?;
         let eye = between(view.previous_eye, view.eye, self.runtime.tick_fraction());
@@ -289,9 +297,10 @@ mod tests {
     #[test]
     fn keys_make_a_command() {
         let keys = Keys { forward: true, left: true, run: true, ..Keys::default() };
-        let buttons = Buttons { attack: true, using: true, ..Buttons::default() };
+        let buttons = Buttons { attack: true, using: true, wheel: -1, mouse: [3, -4], ..Buttons::default() };
         let cmd = command(&keys, &buttons, 10.0, 90.0);
         assert_eq!(cmd.view_angles, Angle::new(10.0, 90.0, 0.0));
+        assert_eq!((cmd.mouse_wheel, cmd.mouse_x, cmd.mouse_y), (-1, 3, -4));
         assert_eq!((cmd.forward_move, cmd.side_move), (FULL_MOVE, -FULL_MOVE));
         assert_eq!(cmd.buttons, key::FORWARD | key::MOVELEFT | key::SPEED | key::ATTACK | key::USE);
     }
@@ -314,6 +323,7 @@ mod tests {
             health: 80,
             armor: 0,
             weapon: Some(gmod_lua::WeaponView { class: "weapon_pistol".into(), name: "#HL2_Pistol".into(), clip: 12, ammo: 36 }),
+            holding: false,
         };
         assert_eq!(status(&view), "health 80 - weapon_pistol 12/36");
         view.weapon = None;

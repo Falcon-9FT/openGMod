@@ -100,6 +100,8 @@ pub struct Ent {
     pub use_type: i64,
     pub trigger: bool,
     pub custom_collisions: bool,
+    /// Kept across map loads by sandbox (`SetPersistent`).
+    pub persistent: bool,
     pub transmit_with_parent: bool,
     pub mins: Vector,
     pub maxs: Vector,
@@ -155,6 +157,7 @@ impl Ent {
             use_type: 0,
             trigger: false,
             custom_collisions: false,
+            persistent: false,
             transmit_with_parent: false,
             mins: Vector::default(),
             maxs: Vector::default(),
@@ -1045,6 +1048,11 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("EnableCustomCollisions", |a| {
         let enable = a.boolean(2);
         write(a, |ent| ent.custom_collisions = enable)
+    })?;
+    def("GetPersistent", |a| Ok(Value::Boolean(read(a, |ent| ent.persistent)?)))?;
+    def("SetPersistent", |a| {
+        let persistent = a.boolean(2);
+        write(a, |ent| ent.persistent = persistent)
     })?;
     def("SetTransmitWithParent", |a| {
         let with_parent = a.boolean(2);

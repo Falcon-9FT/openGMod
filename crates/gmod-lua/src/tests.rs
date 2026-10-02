@@ -1693,3 +1693,99 @@ fn props_of_the_map() {
     assert!(g.eval::<bool>("return math.abs(ents.FindByName('asleep')[1]:GetPos().z) < 0.5"));
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
+
+/// Looking along `pitch` and `yaw` with these keys held.
+fn aiming(pitch: f32, yaw: f32, buttons: u32) -> UserCmd {
+    UserCmd { view_angles: vector::Angle::new(pitch, yaw, 0.0), buttons, ..UserCmd::default() }
+}
+
+#[test]
+fn the_physics_gun() {
+    use player::key::{ATTACK, ATTACK2, RELOAD, USE};
+    let g = physics_game(&[]);
+    g.runtime
+        .run_string(
+            "HOOKS.PlayerSelectSpawn = function(p) return ents.FindByClass('info_player_start')[1] end
+             HOOKS.PlayerSpawn = function(p) p:Give('weapon_physgun') end
+             HOOKS.PhysgunPickup = function(p, e) return not e:IsPlayer() and not e.NoPickup end
+             HOOKS.OnPhysgunPickup = function(p, e) print('picked', e:GetName()) end
+             HOOKS.PhysgunDrop = function(p, e) print('dropped', e:GetName()) end
+             HOOKS.OnPhysgunFreeze = function(w, phys, e, p) phys:EnableMotion(false) print('froze', w:GetClass(), e:GetName()) end
+             HOOKS.OnPhysgunReload = function(w, p) print('reload', w:GetClass(), p:Nick()) end
+             local function crate(name, pos) local c = ents.Create('prop_physics') c:SetModel('models/crate.mdl') c:SetName(name) c:SetPos(pos) c:Spawn() return c end
+             CRATE = crate('crate', Vector(0, 100, 0))
+             crate('heavy', Vector(100, 0, 0)).NoPickup = true",
+            "physgun",
+        )
+        .unwrap();
+    let alice = g.runtime.join(alice()).unwrap();
+    assert_eq!(g.runtime.view(alice).unwrap().weapon.map(|w| w.class), Some("weapon_physgun".to_string()));
+    // the crate's near side, 8 units up: 92 units along y and 52 down from the eyes at 64
+    let down = (52.0f32 / 92.0).atan().to_degrees();
+    g.runtime.set_input(alice, aiming(down, 90.0, ATTACK));
+    g.runtime.think(0.02);
+    assert_eq!(g.printed(), "picked\tcrate\n");
+    assert!(g.runtime.view(alice).unwrap().holding);
+    // looking straight ahead it comes up there, by the point it was taken at
+    g.runtime.set_input(alice, aiming(0.0, 90.0, ATTACK));
+    g.runtime.think(1.0);
+    let far = (92.0f32 * 92.0 + 52.0 * 52.0).sqrt();
+    assert!(g.eval::<bool>(&format!(
+        "return CRATE:GetPos():IsEqualTol(Vector(0, {} + 8, 64 - 12), 1) and CRATE:GetAngles():IsEqualTol(Angle(0, 0, 0), 1)",
+        far
+    )));
+    // turning round, it goes round with the player and turns as they turn
+    g.runtime.set_input(alice, aiming(0.0, 180.0, ATTACK));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>(&format!(
+        "return CRATE:GetPos():IsEqualTol(Vector(-{far} - 8, 0, 52), 1) and math.abs(CRATE:GetAngles().y - 90) < 1"
+    )));
+    // the wheel takes it farther; with E the mouse turns it, and the view stays
+    g.runtime.set_input(alice, UserCmd { mouse_wheel: 2, ..aiming(0.0, 180.0, ATTACK) });
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>(&format!("return CRATE:GetPos():IsEqualTol(Vector(-{far} - 48, 0, 52), 1)")));
+    g.runtime.set_input(alice, UserCmd { mouse_x: 50, ..aiming(0.0, 200.0, ATTACK | USE) });
+    g.runtime.think(1.0);
+    assert_eq!(g.runtime.view(alice).unwrap().angles, vector::Angle::new(0.0, 180.0, 0.0));
+    assert!(g.eval::<bool>("return math.abs(CRATE:GetAngles().y - 80) < 1"), "{}", g.eval::<String>("return tostring(CRATE:GetAngles())"));
+    // the right button freezes it there and lets go; the gun takes nothing until the left
+    // one comes up
+    g.runtime.set_input(alice, aiming(0.0, 180.0, ATTACK | ATTACK2));
+    g.runtime.think(0.5);
+    assert_eq!(g.printed(), "picked\tcrate\nfroze\tweapon_physgun\tcrate\ndropped\tcrate\n");
+    assert!(!g.runtime.view(alice).unwrap().holding);
+    assert!(g.eval::<bool>("return not CRATE:GetPhysicsObject():IsMotionEnabled() and CRATE:GetPos().z > 40"));
+    // R asks the gamemode to unfreeze; what the hook will not let go is not taken
+    g.runtime.set_input(alice, aiming(0.0, 180.0, RELOAD));
+    g.runtime.think(0.02);
+    let heavy_down = (56.0f32 / 92.0).atan().to_degrees();
+    g.runtime.set_input(alice, aiming(heavy_down, 0.0, ATTACK));
+    g.runtime.think(0.02);
+    assert_eq!(g.printed(), "picked\tcrate\nfroze\tweapon_physgun\tcrate\ndropped\tcrate\nreload\tweapon_physgun\tAlice\n");
+    // taken again, it moves again, and is dropped when the player dies
+    g.runtime.set_input(alice, aiming(0.0, 180.0, 0));
+    g.runtime.think(0.02);
+    g.runtime.set_input(alice, aiming(0.0, 180.0, ATTACK));
+    g.runtime.think(0.02);
+    assert!(g.eval::<bool>("return CRATE:GetPhysicsObject():IsMotionEnabled() and CRATE:GetPhysicsObject():IsGravityEnabled() == false"));
+    g.runtime.run_string("Entity(1):Kill()", "kill").unwrap();
+    g.runtime.think(0.02);
+    assert!(g.printed().ends_with("picked\tcrate\ndropped\tcrate\n"), "{}", g.printed());
+    assert!(g.eval::<bool>("return CRATE:GetPhysicsObject():IsGravityEnabled()"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn effects_and_persistence() {
+    let g = entity_game(Realm::Server);
+    assert!(g.eval::<bool>(
+        "local e = EffectData() e:SetOrigin(Vector(1, 2, 3)) e:SetScale(2) e:SetEntity(Entity(0)) e:SetFlags(3) e:SetAngles(Angle(0, 90, 0))
+         util.Effect('phys_freeze', e, true, true)
+         return e:GetOrigin() == Vector(1, 2, 3) and e:GetScale() == 2 and e:GetEntity() == Entity(0) and e:GetFlags() == 3
+             and e:GetAngles() == Angle(0, 90, 0) and e:GetNormal() == Vector(0, 0, 0) and e:GetEntIndex() == 0
+             and getmetatable(e).MetaName == 'CEffectData' and not pcall(util.Effect, 'phys_freeze')"
+    ));
+    assert!(g.eval::<bool>(
+        "local p = ents.Create('prop_physics') local was = p:GetPersistent() p:SetPersistent(true) return not was and p:GetPersistent()"
+    ));
+}

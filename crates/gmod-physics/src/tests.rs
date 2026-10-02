@@ -159,3 +159,26 @@ fn balls_and_what_has_no_volume() {
     physics.remove(ball);
     assert!(!physics.contains(ball));
 }
+
+#[test]
+fn steered_where_it_should_be() {
+    let mut physics = floor();
+    let body = physics.add(&crate_body([0.0, 0.0, 100.0])).unwrap();
+    // held in the air, a little off its centre, it goes there and turns so, gravity or not
+    for _ in 0..100 {
+        physics.steer(body, [50.0, 20.0, 150.0], [0.0, 90.0, 30.0], 0.05, 5000.0, 5000.0);
+        physics.step(TICK);
+    }
+    let (origin, angles) = physics.pose(body).unwrap();
+    assert!(near(origin, [50.0, 20.0, 150.0], 1.0) && near(angles, [0.0, 90.0, 30.0], 1.0), "{origin:?} {angles:?}");
+    // no faster than it may
+    physics.steer(body, [5050.0, 20.0, 150.0], [0.0, 90.0, 30.0], 0.05, 100.0, 5000.0);
+    let v = physics.velocity(body);
+    assert!((v[0] - 100.0).abs() < 1.0, "{v:?}");
+    // the floor stops it
+    for _ in 0..100 {
+        physics.steer(body, [50.0, 20.0, -100.0], [0.0; 3], 0.05, 5000.0, 5000.0);
+        physics.step(TICK);
+    }
+    assert!(physics.pose(body).unwrap().0[2] > 10.0, "{:?}", physics.pose(body));
+}

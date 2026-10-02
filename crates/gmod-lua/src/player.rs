@@ -481,6 +481,15 @@ pub(crate) fn eye_angles(lua: &Lua, handle: EntityHandle) -> Option<Angle> {
     state(lua, handle, |_, p| p.eye_angles)
 }
 
+/// The weapon in a player's hands (`NULL` for none); none for what is not a player.
+pub(crate) fn active_weapon(lua: &Lua, handle: EntityHandle) -> Option<EntityHandle> {
+    state(lua, handle, |_, p| p.active_weapon)
+}
+
+pub(crate) fn alive(lua: &Lua, handle: EntityHandle) -> bool {
+    state(lua, handle, |_, p| p.alive).unwrap_or(false)
+}
+
 pub(crate) fn water_level(lua: &Lua, handle: EntityHandle) -> Option<u8> {
     state(lua, handle, |_, p| p.moving.water_level)
 }
@@ -698,10 +707,19 @@ pub(crate) fn leave(lua: &Lua, handle: EntityHandle) {
     crate::ents::remove(lua, handle);
 }
 
-/// The command a player sends from now on, every tick; its impulse and mouse wheel only with
-/// the next one.
+/// The command a player sends from now on, every tick; its impulse, mouse wheel and mouse
+/// movement only with the next one, added to what the next one has not sent yet.
 pub(crate) fn set_input(lua: &Lua, handle: EntityHandle, cmd: UserCmd) {
-    with_player(lua, handle, |_, p| p.input = cmd);
+    with_player(lua, handle, |_, p| {
+        let waiting = p.input;
+        p.input = UserCmd {
+            impulse: if cmd.impulse != 0 { cmd.impulse } else { waiting.impulse },
+            mouse_wheel: waiting.mouse_wheel + cmd.mouse_wheel,
+            mouse_x: waiting.mouse_x + cmd.mouse_x,
+            mouse_y: waiting.mouse_y + cmd.mouse_y,
+            ..cmd
+        };
+    });
 }
 
 /// One tick of every player.
@@ -719,9 +737,11 @@ fn tick(lua: &Lua, handle: EntityHandle) {
     }
     let Some(cmd) = with_player(lua, handle, |_, p| {
         p.cmd = CmdData { cmd: p.input, number: p.cmd.number + 1, tick, select: None };
-        // an impulse and the mouse wheel go with one command, not every one after it
+        // an impulse, the mouse wheel and the mouse go with one command, not every one after it
         p.input.impulse = 0;
         p.input.mouse_wheel = 0;
+        p.input.mouse_x = 0;
+        p.input.mouse_y = 0;
         p.cmd
     }) else {
         return;
@@ -730,12 +750,14 @@ fn tick(lua: &Lua, handle: EntityHandle) {
     let Ok(cmd_ud) = lua.create_userdata(cmd) else { return };
     hook(lua, "StartCommand", [Value::UserData(ply.clone()), Value::UserData(cmd_ud.clone())]);
     let cmd = cmd_ud.borrow::<CmdData>().map(|c| *c).unwrap_or(cmd);
+    // the mouse turns what the physics gun holds while E is down, not the view
+    let turning = cmd.cmd.buttons & key::USE != 0 && crate::physgun::holding(lua, handle).is_some();
     let Some((pressed, released, alive, frozen)) = with_player(lua, handle, |ent, p| {
         p.cmd = cmd;
         p.old_buttons = p.buttons;
         p.buttons = cmd.cmd.buttons;
         let frozen = ent.flags & fl::FROZEN != 0;
-        if !frozen {
+        if !frozen && !turning {
             p.eye_angles = cmd.cmd.view_angles;
         }
         (p.buttons & !p.old_buttons, p.old_buttons & !p.buttons, p.alive, frozen)
@@ -791,6 +813,7 @@ fn tick(lua: &Lua, handle: EntityHandle) {
     if host(lua).entities.is_valid(active) {
         let (buttons, pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
         weapon::post_frame(lua, active, buttons, pressed);
+        crate::physgun::command(lua, handle, active, &cmd.cmd, pressed);
     }
     if host(lua).entities.is_valid(handle) {
         hook(lua, "PlayerPostThink", [Value::UserData(ply)]);
@@ -889,6 +912,9 @@ pub struct PlayerView {
     pub health: i64,
     pub armor: i64,
     pub weapon: Option<WeaponView>,
+    /// The physics gun holds something: the mouse wheel takes it farther or nearer rather
+    /// than choosing a weapon, and the mouse turns it while E is down.
+    pub holding: bool,
 }
 
 /// The weapon in a player's hands.
@@ -913,7 +939,8 @@ pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
         let ammo = ammo_count(lua, handle, weapon::ammo_id(lua, &data.ammo[0]));
         WeaponView { class: ent.class.clone(), name: data.print_name, clip, ammo }
     });
-    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon })
+    let holding = crate::physgun::holding(lua, handle).is_some();
+    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon, holding })
 }
 
 /// The engine's commands a player types into the console: `noclip`, `kill` and `explode`,
@@ -2125,7 +2152,9 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
     ] {
         def(name, nothing)?;
     }
-    // no physics, so nothing frozen or held, and no vehicles
+    // the base gamemode makes the physics gun's own in Lua (`AddFrozenPhysicsObject`,
+    // `PhysgunUnfreeze`, `UnfreezePhysicsObjects`); these stand in without it. Nothing is
+    // carried by hand or with the gravity gun yet, and there are no vehicles.
     for name in
         ["AddFrozenPhysicsObject", "DropObject", "PickupObject", "SimulateGravGunDrop", "SimulateGravGunPickup", "DetonateTripmines"]
     {

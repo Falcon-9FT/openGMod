@@ -95,8 +95,8 @@
   (`IN_ATTACK`, `IN_RELOAD`, выбор оружия, фонарик, noclip, `gmod_undo`), терминал — консоль
   игры от лица игрока (и `lua_run`). Модели энтити видны ✅: пропы, SENT, NPC, оружие на
   земле — всё, что не спрятано (`SetNoDraw`, `EF_NODRAW`), кроме самого игрока и того, что
-  он несёт (`Runtime::drawn`). Пропы падают и ложатся ✅. Дальше, чтобы играть с модами:
-  физган и тулган, оружие в руках (вью-модели), анимация моделей, интерфейс (этап 5).
+  он несёт (`Runtime::drawn`). Пропы падают и ложатся ✅, физган ✅. Дальше, чтобы играть с
+  модами: тулган, оружие в руках (вью-модели), анимация моделей, интерфейс (этап 5).
 * Физика — `gmod-physics` на Rapier (чистый Rust, без C++ в сборке):
   * пропы с формами из `.phy` ✅: масса, затухание и материал из модели; `PhysicsInit`,
     `PhysicsInitBox`, `PhysicsInitSphere`, `PhysicsInitConvex`, `PhysObj` в Lua
@@ -104,8 +104,10 @@
     пропы карты (`prop_physics*`, флаги «motion disabled» и «start asleep»), `sv_gravity`,
     `util.IsValidProp` и `util.IsValidRagdoll` для `gm_spawn`;
   * мир из BSP ✅: браши, дисплейсменты, статические пропы;
-  * физган (в GMod он на C++ — пишется на Rust) и контроллеры движения
-    (`StartMotionController`, тени `PhysicsInitShadow`);
+  * физган ✅ — `gmod-lua::physgun` (в GMod он на C++): взять, нести, колесо, поворот на E,
+    заморозка на правую кнопку, разморозка на R; хуки `PhysgunPickup`, `OnPhysgunPickup`,
+    `PhysgunDrop`, `OnPhysgunFreeze`, `OnPhysgunReload`, как их ждёт sandbox;
+  * контроллеры движения (`StartMotionController`, тени `PhysicsInitShadow`);
   * все констрейнты `constraint.lua` — для тулгана;
   * игрок толкает пропы и встаёт на них, трассировки по формам пропов;
   * плавучесть, звуки ударов, поломка пропов;

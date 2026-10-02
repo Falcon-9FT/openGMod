@@ -261,6 +261,26 @@ impl Physics {
         }
     }
 
+    /// Sets a body going to a pose, as the physics gun drags what it holds: the speeds that
+    /// take its origin there and turn it so in `seconds`, no faster than `max_speed` units and
+    /// `max_turn` degrees a second. What is in the way still stops it.
+    pub fn steer(&mut self, id: BodyId, origin: Vec3, angles: Vec3, seconds: f32, max_speed: f32, max_turn: f32) {
+        let Some(body) = self.world.bodies.get_mut(id.0) else { return };
+        let seconds = seconds.max(1e-3);
+        // the shortest way round from how it is turned to how it should be
+        let (axis, mut angle) = (rotation(angles) * body.rotation().inverse()).to_axis_angle();
+        if angle > std::f32::consts::PI {
+            angle -= std::f32::consts::TAU;
+        }
+        let turn = (axis * angle / seconds).clamp_length_max(max_turn.to_radians());
+        let pose = body.translation();
+        let speed = ((metres(origin) - pose) / seconds).clamp_length_max(max_speed * METRES_PER_UNIT);
+        // the speed of its origin, and of its centre of mass turning about it
+        let centre = body.center_of_mass();
+        body.set_linvel(speed + turn.cross(centre - pose), true);
+        body.set_angvel(turn, true);
+    }
+
     /// A push through the centre of mass: kilograms times units per second (`ApplyForceCenter`).
     pub fn apply_impulse(&mut self, id: BodyId, impulse: Vec3) {
         if let Some(body) = self.world.bodies.get_mut(id.0) {

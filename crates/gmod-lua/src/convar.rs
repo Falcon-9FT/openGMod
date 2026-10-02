@@ -309,7 +309,7 @@ pub(crate) fn run_buffer(lua: &Lua) {
 }
 
 pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
-    for (name, value, help) in ENGINE_CONVARS {
+    for (name, value, help) in ENGINE_CONVARS.iter().chain(crate::physgun::CONVARS) {
         create(lua, name, value, help, 0, None, None);
     }
     let globals = lua.globals();
