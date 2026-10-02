@@ -161,6 +161,19 @@ impl Game {
         self.client.paint(seconds);
     }
 
+    /// What the server and the client played since the last call: sounds of entities, of
+    /// places, of the menus.
+    pub fn take_sounds(&self) -> Vec<gmod_lua::sound::SoundEvent> {
+        let mut sounds = self.runtime.take_sounds();
+        sounds.extend(self.client.take_sounds());
+        sounds
+    }
+
+    /// Where an entity is now (the client has the server's entities by the same handles).
+    pub fn entity_position(&self, entity: gmod_lua::entity::EntityHandle) -> Option<Vector> {
+        self.runtime.entity_position(entity)
+    }
+
     /// The client's runtime: what [`paint`](Self::paint) drew, and its images.
     pub fn client(&self) -> &Runtime {
         &self.client

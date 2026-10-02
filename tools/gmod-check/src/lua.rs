@@ -105,9 +105,10 @@ const KEY_C: i32 = 13;
 /// given): what the server has comes to the client every frame, what the client sends goes to
 /// the server, the HUD and the panels are painted; Q is held from the 10th frame to the
 /// 30th, and the first prop of the spawn menu clicked on the way; C is held from the 35th to
-/// the 50th. What showed, whether the click spawned the prop, and how the server did.
+/// the 50th. What showed, whether the click spawned the prop, what sounds played, and how
+/// the server did.
 fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> String {
-    let server = match Runtime::new(Realm::Server, vfs) {
+    let server = match Runtime::new(Realm::Server, vfs.clone()) {
         Ok(server) => server,
         Err(e) => return format!("The server could not be started: {e}"),
     };
@@ -126,6 +127,8 @@ fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> 
     let mut vertices = 0;
     // the first prop of the spawn list that shows, which is clicked
     let mut clicked: Option<String> = None;
+    // the files of the sounds played, and whether the game has each
+    let mut sounds: Vec<(String, bool)> = Vec::new();
     for frame in 0..60 {
         let dt = 1.0 / 60.0;
         server.think(dt);
@@ -154,6 +157,12 @@ fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> 
             _ => false,
         };
         client.paint(dt);
+        for event in server.take_sounds().into_iter().chain(client.take_sounds()) {
+            if let gmod_lua::sound::SoundEvent::Play(play) = event {
+                let there = vfs.exists(&play.wave, "GAME");
+                sounds.push((play.wave, there));
+            }
+        }
         vertices = vertices.max(client.with_canvas(|canvas, _| canvas.vertices().len()));
         let shown = client.lua().load("return #vgui.GetAll()").eval::<usize>().unwrap_or(0);
         most_panels = most_panels.max(shown);
@@ -173,9 +182,16 @@ fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> 
             }
         }
     };
+    let missing: Vec<&str> = sounds.iter().filter(|(_, there)| !there).map(|(wave, _)| wave.as_str()).collect();
+    let heard = match (sounds.len(), missing.first()) {
+        (0, _) => "No sounds played.".to_string(),
+        (1, None) => "1 sound played, its file there.".to_string(),
+        (n, None) => format!("{n} sounds played, their files all there."),
+        (n, Some(first)) => format!("{n} sound{} played, {} missing ({first}...).", if n == 1 { "" } else { "s" }, missing.len()),
+    };
     format!(
         "Client: 60 frames, at most {most_panels} panels and {vertices} vertices; {spawn_menu} panels with the spawn menu open, \
-         {context_menu} with the context menu. {click} Server behind it: {} errors.",
+         {context_menu} with the context menu. {click} {heard} Server behind it: {} errors.",
         server.errors().len()
     )
 }

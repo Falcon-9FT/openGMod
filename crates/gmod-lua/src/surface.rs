@@ -649,7 +649,10 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         screen.canvas.borrow_mut().polygon(texture, additive, &list, color);
         Ok(Value::Nil)
     })?;
-    def(lua, &s, "PlaySound", |a| a.string(1).map(|_| Value::Nil))?;
+    def(lua, &s, "PlaySound", |a| {
+        crate::sound::play_ui(a.lua, &a.string(1)?);
+        Ok(Value::Nil)
+    })?;
     def(lua, &s, "GetHUDTexture", |a| {
         let name = a.string(1)?;
         crate::material::push_named(a.lua, &format!("hud/{name}"))

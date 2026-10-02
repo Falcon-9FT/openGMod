@@ -1946,15 +1946,16 @@ fn what_scripts_ask_of_entities() {
              and e:GetBoneCount() == 0 and e:LookupBone('root') == nil and e:LookupAttachment('muzzle') == 0 and e:GetFlexNum() == 0
              and ents.Create('info_target'):LookupAttachment('muzzle') == -1 and e:GetWorkshopID() == nil"
     ));
-    // sounds are taken and kept quiet
+    // sounds: what Lua asks for (the events are in sounds_are_what_lua_asks_for)
     assert!(g.eval::<bool>(
         "E:EmitSound('Weapon_Pistol.Single') E:StopSound('Weapon_Pistol.Single') EmitSound('a.wav', Vector(), 0)
          sound.Add({ name = 'Test.Sound', sound = 'test.wav', level = 80 })
          local patch = CreateSound(E, 'Test.Sound')
          patch:PlayEx(0.5, 120) local playing = patch:IsPlaying() and patch:GetVolume() == 0.5 and patch:GetPitch() == 120
          patch:Stop()
+         local first = E:StartLoopingSound('a.wav')
          return playing and not patch:IsPlaying() and sound.GetProperties('test.sound').level == 80 and sound.GetTable()[1] == 'Test.Sound'
-             and E:StartLoopingSound('a.wav') == 1 and E:StartLoopingSound('b.wav') == 2"
+             and E:StartLoopingSound('b.wav') == first + 1"
     ));
     assert_eq!(g.messages(), ["on purpose"]);
 }
@@ -2185,4 +2186,51 @@ fn text_of_a_token_is_its_phrase() {
     );
     assert_eq!(token, phrase);
     assert_ne!(token, raw);
+}
+
+#[test]
+fn sounds_are_what_lua_asks_for() {
+    use crate::sound::SoundEvent;
+    let g = game(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA),
+            ("scripts/game_sounds_manifest.txt", "\"game_sounds_manifest\" { \"precache_file\" \"scripts/game_sounds_test.txt\" }"),
+            (
+                "scripts/game_sounds_test.txt",
+                "\"Test.Engine\" { \"channel\" \"CHAN_WEAPON\" \"volume\" \"0.5\" \"soundlevel\" \"SNDLVL_GUNFIRE\" \"wave\" \")weapons/shot.wav\" }",
+            ),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(
+        "E = ents.Create('prop_physics') E:Spawn()
+         E:EmitSound('Test.Engine')
+         sound.Add({ name = 'Test.Lua', channel = CHAN_ITEM or 3, volume = { 0.2, 0.4 }, level = 80, pitch = 110, sound = { 'a.wav', 'b.wav' } })
+         sound.Play('Test.Lua', Vector(1, 2, 3))
+         EmitSound('ambient/file.mp3', Vector(), 0, 0, 0.7)
+         E:EmitSound('nothing at all')
+         E:StopSound('Test.Engine')
+         P = CreateSound(E, 'loop.wav') P:Play() P:ChangePitch(150) P:Stop()",
+        "test",
+    )
+    .unwrap();
+    let events = g.runtime.take_sounds();
+    let SoundEvent::Play(engine) = &events[0] else { panic!("{events:?}") };
+    assert_eq!((engine.wave.as_str(), engine.volume, engine.level, engine.channel), ("sound/weapons/shot.wav", 0.5, 140.0, 1));
+    assert!(engine.entity.is_some() && engine.position.is_none());
+    let SoundEvent::Play(scripted) = &events[1] else { panic!() };
+    assert!(scripted.wave == "sound/a.wav" || scripted.wave == "sound/b.wav");
+    assert!(
+        (0.2..=0.4).contains(&scripted.volume) && (scripted.pitch - 1.1).abs() < 1e-4 && scripted.level == 80.0 && scripted.channel == 3
+    );
+    assert!(scripted.position.is_some_and(|p| p.y == 2.0));
+    let SoundEvent::Play(file) = &events[2] else { panic!() };
+    assert_eq!((file.wave.as_str(), file.volume), ("sound/ambient/file.mp3", 0.7));
+    // an unknown name plays nothing; a stop by name; the patch plays, changes and stops
+    assert!(matches!(&events[3], SoundEvent::Stop { name, .. } if name == "Test.Engine"));
+    let SoundEvent::Play(patch) = &events[4] else { panic!() };
+    let id = patch.patch.expect("a patch");
+    assert_eq!(&events[5..], [SoundEvent::ChangePatch { patch: id, volume: 1.0, pitch: 1.5 }, SoundEvent::StopPatch(id)]);
+    assert!(g.runtime.take_sounds().is_empty());
 }

@@ -29,6 +29,7 @@ use gmod_render::block_on;
 use gmod_world::World;
 use gmod_world::gpu::Camera;
 
+mod audio;
 mod game;
 mod walk;
 
@@ -374,6 +375,8 @@ struct App {
     game: Option<Game>,
     /// The models of the game's entities.
     models: Option<Models>,
+    /// The game's sound.
+    audio: Option<audio::Audio>,
     /// The game's status for the title: health, the weapon.
     status: String,
     settings: Settings,
@@ -547,6 +550,11 @@ impl App {
         // fell out of the map: as if into a pit
         if shown.view.alive && !self.collision.is_empty() && shown.eye[2] < self.collision.mins[2] - 1024.0 {
             game.command("kill");
+        }
+        // what the game played this frame, heard from the eyes
+        if let Some(audio) = &mut self.audio {
+            audio.handle(game.take_sounds(), |entity| game.entity_position(entity));
+            audio.listen(self.camera.eye, self.camera.yaw, |entity| game.entity_position(entity));
         }
     }
 
@@ -897,6 +905,7 @@ fn main() -> ExitCode {
         world: loaded.world,
         collision: loaded.collision,
         models: game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone())),
+        audio: game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| audio::Audio::new(vfs.clone())),
         game,
         status: String::new(),
         settings: Settings::default(),

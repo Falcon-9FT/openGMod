@@ -12,6 +12,7 @@ members = [
     "crates/gmod-movement",
     "crates/gmod-physics",
     "crates/gmod-ui",
+    "crates/gmod-audio",
     "crates/gmod-render",
     "crates/gmod-app",
     "tools/gmod-check",
@@ -35,6 +36,7 @@ gmod-world = { path = "crates/gmod-world" }
 gmod-movement = { path = "crates/gmod-movement" }
 gmod-physics = { path = "crates/gmod-physics" }
 gmod-ui = { path = "crates/gmod-ui" }
+gmod-audio = { path = "crates/gmod-audio" }
 gmod-render = { path = "crates/gmod-render" }
 # LuaJIT 2.1, built from source with the crate
 mlua = { version = "0.12.1", features = ["luajit", "vendored"] }
@@ -44,6 +46,10 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 # that scans HTTPS adds its root there). Pinned exactly: the resolver that keeps requests off
 # private networks uses ureq's `unversioned` API
 ureq = { version = "=3.4.2", features = ["platform-verifier"] }
+# sounds: WAV (PCM, ADPCM), MP3 and OGG decoded in pure Rust
+symphonia = { version = "0.6.1", default-features = false, features = ["wav", "pcm", "adpcm", "mp3", "ogg", "vorbis"] }
+# the sound card: WASAPI on Windows (Linux and macOS later)
+cpal = "0.18.2"
 # physics of props: pure Rust, no C++ to build
 rapier3d = "0.36.0"
 # fonts: the rasterizer, and the tables of font files (names, weights, Windows metrics)

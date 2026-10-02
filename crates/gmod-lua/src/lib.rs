@@ -253,6 +253,8 @@ pub(crate) struct Host {
     pub panels: vgui::Panels,
     /// The engine's HUD: where its elements go, its colours.
     pub hud: RefCell<hud::Hud>,
+    /// The sounds Lua played, for the program.
+    pub sounds: sound::Sounds,
 }
 
 impl Host {
@@ -329,6 +331,7 @@ impl Runtime {
             client: client::Client::default(),
             panels: vgui::Panels::default(),
             hud: RefCell::new(hud::Hud::default()),
+            sounds: sound::Sounds::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -567,6 +570,17 @@ impl Runtime {
     /// not loaded.
     pub fn call_hook(&self, name: &str, args: mlua::MultiValue) -> mlua::MultiValue {
         call_hook(&self.lua, name, args)
+    }
+
+    /// What Lua did with sounds since the last call, oldest first: what to play, change and
+    /// stop.
+    pub fn take_sounds(&self) -> Vec<sound::SoundEvent> {
+        std::mem::take(&mut *host(&self.lua).sounds.events.borrow_mut())
+    }
+
+    /// Where an entity is in the world now, if it is still there: for its sounds to follow.
+    pub fn entity_position(&self, entity: entity::EntityHandle) -> Option<vector::Vector> {
+        host(&self.lua).entities.transform(entity).map(|(pos, _)| pos)
     }
 
     /// The `net` messages sent since the last call, oldest first.

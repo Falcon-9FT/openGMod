@@ -19,6 +19,10 @@ gmod-movement.workspace = true
 gmod-render.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+gmod-audio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+cpal.workspace = true
 
 [dev-dependencies]
 gmod-bsp = { workspace = true, features = ["testmap"] }

@@ -15,6 +15,7 @@ gmod-movement.workspace = true
 gmod-physics.workspace = true
 gmod-glua.workspace = true
 gmod-ui.workspace = true
+gmod-audio.workspace = true
 mlua.workspace = true
 rusqlite.workspace = true
 ureq.workspace = true
