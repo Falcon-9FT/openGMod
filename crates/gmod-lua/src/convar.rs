@@ -20,6 +20,13 @@ use crate::{ScriptError, files, host};
 const ENGINE_CONVARS: &[(&str, &str, &str)] = &[
     ("sv_cheats", "0", "Allow cheats on server"),
     ("sv_gravity", "600", "World gravity."),
+    ("sv_friction", "8", "World friction."),
+    ("sv_stopspeed", "10", "Minimum stopping speed when on ground."),
+    ("sv_accelerate", "10", "Linear acceleration amount (old value is 5.6)"),
+    ("sv_airaccelerate", "10", ""),
+    ("sv_maxvelocity", "3500", "Maximum speed any ballistically moving object is allowed to attain per axis."),
+    ("sv_noclipspeed", "5", ""),
+    ("sv_noclipaccelerate", "5", ""),
     ("sv_lan", "0", "Server is a lan server (no heartbeat, no authentication, no non-class C addresses)"),
     ("hostname", "openGMOD", "Hostname for server."),
     ("sv_password", "", "Server password for entry into multiplayer games"),
@@ -253,6 +260,12 @@ pub fn split_commands(text: &str) -> Vec<Vec<String>> {
 
 /// Runs one command now: sets a ConVar, or calls a command of Lua.
 pub(crate) fn execute(lua: &Lua, words: &[String]) {
+    execute_as(lua, words, EntityHandle::NULL);
+}
+
+/// Runs a command typed by `player` (`NULL`: the server's console), whom the commands of
+/// `concommand.Add` get.
+pub(crate) fn execute_as(lua: &Lua, words: &[String], player: EntityHandle) {
     let Some((name, arguments)) = words.split_first() else { return };
     if let Some(handle) = find(lua, name) {
         match arguments.first() {
@@ -273,8 +286,7 @@ pub(crate) fn execute(lua: &Lua, words: &[String]) {
     let run = || -> mlua::Result<Option<(mlua::Function, MultiValue)>> {
         let Some(concommand) = lua.globals().get::<Option<Table>>("concommand")? else { return Ok(None) };
         let Some(run) = concommand.get::<Option<mlua::Function>>("Run")? else { return Ok(None) };
-        let args =
-            (EntityHandle::NULL, name.as_str(), lua.create_sequence_from(arguments.iter().map(String::as_str))?, arguments.join(" "));
+        let args = (player, name.as_str(), lua.create_sequence_from(arguments.iter().map(String::as_str))?, arguments.join(" "));
         Ok(Some((run, mlua::IntoLuaMulti::into_lua_multi(args, lua)?)))
     };
     match run() {
@@ -297,7 +309,7 @@ pub(crate) fn run_buffer(lua: &Lua) {
 }
 
 pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
-    for (name, value, help) in ENGINE_CONVARS {
+    for (name, value, help) in ENGINE_CONVARS.iter().chain(crate::physgun::CONVARS) {
         create(lua, name, value, help, 0, None, None);
     }
     let globals = lua.globals();

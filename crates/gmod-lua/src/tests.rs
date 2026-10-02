@@ -1026,6 +1026,7 @@ fn map_entities() {
             pairs(&[("classname", "some_class_of_another_game"), ("origin", "1 2 3")]),
         ],
         brush_models: vec![([-512.0, -512.0, -64.0], [512.0, 512.0, 0.0]), ([0.0, 0.0, 0.0], [64.0, 8.0, 96.0])],
+        ..Map::default()
     };
     g.runtime.spawn_map(&map);
     assert_eq!(g.printed(), "runner\tbarrel\npost\t6\n", "parents are set before anything spawns");
@@ -1043,4 +1044,917 @@ fn map_entities() {
              and ents.FindByClass('some_class_of_another_game')[1]:GetPos() == Vector(1, 2, 3)"
     ));
     assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+/// The engine's pistol as `scripts/weapons/weapon_pistol.txt` has it, cut down.
+const PISTOL: &str = r##"WeaponData
+{
+    "printname"         "#HL2_Pistol"
+    "bucket"            "1"
+    "bucket_position"   "0"
+    "clip_size"         "18"
+    "default_clip"      "36"
+    "primary_ammo"      "Pistol"
+    "secondary_ammo"    "None"
+    "weight"            "2"
+}"##;
+
+/// What the gamemode does for players in these tests: a spawn point, speeds, and a pistol with
+/// some rounds more.
+const PLAYER_LUA: &str = r#"
+    HOOKS.PlayerSelectSpawn = function(p) return ents.FindByClass('info_player_start')[1] end
+    HOOKS.PlayerSpawn = function(p)
+        p:SetWalkSpeed(200) p:SetRunSpeed(400)
+        p:GiveAmmo(10, 'Pistol', true)
+        p:Give('weapon_pistol')
+    end
+"#;
+
+/// A map for players: a floor with its top at 0, a wall from x 100 to 132, a spawn point at
+/// the middle looking along y.
+fn player_map() -> Map {
+    use gmod_bsp::testmap::{TestBrush, TestMap};
+    let brushes = vec![
+        TestBrush::cuboid([-1024.0, -1024.0, -64.0], [1024.0, 1024.0, 0.0]),
+        TestBrush::cuboid([100.0, -1024.0, 0.0], [132.0, 1024.0, 256.0]).material("TEST/WALL", 0),
+    ];
+    let test = TestMap { models: vec![brushes], ..TestMap::default() };
+    let bsp = gmod_bsp::Bsp::parse("test.bsp".into(), Arc::from(test.bytes())).unwrap();
+    let texture =
+        |info: &gmod_bsp::TexInfo| usize::try_from(info.texdata).ok().and_then(|i| bsp.materials.get(i)).cloned().unwrap_or_default();
+    let pairs = |list: &[(&str, &str)]| list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    Map {
+        name: "gm_players".into(),
+        entities: vec![
+            pairs(&[("classname", "worldspawn")]),
+            pairs(&[("classname", "info_player_start"), ("origin", "0 0 0"), ("angles", "0 90 0")]),
+        ],
+        brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
+        collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
+        textures: bsp.texinfo.iter().map(texture).collect(),
+    }
+}
+
+/// A server with [`ENTITY_LUA`] and [`PLAYER_LUA`] on [`player_map`], the pistol's script and
+/// `models/box.mdl`.
+fn player_game() -> Game {
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/box.mdl", &mdl),
+            ("scripts/weapons/weapon_pistol.txt", PISTOL.as_bytes()),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    g.runtime.spawn_map(&player_map());
+    g
+}
+
+fn alice() -> PlayerInfo {
+    PlayerInfo { name: "Alice".into(), steam_id64: Some(76561197960265731), ..PlayerInfo::default() }
+}
+
+/// Walking forward along a yaw, with these keys held too.
+fn walking(yaw: f32, buttons: u32) -> UserCmd {
+    UserCmd { view_angles: vector::Angle::new(0.0, yaw, 0.0), forward_move: gmod_movement::FULL_MOVE, buttons, ..UserCmd::default() }
+}
+
+#[test]
+fn players_join_spawn_and_leave() {
+    let g = player_game();
+    g.runtime
+        .run_string(
+            "local spawn = HOOKS.PlayerSpawn
+             HOOKS.PlayerConnect = function(name, address) print('connect', name, address) end
+             HOOKS.OnEntityCreated = function(e) if e:IsPlayer() then print('created', e:Nick()) end end
+             HOOKS.PlayerAuthed = function(p, id, unique) print('authed', p:Nick(), id, unique) end
+             HOOKS.PlayerInitialSpawn = function(p, transition) print('initial', p:Nick(), transition) end
+             HOOKS.PlayerSpawn = function(p, transition) print('spawn', p:Nick(), transition) spawn(p) end
+             HOOKS.PlayerDisconnected = function(p) print('disconnected', p:Nick()) end
+             HOOKS.EntityRemoved = function(e) if e:IsPlayer() then print('removed', e:Nick()) end end",
+            "hooks",
+        )
+        .unwrap();
+    let alice = g.runtime.join(alice()).expect("a free slot");
+    assert_eq!(
+        g.printed(),
+        "connect\tAlice\tloopback\ncreated\tAlice\nauthed\tAlice\tSTEAM_0:1:1\t1\ninitial\tAlice\tfalse\nspawn\tAlice\tfalse\n"
+    );
+    assert_eq!(alice.index, Some(1));
+    assert!(g.runtime.join(PlayerInfo { name: "Bob".into(), ..PlayerInfo::default() }).is_none(), "one slot");
+    assert_eq!(g.runtime.players(), vec![alice]);
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:IsPlayer() and tostring(p) == 'Player [1][player]' and getmetatable(p) == FindMetaTable('Player')
+             and p:Nick() == 'Alice' and p:UserID() == 1 and Player(1) == p and player.GetAll()[1] == p and player.GetCount() == 1
+             and p:SteamID64() == '76561197960265731' and p:AccountID() == 3 and p:IsFullyAuthenticated() and not p:IsBot()
+             and p:IsListenServerHost() and p:IPAddress() == 'loopback' and game.MaxPlayers() == 1 and #player.GetHumans() == 1"
+    ));
+    // standing on the floor at the spawn point, looking where it looks, with a pistol
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:Alive() and p:Health() == 100 and p:GetPos().z < 0.1 and p:GetPos().z > 0 and p:GetPos():Length2D() == 0
+             and p:EyeAngles() == Angle(0, 90, 0) and p:GetAngles() == Angle(0, 90, 0) and math.abs(p:EyePos().z - 64) < 0.1
+             and p:GetActiveWeapon():GetClass() == 'weapon_pistol' and #p:GetWeapons() == 1"
+    ));
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) local w = p:GetActiveWeapon()
+         return w:GetOwner() == p and w:Clip1() == 18 and w:GetMaxClip1() == 18 and w:GetPrimaryAmmoType() == 3
+             and w:GetSecondaryAmmoType() == -1 and w:Clip2() == -1 and w:GetPrintName() == '#HL2_Pistol' and w:GetSlot() == 1
+             and p:GetAmmoCount('Pistol') == 28 and p:GetAmmoCount(3) == 28 and w:HasAmmo() and game.GetAmmoID('PISTOL') == 3
+             and game.GetAmmoName(3) == 'Pistol' and game.GetAmmoMax(3) == 9999"
+    ));
+    assert!(
+        g.eval::<bool>("return Entity(1):GetInfo('cl_playercolor') == '0.24 0.34 0.41' and Entity(1):GetInfoNum('cl_playerskin', 5) == 0")
+    );
+
+    g.printed.borrow_mut().clear();
+    g.runtime.leave(alice);
+    assert_eq!(g.printed(), "disconnected\tAlice\nremoved\tAlice\n");
+    g.runtime.think(0.015);
+    assert!(g.eval::<bool>("return Entity(1) == NULL and player.GetCount() == 0 and #ents.FindByClass('weapon_pistol') == 0"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn players_move_by_their_commands() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    let pos = |g: &Game| g.runtime.position(alice).unwrap();
+
+    // walking along y for a second: up to speed at once, on the ground all the way, and
+    // through a weapon lying in the way
+    g.runtime
+        .run_string(
+            "local w = ents.Create('weapon_pistol') w:SetPos(Vector(0, 100, 0)) w:Spawn()
+             w:SetSolid(SOLID_BBOX) w:SetCollisionBounds(Vector(-8, -8, 0), Vector(8, 8, 64))",
+            "weapon",
+        )
+        .unwrap();
+    g.runtime.set_input(alice, walking(90.0, 0));
+    g.runtime.think(1.0);
+    let at = pos(&g);
+    assert!(at.y > 170.0 && at.y < 200.0 && at.x.abs() < 0.01, "{at:?}");
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) return p:OnGround() and math.abs(p:GetVelocity().y - 200) < 1 and p:KeyDown(IN_SPEED) == false"
+    ));
+
+    // running, as far as the hooks see it too
+    g.runtime
+        .run_string("HOOKS.SetupMove = function(p, mv, cmd) MAX, FORWARD = mv:GetMaxSpeed(), cmd:GetForwardMove() end", "setup")
+        .unwrap();
+    g.runtime.set_input(alice, walking(90.0, player::key::SPEED));
+    g.runtime.think(1.0);
+    assert!(pos(&g).y - at.y > 350.0, "{:?}", pos(&g));
+    assert_eq!(g.eval::<(f32, f32)>("return MAX, FORWARD"), (400.0, gmod_movement::FULL_MOVE));
+
+    // into the wall at x 100: the box stops against it
+    g.runtime.set_input(alice, walking(0.0, 0));
+    g.runtime.think(1.0);
+    assert!(pos(&g).x > 83.0 && pos(&g).x < 84.0, "{:?}", pos(&g));
+
+    // a jump: the key once, and up
+    g.runtime.run_string("HOOKS.KeyPress = function(p, key) print('key', key) end", "keys").unwrap();
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::JUMP, ..UserCmd::default() });
+    let before = pos(&g).z;
+    g.runtime.think(0.15);
+    assert!(pos(&g).z - before > 15.0, "{:?}", pos(&g));
+    assert_eq!(g.printed(), "key\t2\n");
+    g.runtime.set_input(alice, UserCmd::default());
+    g.runtime.think(1.0);
+
+    // what the hooks can do: change the command, take the movement over, keep its result
+    let still = |g: &Game, hook: &str| {
+        g.runtime.run_string(hook, "hook").unwrap();
+        g.runtime.set_input(alice, walking(180.0, 0));
+        let before = pos(g);
+        g.runtime.think(0.5);
+        let after = pos(g);
+        g.runtime.run_string("HOOKS.StartCommand, HOOKS.Move, HOOKS.FinishMove = nil, nil, nil", "reset").unwrap();
+        (before - after).length() < 0.01
+    };
+    assert!(still(&g, "HOOKS.StartCommand = function(p, cmd) cmd:ClearMovement() end"));
+    assert!(still(&g, "HOOKS.Move = function(p, mv) return true end"));
+    assert!(still(&g, "HOOKS.FinishMove = function(p, mv) return true end"));
+    assert!(!still(&g, ""), "and without them, the player walks");
+
+    // noclip flies where the player looks, through the wall
+    g.runtime.run_string("Entity(1):SetMoveType(MOVETYPE_NOCLIP)", "noclip").unwrap();
+    g.runtime.set_input(alice, UserCmd { view_angles: vector::Angle::new(-30.0, 0.0, 0.0), ..walking(0.0, 0) });
+    g.runtime.think(1.0);
+    assert!(pos(&g).x > 150.0 && pos(&g).z > 100.0, "{:?}", pos(&g));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn players_are_hurt_die_and_spawn_again() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime
+        .run_string(
+            "HOOKS.PlayerHurt = function(p, attacker, left, taken) print('hurt', left, taken) end
+             HOOKS.DoPlayerDeath = function(p, attacker, info) print('do death', attacker == p, info:GetDamage(), info:IsFallDamage()) end
+             HOOKS.PlayerDeath = function(p, inflictor, attacker) print('death', inflictor:GetClass(), attacker:GetClass()) end
+             HOOKS.PlayerSilentDeath = function(p) print('silent death') end
+             HOOKS.PostPlayerDeath = function(p) print('post death', p:Alive()) end
+             HOOKS.PlayerDeathThink = function(p) if p:KeyPressed(IN_ATTACK) then p:Spawn() end end",
+            "hooks",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("local p = Entity(1) p:TakeDamage(30) return p:Health() == 70"));
+    // armor takes 80%, at a point of armor for two of damage
+    assert!(g.eval::<bool>("local p = Entity(1) p:SetArmor(100) p:TakeDamage(50) return p:Health() == 60 and p:Armor() == 80"));
+    assert!(g.eval::<bool>(
+        "HOOKS.EntityTakeDamage = function(e, info) return info:GetDamage() > 1000 end
+         local p = Entity(1) p:TakeDamage(5000) HOOKS.EntityTakeDamage = nil return p:Health() == 60"
+    ));
+    assert_eq!(g.printed(), "hurt\t70\t30\nhurt\t60\t10\n");
+
+    // a fall goes past the armor, and kills
+    g.printed.borrow_mut().clear();
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) local info = DamageInfo()
+         info:SetDamage(100) info:SetDamageType(DMG_FALL) info:SetAttacker(game.GetWorld()) info:SetInflictor(game.GetWorld())
+         p:TakeDamageInfo(info)
+         return not p:Alive() and p:Armor() == 80 and #p:GetWeapons() == 0 and p:GetActiveWeapon() == NULL and p:GetAmmoCount('Pistol') == 0"
+    ));
+    assert_eq!(g.printed(), "hurt\t-40\t100\ndo death\tfalse\t100\ttrue\ndeath\tworldspawn\tworldspawn\npost death\tfalse\n");
+    assert!(g.eval::<bool>("return #ents.FindByClass('weapon_pistol') == 0"));
+
+    // dead, the player only thinks of coming back: walking does nothing, a click spawns them
+    g.printed.borrow_mut().clear();
+    let dead_at = g.runtime.position(alice).unwrap();
+    g.runtime.set_input(alice, walking(90.0, 0));
+    g.runtime.think(0.5);
+    assert_eq!(g.runtime.position(alice).unwrap(), dead_at);
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::ATTACK, ..UserCmd::default() });
+    g.runtime.think(0.015);
+    assert!(
+        g.eval::<bool>("local p = Entity(1) return p:Alive() and p:Health() == 100 and p:Armor() == 0 and p:HasWeapon('weapon_pistol')")
+    );
+
+    // `Kill` is by the player itself; `KillSilent` tells no one but `PlayerSilentDeath`
+    g.printed.borrow_mut().clear();
+    g.runtime.run_string("Entity(1):Kill()", "kill").unwrap();
+    assert_eq!(g.printed(), "do death\ttrue\t100\tfalse\ndeath\tplayer\tplayer\npost death\tfalse\n");
+    g.runtime.run_string("Entity(1):Spawn() Entity(1):KillSilent()", "silent").unwrap();
+    assert!(g.printed().ends_with("silent death\npost death\tfalse\n"), "{}", g.printed());
+
+    // a weapon that should drop stays in the world
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) p:Spawn() p:ShouldDropWeapon(true) local w = p:GetActiveWeapon() p:Kill()
+         return w:IsValid() and not w:IsMarkedForDeletion() and w:GetOwner() == NULL and w:GetParent() == NULL"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn weapons_in_a_players_hands() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime
+        .run_string(
+            "weapons.list.weapon_test = {
+                 PrintName = 'Test', Slot = 3, Weight = 10,
+                 Primary = { ClipSize = 5, DefaultClip = 10, Ammo = 'SMG1', Automatic = false },
+                 Secondary = { ClipSize = -1, DefaultClip = -1, Ammo = 'none' },
+                 PrimaryAttack = function(self)
+                     print('bang', self:Clip1()) self:SetClip1(self:Clip1() - 1) self:SetNextPrimaryFire(CurTime() + 0.2)
+                 end,
+                 Reload = function(self) self:DefaultReload(ACT_VM_RELOAD) end,
+                 Deploy = function(self) print('deploy') end,
+                 Holster = function(self, to) print('holster', to:GetClass()) return true end,
+                 Equip = function(self, owner) print('equip', owner:Nick()) end,
+                 Think = function(self) THINKS = (THINKS or 0) + 1 end,
+             }",
+            "weapon",
+        )
+        .unwrap();
+    // heavier than the pistol: in hand at once
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) local w = p:Give('weapon_test') TEST = w
+         return w:IsValid() and p:GetActiveWeapon() == w and p:GetPreviousWeapon():GetClass() == 'weapon_pistol'
+             and w:Clip1() == 5 and w:GetMaxClip1() == 5 and p:GetAmmoCount('SMG1') == 5 and w:GetPrimaryAmmoType() == 4
+             and w:GetPrintName() == 'Test' and w:GetSlot() == 3 and w:IsScripted() and #p:GetWeapons() == 2
+             and p:Give('weapon_test') == NULL and p:GetWeapon('weapon_test') == w and p:HasWeapon('weapon_pistol')"
+    ));
+    assert_eq!(g.printed(), "equip\tAlice\ndeploy\n");
+
+    // a press fires once, however long the key is held; then it may fire again
+    g.printed.borrow_mut().clear();
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::ATTACK, ..UserCmd::default() });
+    g.runtime.think(0.5);
+    g.runtime.set_input(alice, UserCmd::default());
+    g.runtime.think(0.015);
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::ATTACK, ..UserCmd::default() });
+    g.runtime.think(0.015);
+    assert_eq!(g.printed(), "bang\t5\nbang\t4\n");
+    assert!(g.eval::<bool>("return THINKS > 30 and TEST:Clip1() == 3"));
+
+    // a reload fills the clip from what the player carries
+    g.runtime.set_input(alice, UserCmd { buttons: 8192, ..UserCmd::default() });
+    g.runtime.think(0.05);
+    g.runtime.set_input(alice, UserCmd::default());
+    assert!(g.eval::<bool>("return TEST:Clip1() == 5 and Entity(1):GetAmmoCount('SMG1') == 3"));
+
+    // back to the pistol, by its class; dropped; and the rest stripped
+    g.printed.borrow_mut().clear();
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) p:SelectWeapon('weapon_pistol') local pistol = p:GetActiveWeapon()
+         p:DropWeapon(pistol)
+         local dropped = pistol:GetOwner() == NULL and #p:GetWeapons() == 1 and p:GetActiveWeapon() == NULL
+         p:StripWeapons()
+         return pistol:GetClass() == 'weapon_pistol' and dropped and #p:GetWeapons() == 0 and TEST:IsMarkedForDeletion()"
+    ));
+    assert_eq!(g.printed(), "holster\tweapon_pistol\n");
+
+    // ammo types the game adds come after the engine's
+    assert!(g.eval::<bool>(
+        "function game.BuildAmmoTypes() return { { name = 'laser', dmgtype = DMG_ENERGYBEAM, maxcarry = 50 } } end
+         local p = Entity(1)
+         return game.GetAmmoID('laser') == 38 and game.GetAmmoTypes()[38] == 'laser' and p:GiveAmmo(20000, 'laser') == 9999
+             and p:GetAmmo()[38] == 9999 and game.GetAmmoID('nothing') == -1"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn traces_through_the_world_and_entities() {
+    let g = player_game();
+    g.runtime.join(alice()).unwrap();
+    // the floor, the wall and its material
+    assert!(g.eval::<bool>(
+        "local t = util.TraceLine({ start = Vector(-300, 0, 100), endpos = Vector(-300, 0, -100) })
+         local w = util.TraceLine({ start = Vector(0, 50, 50), endpos = Vector(500, 50, 50) })
+         return t.Hit and t.HitWorld and t.Entity == game.GetWorld() and math.abs(t.HitPos.z) < 0.1 and t.HitNormal == Vector(0, 0, 1)
+             and math.abs(t.Fraction - 0.5) < 0.01 and w.HitTexture == 'TEST/WALL' and math.abs(w.HitPos.x - 100) < 0.1
+             and util.PointContents(Vector(0, 0, -10)) == CONTENTS_SOLID and util.IsInWorld(Vector(0, 0, 10))
+             and not util.IsInWorld(Vector(0, 0, -10))"
+    ));
+    // a solid prop's box; the filter lets traces through it
+    assert!(g.eval::<bool>(
+        "local prop = ents.Create('prop_physics') prop:SetModel('models/box.mdl') prop:SetPos(Vector(50, -50, 0)) prop:SetSolid(SOLID_BBOX)
+         local line = { start = Vector(0, -50, 8), endpos = Vector(90, -50, 8) }
+         local t = util.TraceLine(line)
+         line.filter = prop local through = util.TraceLine(line)
+         line.filter = function(e) return e ~= prop end local by_function = util.TraceLine(line)
+         local hull = util.TraceHull({ start = Vector(0, -50, 8), endpos = Vector(90, -50, 8), mins = Vector(-4, -4, -4), maxs = Vector(4, 4, 4) })
+         return t.Entity == prop and t.HitNonWorld and math.abs(t.HitPos.x - 42) < 0.1 and t.HitTexture == '**studio**'
+             and not through.Hit and not by_function.Hit and hull.Entity == prop and math.abs(hull.HitPos.x - 38) < 0.1"
+    ));
+    // collision groups: a player's movement goes through a weapon, a trace does not; debris is
+    // hit only by a mask with CONTENTS_DEBRIS
+    assert!(g.eval::<bool>(
+        "local w = ents.Create('weapon_pistol') w:SetModel('models/box.mdl') w:SetPos(Vector(-200, 0, 0)) w:Spawn() w:SetSolid(SOLID_BBOX)
+         local line = { start = Vector(-250, 0, 8), endpos = Vector(-150, 0, 8) }
+         local hit = util.TraceLine(line)
+         line.collisiongroup = COLLISION_GROUP_PLAYER_MOVEMENT local walked = util.TraceLine(line)
+         local was = w:GetCollisionGroup()
+         w:SetCollisionGroup(COLLISION_GROUP_DEBRIS) line.collisiongroup = nil local debris = util.TraceLine(line)
+         line.mask = MASK_SHOT local shot = util.TraceLine(line)
+         return was == COLLISION_GROUP_WEAPON and hit.Entity == w and not walked.Hit and not debris.Hit and shot.Entity == w"
+    ));
+    // what the player looks at, the player left out
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) p:SetEyeAngles(Angle(90, 0, 0))
+         local t = p:GetEyeTrace()
+         return t.HitWorld and t.HitPos:Distance(p:GetPos()) < 1 and p:GetAimVector():Distance(Vector(0, 0, -1)) < 0.001"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn what_a_player_types_and_what_is_shown_of_them() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime
+        .run_string(
+            "HOOKS.PlayerNoClip = function(p, on) print('noclip', on) return true end
+             ALLOW_SUICIDE = false HOOKS.CanPlayerSuicide = function(p) return ALLOW_SUICIDE end
+             concommand = { Run = function(p, cmd, args, line) print(p:Nick(), cmd, #args, line) end }
+             AddConsoleCommand('whoami')
+             weapons.list.weapon_test = {
+                 PrintName = 'Test', Slot = 3,
+                 Primary = { ClipSize = 5, DefaultClip = 5, Ammo = 'SMG1' }, Secondary = { ClipSize = -1, DefaultClip = -1, Ammo = 'none' },
+             }",
+            "setup",
+        )
+        .unwrap();
+
+    // the commands of Lua get the player who typed them
+    g.runtime.run_player_command(alice, "whoami a b; noclip");
+    assert_eq!(g.printed(), "Alice\twhoami\t2\ta b\nnoclip\ttrue\n");
+    assert!(g.eval::<bool>("return Entity(1):GetMoveType() == MOVETYPE_NOCLIP"));
+    g.runtime.run_player_command(alice, "noclip");
+    assert!(g.eval::<bool>("return Entity(1):GetMoveType() == MOVETYPE_WALK"));
+
+    // what is shown: the eyes, between the ticks, and the weapon in hand
+    g.runtime.run_player_command(alice, "give weapon_test");
+    let view = g.runtime.view(alice).unwrap();
+    assert_eq!(view.eye, g.runtime.position(alice).unwrap() + vector::Vector::new(0.0, 0.0, 64.0));
+    assert!(view.alive && view.health == 100 && view.angles == vector::Angle::new(0.0, 90.0, 0.0));
+    let weapon = view.weapon.unwrap();
+    assert_eq!((weapon.class.as_str(), weapon.name.as_str(), weapon.clip, weapon.ammo), ("weapon_test", "Test", 5, 0));
+    g.runtime.set_input(alice, walking(90.0, 0));
+    g.runtime.think(0.0225);
+    let view = g.runtime.view(alice).unwrap();
+    assert!(view.previous_eye.y < view.eye.y && (view.previous_eye.x - view.eye.x).abs() < 0.001, "{view:?}");
+    assert!((g.runtime.tick_fraction() - 0.5).abs() < 0.01, "{}", g.runtime.tick_fraction());
+    g.runtime.set_input(alice, UserCmd::default());
+
+    // choosing a weapon: by slot, one after another, the last one, by class
+    let active = |g: &Game| g.eval::<String>("return Entity(1):GetActiveWeapon():GetClass()");
+    g.runtime.run_player_command(alice, "invnext");
+    assert_eq!(active(&g), "weapon_pistol");
+    g.runtime.run_player_command(alice, "slot4");
+    assert_eq!(active(&g), "weapon_test");
+    g.runtime.run_player_command(alice, "invprev");
+    assert_eq!(active(&g), "weapon_pistol");
+    g.runtime.run_player_command(alice, "lastinv");
+    assert_eq!(active(&g), "weapon_test");
+    g.runtime.run_player_command(alice, "use weapon_pistol");
+    assert_eq!(active(&g), "weapon_pistol");
+
+    // `kill` asks CanPlayerSuicide
+    g.runtime.run_player_command(alice, "kill");
+    assert!(g.runtime.view(alice).unwrap().alive);
+    g.runtime.run_string("ALLOW_SUICIDE = true", "allow").unwrap();
+    g.runtime.run_player_command(alice, "kill");
+    assert!(!g.runtime.view(alice).unwrap().alive);
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn what_is_drawn_of_the_entities() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime
+        .run_string(
+            "local function make(model, pos, spawn)
+                 local e = ents.Create('prop_physics') e:SetModel(model) e:SetPos(pos) e:SetAngles(Angle(0, 90, 0))
+                 if spawn ~= false then e:Spawn() end
+                 return e
+             end
+             BOX = make('models/box.mdl', Vector(10, 20, 30))
+             BOX:SetSkin(1) BOX:SetModelScale(2)
+             make('models/box.mdl', Vector(0, 0, 0)):SetNoDraw(true)
+             make('models/box.mdl', Vector(0, 0, 0)):AddEffects(EF_NODRAW)
+             make('models/box.mdl', Vector(0, 0, 0), false)
+             make('*1', Vector(0, 0, 0))
+             ON_TOP = make('models/box.mdl', Vector(0, 0, 0))
+             ON_TOP:SetParent(BOX) ON_TOP:SetLocalPos(Vector(10, 0, 0))
+             Entity(1):SetModel('models/box.mdl') Entity(1):GetActiveWeapon():SetModel('models/box.mdl')",
+            "props",
+        )
+        .unwrap();
+    let drawn = g.runtime.drawn(alice);
+    let found: Vec<(&str, vector::Vector)> = drawn.iter().map(|d| (d.model.as_str(), d.origin)).collect();
+    // the hidden, the one not spawned and the brush model are not drawn; neither is Alice nor
+    // the pistol in her hands
+    assert_eq!(found.len(), 2, "{drawn:?}");
+    let first = &drawn[0];
+    assert_eq!((first.model.as_str(), first.skin, first.scale), ("models/box.mdl", 1, 2.0));
+    assert_eq!((first.origin, first.angles), (vector::Vector::new(10.0, 20.0, 30.0), vector::Angle::new(0.0, 90.0, 0.0)));
+    // what is parented is drawn where its parent puts it: turned with it
+    let second = &drawn[1];
+    assert!((second.origin - vector::Vector::new(10.0, 30.0, 30.0)).length() < 0.001, "{second:?}");
+    // others see Alice; neither they nor she see her view model, nor the hands on it
+    g.runtime
+        .run_string(
+            "local vm = Entity(1):GetViewModel() vm:SetModel('models/box.mdl')
+             local hands = ents.Create('prop_dynamic') hands:SetModel('models/box.mdl') hands:Spawn() hands:SetParent(vm)",
+            "hands",
+        )
+        .unwrap();
+    assert_eq!(g.runtime.drawn(alice).len(), 2);
+    let others = g.runtime.drawn(EntityHandle::NULL);
+    assert!(others.iter().any(|d| d.entity == alice));
+    assert_eq!(others.len(), 4, "{others:?}");
+
+    // the host's console runs Lua
+    g.runtime.run_player_command(alice, "lua_run print(GetHostName(), #ents.FindByClass('prop_physics'))");
+    assert_eq!(g.printed(), "openGMOD\t6\n");
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+/// A server with [`ENTITY_LUA`] on [`player_map`] with these entities more, and two models of
+/// a box 16 units wide and high: `models/crate.mdl`, a prop of 25 kg of wood, and
+/// `models/doll.mdl`, a ragdoll of two such boxes.
+fn physics_game(entities: &[&[(&str, &str)]]) -> Game {
+    use gmod_model::testmodel::{self, TestConvex};
+    let mdl = testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let part = || vec![TestConvex::cuboid([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0])];
+    let crate_phy = testmodel::phy(1, &[part()], false, "solid { \"index\" \"0\" \"mass\" \"25\" \"surfaceprop\" \"wood\" }");
+    let doll_phy = testmodel::phy(1, &[part(), part()], false, "");
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/crate.mdl", &mdl),
+            ("models/crate.phy", &crate_phy),
+            ("models/doll.mdl", &mdl),
+            ("models/doll.phy", &doll_phy),
+        ],
+    );
+    g.runtime.init();
+    let mut map = player_map();
+    map.entities.extend(entities.iter().map(|list| list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()));
+    g.runtime.spawn_map(&map);
+    g
+}
+
+#[test]
+fn props_fall_and_come_to_rest() {
+    let g = physics_game(&[]);
+    assert!(g.eval::<bool>(
+        "local p = ents.Create('prop_physics') p:SetModel('models/crate.mdl') p:SetPos(Vector(-200, 0, 100)) p:Spawn() CRATE = p
+         local phys = p:GetPhysicsObject()
+         return phys:IsValid() and phys:GetEntity() == p and math.abs(phys:GetMass() - 25) < 0.01 and phys:GetMaterial() == 'wood'
+             and p:GetSolid() == SOLID_VPHYSICS and p:GetMoveType() == MOVETYPE_VPHYSICS and p:GetPhysicsObjectCount() == 1
+             and tostring(phys):match('^PhysObject %[Entity %[%d+%]%[prop_physics%]%]$') ~= nil and phys == p:GetPhysicsObject()
+             and phys:GetPos() == Vector(-200, 0, 100) and phys:IsMotionEnabled() and not phys:IsAsleep()"
+    ));
+    // a third of a second in it falls as gravity says, v = g t; it then lies on the floor
+    g.runtime.think(1.0 / 3.0);
+    assert!(g.eval::<bool>("return math.abs(CRATE:GetVelocity().z + 200) < 15 and CRATE:GetPos().z < 100"));
+    g.runtime.think(4.0);
+    assert!(g.eval::<bool>(
+        "local phys = CRATE:GetPhysicsObject()
+         return math.abs(CRATE:GetPos().z) < 0.5 and CRATE:GetAngles():IsEqualTol(Angle(0, 0, 0), 0.5) and phys:IsAsleep()"
+    ));
+    // the server's gravity
+    assert!(g.eval::<bool>(
+        "RunConsoleCommand('sv_gravity', '0') CRATE:SetPos(Vector(-200, 0, 100)) CRATE:GetPhysicsObject():Wake() return true"
+    ));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>("return math.abs(CRATE:GetPos().z - 100) < 0.01"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn physics_objects() {
+    let g = physics_game(&[]);
+    assert!(g.eval::<bool>(
+        "local p = ents.Create('prop_physics') p:SetModel('models/crate.mdl') p:SetPos(Vector(-200, 0, 100)) p:Spawn() CRATE = p
+         PHYS = p:GetPhysicsObject()
+         -- the entity moved, the body goes along
+         p:SetPos(Vector(-300, 0, 200)) p:SetAngles(Angle(0, 90, 0))
+         local moved = PHYS:GetPos() == Vector(-300, 0, 200) and PHYS:GetAngles():IsEqualTol(Angle(0, 90, 0), 0.01)
+         PHYS:SetPos(Vector(-300, 0, 150))
+         local back = p:GetPos() == Vector(-300, 0, 150)
+         local mins, maxs = PHYS:GetAABB()
+         PHYS:EnableMotion(false)
+         return moved and back and mins == Vector(-8, -8, 0) and maxs == Vector(8, 8, 16) and not PHYS:IsMotionEnabled()
+             and PHYS:LocalToWorld(Vector(8, 0, 0)):IsEqualTol(Vector(-300, 8, 150), 0.01)
+             and PHYS:WorldToLocal(Vector(-300, 8, 150)):IsEqualTol(Vector(8, 0, 0), 0.01)
+             and math.abs(PHYS:GetVolume() - 16 * 16 * 16) < 1"
+    ));
+    g.runtime.think(1.0);
+    // frozen, it stays; a push of 2500 kg·units/s gives its 25 kg 100 units/s
+    assert!(g.eval::<bool>(
+        "local stayed = CRATE:GetPos() == Vector(-300, 0, 150)
+         PHYS:EnableMotion(true) PHYS:EnableGravity(false) PHYS:Wake()
+         PHYS:ApplyForceCenter(Vector(0, 0, 2500))
+         local pushed = PHYS:GetVelocity():IsEqualTol(Vector(0, 0, 100), 0.01)
+         PHYS:SetVelocity(Vector(10, 0, 0)) PHYS:SetAngleVelocity(Vector(0, 0, 90))
+         return stayed and pushed and not PHYS:IsGravityEnabled() and PHYS:GetVelocity():IsEqualTol(Vector(10, 0, 0), 0.01)
+             and PHYS:GetAngleVelocity():IsEqualTol(Vector(0, 0, 90), 0.01)"
+    ));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>(
+        "return CRATE:GetPos():IsEqualTol(Vector(-290, 0, 150), 0.5) and math.abs(math.abs(CRATE:GetAngles().y) - 180) < 1
+             and CRATE:GetVelocity():IsEqualTol(Vector(10, 0, 0), 0.01)"
+    ));
+    // a box and a ball of Lua's; a prop without a physics model has no body
+    assert!(g.eval::<bool>(
+        "local b = ents.Create('prop_physics') b:SetPos(Vector(-400, 0, 50))
+         local boxed = b:PhysicsInitBox(Vector(-4, -4, -4), Vector(4, 4, 4)) and b:GetPhysicsObject():IsValid()
+         local s = ents.Create('prop_physics') s:SetPos(Vector(-400, 100, 50))
+         local ball = s:PhysicsInitSphere(8) and s:GetPhysicsObject():IsValid()
+         local none = ents.Create('prop_physics') none:SetModel('models/none.mdl') none:Spawn()
+         return boxed and ball and b:GetSolid() == SOLID_VPHYSICS and not none:GetPhysicsObject():IsValid()
+             and not none:PhysicsInit(SOLID_VPHYSICS)"
+    ));
+    // a NULL physics object says so, and one whose entity is gone is NULL
+    assert!(g.eval::<bool>(
+        "local null = ents.Create('info_target'):GetPhysicsObject()
+         local ok, err = pcall(null.GetMass, null)
+         CRATE:Remove()
+         local gone, err2 = pcall(PHYS.Wake, PHYS)
+         return not null:IsValid() and tostring(null) == '[NULL PhysObj]' and not ok and tostring(err):find('Tried to use a NULL physics object!', 1, true)
+             and not PHYS:IsValid() and not gone and tostring(err2):find('NULL physics object', 1, true)"
+    ));
+    // what sandbox asks of a model before it spawns one
+    assert!(g.eval::<bool>(
+        "return util.IsValidProp('models/crate.mdl') and not util.IsValidRagdoll('models/crate.mdl')
+             and util.IsValidRagdoll('models/doll.mdl') and not util.IsValidProp('models/doll.mdl') and not util.IsValidProp('models/none.mdl')"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn props_of_the_map() {
+    let g = physics_game(&[
+        &[
+            ("classname", "prop_physics"),
+            ("targetname", "frozen"),
+            ("model", "models/crate.mdl"),
+            ("origin", "-200 0 100"),
+            ("spawnflags", "8"),
+        ],
+        &[
+            ("classname", "prop_physics_multiplayer"),
+            ("targetname", "asleep"),
+            ("model", "models/crate.mdl"),
+            ("origin", "-300 0 100"),
+            ("spawnflags", "1"),
+        ],
+        &[
+            ("classname", "prop_physics_override"),
+            ("targetname", "falls"),
+            ("model", "models/crate.mdl"),
+            ("origin", "-400 0 100"),
+            ("angles", "0 45 0"),
+        ],
+    ]);
+    g.runtime.think(3.0);
+    assert!(g.eval::<bool>(
+        "local frozen, asleep, falls = ents.FindByName('frozen')[1], ents.FindByName('asleep')[1], ents.FindByName('falls')[1]
+         return frozen:GetPos() == Vector(-200, 0, 100) and not frozen:GetPhysicsObject():IsMotionEnabled()
+             and asleep:GetPos() == Vector(-300, 0, 100) and asleep:GetPhysicsObject():IsAsleep()
+             and math.abs(falls:GetPos().z) < 0.5 and math.abs(falls:GetAngles().y - 45) < 0.5"
+    ));
+    // woken, it falls too
+    g.runtime.run_string("ents.FindByName('asleep')[1]:GetPhysicsObject():Wake()", "wake").unwrap();
+    g.runtime.think(3.0);
+    assert!(g.eval::<bool>("return math.abs(ents.FindByName('asleep')[1]:GetPos().z) < 0.5"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+/// Looking along `pitch` and `yaw` with these keys held.
+fn aiming(pitch: f32, yaw: f32, buttons: u32) -> UserCmd {
+    UserCmd { view_angles: vector::Angle::new(pitch, yaw, 0.0), buttons, ..UserCmd::default() }
+}
+
+#[test]
+fn the_physics_gun() {
+    use player::key::{ATTACK, ATTACK2, RELOAD, USE};
+    let g = physics_game(&[]);
+    g.runtime
+        .run_string(
+            "HOOKS.PlayerSelectSpawn = function(p) return ents.FindByClass('info_player_start')[1] end
+             HOOKS.PlayerSpawn = function(p) p:Give('weapon_physgun') end
+             HOOKS.PhysgunPickup = function(p, e) return not e:IsPlayer() and not e.NoPickup end
+             HOOKS.OnPhysgunPickup = function(p, e) print('picked', e:GetName()) end
+             HOOKS.PhysgunDrop = function(p, e) print('dropped', e:GetName()) end
+             HOOKS.OnPhysgunFreeze = function(w, phys, e, p) phys:EnableMotion(false) print('froze', w:GetClass(), e:GetName()) end
+             HOOKS.OnPhysgunReload = function(w, p) print('reload', w:GetClass(), p:Nick()) end
+             local function crate(name, pos) local c = ents.Create('prop_physics') c:SetModel('models/crate.mdl') c:SetName(name) c:SetPos(pos) c:Spawn() return c end
+             CRATE = crate('crate', Vector(0, 100, 0))
+             crate('heavy', Vector(100, 0, 0)).NoPickup = true",
+            "physgun",
+        )
+        .unwrap();
+    let alice = g.runtime.join(alice()).unwrap();
+    assert_eq!(g.runtime.view(alice).unwrap().weapon.map(|w| w.class), Some("weapon_physgun".to_string()));
+    // the crate's near side, 8 units up: 92 units along y and 52 down from the eyes at 64
+    let down = (52.0f32 / 92.0).atan().to_degrees();
+    g.runtime.set_input(alice, aiming(down, 90.0, ATTACK));
+    g.runtime.think(0.02);
+    assert_eq!(g.printed(), "picked\tcrate\n");
+    assert!(g.runtime.view(alice).unwrap().holding);
+    // looking straight ahead it comes up there, by the point it was taken at
+    g.runtime.set_input(alice, aiming(0.0, 90.0, ATTACK));
+    g.runtime.think(1.0);
+    let far = (92.0f32 * 92.0 + 52.0 * 52.0).sqrt();
+    assert!(g.eval::<bool>(&format!(
+        "return CRATE:GetPos():IsEqualTol(Vector(0, {} + 8, 64 - 12), 1) and CRATE:GetAngles():IsEqualTol(Angle(0, 0, 0), 1)",
+        far
+    )));
+    // turning round, it goes round with the player and turns as they turn
+    g.runtime.set_input(alice, aiming(0.0, 180.0, ATTACK));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>(&format!(
+        "return CRATE:GetPos():IsEqualTol(Vector(-{far} - 8, 0, 52), 1) and math.abs(CRATE:GetAngles().y - 90) < 1"
+    )));
+    // the wheel takes it farther; with E the mouse turns it, and the view stays
+    g.runtime.set_input(alice, UserCmd { mouse_wheel: 2, ..aiming(0.0, 180.0, ATTACK) });
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>(&format!("return CRATE:GetPos():IsEqualTol(Vector(-{far} - 48, 0, 52), 1)")));
+    g.runtime.set_input(alice, UserCmd { mouse_x: 50, ..aiming(0.0, 200.0, ATTACK | USE) });
+    g.runtime.think(1.0);
+    assert_eq!(g.runtime.view(alice).unwrap().angles, vector::Angle::new(0.0, 180.0, 0.0));
+    assert!(g.eval::<bool>("return math.abs(CRATE:GetAngles().y - 80) < 1"), "{}", g.eval::<String>("return tostring(CRATE:GetAngles())"));
+    // the right button freezes it there and lets go; the gun takes nothing until the left
+    // one comes up
+    g.runtime.set_input(alice, aiming(0.0, 180.0, ATTACK | ATTACK2));
+    g.runtime.think(0.5);
+    assert_eq!(g.printed(), "picked\tcrate\nfroze\tweapon_physgun\tcrate\ndropped\tcrate\n");
+    assert!(!g.runtime.view(alice).unwrap().holding);
+    assert!(g.eval::<bool>("return not CRATE:GetPhysicsObject():IsMotionEnabled() and CRATE:GetPos().z > 40"));
+    // R asks the gamemode to unfreeze; what the hook will not let go is not taken
+    g.runtime.set_input(alice, aiming(0.0, 180.0, RELOAD));
+    g.runtime.think(0.02);
+    let heavy_down = (56.0f32 / 92.0).atan().to_degrees();
+    g.runtime.set_input(alice, aiming(heavy_down, 0.0, ATTACK));
+    g.runtime.think(0.02);
+    assert_eq!(g.printed(), "picked\tcrate\nfroze\tweapon_physgun\tcrate\ndropped\tcrate\nreload\tweapon_physgun\tAlice\n");
+    // taken again, it moves again, and is dropped when the player dies
+    g.runtime.set_input(alice, aiming(0.0, 180.0, 0));
+    g.runtime.think(0.02);
+    g.runtime.set_input(alice, aiming(0.0, 180.0, ATTACK));
+    g.runtime.think(0.02);
+    assert!(g.eval::<bool>("return CRATE:GetPhysicsObject():IsMotionEnabled() and CRATE:GetPhysicsObject():IsGravityEnabled() == false"));
+    g.runtime.run_string("Entity(1):Kill()", "kill").unwrap();
+    g.runtime.think(0.02);
+    assert!(g.printed().ends_with("picked\tcrate\ndropped\tcrate\n"), "{}", g.printed());
+    assert!(g.eval::<bool>("return CRATE:GetPhysicsObject():IsGravityEnabled()"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn effects_and_persistence() {
+    let g = entity_game(Realm::Server);
+    assert!(g.eval::<bool>(
+        "local e = EffectData() e:SetOrigin(Vector(1, 2, 3)) e:SetScale(2) e:SetEntity(Entity(0)) e:SetFlags(3) e:SetAngles(Angle(0, 90, 0))
+         util.Effect('phys_freeze', e, true, true)
+         return e:GetOrigin() == Vector(1, 2, 3) and e:GetScale() == 2 and e:GetEntity() == Entity(0) and e:GetFlags() == 3
+             and e:GetAngles() == Angle(0, 90, 0) and e:GetNormal() == Vector(0, 0, 0) and e:GetEntIndex() == 0
+             and getmetatable(e).MetaName == 'CEffectData' and not pcall(util.Effect, 'phys_freeze')"
+    ));
+    assert!(g.eval::<bool>(
+        "local p = ents.Create('prop_physics') local was = p:GetPersistent() p:SetPersistent(true) return not was and p:GetPersistent()"
+    ));
+}
+
+#[test]
+fn constraints_hold_bodies_together() {
+    // a crate of the map welded to the world by name
+    let g = physics_game(&[
+        &[("classname", "prop_physics"), ("targetname", "hung"), ("model", "models/crate.mdl"), ("origin", "-300 300 100")],
+        &[("classname", "phys_constraint"), ("attach1", "hung"), ("origin", "-300 300 100")],
+    ]);
+    // the world's body is there to join to, and does not move
+    assert!(g.eval::<bool>(
+        "local world = game.GetWorld() WPHYS = world:GetPhysicsObject() WPHYS:EnableMotion(true) WPHYS:SetPos(Vector(0, 0, 50))
+         return WPHYS:IsValid() and WPHYS:GetEntity() == world and world:GetPhysicsObjectNum(0) == WPHYS and not WPHYS:IsMoveable()
+             and WPHYS:GetPos() == Vector(0, 0, 0)"
+    ));
+    // welded to the world a crate stays in the air, and one on a rope from it hangs below;
+    // a weld that takes 5 kg breaks under 25, one that takes 100 does not
+    assert!(g.eval::<bool>(
+        "local function crate(pos) local c = ents.Create('prop_physics') c:SetModel('models/crate.mdl') c:SetPos(pos) c:Spawn() return c end
+         local function constraint(class, first, second, keys, pos)
+             local c = ents.Create(class) if pos then c:SetPos(pos) end
+             for k, v in pairs(keys) do c:SetKeyValue(k, v) end
+             c:SetPhysConstraintObjects(first:GetPhysicsObject(), second:GetPhysicsObject()) c:Spawn() c:Activate()
+             return c
+         end
+         local world = game.GetWorld()
+         A = crate(Vector(-200, 0, 100)) B = crate(Vector(-200, 0, 60))
+         WELD = constraint('phys_constraint', world, A, {})
+         ROPE = constraint('phys_lengthconstraint', A, B, { attachpoint = tostring(Vector(-200, 0, 76)), length = 40 }, Vector(-200, 0, 100))
+         C = crate(Vector(-100, -300, 100)) WEAK = constraint('phys_constraint', world, C, { forcelimit = 5 })
+         D = crate(Vector(-100, -200, 100)) STRONG = constraint('phys_constraint', world, D, { forcelimit = 100 })
+         local first, second = WELD:GetConstrainedEntities()
+         return WELD:IsConstraint() and ROPE:IsConstraint() and first == world and second == A
+             and not ents.Create('info_target'):IsConstraint()"
+    ));
+    g.runtime.think(2.0);
+    assert!(g.eval::<bool>(
+        "return A:GetPos():IsEqualTol(Vector(-200, 0, 100), 0.5) and B:GetPos():IsEqualTol(Vector(-200, 0, 44), 1)
+             and ents.FindByName('hung')[1]:GetPos():IsEqualTol(Vector(-300, 300, 100), 0.5)
+             and not WEAK:IsValid() and C:GetPos().z < 1 and STRONG:IsValid() and D:GetPos():IsEqualTol(Vector(-100, -200, 100), 0.5)"
+    ));
+    // broken, the weld is gone and they fall together; two that do not collide go through
+    // each other
+    assert!(g.eval::<bool>(
+        "local function crate(pos) local c = ents.Create('prop_physics') c:SetModel('models/crate.mdl') c:SetPos(pos) c:Spawn() return c end
+         WELD:Fire('Break')
+         F = crate(Vector(-100, 300, 0)) F:GetPhysicsObject():EnableMotion(false)
+         G = crate(Vector(-100, 300, 50))
+         local pair = ents.Create('logic_collision_pair') pair:SetKeyValue('startdisabled', 1)
+         pair:SetPhysConstraintObjects(F:GetPhysicsObject(), G:GetPhysicsObject()) pair:Spawn() pair:Activate() pair:Input('DisableCollisions')
+         return WELD:IsValid()"
+    ));
+    g.runtime.think(2.0);
+    assert!(g.eval::<bool>(
+        "return not WELD:IsValid() and ROPE:IsValid() and A:GetPos().z < 50 and B:GetPos().z < 1 and math.abs(G:GetPos().z) < 1"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn inputs_of_entities() {
+    let g = entity_game(Realm::Server);
+    assert!(g.eval::<bool>(
+        "HOOKS.AcceptInput = function(e, input, activator, caller, value)
+             print('input', e:GetName(), input, value, activator == CALLER)
+             if e:GetName() == 'kept' and input == 'Kill' then return true end
+         end
+         CALLER = ents.Create('info_target')
+         A = ents.Create('info_target') A:SetName('a')
+         KEPT = ents.Create('info_target') KEPT:SetName('kept')
+         CHILD = ents.Create('info_target') CHILD:SetParent(A)
+         A:Input('AddOutput', CALLER, CALLER, 'targetname renamed')
+         A:Fire('Color', '255 0 0')
+         KEPT:Fire('Kill')
+         A:Fire('KillHierarchy', nil, 0.5)
+         local r, g, b = A:GetColor4Part()
+         return A:GetName() == 'renamed' and g == 255"
+    ));
+    assert_eq!(g.printed(), "input\ta\tAddOutput\ttargetname renamed\ttrue\n");
+    g.runtime.think(0.02);
+    assert!(g.eval::<bool>(
+        "local r, g, b, a = A:GetColor4Part() return r == 255 and g == 0 and b == 0 and a == 255 and KEPT:IsValid() and A:IsValid()"
+    ));
+    g.runtime.think(0.6);
+    assert!(g.eval::<bool>("return not A:IsValid() and not CHILD:IsValid() and KEPT:IsValid()"));
+    assert_eq!(
+        g.printed(),
+        "input\ta\tAddOutput\ttargetname renamed\ttrue\ninput\trenamed\tColor\t255 0 0\tfalse\ninput\tkept\tKill\t\tfalse\n\
+         input\trenamed\tKillHierarchy\t\tfalse\n"
+    );
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn what_a_players_client_would_say() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).unwrap();
+    // what a client has not set is the default, or the default of a sandbox tool's setting
+    assert!(g.eval::<bool>(
+        "weapons.list.gmod_tool = { Tool = { weld = { ClientConVar = { forcelimit = '0', nocollide = 1 } }, rope = {} } }
+         local p = Entity(1)
+         return p:GetInfo('gmod_toolmode') == 'rope' and p:GetInfo('weld_forcelimit') == '0' and p:GetInfoNum('weld_nocollide', 5) == 1
+             and p:GetInfo('nope') == '' and p:GetInfoNum('nope', 5) == 5"
+    ));
+    // typed in the console, or run by `ConCommand`, it is set
+    g.runtime.run_player_command(alice, "gmod_toolmode weld; weld_forcelimit 1000; gmod_toolmode");
+    g.runtime.run_string("Entity(1):ConCommand('cl_playerskin 3; finger_0 1 2')", "concommand").unwrap();
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetInfo('gmod_toolmode') == 'weld' and p:GetInfoNum('weld_forcelimit', 0) == 1000 and p:GetInfoNum('cl_playerskin', 0) == 3"
+    ));
+    assert_eq!(g.printed(), "\"gmod_toolmode\" = \"weld\"\nUnknown command \"finger_0\"\n");
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn what_scripts_ask_of_entities() {
+    let g = entity_game(Realm::Server);
+    // GMod's `table.insert` says where; `ProtectedCall` reports and goes on
+    assert!(g.eval::<bool>(
+        "local t = {} local first, second = table.insert(t, 'a'), table.insert(t, 1, 'b')
+         local ok, err = pcall(table.insert, t)
+         return first == 1 and second == 1 and t[1] == 'b' and t[2] == 'a' and not ok and tostring(err):find('wrong number', 1, true)
+             and ProtectedCall(function(a) assert(a == 1) end, 1) and not ProtectedCall(error, 'on purpose')"
+    ));
+    assert_eq!(g.messages(), ["on purpose"]);
+    // the methods that give more than one value; the world's spaces
+    assert!(g.eval::<bool>(
+        "local e = ents.Create('prop_physics') e:SetModel('models/box.mdl') e:SetPos(Vector(10, 0, 0)) e:SetAngles(Angle(0, 90, 0)) E = e
+         local mins, maxs = e:GetCollisionBounds()
+         local lo, hi = e:GetModelBounds()
+         e:SetColor4Part(1, 2, 3, 4)
+         local r, g, b, a = e:GetColor4Part()
+         local pos, ang = LocalToWorld(Vector(1, 0, 0), Angle(0, 10, 0), Vector(10, 0, 0), Angle(0, 90, 0))
+         local back, back_ang = WorldToLocal(pos, ang, Vector(10, 0, 0), Angle(0, 90, 0))
+         local small, big = Vector(1, 5, -1), Vector(2, -5, 3) OrderVectors(small, big)
+         return mins == Vector(-8, -8, 0) and maxs == Vector(8, 8, 16) and lo == mins and hi == maxs and r == 1 and g == 2 and b == 3 and a == 4
+             and pos:IsEqualTol(Vector(10, 1, 0), 0.001) and ang:IsEqualTol(Angle(0, 100, 0), 0.01)
+             and back:IsEqualTol(Vector(1, 0, 0), 0.001) and back_ang:IsEqualTol(Angle(0, 10, 0), 0.01)
+             and small == Vector(1, -5, -1) and big == Vector(2, 5, 3)
+             and e:NearestPoint(Vector(10, 100, 8)):IsEqualTol(Vector(10, 8, 8), 0.001)
+             and e:AlignAngles(Angle(0, 90, 0), Angle(0, 0, 0)):IsEqualTol(Angle(0, 0, 0), 0.01)"
+    ));
+    // what is kept of how it looks: bones, attachments and flexes as the model has them
+    assert!(g.eval::<bool>(
+        "local e = E
+         e:SetSubMaterial(0, 'models/debug/debugwhite') e:SetSubMaterial(1, 'a') e:SetSubMaterial(1, '')
+         local sub = e:GetSubMaterial(0) == 'models/debug/debugwhite' and e:GetSubMaterial(1) == ''
+         e:SetSubMaterial() local cleared = e:GetSubMaterial(0) == ''
+         e:ManipulateBonePosition(0, Vector(1, 2, 3)) local moved = e:HasBoneManipulations() and e:GetManipulateBonePosition(0) == Vector(1, 2, 3)
+         e:ManipulateBonePosition(0, Vector(0, 0, 0)) local back = not e:HasBoneManipulations() and e:GetManipulateBoneScale(0) == Vector(1, 1, 1)
+         e:SetFlexScale(2) e:SetFlexWeight(3, 0.5) e:SetRenderFX(kRenderFxHologram or 16) e:SetSpawnEffect(true)
+         local t = { Type = 'Weld' } e:SetTable(t)
+         return sub and cleared and moved and back and e:GetFlexScale() == 2 and e:GetFlexWeight(3) == 0.5 and e:GetRenderFX() == 16
+             and e:GetSpawnEffect() and e:GetTable() == t and e.Type == 'Weld'
+             and e:GetBoneCount() == 0 and e:LookupBone('root') == nil and e:LookupAttachment('muzzle') == 0 and e:GetFlexNum() == 0
+             and ents.Create('info_target'):LookupAttachment('muzzle') == -1 and e:GetWorkshopID() == nil"
+    ));
+    // sounds are taken and kept quiet
+    assert!(g.eval::<bool>(
+        "E:EmitSound('Weapon_Pistol.Single') E:StopSound('Weapon_Pistol.Single') EmitSound('a.wav', Vector(), 0)
+         sound.Add({ name = 'Test.Sound', sound = 'test.wav', level = 80 })
+         local patch = CreateSound(E, 'Test.Sound')
+         patch:PlayEx(0.5, 120) local playing = patch:IsPlaying() and patch:GetVolume() == 0.5 and patch:GetPitch() == 120
+         patch:Stop()
+         return playing and not patch:IsPlaying() and sound.GetProperties('test.sound').level == 80 and sound.GetTable()[1] == 'Test.Sound'
+             and E:StartLoopingSound('a.wav') == 1 and E:StartLoopingSound('b.wav') == 2"
+    ));
+    assert_eq!(g.messages(), ["on purpose"]);
 }

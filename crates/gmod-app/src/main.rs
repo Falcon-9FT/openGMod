@@ -1,7 +1,9 @@
-//! `opengmod`: for now, a map from your Garry's Mod on the screen to walk and fly around in -
-//! the world, brush entities and static props with their textures and light, and the sky box.
-//! Drawn with Direct3D 12 on Windows (Vulkan when that is missing). Walking moves the player
-//! as the game does ([`gmod_movement`]), tick by tick against what is solid in the map.
+//! `opengmod`: a map from your Garry's Mod on the screen - the world, brush entities and static
+//! props with their textures and light, and the sky box - with the game running in it: the
+//! Lua of the server, the `sandbox` gamemode and the addons ([`game`]), and the player of a
+//! single-player game walking through it as the game moves them. Drawn with Direct3D 12 on
+//! Windows (Vulkan when that is missing). Without the game's Lua (`--no-lua`, or a map file
+//! without the game) the player only walks ([`gmod_movement`]).
 
 #![forbid(unsafe_code)]
 
@@ -12,13 +14,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use gmod_bsp::Collision;
 use gmod_fs::UserDir;
+use gmod_fs::Vfs;
 use gmod_fs::install::Install;
 use gmod_fs::mount::{MountOptions, mount_install};
 use gmod_movement::{Player, Settings};
@@ -26,12 +29,14 @@ use gmod_render::block_on;
 use gmod_world::World;
 use gmod_world::gpu::Camera;
 
+mod game;
 mod walk;
 
+use game::{Buttons, Game, Models};
 use walk::{Keys, Walker};
 
 const USAGE: &str = "\
-opengmod - a Garry's Mod map from your installation, to walk and fly around in
+opengmod - a Garry's Mod map from your installation, with the game's Lua and your addons
 
 USAGE:
     opengmod [OPTIONS] [MAP]
@@ -41,13 +46,21 @@ USAGE:
 OPTIONS:
     --gmod <DIR>         the Garry's Mod folder (default: GMOD_ROOT, then Steam's libraries)
     --no-addons          the game only: no workshop items, no addon files
+    --no-lua             no Lua: only walk through the map
     -h, --help           this text
 
 CONTROLS:
     click the window to look around with the mouse, Esc to let the mouse go
-    W A S D to walk, Shift to run, Space to jump, Ctrl to duck
-    V to fly through walls (noclip) and back: W A S D, Space and Ctrl up and down, Shift faster
-    F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)";
+    W A S D to walk, Shift to run, Alt to walk slowly, Space to jump, Ctrl to duck
+    left and right mouse buttons to fire, R to reload, E to use, F for the flashlight
+    1 to 6 and the mouse wheel to choose a weapon, Z to undo
+    the physics gun: hold the left button to carry, the wheel to take it farther or
+    nearer, E and the mouse to turn it, the right button to freeze it, R to unfreeze
+    V to fly through walls (noclip) and back
+    F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)
+
+    Lines typed into this terminal are the game's console: give weapon_crowbar,
+    gm_spawn models/props_c17/oildrum001.mdl, the commands of the addons.";
 
 /// Degrees the view turns per pixel the mouse moves.
 const MOUSE_DEGREES: f32 = 0.12;
@@ -60,16 +73,18 @@ struct Args {
     map: String,
     gmod: Option<PathBuf>,
     addons: bool,
+    lua: bool,
 }
 
 fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
-    let mut args = Args { map: "gm_construct".into(), gmod: None, addons: true };
+    let mut args = Args { map: "gm_construct".into(), gmod: None, addons: true, lua: true };
     let mut map = None;
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "--gmod" => args.gmod = Some(raw.next().ok_or("--gmod needs a folder")?.into()),
             "--map" => map = Some(raw.next().ok_or("--map needs a map")?),
             "--no-addons" => args.addons = false,
+            "--no-lua" => args.lua = false,
             "-h" | "--help" => return Ok(None),
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if map.is_none() => map = Some(arg),
@@ -85,7 +100,10 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
 /// A map read, with what it needs from the game.
 struct Loaded {
     world: World,
-    collision: Collision,
+    collision: Arc<Collision>,
+    /// The game's files and the map as the Lua of the server takes it, unless there is no Lua
+    /// to run.
+    lua: Option<(Arc<Vfs>, gmod_lua::Map)>,
     camera: Camera,
     /// Where players start: the feet, and the angles.
     spawn: Option<([f32; 3], [f32; 3])>,
@@ -138,7 +156,12 @@ fn load(args: &Args) -> Result<Loaded, String> {
     }
     let (eye, target) = gmod_world::default_view(&bsp);
     let name = Path::new(&path).file_stem().map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned());
-    Ok(Loaded { world, collision, camera: Camera::looking_at(eye, target, FOV), spawn: gmod_world::spawn_point(&bsp), name })
+    let collision = Arc::new(collision);
+    let lua = (args.lua && install.is_ok()).then(|| {
+        let map = gmod_lua::Map::from_bsp(&name, &bsp, collision.clone());
+        (Arc::new(vfs), map)
+    });
+    Ok(Loaded { world, collision, lua, camera: Camera::looking_at(eye, target, FOV), spawn: gmod_world::spawn_point(&bsp), name })
 }
 
 /// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
@@ -320,7 +343,13 @@ impl Gpu {
 
 struct App {
     world: World,
-    collision: Collision,
+    collision: Arc<Collision>,
+    /// The game running in the map; without it the player only walks.
+    game: Option<Game>,
+    /// The models of the game's entities.
+    models: Option<Models>,
+    /// The game's status for the title: health, the weapon.
+    status: String,
     settings: Settings,
     /// Where players start: the feet, and the angles.
     spawn: Option<([f32; 3], [f32; 3])>,
@@ -331,6 +360,13 @@ struct App {
     gpu: Option<Gpu>,
     error: Option<String>,
     keys: HashSet<KeyCode>,
+    /// The left and right mouse buttons held, while the mouse is captured.
+    mouse: [bool; 2],
+    /// The mouse wheel and the mouse's movement since the last command.
+    wheel: i32,
+    mouse_moved: [f64; 2],
+    /// The physics gun holds something: the wheel and, with E, the mouse are its.
+    holding: bool,
     captured: bool,
     last_frame: Instant,
     frames: u32,
@@ -354,6 +390,9 @@ impl App {
         }
         gpu.window.set_cursor_visible(!on);
         self.captured = on;
+        if !on {
+            self.mouse = [false; 2];
+        }
     }
 
     /// A walking player with their feet at `feet`, if there is room for them there.
@@ -361,7 +400,7 @@ impl App {
         if self.collision.is_empty() {
             return None;
         }
-        Player::spawn(&self.collision, &self.settings, feet).map(Walker::new)
+        Player::spawn(&*self.collision, &self.settings, feet).map(Walker::new)
     }
 
     /// Back to where players start, walking if there is room; flying where it is when the map
@@ -402,12 +441,29 @@ impl App {
         }
     }
 
-    /// Moves the camera by the keys held, for the time since the last frame: the player walks,
-    /// or the camera flies.
+    /// The buttons held besides the walking keys.
+    fn buttons(&self) -> Buttons {
+        let held = |key: KeyCode| self.keys.contains(&key);
+        Buttons {
+            attack: self.mouse[0],
+            attack2: self.mouse[1],
+            reload: held(KeyCode::KeyR),
+            using: held(KeyCode::KeyE),
+            walk: held(KeyCode::AltLeft) || held(KeyCode::AltRight),
+            ..Buttons::default()
+        }
+    }
+
+    /// Moves the camera by the keys held, for the time since the last frame: the game runs
+    /// with the player in it, or the player walks, or the camera flies.
     fn advance(&mut self) {
         let now = Instant::now();
         let seconds = (now - self.last_frame).as_secs_f32().min(0.25);
         self.last_frame = now;
+        if self.game.is_some() {
+            self.play(seconds);
+            return;
+        }
         let Some(mut walker) = self.walker.take() else {
             self.fly(seconds.min(0.1));
             return;
@@ -419,6 +475,42 @@ impl App {
         if self.camera.eye[2] < self.collision.mins[2] - 1024.0 {
             self.respawn();
         }
+    }
+
+    /// A frame of the game: the player's command, the ticks, and the eyes to see from.
+    fn play(&mut self, seconds: f32) {
+        let (keys, mut buttons) = (self.movement_keys(), self.buttons());
+        buttons.wheel = std::mem::take(&mut self.wheel);
+        buttons.mouse = self.mouse_moved.map(|counts| counts.trunc() as i32);
+        self.mouse_moved = self.mouse_moved.map(f64::fract);
+        let Some(game) = &mut self.game else { return };
+        let Some(shown) = game.frame(&keys, &buttons, self.camera.pitch, self.camera.yaw, f64::from(seconds)) else { return };
+        self.holding = shown.view.holding;
+        self.camera.eye = shown.eye;
+        if let Some((pitch, yaw)) = shown.turned {
+            (self.camera.pitch, self.camera.yaw) = (pitch, yaw);
+        }
+        self.status = game::status(&shown.view);
+        // fell out of the map: as if into a pit
+        if shown.view.alive && !self.collision.is_empty() && shown.eye[2] < self.collision.mins[2] - 1024.0 {
+            game.command("kill");
+        }
+    }
+
+    /// A key pressed while the game runs: what the game binds to it. Whether it was one.
+    fn game_key(&mut self, key: KeyCode) -> bool {
+        let Some(game) = &mut self.game else { return false };
+        let slot = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6]
+            .iter()
+            .position(|&k| k == key);
+        match (key, slot) {
+            (_, Some(slot)) => game.command(&format!("slot{}", slot + 1)),
+            (KeyCode::KeyV, _) => game.command("noclip"),
+            (KeyCode::KeyZ, _) => game.command("gmod_undo"),
+            (KeyCode::KeyF, _) => game.flashlight(),
+            _ => return false,
+        }
+        true
     }
 
     /// Flies the camera by the keys held, through walls.
@@ -441,14 +533,27 @@ impl App {
         }
     }
 
+    /// Gives the renderer the models of the game's entities and where they are now.
+    fn show_entities(&mut self) {
+        let (Some(game), Some(models), Some(gpu)) = (&self.game, &mut self.models, &mut self.gpu) else { return };
+        let placed = models.place(&game.drawn(), |model| gpu.renderer.add_model(&gpu.device, &gpu.queue, model));
+        gpu.renderer.set_entities(placed);
+    }
+
     fn count_frame(&mut self) {
         self.frames += 1;
         let elapsed = self.counting_since.elapsed().as_secs_f32();
         if elapsed >= 1.0 {
             if let Some(gpu) = &self.gpu {
                 let [x, y, z] = self.camera.eye.map(|v| v.round() as i32);
-                let mode = if self.walker.is_some() { "" } else { " - noclip" };
-                gpu.window.set_title(&format!("openGMOD - {} - {:.0} fps - {x} {y} {z}{mode}", self.name, self.frames as f32 / elapsed));
+                let fps = self.frames as f32 / elapsed;
+                let title = if self.game.is_some() {
+                    format!("openGMOD - {} - {fps:.0} fps - {}", self.name, self.status)
+                } else {
+                    let mode = if self.walker.is_some() { "" } else { " - noclip" };
+                    format!("openGMOD - {} - {fps:.0} fps - {x} {y} {z}{mode}", self.name)
+                };
+                gpu.window.set_title(&title);
             }
             self.frames = 0;
             self.counting_since = Instant::now();
@@ -486,11 +591,42 @@ impl ApplicationHandler for App {
                 self.keys.clear();
                 self.capture(false);
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => self.capture(true),
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                let index = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Right => 1,
+                    _ => return,
+                };
+                if pressed && !self.captured {
+                    // the click that takes the mouse does not fire
+                    if index == 0 {
+                        self.capture(true);
+                    }
+                } else if self.captured || !pressed {
+                    self.mouse[index] = pressed;
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let up = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                };
+                if let Some(game) = &self.game
+                    && self.captured
+                {
+                    if self.holding {
+                        self.wheel += if up { 1 } else { -1 };
+                    } else {
+                        game.command(if up { "invprev" } else { "invnext" });
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(key), state, repeat, .. }, .. } => {
                 if state == ElementState::Pressed {
                     match key {
                         KeyCode::Escape => self.capture(false),
+                        _ if !repeat && self.game_key(key) => {}
                         KeyCode::KeyV if !repeat => self.toggle_noclip(),
                         KeyCode::F12 if !repeat => self.screenshot = true,
                         KeyCode::F11 if !repeat => {
@@ -508,6 +644,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.advance();
+                self.show_entities();
                 if let Some(gpu) = &mut self.gpu {
                     gpu.draw(&self.camera);
                     if std::mem::take(&mut self.screenshot) {
@@ -528,8 +665,12 @@ impl ApplicationHandler for App {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
             && self.captured
         {
-            self.camera.yaw -= dx as f32 * MOUSE_DEGREES;
-            self.camera.pitch = (self.camera.pitch + dy as f32 * MOUSE_DEGREES).clamp(-89.0, 89.0);
+            self.mouse_moved = [self.mouse_moved[0] + dx, self.mouse_moved[1] + dy];
+            // E with the physics gun holding something: the mouse turns that, not the view
+            if !(self.holding && self.keys.contains(&KeyCode::KeyE)) {
+                self.camera.yaw -= dx as f32 * MOUSE_DEGREES;
+                self.camera.pitch = (self.camera.pitch + dy as f32 * MOUSE_DEGREES).clamp(-89.0, 89.0);
+            }
         }
     }
 }
@@ -564,6 +705,19 @@ fn main() -> ExitCode {
         Ok(loaded) => loaded,
         Err(e) => return fail(&e),
     };
+    let game = loaded.lua.as_ref().and_then(|(vfs, map)| {
+        let started = Instant::now();
+        match Game::start(vfs.clone(), map) {
+            Ok(game) => {
+                println!("The game started in {:.1} s", started.elapsed().as_secs_f64());
+                Some(game)
+            }
+            Err(e) => {
+                println!("{e}\nThe map is walked without the game's Lua.");
+                None
+            }
+        }
+    });
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
         Err(e) => return fail(&format!("window system: {e}")),
@@ -574,6 +728,9 @@ fn main() -> ExitCode {
     let mut app = App {
         world: loaded.world,
         collision: loaded.collision,
+        models: game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone())),
+        game,
+        status: String::new(),
         settings: Settings::default(),
         spawn: loaded.spawn,
         walker: None,
@@ -582,16 +739,25 @@ fn main() -> ExitCode {
         gpu: None,
         error: None,
         keys: HashSet::new(),
+        mouse: [false; 2],
+        wheel: 0,
+        mouse_moved: [0.0; 2],
+        holding: false,
         captured: false,
         last_frame: now,
         frames: 0,
         counting_since: now,
         screenshot: false,
     };
-    // walking from the player start, as the game begins
-    app.respawn();
-    if app.walker.is_none() {
-        println!("No player start with room to stand: flying (V walks from where you are)");
+    if app.game.is_some() {
+        // the eyes and angles of the player where the game spawned them
+        app.play(0.0);
+    } else {
+        // walking from the player start, as the game begins
+        app.respawn();
+        if app.walker.is_none() {
+            println!("No player start with room to stand: flying (V walks from where you are)");
+        }
     }
     if let Err(e) = event_loop.run_app(&mut app) {
         return fail(&format!("window system: {e}"));
@@ -613,7 +779,8 @@ mod tests {
     #[test]
     fn arguments() {
         let args = parse(&[]).unwrap().unwrap();
-        assert_eq!((args.map.as_str(), args.addons), ("gm_construct", true));
+        assert_eq!((args.map.as_str(), args.addons, args.lua), ("gm_construct", true, true));
+        assert!(!parse(&["--no-lua"]).unwrap().unwrap().lua);
         let args = parse(&["gm_flatgrass", "--gmod", "D:/GarrysMod", "--no-addons"]).unwrap().unwrap();
         assert_eq!((args.map.as_str(), args.gmod.as_deref(), args.addons), ("gm_flatgrass", Some(Path::new("D:/GarrysMod")), false));
         assert_eq!(parse(&["--map", "x"]).unwrap().unwrap().map, "x");

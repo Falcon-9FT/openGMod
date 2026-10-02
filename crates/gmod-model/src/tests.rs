@@ -90,8 +90,17 @@ fn mdl() -> Vec<u8> {
         let mesh = meshes + i * 116;
         b.set(mesh + 8, vertices);
     }
+    // an attachment on the root bone, 4 5 6 along it; a flex
+    let attachment = b.at();
+    b.i32(0).i32(0).i32(0).f32s(&[1.0, 0.0, 0.0, 4.0, 0.0, 1.0, 0.0, 5.0, 0.0, 0.0, 1.0, 6.0]).zeros(32);
+    let flex = b.at();
+    b.i32(0);
     let name = b.string("root");
     b.set(bone, (name - bone) as i32);
+    let muzzle = b.string("muzzle");
+    b.set(attachment, (muzzle - attachment) as i32);
+    let smile = b.string("smile");
+    b.set(flex, (smile - flex) as i32);
     for (i, texture) in ["metal", "metal_rusty"].into_iter().enumerate() {
         let at = b.string(texture);
         b.set(textures + i * 64, (at - (textures + i * 64)) as i32);
@@ -116,6 +125,10 @@ fn mdl() -> Vec<u8> {
         (228, skins as i32),
         (232, 1),
         (236, part as i32),
+        (240, 1),
+        (244, attachment as i32),
+        (260, 1),
+        (264, flex as i32),
         (308, surface as i32),
         (312, key_values as i32),
         (316, text.len() as i32 + 1),
@@ -214,6 +227,9 @@ fn reads_a_model() {
     assert_eq!(mdl.skins, [vec![0], vec![1]]);
     assert_eq!((mdl.surface_prop.as_str(), mdl.mass), ("metal", 25.0));
     assert!(mdl.key_values.starts_with("prop_data"));
+    assert_eq!(mdl.attachments.len(), 1);
+    assert_eq!((mdl.attachments[0].name.as_str(), mdl.attachments[0].bone, mdl.attachments[0].local[2][3]), ("muzzle", 0, 6.0));
+    assert_eq!(mdl.flexes, ["smile"]);
     assert_eq!(mdl.body_parts[0].name, "body");
     assert_eq!(mdl.body_parts[0].models.iter().map(|m| (m.first_vertex, m.vertex_count)).collect::<Vec<_>>(), [(0, 4), (4, 3)]);
     assert_eq!(model.vvd.vertices.len(), 7);

@@ -52,6 +52,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     globals.raw_set("UnPredictedCurTime", lua.create_function(|lua, ()| Ok(host(lua).clock.cur_time.get()))?)?;
     globals.raw_set("RealTime", lua.create_function(|lua, ()| Ok(host(lua).started.elapsed().as_secs_f64()))?)?;
     globals.raw_set("FrameTime", lua.create_function(|lua, ()| Ok(host(lua).clock.frame_time.get()))?)?;
+    // the server runs each command once: there is nothing to predict again
+    globals.raw_set("IsFirstTimePredicted", lua.create_function(|_, ()| Ok(true))?)?;
 
     let timer = lua.create_table()?;
     def(&timer, "Create", |a| {

@@ -93,6 +93,19 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let ok = model.ends_with(".mdl") && host(a.lua).vfs.exists(&model, "GAME");
         Ok(Value::Boolean(ok))
     })?;
+    // a prop has a physics model of one solid, a ragdoll one of more
+    def("IsValidProp", |a| {
+        let model = a.string(1)?;
+        Ok(Value::Boolean(crate::physics::solids(a.lua, &model) == 1))
+    })?;
+    def("IsValidRagdoll", |a| {
+        let model = a.string(1)?;
+        Ok(Value::Boolean(crate::physics::solids(a.lua, &model) > 1))
+    })?;
+    // decals are drawn by clients, which are not there yet
+    def("Decal", |a| a.string(1).map(|_| Value::Nil))?;
+    def("DecalMaterial", |a| Ok(Value::String(a.lua.create_string(a.string(1)?)?)))?;
+    def("SpriteTrail", sprite_trail)?;
     // precaching is for the renderer and the sound system, which load what they need
     def("PrecacheModel", |_| Ok(Value::Nil))?;
     def("PrecacheSound", |_| Ok(Value::Nil))?;
@@ -565,4 +578,37 @@ fn steamid_to_64(id: &str) -> Option<u64> {
 fn steamid_from_64(id: u64) -> Option<String> {
     let account = id.checked_sub(STEAMID64_BASE)?;
     Some(format!("STEAM_0:{}:{}", account % 2, account / 2))
+}
+
+/// `util.SpriteTrail(ent, attachment, color, additive, start_width, end_width, lifetime,
+/// texture_res, texture)`: an `env_spritetrail` that follows the entity, made and given back.
+fn sprite_trail(a: &Args) -> mlua::Result<Value> {
+    let target = crate::entity::this(a, 1)?;
+    let number = |position: usize| a.opt_number(position).ok().flatten().unwrap_or(0.0);
+    let color = match a.get(3) {
+        Some(Value::Table(c)) => {
+            let part = |key: &str| c.get::<Option<f64>>(key).ok().flatten().unwrap_or(255.0);
+            [part("r"), part("g"), part("b"), part("a")]
+        }
+        _ => [255.0; 4],
+    };
+    let texture = a.opt_string(9)?.unwrap_or_default();
+    let Some(trail) = crate::ents::create(a.lua, "env_spritetrail", None)? else { return Ok(Value::Nil) };
+    let pos = crate::host(a.lua).entities.transform(target).map(|(pos, _)| pos).unwrap_or_default();
+    crate::entity::set_world_pos(a.lua, trail, pos);
+    let render_mode = if a.boolean(4) { "5" } else { "1" };
+    for (key, value) in [
+        ("lifetime", number(7).to_string()),
+        ("startwidth", number(5).to_string()),
+        ("endwidth", number(6).to_string()),
+        ("spritename", texture),
+        ("rendermode", render_mode.to_string()),
+        ("rendercolor", format!("{} {} {}", color[0], color[1], color[2])),
+        ("renderamt", color[3].to_string()),
+    ] {
+        crate::ents::key_value(a.lua, trail, key, &value);
+    }
+    crate::entity::set_parent(a.lua, trail, target);
+    crate::ents::spawn(a.lua, trail);
+    crate::entity::push(a.lua, trail)
 }

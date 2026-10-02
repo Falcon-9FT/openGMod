@@ -391,6 +391,29 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             }
         })?,
     )?;
+    // a position and angles of one space in another: two values each
+    def(lua, &globals, "LocalToWorld", |a| {
+        let (pos, angles) = (a.userdata::<Vector>(1, "Vector")?, a.userdata::<Angle>(2, "Angle")?);
+        let (origin, turned) = (a.userdata::<Vector>(3, "Vector")?, a.userdata::<Angle>(4, "Angle")?);
+        Ok((origin + pos.rotated(turned), crate::entity::compose(turned, angles)))
+    })?;
+    def(lua, &globals, "WorldToLocal", |a| {
+        let (pos, angles) = (a.userdata::<Vector>(1, "Vector")?, a.userdata::<Angle>(2, "Angle")?);
+        let (origin, turned) = (a.userdata::<Vector>(3, "Vector")?, a.userdata::<Angle>(4, "Angle")?);
+        Ok((crate::entity::unrotated(pos - origin, turned), crate::entity::decompose(turned, angles)))
+    })?;
+    // the first takes the smaller of each, the second the larger
+    def(lua, &globals, "OrderVectors", |a| {
+        let (first, second) = (a.userdata::<Vector>(1, "Vector")?, a.userdata::<Vector>(2, "Vector")?);
+        let lo = Vector::new(first.x.min(second.x), first.y.min(second.y), first.z.min(second.z));
+        let hi = Vector::new(first.x.max(second.x), first.y.max(second.y), first.z.max(second.z));
+        for (position, value) in [(1, lo), (2, hi)] {
+            if let Some(Value::UserData(ud)) = a.get(position) {
+                *ud.borrow_mut::<Vector>()? = value;
+            }
+        }
+        Ok(())
+    })?;
     vector_methods(lua, &meta::meta_table(lua, "Vector", type_id::VECTOR)?)?;
     angle_methods(lua, &meta::meta_table(lua, "Angle", type_id::ANGLE)?)?;
     Ok(())

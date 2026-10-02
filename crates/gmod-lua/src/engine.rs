@@ -38,6 +38,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     install_enums(lua, &globals)?;
 
     globals.raw_set("SysTime", lua.create_function(|lua, ()| Ok(host(lua).started.elapsed().as_secs_f64()))?)?;
+    globals.raw_set("GetHostName", lua.create_function(|lua, ()| Ok(crate::convar::value(lua, "hostname").unwrap_or_default()))?)?;
     install_libraries(lua, &globals)?;
     Ok(())
 }
@@ -91,8 +92,8 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     globals.raw_set("gmod", gmod)?;
 
     let game = lua.create_table()?;
-    def(lua, &game, "SinglePlayer", |_| Ok(Value::Boolean(true)))?;
-    def(lua, &game, "MaxPlayers", |_| Ok(Value::Integer(1)))?;
+    def(lua, &game, "SinglePlayer", |_| Ok(Value::Boolean(crate::player::MAX_PLAYERS == 1)))?;
+    def(lua, &game, "MaxPlayers", |_| Ok(Value::Integer(crate::player::MAX_PLAYERS.into())))?;
     def(lua, &game, "IsDedicated", |_| Ok(Value::Boolean(false)))?;
     def(lua, &game, "GetMap", |a| string(a, &host(a.lua).game.map.borrow()))?;
     def(lua, &game, "GetIPAddress", |a| string(a, "loopback"))?;

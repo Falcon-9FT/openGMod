@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gmod_fs::Vfs;
-use gmod_lua::{Output, Realm, Runtime, ScriptError};
+use gmod_lua::{Output, PlayerInfo, Realm, Runtime, ScriptError};
 
 use crate::out::Out;
 
@@ -51,6 +51,8 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
     runtime.start("sandbox");
     if let Some(map) = map.filter(|_| realm == Realm::Server) {
         runtime.spawn_map(map);
+        // and the player of a single-player game joins
+        runtime.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() });
     }
     // one second of game time: the timers and hooks of the first frames
     for _ in 0..60 {
@@ -71,6 +73,7 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
     ));
     if let Some(map) = map.filter(|_| realm == Realm::Server) {
         out.line(format!("Map {}: {} entities.", map.name, runtime.entity_count()));
+        out.line(player_report(&runtime));
     }
     let missing = missing_globals(&errors);
     if !missing.is_empty() {
@@ -81,6 +84,17 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
     }
     print_coverage(&runtime, all, out);
     if errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Where the player got to in the first second, and what they hold.
+fn player_report(runtime: &Runtime) -> String {
+    const REPORT: &str = "local p = player.GetAll()[1]
+        if not IsValid(p) then return 'No player could join.' end
+        local pos, w = p:GetPos(), p:GetActiveWeapon()
+        return string.format('Player %s: %s at (%.0f %.0f %.0f), %s, health %d, %d weapons, holding %s.', p:Nick(),
+            p:Alive() and 'alive' or 'dead', pos.x, pos.y, pos.z, p:OnGround() and 'on the ground' or 'in the air',
+            p:Health(), #p:GetWeapons(), IsValid(w) and w:GetClass() or 'nothing')";
+    runtime.lua().load(REPORT).eval::<String>().unwrap_or_else(|e| format!("The player could not be looked at: {e}"))
 }
 
 /// GMod's Lua API by the wiki: realms (`S`, `C`, `M`) and names (`net.Start`,

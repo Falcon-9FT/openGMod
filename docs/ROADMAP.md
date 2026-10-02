@@ -38,7 +38,8 @@
 * Превью без видеокарты — `gmod-check render` ✅: мир, брашевые энтити и статические пропы с
   текстурами и светом, смешивание на дисплейсментах, alpha test, прозрачность, вода, скайбокс.
 * Рендер на wgpu — `gmod-render`, программа `opengmod` ✅: мир, брашевые энтити, статические
-  пропы, небо, вода, прозрачность; полёт камерой. Дальше — 3D skybox, кубмапы и отражения,
+  пропы, небо, вода, прозрачность, модели энтити (каждая загружается один раз и рисуется
+  там, где стоит энтити, освещена сверху); полёт камерой. Дальше — 3D skybox, кубмапы и отражения,
   карты нормалей, декали и оверлеи, туман, анимированные материалы.
 * `gmod-check` проверяет все карты, материалы, текстуры и модели установки ✅.
 
@@ -77,20 +78,59 @@
     `ents.Create`/`Find*`, SENT (`Initialize`, `Think`, `KeyValue`, `OnRemove`,
     `SetupDataTables`), NW/NW2/DT-переменные, энтити карты с ключами, родителями и
     `InitPostEntity`; `gmod-check lua --map` грузит энтити карты.
-  * Дальше: игроки (`Player`, хуки спавна, движение через `CMoveData`), оружие, NPC, поведение
-    энтити движка (двери, триггеры, ввод-вывод `Fire`).
-* Физика на Jolt ([PHYSICS.md](PHYSICS.md)):
-  * пропы с формами из `.phy` (формы читаются ✅ — `gmod-model::phy`; статические пропы уже
-    твёрдые для трассировок и игрока);
-  * мир из BSP;
-  * все констрейнты `constraint.lua`;
-  * плавучесть;
+  * Игроки ✅ — `gmod-lua::player`: игрок — энтити с индексом 1, вход как в движке
+    (`PlayerConnect`, `PlayerAuthed`, `PlayerInitialSpawn`), спавн через `PlayerSelectSpawn` и
+    `PlayerSpawn`, смерть (`DoPlayerDeath`, `PlayerDeath`, `PlayerSilentDeath`,
+    `PostPlayerDeath`, `PlayerDeathThink`), все методы `Player` по вики и библиотека `player`.
+    Каждый тик — команда (`StartCommand`, `KeyPress`), движение через `CMoveData` и хуки
+    `SetupMove`/`Move`/`FinishMove` на `gmod-movement`, оружие в руках.
+  * Оружие ✅ — `gmod-lua::weapon`: оружие движка по `scripts/weapons/*.txt` и SWEP, обоймы и
+    патроны, выдача, переключение (`Holster`/`Deploy`), выстрелы и перезарядка, выброс при
+    смерти, типы патронов движка и `game.BuildAmmoTypes`.
+  * Урон ✅ — `CTakeDamageInfo`, `EntityTakeDamage`, броня, `PlayerHurt`, `OnTakeDamage` у SENT.
+  * Ввод энтити ✅ — `Entity:Input`, `Entity:Fire` с задержкой, хук `AcceptInput` и
+    `ENT:AcceptInput`, `Kill`, `KillHierarchy`, `AddOutput`, `SetParent`, `Color`, `Alpha`,
+    `Skin`, входы констрейнтов.
+  * Дальше: подбор оружия касанием, NPC, поведение энтити движка (двери, триггеры, выводы
+    `OnTrigger`... и `AddOutput` с ними), рэгдоллы трупов.
+* Игра в `opengmod` ✅: при запуске карты работает Lua сервера с `sandbox` и аддонами
+  воркшопа, игрок одиночной игры ходит через хуки геймода, мышь и клавиши — его команды
+  (`IN_ATTACK`, `IN_RELOAD`, выбор оружия, фонарик, noclip, `gmod_undo`), терминал — консоль
+  игры от лица игрока (и `lua_run`). Модели энтити видны ✅: пропы, SENT, NPC, оружие на
+  земле — всё, что не спрятано (`SetNoDraw`, `EF_NODRAW`), кроме самого игрока и того, что
+  он несёт (`Runtime::drawn`). Пропы падают и ложатся ✅, физган ✅, тулган ✅ (все 37
+  инструментов sandbox отрабатывают без ошибок; режим и настройки — из консоли, пока нет меню).
+  Дальше, чтобы играть с модами: оружие в руках (вью-модели), анимация моделей, интерфейс
+  (этап 5).
+* Физика — `gmod-physics` на Rapier (чистый Rust, без C++ в сборке):
+  * пропы с формами из `.phy` ✅: масса, затухание и материал из модели; `PhysicsInit`,
+    `PhysicsInitBox`, `PhysicsInitSphere`, `PhysicsInitConvex`, `PhysObj` в Lua
+    (`gmod-lua::physics`: движение, заморозка, сон, толчки, вращение, гравитация, коллизии);
+    пропы карты (`prop_physics*`, флаги «motion disabled» и «start asleep»), `sv_gravity`,
+    `util.IsValidProp` и `util.IsValidRagdoll` для `gm_spawn`;
+  * мир из BSP ✅: браши, дисплейсменты, статические пропы;
+  * физган ✅ — `gmod-lua::physgun` (в GMod он на C++): взять, нести, колесо, поворот на E,
+    заморозка на правую кнопку, разморозка на R; хуки `PhysgunPickup`, `OnPhysgunPickup`,
+    `PhysgunDrop`, `OnPhysgunFreeze`, `OnPhysgunReload`, как их ждёт sandbox;
+  * контроллеры движения (`StartMotionController`, тени `PhysicsInitShadow`);
+  * констрейнты ✅ — `gmod-lua::constraint`: `phys_constraint` (сварка), `phys_ballsocket`,
+    `phys_hinge` (ось), `phys_slideconstraint`, `phys_lengthconstraint` (верёвка), `phys_spring`
+    (резинка), `logic_collision_pair` (no-collide) — суставы Rapier к пропам и к миру, предел
+    силы и кручения (`forcelimit`, `torquelimit`), `Break`, `TurnOn`/`TurnOff`, констрейнты карт
+    по именам (`attach1`, `attach2`). Дальше: моторы (`phys_torque`), `phys_keepupright`, блоки
+    (`phys_pulleyconstraint`), пределы `phys_ragdollconstraint`, трение осей, резинка «только на
+    растяжение», лебёдки и гидравлика (`gmod_winch_controller`), видимые верёвки
+    (`keyframe_rope`);
+  * игрок толкает пропы и встаёт на них, трассировки по формам пропов;
+  * плавучесть, звуки ударов, поломка пропов;
   * рэгдоллы.
 * Трассировки как в Source — `gmod-bsp::collision` ✅: луч и коробка по брашам мира,
   дисплейсментам, брашевым энтити и статическим пропам, маски и содержимое как в Lua GMod,
-  `gmod-check trace` для сверки с игрой. По подвижным моделям и игрокам — вместе с физикой.
+  `gmod-check trace` для сверки с игрой. В Lua ✅ — `util.TraceLine`, `util.TraceHull`,
+  `GetEyeTrace`: мир карты и коробки твёрдых энтити, фильтры и группы коллизий как в HL2
+  (игрок проходит сквозь оружие и обломки). Формы моделей — вместе с физикой.
 * Движение игрока — `gmod-movement` ✅, ходьба в `opengmod`: трение и разгон, бег, ступеньки,
-  склоны, скольжение по стенам, прыжок, приседание, плавание, лестницы-браши. Дальше —
+  склоны, скольжение по стенам, прыжок, приседание, плавание, лестницы-браши, noclip. Дальше —
   лестницы HL2 по кнопке E (`func_useableladder`), движущиеся опоры, толчки конвейеров и
   триггеров, сверка чисел с игрой.
 * Анимации моделей (кости, последовательности, позы), рэгдоллы.

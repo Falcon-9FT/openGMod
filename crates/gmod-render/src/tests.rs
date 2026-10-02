@@ -34,10 +34,41 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     None
 }
 
-/// Draws the test map from `camera` into a 64 x 64 picture and reads it back, RGBA.
+/// The device, or none when there is no GPU here and the test is skipped.
+fn device_or_skip() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let pair = device();
+    if pair.is_none() {
+        // CI sets this on Windows, which always has WARP: there a skip would hide a broken renderer
+        let required = std::env::var_os("OPENGMOD_REQUIRE_GPU").is_some_and(|v| !v.is_empty());
+        assert!(!required, "no GPU, not even WARP, and OPENGMOD_REQUIRE_GPU is set");
+        println!("no GPU here, not even a software one: skipped");
+    }
+    pair
+}
+
+const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+fn test_map() -> World {
+    let bsp = gmod_bsp::Bsp::parse("test.bsp".into(), Arc::from(gmod_bsp::testmap::bytes())).unwrap();
+    gmod_world::load(&gmod_fs::Vfs::new(), &bsp)
+}
+
+fn red(p: &[u8]) -> bool {
+    p[0] > 200 && p[1] < 40 && p[2] < 40
+}
+
+/// A pixel of a picture: RGBA.
+fn at(pixels: &[u8], x: usize, y: usize) -> &[u8] {
+    &pixels[y * 256 + x * 4..y * 256 + x * 4 + 4]
+}
+
+/// Draws `world` from `camera` into a 64 x 64 picture and reads it back, RGBA.
 fn draw(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, camera: &Camera) -> Vec<u8> {
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut renderer = Renderer::new(device, queue, format, world);
+    picture(device, queue, &mut Renderer::new(device, queue, FORMAT, world), camera)
+}
+
+/// Draws what `renderer` has from `camera` into a 64 x 64 picture, rows of 256 bytes.
+fn picture(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut Renderer, camera: &Camera) -> Vec<u8> {
     let (width, height) = (64u32, 64u32);
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("picture"),
@@ -45,7 +76,7 @@ fn draw(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, camera: &Came
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format,
+        format: FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
@@ -75,30 +106,86 @@ fn draw(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, camera: &Came
 
 #[test]
 fn draws_the_test_map() {
-    let Some((device, queue)) = device() else {
-        // CI sets this on Windows, which always has WARP: there a skip would hide a broken renderer
-        let required = std::env::var_os("OPENGMOD_REQUIRE_GPU").is_some_and(|v| !v.is_empty());
-        assert!(!required, "no GPU, not even WARP, and OPENGMOD_REQUIRE_GPU is set");
-        println!("no GPU here, not even a software one: skipped");
-        return;
-    };
+    let Some((device, queue)) = device_or_skip() else { return };
     // without the game, every material is missing: purple and black squares, lit by the light
     // maps - the floor's is red
-    let bsp = gmod_bsp::Bsp::parse("test.bsp".into(), Arc::from(gmod_bsp::testmap::bytes())).unwrap();
-    let world = gmod_world::load(&gmod_fs::Vfs::new(), &bsp);
-    let red = |p: &[u8]| p[0] > 200 && p[1] < 40 && p[2] < 40;
-    let at = |pixels: &[u8], x: usize, y: usize| pixels[y * 256 + x * 4..y * 256 + x * 4 + 4].to_vec();
+    let world = test_map();
 
     // from above, looking down at the floor: red (and black) in the middle, the clear colour
     // around it
     let above = draw(&device, &queue, &world, &Camera::looking_at([64.0, 64.0, 200.0], [64.0, 64.1, 0.0], 75.0));
-    let reds = (0..64 * 64).filter(|i| red(&at(&above, i % 64, i / 64))).count();
+    let reds = (0..64 * 64).filter(|i| red(at(&above, i % 64, i / 64))).count();
     assert!(reds > 64 * 64 / 10, "{reds} red pixels");
     let corner = at(&above, 0, 0);
     assert!(corner[2] > corner[0] && corner[1] > corner[0], "{corner:?}");
 
     // from below the floor is turned away and not drawn: nothing red
     let below = draw(&device, &queue, &world, &Camera::looking_at([64.0, 64.0, -200.0], [64.0, 64.1, 0.0], 75.0));
-    let reds = (0..64 * 64).filter(|i| red(&at(&below, i % 64, i / 64))).count();
+    let reds = (0..64 * 64).filter(|i| red(at(&below, i % 64, i / 64))).count();
     assert_eq!(reds, 0, "the back of the floor is drawn");
+}
+
+#[test]
+fn draws_models_where_the_entities_are() {
+    let Some((device, queue)) = device_or_skip() else { return };
+    // a model: a square of the missing texture, 64 units a side, facing up; it is lit from
+    // where it is drawn, so its purple stays purple over the red floor
+    let vertices = [[0.0, 0.0], [0.0, 64.0], [64.0, 64.0], [64.0, 0.0]]
+        .map(|[x, y]| gmod_world::Vertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [x / 64.0, y / 64.0],
+            light: [1.0; 3],
+            ..Default::default()
+        })
+        .to_vec();
+    let surface = gmod_world::Surface {
+        material: "square".to_string(),
+        first: 0,
+        count: 6,
+        base: None,
+        base2: None,
+        alpha_test: None,
+        translucent: false,
+        additive: false,
+        lit: true,
+        no_cull: false,
+        tint: [1.0; 3],
+        alpha: 1.0,
+        water: None,
+        missing: true,
+    };
+    let square = World {
+        pieces: vec![gmod_world::Piece { vertices, indices: vec![0, 1, 2, 0, 2, 3], lightmap: None, surfaces: vec![surface] }],
+        textures: Vec::new(),
+        sky: Default::default(),
+        missing_materials: Vec::new(),
+        missing_textures: Vec::new(),
+        missing_models: Vec::new(),
+    };
+    let purple = |p: &[u8]| p[0] > 120 && p[2] > 120 && p[1] < 40;
+    let above = Camera::looking_at([64.0, 64.0, 200.0], [64.0, 64.1, 0.0], 75.0);
+
+    let mut renderer = Renderer::new(&device, &queue, FORMAT, &test_map());
+    let model = renderer.add_model(&device, &queue, &square);
+    // turned a quarter, its x runs along the world's y and its y along the world's -x: from
+    // (96, 32) it covers the middle of the floor, above it
+    renderer.set_entities(vec![Placed { model, origin: [96.0, 32.0, 32.0], angles: [0.0, 90.0, 0.0], scale: 1.0 }]);
+    let pixels = picture(&device, &queue, &mut renderer, &above);
+    let middle = (24..40).flat_map(|y| (24..40).map(move |x| (x, y)));
+    let purples = middle.clone().filter(|&(x, y)| purple(at(&pixels, x, y))).count();
+    assert!(purples > 16 * 16 / 4, "{purples} purple pixels in the middle");
+    assert!(middle.clone().all(|(x, y)| !red(at(&pixels, x, y))), "the floor shows through the model");
+    // the floor around it, the clear colour in the corner
+    assert!((0..64 * 64).any(|i| red(at(&pixels, i % 64, i / 64))));
+    let corner = at(&pixels, 0, 0);
+    assert!(corner[2] > corner[0] && corner[1] > corner[0], "{corner:?}");
+
+    // from below it is turned away, like the floor; with no entities it is gone
+    let below = Camera::looking_at([64.0, 64.0, 10.0], [64.0, 64.1, 100.0], 75.0);
+    let pixels = picture(&device, &queue, &mut renderer, &below);
+    assert!((0..64 * 64).all(|i| !purple(at(&pixels, i % 64, i / 64))), "the back of the model is drawn");
+    renderer.set_entities(Vec::new());
+    let pixels = picture(&device, &queue, &mut renderer, &above);
+    assert!((0..64 * 64).all(|i| !purple(at(&pixels, i % 64, i / 64))), "a model is drawn with no entity");
 }

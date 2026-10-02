@@ -387,3 +387,26 @@ fn a_hull_stops_what_the_same_brush_stops() {
         assert_eq!((a.start_solid, a.all_solid), (b.start_solid, b.all_solid), "sweep {i}");
     }
 }
+
+#[test]
+fn shapes_for_physics() {
+    let (_, mut collision) = load(&room());
+    let crate_shape = collision.add_shape(vec![Hull::cuboid([-16.0, -16.0, 0.0], [16.0, 16.0, 32.0])]);
+    collision.add_static(0, crate_shape, [100.0, 0.0, 0.0], [0.0, 90.0, 0.0]);
+    let shapes = collision.solid_shapes(mask::SOLID_BRUSHONLY);
+    // the floor, the wall, the sky, the ramp, the brush under the water - not the water nor the
+    // clip for players - and the crate
+    assert_eq!(shapes.hulls.len(), 6, "{:?}", shapes.hulls.iter().map(Vec::len).collect::<Vec<_>>());
+    let has = |corner: Vec3| shapes.hulls.iter().any(|h| h.iter().any(|&p| near(p, corner)));
+    let floor = shapes.hulls.iter().find(|h| h.iter().any(|&p| near(p, [-512.0, -512.0, -32.0]))).unwrap();
+    assert_eq!(floor.len(), 8);
+    assert!(floor.iter().all(|p| p[2] == 0.0 || p[2] == -32.0));
+    // the ramp is cut: its high corners stand at x / 2
+    assert!(has([256.0, -400.0, 128.0]) && has([0.0, -400.0, 0.0]) && !has([0.0, -400.0, 128.0]));
+    assert!(has([116.0, 16.0, 32.0]), "the crate where it stands, turned");
+    assert!(shapes.triangles.is_empty());
+
+    let (_, collision) = load(&hill());
+    let shapes = collision.solid_shapes(mask::SOLID_BRUSHONLY);
+    assert!(!shapes.triangles.is_empty() && shapes.vertices.len() == shapes.triangles.len() * 3);
+}

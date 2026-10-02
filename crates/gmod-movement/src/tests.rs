@@ -332,3 +332,28 @@ fn climbs_over_the_top_and_walks_off_at_the_bottom() {
     run(&mut player, &world, &Command { angles: [0.0, 180.0, 0.0], ..forward(0) }, 0.5);
     assert!(player.ladder.is_none() && player.origin[0] < 40.0, "{player:?}");
 }
+
+#[test]
+fn noclip_flies_through_walls_where_the_player_looks() {
+    let world = world(vec![TestBrush::cuboid([100.0, -100.0, 0.0], [132.0, 100.0, 300.0])], Vec::new());
+    let mut player = standing(&world, [0.0; 3]);
+    let s = Settings::default();
+    // looking 45° up: up and forward alike, through the wall; speeding up by 5 × (5 × 200) a
+    // second against friction 8, the speed settles where a tick's gain (75) is what friction
+    // takes of the speed after it: v = 0.88 × (v + 75), 550
+    let up = Command { angles: [-45.0, 0.0, 0.0], ..forward(0) };
+    for _ in 0..(2.0 / TICK) as usize {
+        player.noclip(&s, &up, TICK);
+    }
+    let speed = horizontal(player.velocity).hypot(player.velocity[2]);
+    assert!((speed - 550.0).abs() < 1.0, "{player:?}");
+    assert!(player.origin[0] > 300.0 && (player.origin[0] - player.origin[2]).abs() < 1.0, "{player:?}");
+    assert!(!player.on_ground);
+    // let go: stopped within half a second, no gravity
+    let z = player.origin[2];
+    for _ in 0..(0.5 / TICK) as usize {
+        player.noclip(&s, &Command::default(), TICK);
+    }
+    assert_eq!(player.velocity, [0.0; 3]);
+    assert!(player.origin[2] > z, "it slows, it does not fall");
+}

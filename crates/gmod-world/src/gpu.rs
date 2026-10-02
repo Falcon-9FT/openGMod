@@ -13,7 +13,7 @@ use gmod_material::decode::to_half;
 use gmod_material::vtf::flags;
 use gmod_material::{Format, Vtf};
 
-use crate::{Surface, Vec3, World, add, dot, normalize, scale, sub};
+use crate::{SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
 
 /// Bytes of one vertex: position (3 `f32`), normal (3), texture coordinates (2), light map
 /// coordinates (2), blend alpha (1) and vertex light (3).
@@ -222,6 +222,27 @@ pub struct Camera {
 /// Nothing closer than this is drawn.
 pub const NEAR: f32 = 4.0;
 
+/// Matrices of four columns, as the shaders take them.
+pub fn multiply(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    std::array::from_fn(|i| {
+        let (row, column) = (i % 4, i / 4);
+        (0..4).map(|k| a[k * 4 + row] * b[column * 4 + k]).sum()
+    })
+}
+
+/// What a model drawn at `origin`, turned by `angles`, needs: the matrix from its space to the
+/// world's, and where the light of [`SUN`] comes from in its space.
+pub fn placement(origin: Vec3, angles: Vec3) -> ([f32; 16], Vec3) {
+    let [forward, left, up] = axes(angles);
+    let columns = [forward, left, up, origin];
+    let matrix = std::array::from_fn(|i| {
+        let (row, column) = (i % 4, i / 4);
+        if row == 3 { if column == 3 { 1.0 } else { 0.0 } } else { columns[column][row] }
+    });
+    let sun = normalize(SUN);
+    (matrix, [dot(forward, sun), dot(left, sun), dot(up, sun)])
+}
+
 impl Camera {
     /// A camera at `eye` looking at `target`.
     pub fn looking_at(eye: Vec3, target: Vec3, fov: f32) -> Camera {
@@ -384,6 +405,24 @@ mod tests {
         let looking = Camera::looking_at([0.0; 3], [0.0, -10.0, -10.0], 75.0);
         assert!((looking.yaw + 90.0).abs() < 1e-4 && (looking.pitch - 45.0).abs() < 1e-4, "{looking:?}");
         assert!(near(looking.forward(), normalize([0.0, -1.0, -1.0])));
+    }
+
+    #[test]
+    fn models_placed_in_the_world() {
+        // turned to look along y and moved: its forward is the world's y, its left the world's -x
+        let (m, sun) = placement([10.0, 20.0, 30.0], [0.0, 90.0, 0.0]);
+        let near = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(near(transform(&m, [1.0, 0.0, 0.0]), [10.0, 21.0, 30.0, 1.0]));
+        assert!(near(transform(&m, [0.0, 1.0, 0.0]), [9.0, 20.0, 30.0, 1.0]));
+        assert!(near(transform(&m, [0.0, 0.0, 1.0]), [10.0, 20.0, 31.0, 1.0]));
+        // the light from above stays above; from the side it turns with the model
+        let s = normalize(SUN);
+        assert!((sun[2] - s[2]).abs() < 1e-5 && (sun[0] - s[1]).abs() < 1e-5 && (sun[1] + s[0]).abs() < 1e-5, "{sun:?}");
+        // the camera after the model is the model through the camera
+        let camera = Camera { eye: [0.0, -200.0, 30.0], yaw: 90.0, pitch: 0.0, fov: 90.0 }.view_projection(1.0);
+        let both = multiply(&camera, &m);
+        let through = transform(&camera, [10.0, 21.0, 30.0]);
+        assert!(near(transform(&both, [1.0, 0.0, 0.0]), through), "{:?} {through:?}", transform(&both, [1.0, 0.0, 0.0]));
     }
 
     #[test]

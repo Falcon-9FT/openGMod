@@ -369,11 +369,7 @@ pub fn placed_models(bsp: &Bsp) -> Vec<(usize, Vec3, Vec3)> {
 /// Moves vertices from their own space into the world: turned by pitch, yaw and roll
 /// (degrees), then moved to `origin`.
 pub fn place(vertices: &mut [Vertex], origin: Vec3, angles: Vec3) {
-    let [pitch, yaw, roll] = angles.map(f32::to_radians);
-    let ((sp, cp), (sy, cy), (sr, cr)) = (pitch.sin_cos(), yaw.sin_cos(), roll.sin_cos());
-    let forward = [cp * cy, cp * sy, -sp];
-    let left = [sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, sr * cp];
-    let up = [cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp];
+    let [forward, left, up] = axes(angles);
     let turn = |v: Vec3| add(add(scale(forward, v[0]), scale(left, v[1])), scale(up, v[2]));
     for vertex in vertices {
         vertex.position = add(origin, turn(vertex.position));
@@ -381,9 +377,23 @@ pub fn place(vertices: &mut [Vertex], origin: Vec3, angles: Vec3) {
     }
 }
 
+/// Where a thing turned by `angles` (pitch, yaw, roll in degrees, as the game gives them) has
+/// its forward, left and up.
+pub fn axes(angles: Vec3) -> [Vec3; 3] {
+    let [pitch, yaw, roll] = angles.map(f32::to_radians);
+    let ((sp, cp), (sy, cy), (sr, cr)) = (pitch.sin_cos(), yaw.sin_cos(), roll.sin_cos());
+    let forward = [cp * cy, cp * sy, -sp];
+    let left = [sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, sr * cp];
+    let up = [cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp];
+    [forward, left, up]
+}
+
+/// Where the light of models without baked light comes from, from above.
+pub const SUN: Vec3 = [0.4, 0.3, 1.0];
+
 /// Light for a model vertex without baked light: some from everywhere, more from above.
 fn plain_light(normal: Vec3) -> Vec3 {
-    let sun = dot(normal, normalize([0.4, 0.3, 1.0])).max(0.0);
+    let sun = dot(normal, normalize(SUN)).max(0.0);
     [0.35 + 0.5 * sun; 3]
 }
 
@@ -398,6 +408,17 @@ struct Gather<'a> {
 }
 
 impl Gather<'_> {
+    fn new(vfs: &Vfs) -> Gather<'_> {
+        Gather {
+            vfs,
+            library: Library::new(),
+            textures: Vec::new(),
+            by_name: HashMap::new(),
+            missing_textures: Vec::new(),
+            missing_materials: Vec::new(),
+        }
+    }
+
     fn texture(&mut self, name: &str) -> Option<usize> {
         if let Some(&known) = self.by_name.get(name) {
             return known;
@@ -461,14 +482,7 @@ impl Gather<'_> {
 
 /// Gathers a map ready to draw. The map's pakfile should be mounted ([`mount_pakfile`]).
 pub fn load(vfs: &Vfs, bsp: &Bsp) -> World {
-    let mut gather = Gather {
-        vfs,
-        library: Library::new(),
-        textures: Vec::new(),
-        by_name: HashMap::new(),
-        missing_textures: Vec::new(),
-        missing_materials: Vec::new(),
-    };
+    let mut gather = Gather::new(vfs);
     let mut pieces = brushes(bsp, &mut gather);
     let missing_models = static_props(bsp, &mut gather, &mut pieces);
     let sky_name = bsp.worldspawn().and_then(|w| w.get("skyname")).unwrap_or("").to_string();
@@ -574,26 +588,56 @@ fn static_props(bsp: &Bsp, gather: &mut Gather, pieces: &mut Vec<Piece>) -> Vec<
                 v.light = plain_light(v.normal);
             }
         }
-        let mut surfaces = Vec::new();
-        for batch in &mesh.batches {
-            let candidates = model.mdl.material_candidates(batch.texture);
-            let found = candidates.iter().find_map(|candidate| gather.library.material(gather.vfs, candidate).ok().map(|m| (candidate, m)));
-            let (first, count) = (batch.first_index as usize, batch.index_count as usize);
-            let surface = match found {
-                Some((name, material)) => gather.surface(name, Some(&material), first, count),
-                None => {
-                    let name = candidates.first().cloned().unwrap_or_default();
-                    if !gather.missing_materials.contains(&name) {
-                        gather.missing_materials.push(name.clone());
-                    }
-                    Surface::plain(&name, first, count)
-                }
-            };
-            surfaces.push(surface);
-        }
+        let surfaces = model_surfaces(gather, model, &mesh);
         pieces.push(Piece { vertices, indices: mesh.indices, lightmap: None, surfaces });
     }
     missing
+}
+
+/// How to draw each batch of a model's triangles: the first of the materials it may have
+/// that the game has.
+fn model_surfaces(gather: &mut Gather, model: &Model, mesh: &gmod_model::StaticMesh) -> Vec<Surface> {
+    let mut surfaces = Vec::new();
+    for batch in &mesh.batches {
+        let candidates = model.mdl.material_candidates(batch.texture);
+        let found = candidates.iter().find_map(|candidate| gather.library.material(gather.vfs, candidate).ok().map(|m| (candidate, m)));
+        let (first, count) = (batch.first_index as usize, batch.index_count as usize);
+        let surface = match found {
+            Some((name, material)) => gather.surface(name, Some(&material), first, count),
+            None => {
+                let name = candidates.first().cloned().unwrap_or_default();
+                if !gather.missing_materials.contains(&name) {
+                    gather.missing_materials.push(name.clone());
+                }
+                Surface::plain(&name, first, count)
+            }
+        };
+        surfaces.push(surface);
+    }
+    surfaces
+}
+
+/// A model on its own, to draw wherever an entity has it: one piece in the model's space (its
+/// first body group, in the pose it was made in), with its materials and textures. The
+/// light comes from where it is drawn, so the vertices have none of their own.
+pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
+    let model = gmod_model::load(vfs, name)?;
+    let mesh = model.mesh(0, skin)?;
+    let mut gather = Gather::new(vfs);
+    let vertices = mesh
+        .vertices
+        .iter()
+        .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: [0.0; 2], alpha: 0.0, light: [1.0; 3] })
+        .collect();
+    let surfaces = model_surfaces(&mut gather, &model, &mesh);
+    Ok(World {
+        pieces: vec![Piece { vertices, indices: mesh.indices, lightmap: None, surfaces }],
+        textures: gather.textures,
+        sky: Default::default(),
+        missing_materials: gather.missing_materials,
+        missing_textures: gather.missing_textures,
+        missing_models: Vec::new(),
+    })
 }
 
 #[cfg(test)]

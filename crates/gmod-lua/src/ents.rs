@@ -38,36 +38,88 @@ pub struct Map {
     pub entities: Vec<Vec<(String, String)>>,
     /// Mins and maxs of the brush models; `*0` is the world.
     pub brush_models: Vec<([f32; 3], [f32; 3])>,
+    /// What traces and players run into ([`gmod_bsp::Collision`]); without it the world is
+    /// empty space.
+    pub collision: Option<std::sync::Arc<gmod_bsp::Collision>>,
+    /// The material of each surface (`texinfo`), which traces name as `HitTexture`.
+    pub textures: Vec<String>,
 }
 
-/// The collision boxes of models, as `SetModel` gives them.
+impl Map {
+    /// The map `bsp` named `name` (`gm_construct`), solid as `collision` says.
+    pub fn from_bsp(name: &str, bsp: &gmod_bsp::Bsp, collision: std::sync::Arc<gmod_bsp::Collision>) -> Map {
+        let texture = |texdata: i32| usize::try_from(texdata).ok().and_then(|i| bsp.materials.get(i)).cloned().unwrap_or_default();
+        Map {
+            name: name.to_string(),
+            entities: bsp.entities.iter().map(|e| e.pairs.clone()).collect(),
+            brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
+            collision: Some(collision),
+            textures: bsp.texinfo.iter().map(|info| texture(info.texdata)).collect(),
+        }
+    }
+}
+
+/// The models entities have, as far as the engine reads them: the bounds of the brush models
+/// of the map, and what `SetModel` takes from a studio model.
 #[derive(Default)]
 pub(crate) struct Models {
     brush: RefCell<Vec<(Vector, Vector)>>,
-    studio: RefCell<HashMap<String, Option<(Vector, Vector)>>>,
+    studio: RefCell<HashMap<String, Option<Studio>>>,
+}
+
+/// What the engine takes from a studio model (`.mdl`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Studio {
+    pub hull: (Vector, Vector),
+    /// The body groups: the name of each, and the names of its models.
+    pub body_parts: Vec<(String, Vec<String>)>,
+    /// How many skins it has.
+    pub skins: usize,
+    /// The bones: the name of each, and its parent's number (-1 for none).
+    pub bones: Vec<(String, i32)>,
+    /// The names of the attachments, numbered from 1.
+    pub attachments: Vec<String>,
+    /// The names of the flexes.
+    pub flexes: Vec<String>,
+}
+
+/// A studio model, read once.
+pub(crate) fn studio(lua: &Lua, model: &str) -> Option<Studio> {
+    if model.is_empty() || model.starts_with('*') {
+        return None;
+    }
+    let host = host(lua);
+    let path = model.replace('\\', "/").to_ascii_lowercase();
+    if let Some(studio) = host.models.studio.borrow().get(&path) {
+        return studio.clone();
+    }
+    let studio = host.vfs.read(&path, "GAME").ok().and_then(|bytes| gmod_model::Mdl::parse(&bytes).ok()).map(|mdl| {
+        let (lo, hi) = mdl.hull;
+        Studio {
+            hull: (Vector::new(lo[0], lo[1], lo[2]), Vector::new(hi[0], hi[1], hi[2])),
+            body_parts: mdl
+                .body_parts
+                .iter()
+                .map(|part| (part.name.clone(), part.models.iter().map(|m| m.name.clone()).collect()))
+                .collect(),
+            skins: mdl.skins.len().max(1),
+            bones: mdl.bones.iter().map(|b| (b.name.clone(), b.parent)).collect(),
+            attachments: mdl.attachments.iter().map(|a| a.name.clone()).collect(),
+            flexes: mdl.flexes.clone(),
+        }
+    });
+    host.models.studio.borrow_mut().insert(path, studio.clone());
+    studio
 }
 
 /// The collision box a model gives an entity: the hull of a studio model (`.mdl`), the
 /// bounds of a brush model of the map (`*3`).
 pub(crate) fn model_bounds(lua: &Lua, model: &str) -> Option<(Vector, Vector)> {
-    let host = host(lua);
     if let Some(number) = model.strip_prefix('*') {
         let number: usize = number.parse().ok()?;
-        return host.models.brush.borrow().get(number).copied();
+        return host(lua).models.brush.borrow().get(number).copied();
     }
-    if model.is_empty() {
-        return None;
-    }
-    let path = model.replace('\\', "/").to_ascii_lowercase();
-    if let Some(bounds) = host.models.studio.borrow().get(&path) {
-        return *bounds;
-    }
-    let bounds = host.vfs.read(&path, "GAME").ok().and_then(|bytes| gmod_model::Mdl::parse(&bytes).ok()).map(|mdl| {
-        let (lo, hi) = mdl.hull;
-        (Vector::new(lo[0], lo[1], lo[2]), Vector::new(hi[0], hi[1], hi[2]))
-    });
-    host.models.studio.borrow_mut().insert(path, bounds);
-    bounds
+    studio(lua, model).map(|studio| studio.hull)
 }
 
 /// The classes of entity the engine itself has (Source's and GMod's C++ ones) that
@@ -201,7 +253,7 @@ fn userdata(lua: &Lua, handle: EntityHandle) -> Option<AnyUserData> {
 
 /// Calls `ent:name(...)` if the entity has such a function: what it returned, or nothing
 /// when it has none or it failed (the error is reported).
-fn call_method(lua: &Lua, ud: &AnyUserData, name: &str, args: MultiValue) -> Option<MultiValue> {
+pub(crate) fn call_method(lua: &Lua, ud: &AnyUserData, name: &str, args: MultiValue) -> Option<MultiValue> {
     let function = match ud.get::<Value>(name) {
         Ok(Value::Function(f)) => f,
         Ok(_) => return None,
@@ -223,9 +275,9 @@ fn invalidate_cache(lua: &Lua, player: bool) {
     }
 }
 
-/// The first index of entities that are not players: after the world and the one player of
-/// a single-player game (`game.MaxPlayers()`).
-const FIRST_INDEX: u32 = 2;
+/// The first index of entities that are not players: after the world and the player slots
+/// (`game.MaxPlayers()`).
+const FIRST_INDEX: u32 = crate::player::MAX_PLAYERS + 1;
 
 /// Makes an entity of a class, as `ents.Create` does; none when the class is unknown (or every
 /// index is used). The entities of a map pass their map creation ID and are made whatever
@@ -267,29 +319,89 @@ pub(crate) fn create(lua: &Lua, class: &str, map_creation_id: Option<i32>) -> ml
         call_method(lua, &ud, "InstallDataTable", MultiValue::new());
         call_method(lua, &ud, "SetupDataTables", MultiValue::new());
     }
-    invalidate_cache(lua, kind == Kind::Player);
-    crate::call_hook(lua, "OnEntityCreated", MultiValue::from_iter([Value::UserData(ud)]));
+    if kind == Kind::Weapon {
+        crate::weapon::setup(lua, handle);
+    }
+    announce(lua, handle);
     Ok(Some(handle))
 }
 
-/// `ent:Spawn()`: a SENT or SWEP runs its `Initialize`.
+/// Makes an entity of one of the engine's own classes that scripts do not make themselves
+/// (`predicted_viewmodel`, `hl2mp_ragdoll`).
+pub(crate) fn create_engine(lua: &Lua, class: &str, kind: Kind) -> mlua::Result<Option<EntityHandle>> {
+    let handle = {
+        let host = host(lua);
+        let ent = Ent::new(class, kind, host.entities.next_creation_id(), host.clock.cur_time.get());
+        match host.entities.insert(ent, FIRST_INDEX) {
+            Some(handle) => handle,
+            None => return Ok(None),
+        }
+    };
+    host(lua).entities.with_mut(handle, |ent| ent.spawned = true);
+    announce(lua, handle);
+    Ok(Some(handle))
+}
+
+/// Tells the game's Lua that an entity was made: `OnEntityCreated`.
+pub(crate) fn announce(lua: &Lua, handle: EntityHandle) {
+    let Some(ud) = userdata(lua, handle) else { return };
+    invalidate_cache(lua, handle.kind == Kind::Player);
+    crate::call_hook(lua, "OnEntityCreated", MultiValue::from_iter([Value::UserData(ud)]));
+}
+
+const SOLID_VPHYSICS: i64 = 6;
+const MOVETYPE_VPHYSICS: i64 = 6;
+
+/// Whether an engine class is a prop of physics: `prop_physics` and its kin
+/// (`prop_physics_multiplayer`, `_override`, `_respawnable`).
+fn is_physics_prop(class: &str) -> bool {
+    class.to_ascii_lowercase().starts_with("prop_physics")
+}
+
+/// `ent:Spawn()`: a SENT or SWEP runs its `Initialize`; a prop of physics takes its body; a
+/// player spawns again.
 pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
+    if handle.kind == Kind::Player {
+        crate::player::spawn(lua, handle);
+        return;
+    }
     let now = host(lua).clock.cur_time.get();
-    let scripted = host(lua).entities.with_mut(handle, |ent| {
+    let Some((scripted, prop, flags)) = host(lua).entities.with_mut(handle, |ent| {
         ent.spawned = true;
         ent.next_think = now;
-        ent.scripted
-    });
-    if scripted == Some(true)
-        && let Some(ud) = userdata(lua, handle)
-    {
+        (ent.scripted, !ent.scripted && is_physics_prop(&ent.class), ent.spawn_flags)
+    }) else {
+        return;
+    };
+    // the engine's props take their bodies when they spawn: frozen when the map says "motion
+    // disabled" (8), asleep when it says "start asleep" (1)
+    if prop {
+        host(lua).entities.with_mut(handle, |ent| {
+            ent.solid = SOLID_VPHYSICS;
+            ent.move_type = MOVETYPE_VPHYSICS;
+        });
+        if crate::physics::init_model(lua, handle) {
+            if flags & 8 != 0 {
+                crate::physics::set_motion(lua, handle, false);
+            } else if flags & 1 != 0 {
+                crate::physics::sleep(lua, handle);
+            }
+        }
+    }
+    if scripted && let Some(ud) = userdata(lua, handle) {
         call_method(lua, &ud, "Initialize", MultiValue::new());
     }
 }
 
-/// `ent:Remove()`: `OnRemove` and the `EntityRemoved` hook now, and it is taken out of its
-/// parent's children and its children out of it; the entity itself goes at the end of the
-/// frame. The world stays.
+/// `ent:Activate()`, after `Spawn`: a constraint takes hold ([`crate::constraint`]).
+pub(crate) fn activate(lua: &Lua, handle: EntityHandle) {
+    crate::constraint::activate(lua, handle);
+}
+
+/// `ent:Remove()`: `OnRemove` and the `EntityRemoved` hook now, the entities it was to take
+/// with it (`DeleteOnRemove`) go too, and it is taken out of its parent's children and its
+/// children out of it - and out of any player's hands; the entity itself goes at the end of
+/// the frame. The world stays.
 pub(crate) fn remove(lua: &Lua, handle: EntityHandle) {
     if handle.index == Some(0) {
         return;
@@ -308,8 +420,18 @@ pub(crate) fn remove(lua: &Lua, handle: EntityHandle) {
     if scripted {
         call_method(lua, &ud, "OnRemove", MultiValue::new());
     }
-    crate::call_hook(lua, "EntityRemoved", MultiValue::from_iter([Value::UserData(ud)]));
+    crate::call_hook(lua, "EntityRemoved", MultiValue::from_iter([Value::UserData(ud.clone())]));
     invalidate_cache(lua, kind == Kind::Player);
+    crate::player::forget(lua, handle);
+    crate::constraint::removed(lua, handle);
+    crate::physics::destroy(lua, handle);
+    if let Ok(Some(list)) = ud.named_user_value::<Option<Table>>("delete-on-remove") {
+        for other in list.sequence_values::<Value>().flatten() {
+            if let Some(other) = entity::handle_of(Some(&other)) {
+                remove(lua, other);
+            }
+        }
+    }
     // it leaves its parent, and its children stay where they are, without it
     entity::set_parent(lua, handle, EntityHandle::NULL);
     let children: Vec<EntityHandle> = {
@@ -333,7 +455,8 @@ pub(crate) fn collect(lua: &Lua) {
     }
 }
 
-/// One tick: the SENTs whose time has come think.
+/// One tick: the SENTs whose time has come think. A SWEP thinks in a player's hands
+/// ([`crate::weapon::post_frame`]).
 pub(crate) fn think(lua: &Lua) {
     let now = host(lua).clock.cur_time.get();
     let due: Vec<EntityHandle> = {
@@ -341,6 +464,7 @@ pub(crate) fn think(lua: &Lua) {
         entities
             .handles()
             .into_iter()
+            .filter(|&h| h.kind != Kind::Weapon)
             .filter(|&h| entities.get(h).is_some_and(|ent| ent.scripted && ent.spawned && !ent.removed && ent.next_think <= now))
             .collect()
     };
@@ -356,8 +480,62 @@ pub(crate) fn think(lua: &Lua) {
     }
 }
 
+/// An entity's model, where it is drawn: what [`crate::Runtime::drawn`] lists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Drawn {
+    pub entity: EntityHandle,
+    /// The model's path in the game's files: `models/props_c17/oildrum001.mdl`.
+    pub model: String,
+    pub skin: i64,
+    pub origin: Vector,
+    pub angles: Angle,
+    pub scale: f32,
+}
+
+/// `RENDERMODE_NONE`: not drawn at all.
+const RENDERMODE_NONE: i64 = 10;
+/// `EF_NODRAW`.
+const EF_NODRAW: i64 = 32;
+
+/// The models of entities as `viewer` sees them, through its own eyes: not the viewer itself
+/// nor what it carries (its weapon, its view model and the hands on it), not what is hidden,
+/// not brush entities (the map draws those) and not ragdolls, which fall only with physics.
+pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
+    let entities = &host(lua).entities;
+    // the viewer, or what goes with its eyes, all the way up the parents
+    let carried = |mut handle: EntityHandle| {
+        for _ in 0..16 {
+            let Some(ent) = entities.get(handle) else { return false };
+            if handle == viewer || matches!(ent.class.as_str(), "predicted_viewmodel" | "viewmodel") {
+                return true;
+            }
+            handle = ent.parent;
+        }
+        false
+    };
+    entities
+        .handles()
+        .into_iter()
+        .filter(|&handle| !carried(handle))
+        .filter_map(|handle| {
+            let (model, skin, scale) = {
+                let ent = entities.get(handle)?;
+                let hidden =
+                    ent.removed || !ent.spawned || ent.no_draw || ent.effects & EF_NODRAW != 0 || ent.render_mode == RENDERMODE_NONE;
+                let studio = ent.model.len() > 4 && ent.model[ent.model.len() - 4..].eq_ignore_ascii_case(".mdl");
+                if hidden || !studio || ent.class == "hl2mp_ragdoll" {
+                    return None;
+                }
+                (ent.model.clone(), ent.skin, ent.model_scale)
+            };
+            let (origin, angles) = entities.transform(handle)?;
+            Some(Drawn { entity: handle, model, skin, origin, angles, scale })
+        })
+        .collect()
+}
+
 /// Parses `1 2 3` as the engine does: what is missing is 0.
-fn three(text: &str) -> [f32; 3] {
+pub(crate) fn three(text: &str) -> [f32; 3] {
     let mut parts = text.split_whitespace().map(|p| crate::convar::atof(p) as f32);
     [parts.next().unwrap_or(0.0), parts.next().unwrap_or(0.0), parts.next().unwrap_or(0.0)]
 }
@@ -426,6 +604,7 @@ fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
             }
             "renderamt" => ent.color[3] = number().clamp(0.0, 255.0) as u8,
             "rendermode" => ent.render_mode = number() as i64,
+            "renderfx" => ent.render_fx = number() as i64,
             "modelscale" => ent.model_scale = number() as f32,
             _ => {}
         }
@@ -438,15 +617,18 @@ fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
 
 /// Loads a map's entities as the server does when the map starts: the world takes the
 /// `worldspawn` key-values, every other entity is made with its key-values, parents are set
-/// (`parentname`), all are spawned, parents before their children, and the `InitPostEntity`
-/// hook runs.
+/// (`parentname`), all are spawned, parents before their children, then activated, and the
+/// `InitPostEntity` hook runs.
 pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     {
         let host = host(lua);
         *host.game.map.borrow_mut() = map.name.clone();
         *host.models.brush.borrow_mut() =
             map.brush_models.iter().map(|(lo, hi)| (Vector::new(lo[0], lo[1], lo[2]), Vector::new(hi[0], hi[1], hi[2]))).collect();
+        *host.world.collision.borrow_mut() = map.collision.clone();
+        *host.world.textures.borrow_mut() = map.textures.clone();
     }
+    crate::physics::load_world(lua, map.collision.as_deref());
     let world = EntityHandle::WORLD;
     let world_bounds = model_bounds(lua, "*0").unwrap_or_default();
     host(lua).entities.with_mut(world, |ent| {
@@ -504,6 +686,10 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     for &handle in &made {
         spawn(lua, handle);
     }
+    // once all are there: the constraints take hold of what they name
+    for &handle in &made {
+        activate(lua, handle);
+    }
     crate::call_hook(lua, "InitPostEntity", MultiValue::new());
 }
 
@@ -513,6 +699,11 @@ fn names_match(pattern: &str, name: &str) -> bool {
         Some(prefix) => name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()),
         None => pattern.eq_ignore_ascii_case(name),
     }
+}
+
+/// The first entity with a name (Source's matching: a trailing `*` matches any end).
+pub(crate) fn named(lua: &Lua, name: &str) -> Option<EntityHandle> {
+    find(lua, |ent| names_match(name, &ent.name)).into_iter().next()
 }
 
 /// The entities that are not being removed and pass a test, in index order.
