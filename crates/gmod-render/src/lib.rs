@@ -49,7 +49,7 @@ const PARAMS_STRIDE: u64 = 256;
 /// Bytes of a surface's parameters.
 const PARAMS_SIZE: u64 = 48;
 /// Bytes of a camera for the shaders: its matrix, its eye, where the light of models comes from.
-const CAMERA_SIZE: u64 = 96;
+const CAMERA_SIZE: u64 = 240;
 /// Bytes between two cameras in their buffer: the world's, then one for each entity drawn.
 const CAMERA_STRIDE: u64 = 256;
 
@@ -96,12 +96,14 @@ pub struct ModelId(usize);
 
 /// A model where an entity is: its origin, its angles (pitch, yaw, roll in degrees) and how
 /// much bigger than it was made it is drawn.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Placed {
     pub model: ModelId,
     pub origin: [f32; 3],
     pub angles: [f32; 3],
     pub scale: f32,
+    /// The light of the map where it stands ([`gmod_world::light::MapLight::at`]).
+    pub light: gmod_world::light::ModelLight,
 }
 
 /// An uploaded texture and which sampler it takes; none when it could not be uploaded.
@@ -277,10 +279,32 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
 }
 
 /// A camera for the shaders, padded to `CAMERA_STRIDE`: its matrix, its eye, and for a model
-/// where the light comes from in the model's space (w 1; 0 for the world, lit as it was baked).
-fn camera_bytes(matrix: [f32; 16], eye: [f32; 3], sun: Option<[f32; 3]>) -> Vec<u8> {
-    let sun = sun.map_or([0.0; 4], |[x, y, z]| [x, y, z, 1.0]);
-    let mut bytes: Vec<u8> = matrix.iter().chain(&eye).chain(&[1.0]).chain(&sun).flat_map(|v| v.to_le_bytes()).collect();
+/// its light in the model's space - the ambient cube (w 1 on the first side; 0 for the world,
+/// lit as it was baked), then the directions towards its lights (w 1 for a light) and their
+/// light.
+fn camera_bytes(matrix: [f32; 16], eye: [f32; 3], light: Option<&gmod_world::light::ModelLight>) -> Vec<u8> {
+    let mut values: Vec<f32> = matrix.iter().chain(&eye).copied().collect();
+    values.push(1.0);
+    match light {
+        Some(light) => {
+            for (i, side) in light.ambient.iter().enumerate() {
+                values.extend(side);
+                values.push(if i == 0 { 1.0 } else { 0.0 });
+            }
+            for i in 0..gmod_world::light::MAX_LIGHTS {
+                match light.lights.get(i) {
+                    Some((towards, _)) => values.extend([towards[0], towards[1], towards[2], 1.0]),
+                    None => values.extend([0.0; 4]),
+                }
+            }
+            for i in 0..gmod_world::light::MAX_LIGHTS {
+                let color = light.lights.get(i).map_or([0.0; 3], |(_, c)| *c);
+                values.extend([color[0], color[1], color[2], 0.0]);
+            }
+        }
+        None => values.resize(values.len() + 4 * (6 + 2 * gmod_world::light::MAX_LIGHTS), 0.0),
+    }
+    let mut bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     bytes.resize(CAMERA_STRIDE as usize, 0);
     bytes
 }
@@ -719,9 +743,10 @@ impl Renderer {
         }
         let mut cameras = camera_bytes(view_projection, camera.eye, None);
         for placed in &self.entities {
-            let (mut matrix, sun) = gpu::placement(placed.origin, placed.angles);
+            let (mut matrix, _) = gpu::placement(placed.origin, placed.angles);
+            let light = gmod_world::light::in_model_space(&placed.light, gmod_world::axes(placed.angles));
             matrix[..12].iter_mut().for_each(|v| *v *= placed.scale);
-            cameras.extend(camera_bytes(gpu::multiply(&view_projection, &matrix), camera.eye, Some(sun)));
+            cameras.extend(camera_bytes(gpu::multiply(&view_projection, &matrix), camera.eye, Some(&light)));
         }
         queue.write_buffer(&self.camera_buffer, 0, &cameras);
         queue.write_buffer(&self.sky_camera_buffer, 0, &camera_bytes(camera.sky_projection(aspect), [0.0; 3], None));

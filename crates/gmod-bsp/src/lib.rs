@@ -20,6 +20,7 @@ use gmod_fs::ZipArchive;
 
 pub mod collision;
 mod entities;
+pub mod light;
 mod lighting;
 pub mod lumps;
 mod math;
@@ -28,6 +29,7 @@ pub mod props;
 
 pub use collision::{Collision, SolidShapes, Trace, mask};
 pub use entities::{Entity, parse_entities};
+pub use light::{AmbientSample, LightCube, LightKind, WorldLight};
 pub use lighting::{luxels, rgbe_to_linear};
 pub use lumps::{
     Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Plane, TexData, TexInfo, contents, surf,

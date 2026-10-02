@@ -122,3 +122,37 @@ fn faces_look_along_their_plane() {
     let mesh = mesh::build(&bsp, mesh::Options::default());
     assert!(mesh.vertices[4..8].iter().all(|v| v.normal == [0.0, 1.0, 0.0]), "{:?}", mesh.vertices[4].normal);
 }
+
+#[test]
+fn the_light_for_what_moves() {
+    use crate::testmap::{TestBrush, TestLight, TestMap};
+    // a cube 1 from +z, a quarter from the rest; a lamp and the sun
+    let quarter = [64, 64, 64, (-1i8) as u8];
+    let lit = TestMap {
+        models: vec![vec![TestBrush::cuboid([-512.0, -512.0, -16.0], [512.0, 512.0, 0.0])]],
+        ambient: Some([quarter, quarter, quarter, quarter, [255, 255, 255, 0], quarter]),
+        lights: vec![
+            TestLight { kind: 1, origin: [0.0, 0.0, 100.0], intensity: [1000.0, 500.0, 0.0], normal: [0.0; 3] },
+            TestLight { kind: 3, origin: [0.0; 3], intensity: [2.0; 3], normal: [0.0, 0.0, -1.0] },
+        ],
+        ..TestMap::default()
+    };
+    let bsp = Bsp::parse("light.bsp".into(), Arc::from(lit.bytes())).unwrap();
+    let lights = bsp.world_lights();
+    assert_eq!(lights.len(), 2);
+    assert_eq!(
+        (lights[0].kind, lights[0].origin, lights[0].intensity, lights[0].quadratic),
+        (LightKind::Point, [0.0, 0.0, 100.0], [1000.0, 500.0, 0.0], 1.0)
+    );
+    assert_eq!((lights[1].kind, lights[1].normal), (LightKind::Sky, [0.0, 0.0, -1.0]));
+    let samples = bsp.ambient_samples().unwrap();
+    assert_eq!(samples.len(), bsp.leaves.len());
+    let sample = samples.iter().flatten().next().expect("a sample");
+    assert_eq!(sample.cube[4], [1.0; 3]);
+    assert!((sample.cube[0][0] - 64.0 / 255.0 / 2.0).abs() < 1e-6);
+    // in the middle of its leaf
+    let leaf = bsp.leaves.iter().zip(&samples).find(|(_, s)| !s.is_empty()).unwrap().0;
+    assert!((0..3).all(|i| sample.position[i] >= f32::from(leaf.mins[i]) && sample.position[i] <= f32::from(leaf.maxs[i])));
+    // a map without them has none
+    assert!(map().world_lights().is_empty());
+}

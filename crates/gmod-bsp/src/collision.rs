@@ -717,6 +717,16 @@ impl Collision {
         found.trace(start, end)
     }
 
+    /// The leaf of the world's tree a point is in: its index in the map's leaves.
+    pub fn leaf_at(&self, point: Vec3) -> Option<usize> {
+        let mut node = *self.heads.first()?;
+        while let Ok(i) = usize::try_from(node) {
+            let n = self.nodes.get(i)?;
+            node = n.children[usize::from(dot(n.normal, point) < n.dist)];
+        }
+        Some((-1 - node) as usize).filter(|&leaf| leaf < self.leaves.len())
+    }
+
     /// What is at a point: the [`contents`] of all the brushes there, of the world and of the
     /// solid brush entities. Static props are left out, as the engine does.
     pub fn point_contents(&self, point: Vec3) -> u32 {

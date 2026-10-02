@@ -247,7 +247,7 @@ impl Models {
                     }
                 });
                 let (o, a) = (d.origin, d.angles);
-                Some(Placed { model: model?, origin: [o.x, o.y, o.z], angles: [a.p, a.y, a.r], scale: d.scale })
+                Some(Placed { model: model?, origin: [o.x, o.y, o.z], angles: [a.p, a.y, a.r], scale: d.scale, light: Default::default() })
             })
             .collect()
     }

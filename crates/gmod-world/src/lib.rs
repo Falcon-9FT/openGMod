@@ -29,6 +29,7 @@ use gmod_material::{Library, Material, Vtf};
 use gmod_model::{Mdl, Model, Vhv};
 
 pub mod gpu;
+pub mod light;
 
 pub use gmod_bsp::mesh::Lightmap;
 

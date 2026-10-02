@@ -4,9 +4,12 @@
 struct Camera {
     view_projection: mat4x4<f32>,
     eye: vec4<f32>,
-    // for a model of an entity: where the light comes from in the model's space, w 1; the
-    // world (w 0) has its light baked
-    sun: vec4<f32>,
+    // for a model of an entity, in the model's space: the ambient light cube (+x, -x, +y, -y,
+    // +z, -z; w of the first 1), the directions towards its lights (w 1 for a light) and their
+    // light; the world (w 0) has its light baked
+    ambient: array<vec4<f32>, 6>,
+    light_dir: array<vec4<f32>, 2>,
+    light_color: array<vec4<f32>, 2>,
 };
 
 struct Surface {
@@ -52,10 +55,20 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.lightmap_uv = input.lightmap_uv;
     output.alpha = input.alpha;
     output.light = input.light;
-    if (camera.sun.w > 0.5) {
-        // some light from everywhere, more from above, as props without baked light have
-        let sun = max(dot(input.normal, camera.sun.xyz), 0.0) / max(length(input.normal), 1e-6);
-        output.light = vec3<f32>(0.35 + 0.5 * sun);
+    if (camera.ambient[0].w > 0.5) {
+        // the cube, each side by the square of the normal along it, and the lights that face it
+        let n = input.normal / max(length(input.normal), 1e-6);
+        let w = n * n;
+        let x = select(camera.ambient[1].rgb, camera.ambient[0].rgb, n.x >= 0.0);
+        let y = select(camera.ambient[3].rgb, camera.ambient[2].rgb, n.y >= 0.0);
+        let z = select(camera.ambient[5].rgb, camera.ambient[4].rgb, n.z >= 0.0);
+        var light = w.x * x + w.y * y + w.z * z;
+        for (var i = 0; i < 2; i++) {
+            if (camera.light_dir[i].w > 0.5) {
+                light += max(dot(n, camera.light_dir[i].xyz), 0.0) * camera.light_color[i].rgb;
+            }
+        }
+        output.light = light;
     }
     return output;
 }

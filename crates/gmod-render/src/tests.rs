@@ -176,7 +176,13 @@ fn draws_models_where_the_entities_are() {
     let model = renderer.add_model(&device, &queue, &square);
     // turned a quarter, its x runs along the world's y and its y along the world's -x: from
     // (96, 32) it covers the middle of the floor, above it
-    renderer.set_entities(vec![Placed { model, origin: [96.0, 32.0, 32.0], angles: [0.0, 90.0, 0.0], scale: 1.0 }]);
+    renderer.set_entities(vec![Placed {
+        model,
+        origin: [96.0, 32.0, 32.0],
+        angles: [0.0, 90.0, 0.0],
+        scale: 1.0,
+        light: Default::default(),
+    }]);
     let pixels = picture(&device, &queue, &mut renderer, &above);
     let middle = (24..40).flat_map(|y| (24..40).map(move |x| (x, y)));
     let purples = middle.clone().filter(|&(x, y)| purple(at(&pixels, x, y))).count();
@@ -186,6 +192,33 @@ fn draws_models_where_the_entities_are() {
     assert!((0..64 * 64).any(|i| red(at(&pixels, i % 64, i / 64))));
     let corner = at(&pixels, 0, 0);
     assert!(corner[2] > corner[0] && corner[1] > corner[0], "{corner:?}");
+
+    // lit by the map: blue light from above (the cube's +z side) makes it blue; a blue lamp
+    // above does too; one below leaves it black
+    let lit = |light: gmod_world::light::ModelLight| {
+        vec![Placed { model, origin: [96.0, 32.0, 32.0], angles: [0.0, 90.0, 0.0], scale: 1.0, light }]
+    };
+    let blue_pixels = |pixels: &[u8]| {
+        (24..40)
+            .flat_map(|y| (24..40).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = at(pixels, x, y);
+                p[2] > 120 && p[0] < 40 && p[1] < 40
+            })
+            .count()
+    };
+    let mut cube = [[0.0; 3]; 6];
+    cube[4] = [0.0, 0.0, 1.0];
+    renderer.set_entities(lit(gmod_world::light::ModelLight { ambient: cube, lights: Vec::new() }));
+    assert!(blue_pixels(&picture(&device, &queue, &mut renderer, &above)) > 16 * 16 / 4, "the cube's light");
+    let lamp = |towards: [f32; 3]| gmod_world::light::ModelLight { ambient: [[0.0; 3]; 6], lights: vec![(towards, [0.0, 0.0, 1.0])] };
+    renderer.set_entities(lit(lamp([0.0, 0.0, 100.0])));
+    assert!(blue_pixels(&picture(&device, &queue, &mut renderer, &above)) > 16 * 16 / 4, "a lamp above");
+    renderer.set_entities(lit(lamp([0.0, 0.0, -100.0])));
+    let pixels = picture(&device, &queue, &mut renderer, &above);
+    assert_eq!(blue_pixels(&pixels), 0, "a lamp below");
+    assert!(!red(at(&pixels, 32, 32)), "the black model still hides the floor");
+    renderer.set_entities(lit(Default::default()));
 
     // from below it is turned away, like the floor; with no entities it is gone
     let below = Camera::looking_at([64.0, 64.0, 10.0], [64.0, 64.1, 100.0], 75.0);

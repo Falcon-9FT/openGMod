@@ -280,6 +280,17 @@ pub struct TestDisplacement {
     pub heights: Vec<f32>,
 }
 
+/// A light of a [`TestMap`] (`dworldlight_t`), falling off as one over the square of the
+/// distance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TestLight {
+    /// `emittype_t`: 1 a point, 2 a spot, 3 the sun.
+    pub kind: i32,
+    pub origin: [f32; 3],
+    pub intensity: [f32; 3],
+    pub normal: [f32; 3],
+}
+
 /// A static prop of a [`TestMap`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestStaticProp {
@@ -303,6 +314,10 @@ pub struct TestMap {
     pub entities: String,
     /// The leaves as maps of version 19 write them, with an ambient light cube each.
     pub old_leaves: bool,
+    /// One ambient light sample in the middle of every leaf, of this cube (`ColorRGBExp32`
+    /// for +x, -x, +y, -y, +z, -z), in the lumps of version 20.
+    pub ambient: Option<[[u8; 4]; 6]>,
+    pub lights: Vec<TestLight>,
 }
 
 /// A brush as the tree builder sees it: its index and bounds.
@@ -517,7 +532,30 @@ impl TestMap {
             .collect();
         let entities = format!("{{\n\"classname\" \"worldspawn\"\n}}\n{}", self.entities).into_bytes();
 
+        let (mut ambient_index, mut ambient_samples) = (Vec::new(), Vec::new());
+        if let Some(cube) = self.ambient {
+            for leaf in 0..tree.leaf_count {
+                ambient_index.extend(1u16.to_le_bytes());
+                ambient_index.extend((leaf as u16).to_le_bytes());
+                ambient_samples.extend(cube.iter().flatten());
+                ambient_samples.extend([128, 128, 128, 0]);
+            }
+        }
+        let mut world_lights = Vec::new();
+        for light in &self.lights {
+            world_lights.extend(f32s(&[light.origin, light.intensity, light.normal].concat()));
+            // cluster, type, style
+            world_lights.extend(i32s(&[0, light.kind, 0]));
+            // stopdot, stopdot2, exponent, radius, constant, linear, quadratic
+            world_lights.extend(f32s(&[0.9, 0.8, 1.0, 0.0, 0.0, 0.0, 1.0]));
+            // flags, texinfo, owner
+            world_lights.extend(i32s(&[0, -1, 0]));
+        }
+
         let lumps: Vec<(usize, Vec<u8>, u32)> = vec![
+            (15, world_lights, 0),
+            (52, ambient_index, 0),
+            (56, ambient_samples, 0),
             (index::ENTITIES, entities, 0),
             (index::PLANES, tree.planes, 0),
             (index::TEXDATA, texdata, 0),

@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -103,6 +103,8 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
 struct Loaded {
     world: World,
     collision: Arc<Collision>,
+    /// The map's light for the models of entities.
+    light: gmod_world::light::MapLight,
     /// The game's files and the map as the Lua of the server takes it, unless there is no Lua
     /// to run.
     lua: Option<(Arc<Vfs>, gmod_lua::Map)>,
@@ -163,7 +165,8 @@ fn load(args: &Args) -> Result<Loaded, String> {
         let map = gmod_lua::Map::from_bsp(&name, &bsp, collision.clone());
         (Arc::new(vfs), map)
     });
-    Ok(Loaded { world, collision, lua, camera: Camera::looking_at(eye, target, FOV), spawn: gmod_world::spawn_point(&bsp), name })
+    let light = gmod_world::light::MapLight::new(&bsp);
+    Ok(Loaded { world, collision, light, lua, camera: Camera::looking_at(eye, target, FOV), spawn: gmod_world::spawn_point(&bsp), name })
 }
 
 /// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
@@ -375,6 +378,9 @@ struct App {
     game: Option<Game>,
     /// The models of the game's entities.
     models: Option<Models>,
+    /// The map's light for them, and what it was at places already asked about.
+    light: gmod_world::light::MapLight,
+    lit: HashMap<[i32; 3], gmod_world::light::ModelLight>,
     /// The game's sound.
     audio: Option<audio::Audio>,
     /// The game's status for the title: health, the weapon.
@@ -597,7 +603,16 @@ impl App {
     /// Gives the renderer the models of the game's entities and where they are now.
     fn show_entities(&mut self) {
         let (Some(game), Some(models), Some(gpu)) = (&self.game, &mut self.models, &mut self.gpu) else { return };
-        let placed = models.place(&game.drawn(), |model| gpu.renderer.add_model(&gpu.device, &gpu.queue, model));
+        let mut placed = models.place(&game.drawn(), |model| gpu.renderer.add_model(&gpu.device, &gpu.queue, model));
+        // the light where each stands, worked out once for every 8 units
+        if self.lit.len() > 8192 {
+            self.lit.clear();
+        }
+        for p in &mut placed {
+            let key = p.origin.map(|v| (v / 8.0).round() as i32);
+            let (light, collision) = (&self.light, &self.collision);
+            p.light = self.lit.entry(key).or_insert_with(|| light.at(collision, p.origin)).clone();
+        }
         gpu.renderer.set_entities(placed);
     }
 
@@ -906,6 +921,8 @@ fn main() -> ExitCode {
         collision: loaded.collision,
         models: game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone())),
         audio: game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| audio::Audio::new(vfs.clone())),
+        light: loaded.light,
+        lit: HashMap::new(),
         game,
         status: String::new(),
         settings: Settings::default(),
