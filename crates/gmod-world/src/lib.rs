@@ -126,6 +126,14 @@ impl Surface {
     }
 }
 
+/// The bones that move a vertex of a model, and how much each: up to three, the weights adding
+/// up to 1.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Weights {
+    pub bones: [u8; 3],
+    pub weights: [f32; 3],
+}
+
 /// Something drawn: the world, a brush entity or a prop, moved to where it stands.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Piece {
@@ -134,6 +142,8 @@ pub struct Piece {
     /// The light map of a brush model; props have vertex light instead.
     pub lightmap: Option<mesh::Lightmap>,
     pub surfaces: Vec<Surface>,
+    /// For a model that moves, the bones of each vertex; empty for what stands still.
+    pub skin: Vec<Weights>,
 }
 
 /// A texture a material uses.
@@ -535,7 +545,7 @@ fn brushes(bsp: &Bsp, gather: &mut Gather) -> Vec<Piece> {
             let material = materials.entry(batch.material).or_insert_with(|| gather.material(name)).clone();
             surfaces.push(gather.surface(name, material.as_deref(), batch.first_index as usize, batch.index_count as usize));
         }
-        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces });
+        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces, skin: Vec::new() });
     }
     pieces
 }
@@ -590,7 +600,7 @@ fn static_props(bsp: &Bsp, gather: &mut Gather, pieces: &mut Vec<Piece>) -> Vec<
             }
         }
         let surfaces = model_surfaces(gather, model, &mesh);
-        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: None, surfaces });
+        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: None, surfaces, skin: Vec::new() });
     }
     missing
 }
@@ -618,9 +628,27 @@ fn model_surfaces(gather: &mut Gather, model: &Model, mesh: &gmod_model::StaticM
     surfaces
 }
 
+/// The bones of a model's vertex: those it names, their weights made to add up to 1.
+fn weights(vertex: &gmod_model::Vertex) -> Weights {
+    let count = usize::from(vertex.bone_count).clamp(1, 3);
+    let total: f32 = vertex.weights[..count].iter().map(|w| w.max(0.0)).sum();
+    let mut out = Weights { bones: vertex.bones, weights: [0.0; 3] };
+    for i in 0..count {
+        out.weights[i] = if total > 0.0 {
+            vertex.weights[i].max(0.0) / total
+        } else if i == 0 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    out
+}
+
 /// A model on its own, to draw wherever an entity has it: one piece in the model's space (its
-/// first body group, in the pose it was made in), with its materials and textures. The
-/// light comes from where it is drawn, so the vertices have none of their own.
+/// first body group, in the pose it was made in, with the bones of every vertex to pose it),
+/// with its materials and textures. The light comes from where it is drawn, so the vertices
+/// have none of their own.
 pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
     let model = gmod_model::load(vfs, name)?;
     let mesh = model.mesh(0, skin)?;
@@ -630,9 +658,10 @@ pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
         .iter()
         .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: [0.0; 2], alpha: 0.0, light: [1.0; 3] })
         .collect();
+    let bones = mesh.vertices.iter().map(weights).collect();
     let surfaces = model_surfaces(&mut gather, &model, &mesh);
     Ok(World {
-        pieces: vec![Piece { vertices, indices: mesh.indices, lightmap: None, surfaces }],
+        pieces: vec![Piece { vertices, indices: mesh.indices, lightmap: None, surfaces, skin: bones }],
         textures: gather.textures,
         sky: Default::default(),
         missing_materials: gather.missing_materials,
@@ -814,6 +843,18 @@ mod tests {
         }
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains("other.phy") && failed[0].contains("another build"), "{failed:?}");
+    }
+
+    #[test]
+    fn the_weights_of_a_vertex_add_up() {
+        let vertex =
+            |bones: [u8; 3], weights: [f32; 3], count: u8| gmod_model::Vertex { bones, weights, bone_count: count, ..Default::default() };
+        // as the model has them
+        assert_eq!(weights(&vertex([3, 4, 0], [0.75, 0.25, 0.0], 2)), Weights { bones: [3, 4, 0], weights: [0.75, 0.25, 0.0] });
+        // only as many as it says it has, made to add up to 1
+        assert_eq!(weights(&vertex([1, 2, 9], [0.2, 0.2, 0.6], 2)).weights, [0.5, 0.5, 0.0]);
+        // none at all: the first bone's
+        assert_eq!(weights(&vertex([5, 0, 0], [0.0; 3], 0)), Weights { bones: [5, 0, 0], weights: [1.0, 0.0, 0.0] });
     }
 
     #[test]

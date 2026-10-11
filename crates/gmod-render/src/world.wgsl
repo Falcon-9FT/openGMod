@@ -18,6 +18,8 @@ struct Camera {
     spot_pos: vec4<f32>,
     spot_dir: vec4<f32>,
     spot_color: vec4<f32>,
+    // a posed model: x its first bone in `bones`, y 1 when it is posed
+    skin: vec4<f32>,
 };
 
 struct Surface {
@@ -37,6 +39,9 @@ struct Surface {
 @group(1) @binding(3) var texture_sampler: sampler;
 @group(2) @binding(0) var lightmap: texture_2d<f32>;
 @group(2) @binding(1) var lightmap_sampler: sampler;
+// the bones of the posed models of the frame: three rows of each one's matrix, in the space of
+// its model
+@group(3) @binding(0) var<storage, read> bones: array<vec4<f32>>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -45,6 +50,12 @@ struct VertexInput {
     @location(3) alpha: f32,
     @location(4) light: vec3<f32>,
     @location(5) normal: vec3<f32>,
+};
+
+// the bones that move a vertex of a posed model, and how much each
+struct Skin {
+    @location(6) bones: vec4<u32>,
+    @location(7) weights: vec3<f32>,
 };
 
 struct VertexOutput {
@@ -85,6 +96,41 @@ fn moment_light(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
+    return shade(input);
+}
+
+// a model moved by its bones: each vertex by the matrices of its bones, weighed
+@vertex
+fn vs_posed(input: VertexInput, skin: Skin) -> VertexOutput {
+    var posed = input;
+    if (camera.skin.y > 0.5) {
+        let first = u32(camera.skin.x);
+        let ids = skin.bones;
+        let weights = skin.weights;
+        let p = vec4<f32>(input.position, 1.0);
+        let n = vec4<f32>(input.normal, 0.0);
+        var position = vec3<f32>(0.0);
+        var normal = vec3<f32>(0.0);
+        var total = 0.0;
+        for (var i = 0; i < 3; i++) {
+            let w = weights[i];
+            if (w > 0.0) {
+                let b = (first + ids[i]) * 3u;
+                position += w * vec3<f32>(dot(bones[b], p), dot(bones[b + 1u], p), dot(bones[b + 2u], p));
+                normal += w * vec3<f32>(dot(bones[b], n), dot(bones[b + 1u], n), dot(bones[b + 2u], n));
+                total += w;
+            }
+        }
+        if (total > 0.001) {
+            posed.position = position / total;
+            posed.normal = normal;
+        }
+    }
+    return shade(posed);
+}
+
+// what every vertex goes through: clip space, and the light of a model's
+fn shade(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.clip = camera.view_projection * vec4<f32>(input.position, 1.0);
     output.uv = input.uv;

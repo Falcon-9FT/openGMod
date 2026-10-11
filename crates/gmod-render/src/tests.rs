@@ -162,7 +162,13 @@ fn draws_models_where_the_entities_are() {
         missing: true,
     };
     let square = World {
-        pieces: vec![gmod_world::Piece { vertices, indices: vec![0, 1, 2, 0, 2, 3], lightmap: None, surfaces: vec![surface] }],
+        pieces: vec![gmod_world::Piece {
+            vertices,
+            indices: vec![0, 1, 2, 0, 2, 3],
+            lightmap: None,
+            surfaces: vec![surface],
+            skin: Vec::new(),
+        }],
         textures: Vec::new(),
         sky: Default::default(),
         missing_materials: Vec::new(),
@@ -176,13 +182,7 @@ fn draws_models_where_the_entities_are() {
     let model = renderer.add_model(&device, &queue, &square);
     // turned a quarter, its x runs along the world's y and its y along the world's -x: from
     // (96, 32) it covers the middle of the floor, above it
-    renderer.set_entities(vec![Placed {
-        model,
-        origin: [96.0, 32.0, 32.0],
-        angles: [0.0, 90.0, 0.0],
-        scale: 1.0,
-        light: Default::default(),
-    }]);
+    renderer.set_entities(vec![Placed { model, origin: [96.0, 32.0, 32.0], angles: [0.0, 90.0, 0.0], scale: 1.0, ..Placed::default() }]);
     let pixels = picture(&device, &queue, &mut renderer, &above);
     let middle = (24..40).flat_map(|y| (24..40).map(move |x| (x, y)));
     let purples = middle.clone().filter(|&(x, y)| purple(at(&pixels, x, y))).count();
@@ -196,7 +196,7 @@ fn draws_models_where_the_entities_are() {
     // lit by the map: blue light from above (the cube's +z side) makes it blue; a blue lamp
     // above does too; one below leaves it black
     let lit = |light: gmod_world::light::ModelLight| {
-        vec![Placed { model, origin: [96.0, 32.0, 32.0], angles: [0.0, 90.0, 0.0], scale: 1.0, light }]
+        vec![Placed { model, origin: [96.0, 32.0, 32.0], angles: [0.0, 90.0, 0.0], scale: 1.0, light, ..Placed::default() }]
     };
     let blue_pixels = |pixels: &[u8]| {
         (24..40)
@@ -246,6 +246,123 @@ fn draws_models_where_the_entities_are() {
     renderer.set_entities(Vec::new());
     let pixels = picture(&device, &queue, &mut renderer, &above);
     assert!((0..64 * 64).all(|i| !purple(at(&pixels, i % 64, i / 64))), "a model is drawn with no entity");
+}
+
+/// A square of the missing texture, 64 units a side, facing up, its vertices on bone `bone`
+/// when it is given one.
+fn square(bone: Option<u8>) -> World {
+    let vertices = [[0.0, 0.0], [0.0, 64.0], [64.0, 64.0], [64.0, 0.0]]
+        .map(|[x, y]| gmod_world::Vertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [x / 64.0, y / 64.0],
+            light: [1.0; 3],
+            ..Default::default()
+        })
+        .to_vec();
+    let surface = gmod_world::Surface {
+        material: "square".to_string(),
+        first: 0,
+        count: 6,
+        base: None,
+        base2: None,
+        alpha_test: None,
+        translucent: false,
+        additive: false,
+        lit: true,
+        no_cull: false,
+        tint: [1.0; 3],
+        alpha: 1.0,
+        water: None,
+        missing: true,
+    };
+    let skin = bone.map_or(Vec::new(), |b| vec![gmod_world::Weights { bones: [b, 0, 0], weights: [1.0, 0.0, 0.0] }; 4]);
+    World {
+        pieces: vec![gmod_world::Piece { vertices, indices: vec![0, 1, 2, 0, 2, 3], lightmap: None, surfaces: vec![surface], skin }],
+        textures: Vec::new(),
+        sky: Default::default(),
+        missing_materials: Vec::new(),
+        missing_textures: Vec::new(),
+        missing_models: Vec::new(),
+    }
+}
+
+/// Pixels of the middle of a picture that `is` says yes to.
+fn middle(pixels: &[u8], is: impl Fn(&[u8]) -> bool) -> usize {
+    (24..40).flat_map(|y| (24..40).map(move |x| (x, y))).filter(|&(x, y)| is(at(pixels, x, y))).count()
+}
+
+#[test]
+fn poses_models_by_their_bones() {
+    let Some((device, queue)) = device_or_skip() else { return };
+    let purple = |p: &[u8]| p[0] > 120 && p[2] > 120 && p[1] < 40;
+    let above = Camera::looking_at([64.0, 64.0, 200.0], [64.0, 64.1, 0.0], 75.0);
+    let mut renderer = Renderer::new(&device, &queue, FORMAT, &test_map());
+    let model = renderer.add_model(&device, &queue, &square(Some(1)));
+    let placed = |bones: Vec<[[f32; 4]; 3]>| vec![Placed { model, origin: [32.0, 32.0, 32.0], scale: 1.0, bones, ..Placed::default() }];
+    let identity = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+    let moved = [[1.0, 0.0, 0.0, 300.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+
+    // not posed, or posed where it was made: over the middle of the floor
+    for bones in [Vec::new(), vec![identity, identity]] {
+        renderer.set_entities(placed(bones));
+        assert!(middle(&picture(&device, &queue, &mut renderer, &above), purple) > 16 * 16 / 4);
+    }
+    // its bone moved 300 along x: out of sight, the floor shows
+    renderer.set_entities(placed(vec![identity, moved]));
+    let pixels = picture(&device, &queue, &mut renderer, &above);
+    assert_eq!(middle(&pixels, purple), 0, "the model was not moved by its bone");
+    assert!(middle(&pixels, red) > 16 * 16 / 4, "the floor of red and black squares shows");
+    // fewer bones than its vertices name: drawn as it was made
+    renderer.set_entities(placed(vec![moved]));
+    assert!(middle(&picture(&device, &queue, &mut renderer, &above), purple) > 16 * 16 / 4);
+    // many posed models in a frame: each its own bones
+    let mut many = placed(vec![identity, moved]);
+    for i in 0..300 {
+        many.push(Placed { model, origin: [5000.0 + i as f32, 0.0, 0.0], scale: 1.0, bones: vec![identity; 2], ..Placed::default() });
+    }
+    many.push(placed(vec![moved, identity]).remove(0));
+    renderer.set_entities(many);
+    assert!(middle(&picture(&device, &queue, &mut renderer, &above), purple) > 16 * 16 / 4, "the last model's own bones");
+}
+
+#[test]
+fn view_models_are_drawn_over_everything() {
+    let Some((device, queue)) = device_or_skip() else { return };
+    let above = Camera::looking_at([64.0, 64.0, 200.0], [64.0, 64.1, 0.0], 75.0);
+    let mut renderer = Renderer::new(&device, &queue, FORMAT, &test_map());
+    let model = renderer.add_model(&device, &queue, &square(None));
+    let lit = |color: [f32; 3]| {
+        let mut cube = [[0.0; 3]; 6];
+        cube[4] = color;
+        gmod_world::light::ModelLight { ambient: cube, lights: Vec::new() }
+    };
+    let blue = |p: &[u8]| p[2] > 120 && p[0] < 40 && p[1] < 40;
+    // a red square 50 below the eyes, nearer than a blue view model 100 below
+    let near = Placed { model, origin: [32.0, 32.0, 150.0], scale: 1.0, light: lit([1.0, 0.0, 0.0]), ..Placed::default() };
+    renderer.set_entities(vec![near]);
+    let held = |z: f32, size: f32| Placed {
+        model,
+        origin: [64.0 - 32.0 * size, 64.0 - 32.0 * size, z],
+        scale: size,
+        light: lit([0.0, 0.0, 1.0]),
+        ..Placed::default()
+    };
+    renderer.set_view_models(vec![held(100.0, 1.0)], 75.0);
+    let pixels = picture(&device, &queue, &mut renderer, &above);
+    assert!(middle(&pixels, blue) > 16 * 16 / 4, "the view model is behind what is nearer");
+    // with a narrower field of view it looks bigger
+    let wide = (0..64 * 64).filter(|i| blue(at(&pixels, i % 64, i / 64))).count();
+    renderer.set_view_models(vec![held(100.0, 1.0)], 40.0);
+    let pixels = picture(&device, &queue, &mut renderer, &above);
+    let narrow = (0..64 * 64).filter(|i| blue(at(&pixels, i % 64, i / 64))).count();
+    assert!(narrow > wide * 2, "{narrow} blue pixels at 40 degrees, {wide} at 75");
+    // closer to the eyes than the world is ever drawn, it is still there
+    renderer.set_view_models(vec![held(197.0, 0.25)], 75.0);
+    assert!(middle(&picture(&device, &queue, &mut renderer, &above), blue) > 16 * 16 / 2);
+    // none: the red square again
+    renderer.set_view_models(Vec::new(), 75.0);
+    assert_eq!(middle(&picture(&device, &queue, &mut renderer, &above), blue), 0);
 }
 
 #[test]

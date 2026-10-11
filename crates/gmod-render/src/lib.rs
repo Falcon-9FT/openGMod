@@ -7,10 +7,13 @@
 //! ([`Renderer::set_entities`]), lit by the light of the map where they stand
 //! ([`gmod_world::light`]): the ambient cube and the lights that see them. The lights of the
 //! moment - the game's `DynamicLight`s and the flashlight ([`Renderer::set_lights`]) - light
-//! the world and the models over their baked light. [`Renderer::render`]
-//! draws a frame: the sky box, the opaque surfaces of the world and the entities, then the
-//! translucent ones - the world's from the farthest, then the entities'. Depth runs from 1 at
-//! the eye to 0 at infinity. Over it an [`Overlay`] draws the 2D of the HUD and the panels.
+//! the world and the models over their baked light. A model that moves is posed by the
+//! matrices of its bones ([`Placed::bones`]): the vertex shader moves each vertex by the bones
+//! it is weighted to. [`Renderer::render`] draws a frame: the sky box, the opaque surfaces of
+//! the world and the entities, then the translucent ones - the world's from the farthest,
+//! then the entities'; then the view models (the weapon in the player's hands) with their own
+//! field of view, over everything ([`Renderer::set_view_models`]). Depth runs from 1 at the
+//! eye to 0 at infinity. Over it an [`Overlay`] draws the 2D of the HUD and the panels.
 
 #![forbid(unsafe_code)]
 
@@ -51,8 +54,13 @@ const MAX_TEXTURE: u32 = 4096;
 const PARAMS_STRIDE: u64 = 256;
 /// Bytes of a surface's parameters.
 const PARAMS_SIZE: u64 = 48;
-/// Bytes of a camera for the shaders: its matrix, its eye, where the light of models comes from.
-const CAMERA_SIZE: u64 = 416;
+/// Bytes of a camera for the shaders: its matrix, its eye, where the light of models comes
+/// from, the lights of the moment, and where the bones of a posed model are.
+const CAMERA_SIZE: u64 = 432;
+/// Bytes of a bone's matrix for the shaders: three rows of four.
+const BONE_SIZE: u64 = 48;
+/// Nothing of a view model closer than this is drawn: a weapon is held close to the eyes.
+const VIEW_MODEL_NEAR: f32 = 1.0;
 /// Bytes between two cameras in their buffer: the world's, then one for each entity drawn.
 const CAMERA_STRIDE: u64 = 512;
 
@@ -72,34 +80,29 @@ impl Kind {
     }
 }
 
+const KINDS: [Kind; 5] = [Kind::Opaque, Kind::OpaqueTwoSided, Kind::Blend, Kind::BlendTwoSided, Kind::Additive];
+
+/// The pipelines of each kind of surface: for what stands still, and for models posed by their
+/// bones.
 struct Pipelines {
-    opaque: wgpu::RenderPipeline,
-    opaque_two_sided: wgpu::RenderPipeline,
-    blend: wgpu::RenderPipeline,
-    blend_two_sided: wgpu::RenderPipeline,
-    additive: wgpu::RenderPipeline,
+    still: Vec<wgpu::RenderPipeline>,
+    posed: Vec<wgpu::RenderPipeline>,
     sky: wgpu::RenderPipeline,
 }
 
 impl Pipelines {
-    fn get(&self, kind: Kind) -> &wgpu::RenderPipeline {
-        match kind {
-            Kind::Opaque => &self.opaque,
-            Kind::OpaqueTwoSided => &self.opaque_two_sided,
-            Kind::Blend => &self.blend,
-            Kind::BlendTwoSided => &self.blend_two_sided,
-            Kind::Additive => &self.additive,
-        }
+    fn get(&self, kind: Kind, posed: bool) -> &wgpu::RenderPipeline {
+        &(if posed { &self.posed } else { &self.still })[kind as usize]
     }
 }
 
 /// A model added to a [`Renderer`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ModelId(usize);
 
 /// A model where an entity is: its origin, its angles (pitch, yaw, roll in degrees) and how
 /// much bigger than it was made it is drawn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Placed {
     pub model: ModelId,
     pub origin: [f32; 3],
@@ -107,6 +110,10 @@ pub struct Placed {
     pub scale: f32,
     /// The light of the map where it stands ([`gmod_world::light::MapLight::at`]).
     pub light: gmod_world::light::ModelLight,
+    /// What moves each bone's vertices from where the model was made with them to where it is
+    /// posed, in the model's space (`gmod_model::Rig::skinning`); empty: as it was made. Fewer
+    /// than its vertices name are not used.
+    pub bones: Vec<[[f32; 4]; 3]>,
 }
 
 /// The most lights of the moment a surface takes, besides the flashlight.
@@ -194,6 +201,8 @@ struct Mesh {
     draws: Vec<(Draw, Kind)>,
     surface_groups: Vec<wgpu::BindGroup>,
     lightmap_groups: Vec<wgpu::BindGroup>,
+    /// For a model that moves: the bones of each vertex, and how many bones it needs.
+    skin: Option<(wgpu::Buffer, usize)>,
 }
 
 /// What can be drawn of a world, on the GPU.
@@ -214,6 +223,13 @@ pub struct Renderer {
     /// The lights of the moment: the game's `DynamicLight`s, and the flashlight.
     points: Vec<PointLight>,
     spot: Option<SpotLight>,
+    /// The view models, and the field of view they are drawn with.
+    view_models: Vec<Placed>,
+    view_model_fov: f32,
+    /// The bones of the posed models of a frame, and room for how many.
+    bones_buffer: wgpu::Buffer,
+    bones_group: wgpu::BindGroup,
+    bones_room: usize,
     sky_vertices: Option<wgpu::Buffer>,
     sky_groups: Vec<wgpu::BindGroup>,
     depth: Option<(wgpu::TextureView, (u32, u32))>,
@@ -361,8 +377,14 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
 /// A camera for the shaders, padded to `CAMERA_STRIDE`: its matrix, its eye, and for a model
 /// its light in the model's space - the ambient cube (w 1 on the first side; 0 for the world,
 /// lit as it was baked), then the directions towards its lights (w 1 for a light) and their
-/// light.
-fn camera_bytes(matrix: [f32; 16], eye: [f32; 3], light: Option<&gmod_world::light::ModelLight>, moment: &[f32]) -> Vec<u8> {
+/// light; the lights of the moment; and for a posed model, its first bone in the frame's bones.
+fn camera_bytes(
+    matrix: [f32; 16],
+    eye: [f32; 3],
+    light: Option<&gmod_world::light::ModelLight>,
+    moment: &[f32],
+    first_bone: Option<usize>,
+) -> Vec<u8> {
     let mut values: Vec<f32> = matrix.iter().chain(&eye).copied().collect();
     values.push(1.0);
     match light {
@@ -385,6 +407,12 @@ fn camera_bytes(matrix: [f32; 16], eye: [f32; 3], light: Option<&gmod_world::lig
         None => values.resize(values.len() + 4 * (6 + 2 * gmod_world::light::MAX_LIGHTS), 0.0),
     }
     values.extend(moment);
+    // the lights of the moment take 4 x (2 x 4 + 3) floats, also when there are none
+    values.resize(4 * (1 + 4 + 6 + 2 * gmod_world::light::MAX_LIGHTS + 2 * MAX_POINT_LIGHTS + 3), 0.0);
+    values.extend(match first_bone {
+        Some(bone) => [bone as f32, 1.0, 0.0, 0.0],
+        None => [0.0; 4],
+    });
     let mut bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     bytes.resize(CAMERA_STRIDE as usize, 0);
     bytes
@@ -415,6 +443,23 @@ struct Layouts {
     camera: wgpu::BindGroupLayout,
     surface: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
+    bones: wgpu::BindGroupLayout,
+}
+
+/// A buffer for the bones of `room` matrices, and its bind group.
+fn bones_buffer(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, room: usize) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bones"),
+        size: room.max(1) as u64 * BONE_SIZE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bones"),
+        layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+    });
+    (buffer, group)
 }
 
 /// What uploading needs after the world is up: the layouts, the samplers, the missing texture
@@ -511,7 +556,10 @@ impl Shared {
                 })
             })
             .collect();
-        Mesh { vertices, indices, draws, surface_groups, lightmap_groups }
+        // a model that moves takes the bones of its vertices along
+        let bone_count = gpu::bone_count(world);
+        let skin = (bone_count > 0).then(|| (buffer(device, queue, "skin", wgpu::BufferUsages::VERTEX, &gpu::skin(world)), bone_count));
+        Mesh { vertices, indices, draws, surface_groups, lightmap_groups, skin }
     }
 }
 
@@ -521,6 +569,7 @@ fn pipeline(
     shader: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     kind: Kind,
+    posed: bool,
 ) -> wgpu::RenderPipeline {
     let attributes = [
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
@@ -530,11 +579,22 @@ fn pipeline(
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 44, shader_location: 4 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 5 },
     ];
-    let buffers = [Some(wgpu::VertexBufferLayout {
+    // the bones of each vertex of a posed model: three numbers, then their weights
+    let skin_attributes = [
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint8x4, offset: 0, shader_location: 6 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 4, shader_location: 7 },
+    ];
+    let vertices = Some(wgpu::VertexBufferLayout {
         array_stride: gpu::VERTEX_SIZE as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &attributes,
-    })];
+    });
+    let skin = Some(wgpu::VertexBufferLayout {
+        array_stride: gpu::SKIN_SIZE as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &skin_attributes,
+    });
+    let buffers = if posed { vec![vertices, skin] } else { vec![vertices] };
     let additive = wgpu::BlendState {
         color: wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::SrcAlpha,
@@ -555,11 +615,11 @@ fn pipeline(
     let two_sided = matches!(kind, Kind::OpaqueTwoSided | Kind::BlendTwoSided | Kind::Additive);
     let targets = [Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("world"),
+        label: Some(if posed { "posed" } else { "world" }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(if posed { "vs_posed" } else { "vs_main" }),
             compilation_options: Default::default(),
             buffers: &buffers,
         },
@@ -657,6 +717,19 @@ impl Renderer {
                 label: Some("texture"),
                 entries: &[texture_entry(0), sampler_entry(1)],
             }),
+            bones: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bones"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(BONE_SIZE),
+                    },
+                    count: None,
+                }],
+            }),
         };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world"),
@@ -667,14 +740,18 @@ impl Renderer {
             bind_group_layouts: &[Some(&layouts.camera), Some(&layouts.surface), Some(&layouts.texture)],
             immediate_size: 0,
         });
+        let posed_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("posed"),
+            bind_group_layouts: &[Some(&layouts.camera), Some(&layouts.surface), Some(&layouts.texture), Some(&layouts.bones)],
+            immediate_size: 0,
+        });
         let pipelines = Pipelines {
-            opaque: pipeline(device, &world_layout, &shader, format, Kind::Opaque),
-            opaque_two_sided: pipeline(device, &world_layout, &shader, format, Kind::OpaqueTwoSided),
-            blend: pipeline(device, &world_layout, &shader, format, Kind::Blend),
-            blend_two_sided: pipeline(device, &world_layout, &shader, format, Kind::BlendTwoSided),
-            additive: pipeline(device, &world_layout, &shader, format, Kind::Additive),
+            still: KINDS.iter().map(|&kind| pipeline(device, &world_layout, &shader, format, kind, false)).collect(),
+            posed: KINDS.iter().map(|&kind| pipeline(device, &posed_layout, &shader, format, kind, true)).collect(),
             sky: sky_pipeline(device, &layouts, format),
         };
+        let bones_room = 256;
+        let (bones_buffer, bones_group) = bones_buffer(device, &layouts.bones, bones_room);
 
         let camera_slots = 1;
         let sky_camera_buffer = camera_buffer(device, 1);
@@ -749,6 +826,11 @@ impl Renderer {
             entities: Vec::new(),
             points: Vec::new(),
             spot: None,
+            view_models: Vec::new(),
+            view_model_fov: 54.0,
+            bones_buffer,
+            bones_group,
+            bones_room,
             sky_vertices,
             sky_groups,
             depth: None,
@@ -790,6 +872,13 @@ impl Renderer {
         self.entities = entities.into_iter().filter(|e| e.model.0 < self.models.len()).collect();
     }
 
+    /// The view models to draw from now on - the weapon in the player's hands and the hands -
+    /// seen from the same eye with their own field of view (degrees), in front of everything.
+    pub fn set_view_models(&mut self, view_models: Vec<Placed>, fov: f32) {
+        self.view_models = view_models.into_iter().filter(|e| e.model.0 < self.models.len()).collect();
+        self.view_model_fov = fov;
+    }
+
     fn depth_view(&mut self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::TextureView {
         if let Some((view, made)) = &self.depth
             && *made == size
@@ -824,8 +913,10 @@ impl Renderer {
         let depth = self.depth_view(device, size);
         let aspect = size.0.max(1) as f32 / size.1.max(1) as f32;
         let view_projection = camera.view_projection(aspect);
-        // the world's camera, then each entity's: the camera after the entity's placement
-        let slots = 1 + self.entities.len();
+        let held = Camera { fov: self.view_model_fov, ..*camera }.view_projection_near(aspect, VIEW_MODEL_NEAR);
+        // the world's camera, then each entity's and each view model's: the camera after its
+        // placement
+        let slots = 1 + self.entities.len() + self.view_models.len();
         if slots > self.camera_slots {
             self.camera_slots = slots.next_power_of_two();
             self.camera_buffer = camera_buffer(device, self.camera_slots);
@@ -833,17 +924,37 @@ impl Renderer {
         }
         let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let world_lights = lights_bytes(&self.points, self.spot.as_ref(), false, [0.0; 3], identity, 1.0);
-        let mut cameras = camera_bytes(view_projection, camera.eye, None, &world_lights);
-        for placed in &self.entities {
+        let mut cameras = camera_bytes(view_projection, camera.eye, None, &world_lights, None);
+        // the bones of the posed models, one after another
+        let mut bones: Vec<u8> = Vec::new();
+        let placements = self.entities.iter().map(|p| (p, &view_projection)).chain(self.view_models.iter().map(|p| (p, &held)));
+        for (placed, projection) in placements {
             let (mut matrix, _) = gpu::placement(placed.origin, placed.angles);
             let axes = gmod_world::axes(placed.angles);
             let light = gmod_world::light::in_model_space(&placed.light, axes);
             let moment = lights_bytes(&self.points, self.spot.as_ref(), true, placed.origin, axes, placed.scale);
             matrix[..12].iter_mut().for_each(|v| *v *= placed.scale);
-            cameras.extend(camera_bytes(gpu::multiply(&view_projection, &matrix), camera.eye, Some(&light), &moment));
+            // a model is posed when it is given the bones its vertices name
+            let first_bone = match &self.models[placed.model.0].skin {
+                Some((_, needed)) if placed.bones.len() >= *needed => {
+                    let first = bones.len() / BONE_SIZE as usize;
+                    bones.extend(placed.bones.iter().flatten().flatten().flat_map(|v| v.to_le_bytes()));
+                    Some(first)
+                }
+                _ => None,
+            };
+            cameras.extend(camera_bytes(gpu::multiply(projection, &matrix), camera.eye, Some(&light), &moment, first_bone));
         }
         queue.write_buffer(&self.camera_buffer, 0, &cameras);
-        queue.write_buffer(&self.sky_camera_buffer, 0, &camera_bytes(camera.sky_projection(aspect), [0.0; 3], None, &[]));
+        let bone_count = bones.len() / BONE_SIZE as usize;
+        if bone_count > self.bones_room {
+            self.bones_room = bone_count.next_power_of_two();
+            (self.bones_buffer, self.bones_group) = bones_buffer(device, &self.shared.layouts.bones, self.bones_room);
+        }
+        if !bones.is_empty() {
+            queue.write_buffer(&self.bones_buffer, 0, &bones);
+        }
+        queue.write_buffer(&self.sky_camera_buffer, 0, &camera_bytes(camera.sky_projection(aspect), [0.0; 3], None, &[], None));
         // translucent surfaces from the farthest
         let distance = |draw: &Draw| {
             let d = [draw.center[0] - camera.eye[0], draw.center[1] - camera.eye[1], draw.center[2] - camera.eye[2]];
@@ -885,48 +996,93 @@ impl Renderer {
                 pass.draw(i as u32 * 6..i as u32 * 6 + 6, 0..1);
             }
         }
+        let draw = Drawing { pipelines: &self.pipelines, camera: &self.camera_group, bones: &self.bones_group };
         let mut current = None;
-        draw_mesh(&mut pass, &self.pipelines, &mut current, &self.camera_group, 0, &self.world, opaque);
-        let entity = |slot: usize| ((slot + 1) as u64 * CAMERA_STRIDE) as u32;
-        for (slot, placed) in self.entities.iter().enumerate() {
+        draw.mesh(&mut pass, &mut current, 0, &self.world, opaque);
+        let slot = |slot: usize| (slot as u64 * CAMERA_STRIDE) as u32;
+        for (i, placed) in self.entities.iter().enumerate() {
             let mesh = &self.models[placed.model.0];
-            let list = (0..mesh.draws.len()).filter(|&i| !mesh.draws[i].1.translucent());
-            draw_mesh(&mut pass, &self.pipelines, &mut current, &self.camera_group, entity(slot), mesh, list);
+            draw.mesh(&mut pass, &mut current, slot(1 + i), mesh, (0..mesh.draws.len()).filter(|&i| !mesh.draws[i].1.translucent()));
         }
-        draw_mesh(&mut pass, &self.pipelines, &mut current, &self.camera_group, 0, &self.world, translucent);
-        for (slot, placed) in self.entities.iter().enumerate() {
+        draw.mesh(&mut pass, &mut current, 0, &self.world, translucent);
+        for (i, placed) in self.entities.iter().enumerate() {
             let mesh = &self.models[placed.model.0];
-            let list = (0..mesh.draws.len()).filter(|&i| mesh.draws[i].1.translucent());
-            draw_mesh(&mut pass, &self.pipelines, &mut current, &self.camera_group, entity(slot), mesh, list);
+            draw.mesh(&mut pass, &mut current, slot(1 + i), mesh, (0..mesh.draws.len()).filter(|&i| mesh.draws[i].1.translucent()));
+        }
+        drop(pass);
+        if self.view_models.is_empty() {
+            return;
+        }
+        // the view models over everything: what they hide of the world they hide, however near
+        // a wall is
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("view models"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let mut current = None;
+        let first = 1 + self.entities.len();
+        for translucent in [false, true] {
+            for (i, placed) in self.view_models.iter().enumerate() {
+                let mesh = &self.models[placed.model.0];
+                let list = (0..mesh.draws.len()).filter(|&i| mesh.draws[i].1.translucent() == translucent);
+                draw.mesh(&mut pass, &mut current, slot(first + i), mesh, list);
+            }
         }
     }
 }
 
-/// Draws the surfaces `list` of a mesh, seen through the camera at `offset`.
-fn draw_mesh(
-    pass: &mut wgpu::RenderPass,
-    pipelines: &Pipelines,
-    current: &mut Option<Kind>,
-    camera: &wgpu::BindGroup,
-    offset: u32,
-    mesh: &Mesh,
-    list: impl IntoIterator<Item = usize>,
-) {
-    pass.set_bind_group(0, camera, &[offset]);
-    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-    for i in list {
-        let (draw, kind) = mesh.draws[i];
-        if draw.index_count == 0 {
-            continue;
+/// What every draw of a frame shares: the pipelines, the cameras and the bones.
+struct Drawing<'a> {
+    pipelines: &'a Pipelines,
+    camera: &'a wgpu::BindGroup,
+    bones: &'a wgpu::BindGroup,
+}
+
+impl Drawing<'_> {
+    /// Draws the surfaces `list` of a mesh, seen through the camera at `offset`; `current` is
+    /// the pipeline set last.
+    fn mesh(
+        &self,
+        pass: &mut wgpu::RenderPass,
+        current: &mut Option<(Kind, bool)>,
+        offset: u32,
+        mesh: &Mesh,
+        list: impl IntoIterator<Item = usize>,
+    ) {
+        pass.set_bind_group(0, self.camera, &[offset]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        let posed = mesh.skin.is_some();
+        if let Some((skin, _)) = &mesh.skin {
+            pass.set_vertex_buffer(1, skin.slice(..));
+            pass.set_bind_group(3, self.bones, &[]);
         }
-        if *current != Some(kind) {
-            pass.set_pipeline(pipelines.get(kind));
-            *current = Some(kind);
+        for i in list {
+            let (draw, kind) = mesh.draws[i];
+            if draw.index_count == 0 {
+                continue;
+            }
+            if *current != Some((kind, posed)) {
+                pass.set_pipeline(self.pipelines.get(kind, posed));
+                *current = Some((kind, posed));
+            }
+            pass.set_bind_group(1, &mesh.surface_groups[i], &[]);
+            pass.set_bind_group(2, &mesh.lightmap_groups[draw.piece], &[]);
+            pass.draw_indexed(draw.first_index..draw.first_index + draw.index_count, 0, 0..1);
         }
-        pass.set_bind_group(1, &mesh.surface_groups[i], &[]);
-        pass.set_bind_group(2, &mesh.lightmap_groups[draw.piece], &[]);
-        pass.draw_indexed(draw.first_index..draw.first_index + draw.index_count, 0, 0..1);
     }
 }
 

@@ -19,6 +19,31 @@ use crate::{SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
 /// coordinates (2), blend alpha (1) and vertex light (3).
 pub const VERTEX_SIZE: usize = 56;
 
+/// Bytes of the bones of one vertex of a model: three bone numbers and a byte of nothing, then
+/// their three weights (`f32`).
+pub const SKIN_SIZE: usize = 16;
+
+/// The bones of every vertex, in the order of [`geometry`]'s vertices; vertices of pieces
+/// that do not move have their first bone's whole weight.
+pub fn skin(world: &World) -> Vec<u8> {
+    let mut out = Vec::new();
+    for piece in &world.pieces {
+        for i in 0..piece.vertices.len() {
+            let w = piece.skin.get(i).copied().unwrap_or(crate::Weights { bones: [0; 3], weights: [1.0, 0.0, 0.0] });
+            out.extend([w.bones[0], w.bones[1], w.bones[2], 0]);
+            out.extend(w.weights.iter().flat_map(|x| x.to_le_bytes()));
+        }
+    }
+    out
+}
+
+/// How many bones a world's vertices need: one past the highest they name; 0 for one that
+/// does not move.
+pub fn bone_count(world: &World) -> usize {
+    let named = world.pieces.iter().flat_map(|p| &p.skin).flat_map(|w| (0..3).filter(|&i| w.weights[i] > 0.0).map(|i| w.bones[i]));
+    named.max().map_or(0, |b| usize::from(b) + 1)
+}
+
 /// One draw call: a surface of a piece.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Draw {
@@ -265,15 +290,21 @@ impl Camera {
 
     /// The matrix from the world to clip space, column by column as WGSL reads it.
     pub fn view_projection(&self, aspect: f32) -> [f32; 16] {
-        self.matrix(aspect, self.eye)
+        self.matrix(aspect, self.eye, NEAR)
+    }
+
+    /// The same, cutting off only what is nearer than `near`: for what is held close to the
+    /// eyes.
+    pub fn view_projection_near(&self, aspect: f32, near: f32) -> [f32; 16] {
+        self.matrix(aspect, self.eye, near)
     }
 
     /// The same as seen from the world's origin: for the sky box, which goes along with the eye.
     pub fn sky_projection(&self, aspect: f32) -> [f32; 16] {
-        self.matrix(aspect, [0.0; 3])
+        self.matrix(aspect, [0.0; 3], NEAR)
     }
 
-    fn matrix(&self, aspect: f32, eye: Vec3) -> [f32; 16] {
+    fn matrix(&self, aspect: f32, eye: Vec3, near: f32) -> [f32; 16] {
         let forward = self.forward();
         let right = self.right();
         let up = normalize(crate::cross(right, forward));
@@ -284,7 +315,7 @@ impl Camera {
         let rows = [
             [fx * right[0], fx * right[1], fx * right[2], -fx * dot(right, eye)],
             [fy * up[0], fy * up[1], fy * up[2], -fy * dot(up, eye)],
-            [0.0, 0.0, 0.0, NEAR],
+            [0.0, 0.0, 0.0, near],
             [forward[0], forward[1], forward[2], -dot(forward, eye)],
         ];
         std::array::from_fn(|i| rows[i % 4][i / 4])
@@ -342,7 +373,13 @@ mod tests {
                 .map(|&[x, y]| Vertex { position: [x, y, z], light: [0.5; 3], ..Vertex::default() })
                 .collect()
         };
-        let piece = |z: f32| Piece { vertices: quad(z), indices: vec![0, 1, 2, 0, 2, 3], lightmap: None, surfaces: vec![surface(0, 6)] };
+        let piece = |z: f32| Piece {
+            vertices: quad(z),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            lightmap: None,
+            surfaces: vec![surface(0, 6)],
+            skin: Vec::new(),
+        };
         World {
             pieces: vec![piece(0.0), piece(5.0)],
             textures: Vec::new(),
@@ -351,6 +388,19 @@ mod tests {
             missing_textures: Vec::new(),
             missing_models: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_bones_of_the_vertices() {
+        let mut world = world();
+        // the world does not move: every vertex its first bone's, and no bones needed
+        assert_eq!(skin(&world).len(), 8 * SKIN_SIZE);
+        assert_eq!(bone_count(&world), 0);
+        world.pieces[1].skin = vec![crate::Weights { bones: [2, 7, 0], weights: [0.5, 0.5, 0.0] }; 4];
+        let bytes = skin(&world);
+        assert_eq!(&bytes[..8], [0, 0, 0, 0, 0, 0, 0x80, 0x3f], "the first piece: bone 0, weight 1");
+        assert_eq!(&bytes[4 * SKIN_SIZE..4 * SKIN_SIZE + 8], [2, 7, 0, 0, 0, 0, 0, 0x3f]);
+        assert_eq!(bone_count(&world), 8);
     }
 
     #[test]
