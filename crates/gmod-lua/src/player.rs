@@ -53,6 +53,8 @@ const BOT_STEAM_ID64: u64 = 90071996842377216;
 pub mod fl {
     pub const ONGROUND: i64 = 1;
     pub const DUCKING: i64 = 2;
+    /// Ducked, for the animation of the player's model.
+    pub const ANIMDUCKING: i64 = 4;
     pub const FROZEN: i64 = 64;
     pub const CLIENT: i64 = 256;
     pub const FAKECLIENT: i64 = 512;
@@ -814,10 +816,17 @@ fn tick(lua: &Lua, handle: EntityHandle) {
         }
     }
     let keep = truthy(&hook(lua, "FinishMove", [Value::UserData(ply.clone()), Value::UserData(mv_ud.clone())]));
+    let grounded = host(lua).entities.get(handle).is_some_and(|ent| ent.flags & fl::ONGROUND != 0);
     if !keep {
         let mv = mv_ud.borrow::<MoveData>().map(|m| *m).unwrap_or(mv);
         finish_move(lua, handle, &mv);
     }
+    // a jump off the ground is the jump of the player's model
+    let jumped = host(lua).entities.get(handle).is_some_and(|ent| ent.flags & fl::ONGROUND == 0 && ent.velocity.z > 0.0);
+    if grounded && jumped && cmd.cmd.buttons & key::JUMP != 0 {
+        crate::anim::animation_event(lua, handle, crate::anim::EVENT_JUMP, 0);
+    }
+    crate::anim::animate_player(lua, handle);
     footsteps(lua, handle, &ply);
     hook(lua, "PlayerTick", [Value::UserData(ply.clone()), Value::UserData(mv_ud)]);
 
@@ -901,6 +910,7 @@ fn finish_move(lua: &Lua, handle: EntityHandle, mv: &MoveData) {
         let set = |flags: &mut i64, flag: i64, on: bool| if on { *flags |= flag } else { *flags &= !flag };
         set(&mut ent.flags, fl::ONGROUND, p.moving.on_ground && ent.move_type == MOVETYPE_WALK);
         set(&mut ent.flags, fl::DUCKING, p.moving.ducked);
+        set(&mut ent.flags, fl::ANIMDUCKING, p.moving.ducked);
         set(&mut ent.flags, fl::INWATER, p.moving.water_level > 0);
         (ent.mins, ent.maxs) = if p.moving.ducked { p.duck_hull } else { p.hull };
     });
@@ -1347,6 +1357,9 @@ pub(crate) fn switch_weapon(lua: &Lua, handle: EntityHandle, item: EntityHandle)
         p.active_weapon = item;
     });
     host(lua).entities.with_mut(item, |ent| ent.effects &= !EF_NODRAW);
+    // the engine puts the weapon's view model on and plays drawing it; the weapon's own
+    // `Deploy` comes after, and may play something else
+    crate::anim::deploy(lua, handle, item);
     weapon::call(lua, item, "Deploy", MultiValue::new());
     true
 }
@@ -2309,23 +2322,8 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
         def(name, nothing)?;
     }
     def("AllowImmediateDecalPainting", nothing)?;
-    // animations come with models that move
-    for name in [
-        "AddVCDSequenceToGestureSlot",
-        "AnimResetGestureSlot",
-        "AnimRestartGesture",
-        "AnimRestartMainSequence",
-        "AnimSetGestureSequence",
-        "AnimSetGestureWeight",
-        "DoAnimationEvent",
-        "DoAttackEvent",
-        "DoCustomAnimEvent",
-        "DoReloadEvent",
-        "DoSecondaryAttack",
-        "SetAnimation",
-    ] {
-        def(name, nothing)?;
-    }
+    // the gesture slots and the animation events of the player's model
+    crate::anim::install_player(def)?;
     // the base gamemode makes the physics gun's own in Lua (`AddFrozenPhysicsObject`,
     // `PhysgunUnfreeze`, `UnfreezePhysicsObjects`); these stand in without it. Nothing is
     // carried by hand or with the gravity gun yet, and there are no vehicles.

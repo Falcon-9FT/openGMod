@@ -240,21 +240,17 @@ impl Rig {
 
     /// Reads a model (`models/player/kleiner.mdl`) from the game's files with the `.ani` file
     /// of its blocks and the models it includes, and those they include, each once. An
-    /// included model that is not there is left out, as the game leaves it.
+    /// included model that is not there is left out, as the game leaves it; so is an `.ani`
+    /// that is not there or is not one: the animations in its blocks then do not move
+    /// ([`Rig::read_all`] says so).
     pub fn load(vfs: &Vfs, path: &str) -> io::Result<Rig> {
         let read = |path: &str| -> io::Result<(Mdl, Option<Vec<u8>>)> {
             let mdl = Mdl::parse(&vfs.read(path, "GAME")?).map_err(|e| crate::context(path, e))?;
-            let blocks = match &mdl.animation_file {
-                Some(name) => {
-                    let name = name.replace('\\', "/");
-                    let bytes = vfs.read(&name, "GAME").map_err(|e| crate::context(&name, e))?;
-                    if !bytes.starts_with(b"IDAG") {
-                        return Err(crate::context(&name, invalid("not an animation block file (.ani)")));
-                    }
-                    Some(bytes)
-                }
-                None => None,
-            };
+            let blocks = mdl
+                .animation_file
+                .as_ref()
+                .and_then(|name| vfs.read(&name.replace('\\', "/"), "GAME").ok())
+                .filter(|bytes| bytes.starts_with(b"IDAG"));
             Ok((mdl, blocks))
         };
         let normal = |path: &str| path.replace('\\', "/").to_ascii_lowercase();

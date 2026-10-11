@@ -186,6 +186,8 @@ pub struct WeaponState {
     pub deploy_speed: f32,
     /// Reloading (`DefaultReload`): when the clip fills.
     pub reload: Option<f64>,
+    /// When what the view model was last sent has played, and it may go back to idle.
+    pub idle_time: f64,
 }
 
 /// Weapon scripts and ammo types, kept with the [`crate::Host`].
@@ -439,6 +441,30 @@ pub(crate) fn post_frame(lua: &Lua, weapon: EntityHandle, buttons: u32, pressed:
     if buttons & IN_RELOAD != 0 {
         call(lua, weapon, "Reload", MultiValue::new());
     }
+    crate::anim::weapon_idle(lua, weapon, buttons & (IN_ATTACK | IN_ATTACK2 | IN_RELOAD) != 0);
+}
+
+/// Sets a weapon's activity (`SendWeaponAnim`).
+pub(crate) fn set_activity(lua: &Lua, weapon: EntityHandle, act: i64) {
+    host(lua).entities.with_mut(weapon, |ent| {
+        if let Some(w) = ent.weapon.as_mut() {
+            w.activity = act;
+        }
+    });
+}
+
+/// From when a weapon's view model may go back to idle.
+pub(crate) fn set_idle_time(lua: &Lua, weapon: EntityHandle, time: f64) {
+    host(lua).entities.with_mut(weapon, |ent| {
+        if let Some(w) = ent.weapon.as_mut() {
+            w.idle_time = time;
+        }
+    });
+}
+
+/// A weapon's activity, and from when it may go back to idle.
+pub(crate) fn activity_and_idle(lua: &Lua, weapon: EntityHandle) -> Option<(i64, f64)> {
+    host(lua).entities.get(weapon).and_then(|ent| ent.weapon.as_ref().map(|w| (w.activity, w.idle_time)))
 }
 
 /// The end of a reload: the clip takes what it holds from the owner's ammo.
@@ -562,10 +588,11 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let act = a.number(2)? as i64;
         change(a, |w| w.activity = act)
     })?;
-    // no animations yet: the activity is all there is of one
+    // the view model of the owner plays a sequence of the activity
     def("SendWeaponAnim", |a| {
-        let act = a.number(2)? as i64;
-        change(a, |w| w.activity = act)
+        let handle = entity::this(a, 1)?;
+        crate::anim::send_weapon_anim(a.lua, handle, a.number(2)? as i64);
+        Ok(Value::Nil)
     })?;
     def("GetDeploySpeed", |a| Ok(Value::Number(f64::from(state(a)?.1.deploy_speed))))?;
     def("SetDeploySpeed", |a| {
@@ -597,8 +624,9 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         entity::this(a, 1)?;
         Ok(Value::Nil)
     })?;
-    // starts a reload when the clip is not full and the owner has rounds for it; the clip
-    // fills when it is done (next tick: there are no animations to wait for yet)
+    // starts a reload when the clip is not full and the owner has rounds for it: the view model
+    // plays the activity, the owner the reload of their own model, and the clip fills when the
+    // view model's sequence has played (the next tick without one)
     def("DefaultReload", |a| {
         let (handle, state) = state(a)?;
         let act = a.number(2)? as i64;
@@ -612,11 +640,14 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         if state.reload.is_some() || !(room(0) || room(1)) {
             return Ok(Value::Boolean(false));
         }
-        let now = host(a.lua).clock.cur_time.get();
+        let played = crate::anim::send_weapon_anim(a.lua, handle, act);
+        crate::anim::animation_event(a.lua, owner, crate::anim::EVENT_RELOAD, 0);
+        let duration = if played { crate::anim::view_model_duration(a.lua, handle) } else { 0.0 };
+        let done = host(a.lua).clock.cur_time.get() + duration;
         change(a, |w| {
             w.activity = act;
-            w.reload = Some(now);
-            w.next_fire = [now, now];
+            w.reload = Some(done);
+            w.next_fire = [done, done];
         })?;
         Ok(Value::Boolean(true))
     })?;

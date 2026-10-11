@@ -52,6 +52,7 @@ use std::time::Instant;
 use gmod_fs::Vfs;
 use mlua::Lua;
 
+pub mod anim;
 mod args;
 pub mod client;
 pub mod console;
@@ -244,6 +245,8 @@ pub(crate) struct Host {
     pub http: http::Http,
     pub entities: entity::Entities,
     pub models: ents::Models,
+    /// The rigs of models, and the activities they name.
+    pub anims: anim::Anims,
     pub world: trace::World,
     pub weapons: weapon::Weapons,
     pub players: player::Players,
@@ -332,6 +335,7 @@ impl Runtime {
             http: http::Http::default(),
             entities: entity::Entities::default(),
             models: ents::Models::default(),
+            anims: anim::Anims::default(),
             world: trace::World::default(),
             weapons: weapon::Weapons::default(),
             players: player::Players::default(),
@@ -359,6 +363,7 @@ impl Runtime {
         matrix::install(&lua)?;
         entity::install(&lua, realm)?;
         util::install(&lua)?;
+        anim::install_util(&lua)?;
         trace::install(&lua)?;
         effect::install(&lua)?;
         constraint::install(&lua)?;
@@ -488,6 +493,9 @@ impl Runtime {
                 inputs::service(&self.lua);
             }
             ents::think(&self.lua);
+            if server {
+                anim::advance(&self.lua);
+            }
             self.call_hook("Tick", mlua::MultiValue::new());
         }
         host(&self.lua).clock.cur_time.set(end);
@@ -548,6 +556,19 @@ impl Runtime {
     /// is not hidden, but not the player and what they carry.
     pub fn drawn(&self, viewer: EntityHandle) -> Vec<Drawn> {
         ents::drawn(&self.lua, viewer)
+    }
+
+    /// What a player holds before their eyes: the view models of the weapon in hand (and the
+    /// hands on them) at their eyes, with their bones, and the field of view they are drawn
+    /// with. None while there is no weapon to show.
+    pub fn view_models(&self, viewer: EntityHandle) -> (Vec<Drawn>, f32) {
+        anim::view_models(&self.lua, viewer)
+    }
+
+    /// Where a client's Lua puts the view models, from the eyes of its player
+    /// (`CalcViewModelView`).
+    pub fn view_model_view(&self, origin: vector::Vector, angles: vector::Angle) -> (vector::Vector, vector::Angle) {
+        anim::view_model_view(&self.lua, origin, angles)
     }
 
     /// How far game time is into the next tick, 0 to 1: where to draw between where things

@@ -69,6 +69,9 @@ pub struct Bone {
     /// The rest pose: from model space into the bone's space (3 rows of 4).
     pub pose_to_bone: [[f32; 4]; 3],
     pub flags: i32,
+    /// What it is made of (a surface property), and its contents (`CONTENTS_*`).
+    pub surface_prop: String,
+    pub contents: i32,
 }
 
 /// One mesh of a model: the vertices that use one material.
@@ -186,6 +189,11 @@ impl Mdl {
                     rotation_scale: r.vec3(at + 84)?,
                     pose_to_bone: pose,
                     flags: r.i32(at + 160)?,
+                    surface_prop: match r.i32(at + 176)? {
+                        0 => String::new(),
+                        _ => r.string(r.offset(at, at + 176)?)?,
+                    },
+                    contents: r.i32(at + 180)?,
                 })
             })
             .collect::<io::Result<Vec<Bone>>>()?;

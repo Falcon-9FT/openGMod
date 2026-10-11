@@ -2492,3 +2492,384 @@ fn points_of_the_world_on_the_screen() {
     // keys that are numbers are numbers, whole or not
     assert!(g.eval::<bool>("local t = util.KeyValuesToTable('\"r\" { \"1\" \"a\" \"2.5\" \"b\" }') return t[1] == 'a' and t[2.5] == 'b'"));
 }
+
+/// A model of three bones - root, upper (10 up), lower (10 along the upper's x), a tip on the
+/// lower - with sequences: idle turns the upper from 0 to 1 radian over a third of a second,
+/// looping; two attacks of one activity turn it back over half a second; aim blends the root
+/// from -0.5 to 0.5 radian along `aim_yaw`; dance has an activity of its own.
+fn arm_model() -> Vec<u8> {
+    use gmod_model::testmodel::{TestAnimation, TestBone, TestRig, TestSequence};
+    let bone = |name: &str, parent: i32, position: [f32; 3]| TestBone { name: name.into(), parent, position, euler: [0.0; 3] };
+    let still = |name: &str, angle: f32| TestAnimation {
+        frames: vec![vec![(0, None, [0.0, 0.0, angle])]; 2],
+        ..TestAnimation::turning(name, 0, 2, angle, angle)
+    };
+    let mut idle = TestSequence::new("idle", "ACT_IDLE", 0);
+    idle.flags = gmod_model::anim::flags::LOOPING;
+    let mut favourite = TestSequence::new("attack2", "ACT_RANGE_ATTACK1", 1);
+    favourite.activity_weight = 3;
+    let mut aim = TestSequence::new("aim", "", 2);
+    aim.animations = vec![2, 3];
+    aim.blend = [2, 1];
+    aim.parameters = [0, -1];
+    aim.parameter_start = [-45.0, 0.0];
+    aim.parameter_end = [45.0, 0.0];
+    TestRig {
+        name: "arm.mdl".into(),
+        checksum: 5,
+        bones: vec![bone("root", -1, [0.0; 3]), bone("upper", 0, [0.0, 0.0, 10.0]), bone("lower", 1, [10.0, 0.0, 0.0])],
+        animations: vec![
+            TestAnimation::turning("@idle", 1, 11, 0.0, 1.0),
+            TestAnimation::turning("@attack", 1, 16, 0.0, -1.0),
+            still("@left", -0.5),
+            still("@right", 0.5),
+        ],
+        sequences: vec![
+            idle,
+            TestSequence::new("attack", "ACT_RANGE_ATTACK1", 1),
+            favourite,
+            aim,
+            TestSequence::new("dance", "ACT_OPENGMOD_DANCE", 0),
+        ],
+        pose_parameters: vec![gmod_model::PoseParameter { name: "aim_yaw".into(), flags: 0, start: -45.0, end: 45.0, wrap: 0.0 }],
+        attachments: vec![("tip".into(), 2, [5.0, 0.0, 0.0])],
+        ..TestRig::default()
+    }
+    .files()
+    .0
+}
+
+#[test]
+fn entities_play_their_sequences() {
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let g = game_with(
+        Realm::Server,
+        &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/arm.mdl", &arm_model()), ("models/box.mdl", &mdl)],
+    );
+    g.runtime.init();
+    g.runtime.run_string("E = ents.Create('prop_dynamic') E:SetModel('models/arm.mdl') E:Spawn()", "arm").unwrap();
+
+    // the sequences, their activities, how long they take
+    assert!(g.eval::<bool>(
+        "local seq, duration = E:LookupSequence('ATTACK')
+         local none, zero = E:LookupSequence('nope')
+         return seq == 1 and math.abs(duration - 0.5) < 1e-4 and none == -1 and zero == 0
+             and E:GetSequenceCount() == 5 and E:GetSequenceName(0) == 'idle' and E:GetSequenceName(9) == 'Unknown'
+             and E:GetSequenceList()[0] == 'idle' and E:GetSequenceList()[4] == 'dance'
+             and E:GetSequenceActivity(1) == ACT_RANGE_ATTACK1 and E:GetSequenceActivityName(2) == 'ACT_RANGE_ATTACK1'
+             and math.abs(E:SequenceDuration(0) - 1 / 3) < 1e-4 and E:GetSequenceInfo(3).numblends == 2
+             and E:GetAnimCount() == 4 and E:GetAnimInfo(1).numframes == 16 and E:GetAnimInfo(1).label == '@attack'"
+    ));
+    // activities of the game, and one of the model's own, numbered after them
+    assert!(g.eval::<bool>(
+        "local dance = E:GetSequenceActivity(4)
+         return util.GetActivityIDByName('ACT_VM_IDLE') == 174 and util.GetActivityNameByID(174) == 'ACT_VM_IDLE'
+             and dance > LAST_SHARED_ACTIVITY and util.GetActivityNameByID(dance) == 'ACT_OPENGMOD_DANCE'
+             and util.GetActivityIDByName('act_opengmod_dance') == dance and E:SelectWeightedSequence(ACT_WALK) == -1
+             and E:SelectWeightedSequenceSeeded(ACT_RANGE_ATTACK1, 0) == 1 and E:SelectWeightedSequenceSeeded(ACT_RANGE_ATTACK1, 3) == 2"
+    ));
+    // chosen by weight: attack2 three times as often as attack
+    let (attack, favourite): (u32, u32) = g.eval(
+        "local n = { [1] = 0, [2] = 0 }
+         for i = 1, 400 do local s = E:SelectWeightedSequence(ACT_RANGE_ATTACK1) n[s] = n[s] + 1 end
+         return n[1], n[2]",
+    );
+    assert!(attack + favourite == 400 && favourite > attack * 2 && attack > 40, "{attack} {favourite}");
+
+    // a prop_dynamic plays by itself: idle at half rate, a fifth of a second is 0.3 of its cycle
+    g.runtime.run_string("E:ResetSequence('idle') E:SetCycle(0) E:SetPlaybackRate(0.5)", "play").unwrap();
+    g.runtime.think(0.2);
+    let cycle: f32 = g.eval("return E:GetCycle()");
+    assert!((cycle - 0.3).abs() < 0.03, "{cycle}");
+    g.runtime.think(2.0);
+    assert!(g.eval::<bool>("local c = E:GetCycle() return c >= 0 and c < 1 and not E:IsSequenceFinished()"), "it loops");
+    // attack does not loop: it ends, finished
+    g.runtime.run_string("E:ResetSequence(1) E:SetCycle(0) E:SetPlaybackRate(1)", "attack").unwrap();
+    g.runtime.think(0.25);
+    assert!(g.eval::<bool>("return math.abs(E:GetCycle() - 0.5) < 0.05 and not E:IsSequenceFinished()"));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>("return E:GetCycle() == 1 and E:IsSequenceFinished()"));
+
+    // where its bones and its attachment are: idle half way, the upper turned half a radian
+    assert!(g.eval::<bool>(
+        "E:SetPos(Vector(100, 0, 0)) E:SetSequence(0) E:SetCycle(0.5) E:SetPlaybackRate(0)
+         local pos, ang = E:GetBonePosition(2)
+         local tip = E:GetAttachment(1)
+         return close(pos, Vector(100 + 10 * math.cos(0.5), 10 * math.sin(0.5), 10)) and math.abs(ang.y - math.deg(0.5)) < 0.1
+             and close(tip.Pos, Vector(100 + 15 * math.cos(0.5), 15 * math.sin(0.5), 10)) and tip.Bone == 2
+             and E:GetAttachment(2) == nil and E:GetBonePosition(7) == nil
+             and close(E:GetBoneMatrix(1):GetTranslation(), Vector(100, 0, 10)) and #E:GetChildBones(0) == 1
+             and math.abs(E:BoneLength(2) - 10) < 1e-3"
+    ));
+    // pose parameters: kept from 0 to 1 on the server; the aim grid follows them
+    assert!(g.eval::<bool>(
+        "E:SetSequence('aim') E:SetPoseParameter('aim_yaw', 22.5)
+         local lo, hi = E:GetPoseParameterRange(0)
+         return E:GetPoseParameter('aim_yaw') == 0.75 and E:GetPoseParameter(0) == 0.75 and lo == -45 and hi == 45
+             and E:LookupPoseParameter('AIM_YAW') == 0 and E:LookupPoseParameter('nope') == -1
+             and E:GetNumPoseParameters() == 1 and E:GetPoseParameterName(0) == 'aim_yaw'
+             and math.abs(E:GetBoneMatrix(0):GetAngles().y - math.deg(0.25)) < 0.1"
+    ));
+    assert!(g.eval::<bool>("E:ClearPoseParameters() return E:GetPoseParameter('aim_yaw') == 0.5"));
+
+    // layers: a gesture plays once and goes; a layered sequence stays
+    assert!(g.eval::<bool>(
+        "E:SetSequence(0) E:SetPlaybackRate(1)
+         GESTURE = E:AddGestureSequence(1) LAYER = E:AddLayeredSequence(0, 5) E:SetLayerWeight(LAYER, 0.5)
+         return GESTURE == 0 and LAYER == 1 and E:IsValidLayer(GESTURE) and E:GetLayerSequence(GESTURE) == 1
+             and E:GetLayerWeight(LAYER) == 0.5 and E:FindGestureSequenceLayer(1) == 0 and not E:IsValidLayer(7)"
+    ));
+    g.runtime.think(0.75);
+    assert!(g.eval::<bool>("return not E:IsValidLayer(GESTURE) and E:IsValidLayer(LAYER) and E:GetLayerCycle(LAYER) > 0"));
+
+    // what does not animate by itself moves when told
+    assert!(g.eval::<bool>(
+        "S = ents.Create('prop_physics') S:SetModel('models/arm.mdl') S:Spawn() S:ResetSequence(1) S:SetCycle(0) return true"
+    ));
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("local before = S:GetCycle() S:FrameAdvance(0.25) return before == 0 and math.abs(S:GetCycle() - 0.5) < 1e-3"));
+
+    // drawn posed: the arm with its three bones, the box as it was made
+    g.runtime.run_string("B = ents.Create('prop_physics') B:SetModel('models/box.mdl') B:Spawn()", "box").unwrap();
+    let drawn = g.runtime.drawn(EntityHandle::NULL);
+    let bones = |model: &str| drawn.iter().find(|d| d.model == model).map(|d| d.bones.len());
+    assert_eq!((bones("models/arm.mdl"), bones("models/box.mdl")), (Some(3), Some(0)));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+/// A view model: a hand bone, and draw, idle, fire and reload sequences (a third of a second,
+/// looping, a sixth, one second). Hands: the hand bone and a finger.
+fn view_model_files() -> (Vec<u8>, Vec<u8>) {
+    use gmod_model::testmodel::{TestAnimation, TestBone, TestRig, TestSequence};
+    let bone = |name: &str, parent: i32, position: [f32; 3]| TestBone { name: name.into(), parent, position, euler: [0.0; 3] };
+    let mut idle = TestSequence::new("idle", "ACT_VM_IDLE", 1);
+    idle.flags = gmod_model::anim::flags::LOOPING;
+    let weapon = TestRig {
+        name: "v_test.mdl".into(),
+        checksum: 7,
+        bones: vec![bone("root", -1, [0.0; 3]), bone("ValveBiped.Bip01_R_Hand", 0, [20.0, -5.0, -5.0])],
+        animations: vec![
+            TestAnimation::turning("@draw", 1, 11, 1.0, 0.0),
+            TestAnimation::turning("@idle", 1, 2, 0.0, 0.0),
+            TestAnimation::turning("@fire", 1, 6, 0.3, 0.0),
+            TestAnimation::turning("@reload", 1, 31, 0.0, 0.0),
+        ],
+        sequences: vec![
+            TestSequence::new("draw", "ACT_VM_DRAW", 0),
+            idle,
+            TestSequence::new("fire", "ACT_VM_PRIMARYATTACK", 2),
+            TestSequence::new("reload", "ACT_VM_RELOAD", 3),
+        ],
+        ..TestRig::default()
+    };
+    let hands = TestRig {
+        name: "c_hands.mdl".into(),
+        checksum: 8,
+        bones: vec![bone("ValveBiped.Bip01_R_Hand", -1, [0.0; 3]), bone("finger", 0, [3.0, 0.0, 0.0])],
+        animations: vec![TestAnimation::turning("@idle", 0, 2, 0.0, 0.0)],
+        sequences: vec![TestSequence::new("idle", "", 0)],
+        ..TestRig::default()
+    };
+    (weapon.files().0, hands.files().0)
+}
+
+#[test]
+fn the_view_model_plays_the_weapon_in_hand() {
+    let (weapon_model, hands_model) = view_model_files();
+    let pistol = PISTOL.replace("\"weight\"", "\"viewmodel\"          \"models/weapons/v_test.mdl\"\n    \"weight\"");
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/weapons/v_test.mdl", &weapon_model),
+            ("models/weapons/c_hands.mdl", &hands_model),
+            ("scripts/weapons/weapon_pistol.txt", pistol.as_bytes()),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    g.runtime
+        .run_string(
+            "weapons.list.weapon_test = {
+                 ViewModel = 'models/weapons/v_test.mdl', UseHands = true, ViewModelFOV = 70, Weight = 10,
+                 Primary = { ClipSize = 6, DefaultClip = 12, Ammo = 'Pistol', Automatic = false },
+                 Secondary = { ClipSize = -1, DefaultClip = -1, Ammo = 'none' },
+                 PrimaryAttack = function(self) self:SendWeaponAnim(ACT_VM_PRIMARYATTACK) self:SetClip1(self:Clip1() - 1) end,
+                 Reload = function(self) self:DefaultReload(ACT_VM_RELOAD) end,
+             }
+             HOOKS.PlayerSpawn = function(p) p:Give('weapon_pistol') end
+             CHANGED = {}
+             HOOKS.OnViewModelChanged = function(vm, old, new) CHANGED[#CHANGED + 1] = new end",
+            "weapon",
+        )
+        .unwrap();
+    g.runtime.spawn_map(&player_map());
+    let alice = g.runtime.join(alice()).unwrap();
+
+    // the engine's pistol came out: its view model shows it drawing, then goes back to idle
+    assert!(g.eval::<bool>(
+        "local vm = Entity(1):GetViewModel()
+         VM = vm
+         return vm:GetModel() == 'models/weapons/v_test.mdl' and vm:GetSequence() == 0 and vm:GetCycle() == 0
+             and CHANGED[1] == 'models/weapons/v_test.mdl' and Entity(1):GetActiveWeapon():GetActivity() == ACT_VM_DRAW
+             and vm:ViewModelIndex() == 0"
+    ));
+    g.runtime.think(0.2);
+    assert!(g.eval::<bool>("return VM:GetSequence() == 0 and VM:GetCycle() > 0.4"), "still drawing");
+    g.runtime.think(0.3);
+    assert!(g.eval::<bool>("return VM:GetSequence() == 1 and Entity(1):GetActiveWeapon():GetActivity() == ACT_VM_IDLE"), "idle");
+
+    // a scripted weapon: hands on its view model, its field of view
+    g.runtime
+        .run_string(
+            "local p = Entity(1)
+             local hands = ents.Create('prop_dynamic') hands:SetModel('models/weapons/c_hands.mdl')
+             hands:AddEffects(EF_BONEMERGE) hands:SetParent(p:GetViewModel()) hands:Spawn() p:SetHands(hands)
+             TEST = p:Give('weapon_test')",
+            "give",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("return Entity(1):GetActiveWeapon() == TEST and VM:GetSequence() == 0"));
+    let (models, fov) = g.runtime.view_models(alice);
+    assert_eq!(fov, 70.0);
+    assert_eq!(models.iter().map(|d| d.model.as_str()).collect::<Vec<_>>(), ["models/weapons/v_test.mdl", "models/weapons/c_hands.mdl"]);
+    assert!(models.iter().all(|d| d.bones.len() == 2), "{models:?}");
+    // the hands' bone is the view model's hand, wherever that is: drawing starts turned a
+    // radian, and the hand's skinning moves it from where the hands model has it
+    let hand = models[1].bones[0];
+    let moved = (hand[0][3] - 20.0).abs() < 1e-3 && (hand[1][3] + 5.0).abs() < 1e-3;
+    assert!(moved && (hand[0][0] - 1f32.cos()).abs() < 1e-3, "{hand:?}");
+
+    // firing plays its sequence; a scripted weapon stays where it was sent
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::ATTACK, ..UserCmd::default() });
+    g.runtime.think(0.015);
+    g.runtime.set_input(alice, UserCmd::default());
+    assert!(g.eval::<bool>("return VM:GetSequence() == 2 and TEST:Clip1() == 5"));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>("return VM:GetSequence() == 2 and VM:GetCycle() == 1"), "a SWEP says when to go back to idle");
+
+    // a reload takes as long as its sequence: the clip is full after a second, not before
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::RELOAD, ..UserCmd::default() });
+    g.runtime.think(0.015);
+    g.runtime.set_input(alice, UserCmd::default());
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>("return VM:GetSequence() == 3 and TEST:Clip1() == 5"));
+    g.runtime.think(0.6);
+    assert!(g.eval::<bool>("return TEST:Clip1() == 6"));
+
+    // nothing to show without a weapon, or when the view model is not drawn
+    g.runtime.run_string("Entity(1):DrawViewModel(false)", "hide").unwrap();
+    assert!(g.runtime.view_models(alice).0.is_empty());
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn players_animate_as_the_gamemode_says() {
+    use gmod_model::testmodel::{TestAnimation, TestBone, TestRig, TestSequence};
+    let bone = |name: &str, parent: i32, position: [f32; 3]| TestBone { name: name.into(), parent, position, euler: [0.0; 3] };
+    let mut walk = TestSequence::new("walk_all", "ACT_HL2MP_WALK", 1);
+    walk.flags = gmod_model::anim::flags::LOOPING;
+    let mut idle = TestSequence::new("idle_all", "ACT_HL2MP_IDLE", 0);
+    idle.flags = gmod_model::anim::flags::LOOPING;
+    let mut walking_animation = TestAnimation::turning("@walk", 1, 31, 0.0, 0.0);
+    walking_animation.moves = Some([100.0, 0.0, 0.0]);
+    let pose = |name: &str, start: f32, end: f32| gmod_model::PoseParameter { name: name.into(), flags: 0, start, end, wrap: 0.0 };
+    let model = TestRig {
+        name: "player.mdl".into(),
+        checksum: 9,
+        bones: vec![bone("ValveBiped.Bip01_Pelvis", -1, [0.0, 0.0, 40.0]), bone("ValveBiped.Bip01_Spine", 0, [0.0, 0.0, 5.0])],
+        animations: vec![TestAnimation::turning("@idle", 1, 2, 0.0, 0.0), walking_animation],
+        sequences: vec![idle, walk, TestSequence::new("gesture", "ACT_MP_ATTACK_STAND_PRIMARYFIRE", 0)],
+        pose_parameters: vec![
+            pose("move_x", -1.0, 1.0),
+            pose("move_y", -1.0, 1.0),
+            pose("aim_yaw", -60.0, 60.0),
+            pose("aim_pitch", -90.0, 90.0),
+        ],
+        ..TestRig::default()
+    };
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/player.mdl", &model.files().0),
+            ("scripts/weapons/weapon_pistol.txt", PISTOL.as_bytes()),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    g.runtime
+        .run_string(
+            "HOOKS.PlayerSpawn = function(p) p:SetModel('models/player.mdl') p:SetWalkSpeed(200) end
+             HOOKS.CalcMainActivity = function(p, velocity)
+                 return velocity:Length2D() > 1 and ACT_MP_WALK or ACT_MP_STAND_IDLE, -1
+             end
+             HOOKS.TranslateActivity = function(p, act)
+                 return act == ACT_MP_WALK and ACT_HL2MP_WALK or act == ACT_MP_STAND_IDLE and ACT_HL2MP_IDLE or act
+             end
+             HOOKS.UpdateAnimation = function(p, velocity, ground) RATE = velocity:Length() / ground p:SetPlaybackRate(RATE) end
+             HOOKS.DoAnimationEvent = function(p, event)
+                 if event == PLAYERANIMEVENT_ATTACK_PRIMARY then p:AnimRestartGesture(GESTURE_SLOT_ATTACK_AND_RELOAD, ACT_MP_ATTACK_STAND_PRIMARYFIRE, true) end
+                 EVENTS = (EVENTS or '') .. event .. ' '
+             end",
+            "animations",
+        )
+        .unwrap();
+    g.runtime.spawn_map(&player_map());
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("return Entity(1):GetSequence() == 0"), "standing: idle");
+
+    // walking along y: the walk, at the rate the gamemode makes of its ground speed; the legs
+    // turn with the eyes, the aim stays ahead
+    g.runtime.set_input(alice, walking(90.0, 0));
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetSequence() == 1 and math.abs(RATE - p:GetVelocity():Length() / 100) < 1e-3 and RATE > 1
+             and p:GetPoseParameter('move_x') > 0.9 and math.abs(p:GetPoseParameter('move_y') - 0.5) < 0.01
+             and math.abs(p:GetPoseParameter('aim_yaw') - 0.5) < 0.01 and math.abs(p:GetRenderAngles().y - 90) < 0.1"
+    ));
+    // stopped, then looking 30 degrees to the side: the legs stay, the aim turns
+    g.runtime.set_input(alice, UserCmd { view_angles: vector::Angle::new(0.0, 90.0, 0.0), ..UserCmd::default() });
+    g.runtime.think(2.0);
+    g.runtime.set_input(alice, UserCmd { view_angles: vector::Angle::new(0.0, 120.0, 0.0), ..UserCmd::default() });
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetSequence() == 0 and math.abs(p:GetRenderAngles().y - 90) < 0.1
+             and math.abs(p:GetPoseParameter('aim_yaw') - 0.75) < 0.01"
+    ));
+    // the gesture of an attack, over the rest
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) p:SetAnimation(PLAYER_ATTACK1)
+         return EVENTS == '0 ' and p:IsPlayingGesture(ACT_MP_ATTACK_STAND_PRIMARYFIRE) and p:GetLayerSequence(0) == 2"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn dynamic_props_play_what_the_map_says() {
+    let g = game_with(Realm::Server, &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/arm.mdl", &arm_model())]);
+    g.runtime.init();
+    // as the map gives it: its default animation from the start
+    g.runtime
+        .run_string(
+            "D = ents.Create('prop_dynamic') D:SetKeyValue('model', 'models/arm.mdl') D:SetKeyValue('DefaultAnim', 'idle') D:Spawn()",
+            "map",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("return D:GetSequence() == 0"));
+    // an animation once, then the default again; a new default and a rate
+    g.runtime.run_string("D:Fire('SetAnimation', 'attack')", "fire").unwrap();
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("return D:GetSequence() == 1"));
+    g.runtime.think(0.6);
+    assert!(g.eval::<bool>("return D:GetSequence() == 0 and not D:IsSequenceFinished()"), "back to idle");
+    g.runtime
+        .run_string("D:Fire('SetDefaultAnimation', 'dance') D:Fire('SetPlaybackRate', '2') D:Fire('SetAnimation', 'attack')", "fire")
+        .unwrap();
+    g.runtime.think(0.4);
+    assert!(g.eval::<bool>("return D:GetSequence() == 4 and D:GetPlaybackRate() == 2"), "the new default, at the rate set");
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}

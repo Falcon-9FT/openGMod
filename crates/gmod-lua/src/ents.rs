@@ -417,6 +417,9 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
             }
         }
     }
+    if !scripted {
+        crate::anim::spawned(lua, handle);
+    }
     if scripted && let Some(ud) = userdata(lua, handle) {
         call_method(lua, &ud, "Initialize", MultiValue::new());
     }
@@ -519,6 +522,9 @@ pub struct Drawn {
     pub origin: Vector,
     pub angles: Angle,
     pub scale: f32,
+    /// What moves the vertices of the model to where it is posed now, in its own space
+    /// ([`gmod_model::Rig::skinning`]); empty for a model drawn as it was made.
+    pub bones: Vec<[[f32; 4]; 3]>,
 }
 
 /// `RENDERMODE_NONE`: not drawn at all.
@@ -547,7 +553,7 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
         .into_iter()
         .filter(|&handle| !carried(handle))
         .filter_map(|handle| {
-            let (model, skin, scale) = {
+            let (model, skin) = {
                 let ent = entities.get(handle)?;
                 let hidden =
                     ent.removed || !ent.spawned || ent.no_draw || ent.effects & EF_NODRAW != 0 || ent.render_mode == RENDERMODE_NONE;
@@ -555,10 +561,12 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
                 if hidden || !studio || ent.class == "hl2mp_ragdoll" {
                     return None;
                 }
-                (ent.model.clone(), ent.skin, ent.model_scale)
+                (ent.model.clone(), ent.skin)
             };
-            let (origin, angles) = entities.transform(handle)?;
-            Some(Drawn { entity: handle, model, skin, origin, angles, scale })
+            // a merged model is drawn where its parent is, a player's turned as its legs are
+            let (origin, angles, scale) = crate::anim::drawn_at(lua, handle)?;
+            let angles = crate::player::state(lua, handle, |_, p| p.render_angles).unwrap_or(angles);
+            Some(Drawn { entity: handle, model, skin, origin, angles, scale, bones: crate::anim::skinning(lua, handle) })
         })
         .collect()
 }

@@ -675,7 +675,16 @@ fn included_models_play_on_the_bones_of_the_same_names() {
 #[test]
 fn animations_that_do_not_fit_are_errors_not_poses() {
     let (mdl, ani) = arm().files();
-    // the .ani cut short: the blocked animation cannot be read, the others can
+    // the .ani cut short: the blocked animation cannot be read, the others can; one that is
+    // not an .ani is left out when the rig is loaded
+    let game = Game(std::env::temp_dir().join(format!("gmod-model-ani-{}", std::process::id())));
+    std::fs::create_dir_all(game.0.join("models/test")).unwrap();
+    std::fs::write(game.0.join("models/test/arm.mdl"), &mdl).unwrap();
+    std::fs::write(game.0.join("models/test/arm.ani"), b"not an .ani").unwrap();
+    let mut vfs = Vfs::new();
+    vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(&game.0))));
+    let loaded = Rig::load(&vfs, "models/test/arm.mdl").unwrap();
+    assert!(loaded.read_all().is_err() && close(yaw(loaded.pose(0, 1.0, &[], &[])[1].rotation), 1.0, testmodel::ROTATION_SCALE));
     let ani = ani.unwrap();
     let rig = Rig::new(Mdl::parse(&mdl).unwrap(), Some(ani[..90].to_vec()));
     assert!(rig.read_all().is_err());

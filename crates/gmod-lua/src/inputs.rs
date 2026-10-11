@@ -82,7 +82,7 @@ fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str) -> bo
         "color" => crate::ents::key_value(lua, target, "rendercolor", param),
         "alpha" => crate::ents::key_value(lua, target, "renderamt", param),
         "skin" => crate::ents::key_value(lua, target, "skin", param),
-        _ => return crate::constraint::input(lua, target, input),
+        _ => return crate::anim::input(lua, target, input, param) || crate::constraint::input(lua, target, input),
     }
     true
 }

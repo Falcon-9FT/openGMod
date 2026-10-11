@@ -161,6 +161,28 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     Ok(())
 }
 
+/// The activities of the game's enumerations (`ACT_IDLE` ...), by name and number.
+fn activities() -> &'static [(&'static str, i64)] {
+    static LIST: std::sync::OnceLock<Vec<(&'static str, i64)>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        ENUMS
+            .lines()
+            .filter(|l| l.starts_with("ACT_"))
+            .filter_map(|l| l.split_once(' ').and_then(|(name, value)| Some((name, value.parse().ok()?))))
+            .collect()
+    })
+}
+
+/// The number of an activity of the game's (`ACT_VM_IDLE`), ignoring case.
+pub(crate) fn activity(name: &str) -> Option<i64> {
+    activities().iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|&(_, id)| id)
+}
+
+/// The name of an activity of the game's by its number.
+pub(crate) fn activity_name(id: i64) -> Option<&'static str> {
+    activities().iter().find(|&&(_, n)| n == id).map(|&(name, _)| name)
+}
+
 fn install_enums(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     for line in ENUMS.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
         let Some((name, value)) = line.split_once(' ') else { continue };

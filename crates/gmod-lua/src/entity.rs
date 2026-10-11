@@ -137,6 +137,8 @@ pub struct Ent {
     pub flex_weights: Vec<(i64, f32)>,
     /// Bones moved, turned and scaled from where the model has them (`ManipulateBone*`).
     pub bone_manipulations: Vec<BoneManipulation>,
+    /// What it plays on its bones ([`crate::anim`]).
+    pub anim: crate::anim::AnimState,
 }
 
 /// How a bone is moved from where its model has it.
@@ -216,6 +218,7 @@ impl Ent {
             flex_scale: 1.0,
             flex_weights: Vec::new(),
             bone_manipulations: Vec::new(),
+            anim: crate::anim::AnimState::default(),
         }
     }
 
@@ -747,6 +750,7 @@ fn install_many(def: &DefMany) -> mlua::Result<()> {
         let color = read(a, |ent| ent.color)?;
         Ok(color.into_iter().map(|part| Value::Integer(part.into())).collect())
     })?;
+    crate::anim::install_many(def)?;
     crate::constraint::install_many(def)
 }
 
@@ -1519,6 +1523,7 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     crate::inputs::install_methods(def)?;
     crate::constraint::install_methods(def)?;
     crate::sound::install_methods(def)?;
+    crate::anim::install_methods(def)?;
     crate::ents::install_variables(def)
 }
 
