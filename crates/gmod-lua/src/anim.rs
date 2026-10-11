@@ -214,7 +214,7 @@ pub(crate) fn activity_name(lua: &Lua, id: i64) -> Option<String> {
 }
 
 /// A number from 0 up to `below`, for choosing.
-fn random(lua: &Lua, below: i64) -> i64 {
+pub(crate) fn random(lua: &Lua, below: i64) -> i64 {
     let cell = &host(lua).anims.random;
     // xorshift, seeded the first time
     let mut x = cell.get();

@@ -1066,8 +1066,9 @@ pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
 
 /// The engine's commands a player types into the console: `noclip`, `kill` and `explode`,
 /// `give <class>`, and choosing a weapon - `use <class>`, `lastinv`, `invnext`, `invprev`,
-/// `slot1` to `slot6` (what the weapon selection of the client's HUD would send). Whether
-/// `words` was one of them, which then ran.
+/// `slot1` to `slot6` (what the weapon selection of the client's HUD would send) - and, with
+/// `sv_cheats 1`, `ent_fire <target> <input> [param] [delay]`. Whether `words` was one of
+/// them, which then ran.
 pub(crate) fn command(lua: &Lua, handle: EntityHandle, words: &[String]) -> bool {
     let Some((name, args)) = words.split_first() else { return false };
     let name = name.to_ascii_lowercase();
@@ -1092,6 +1093,7 @@ pub(crate) fn command(lua: &Lua, handle: EntityHandle, words: &[String]) -> bool
                 switch_weapon(lua, handle, item);
             }
         }
+        "ent_fire" => ent_fire(lua, handle, args),
         "invnext" => select_weapon(lua, handle, 1, None),
         "invprev" => select_weapon(lua, handle, -1, None),
         _ => match name.strip_prefix("slot").and_then(|n| n.parse::<i64>().ok()).filter(|n| (1..=6).contains(n)) {
@@ -1100,6 +1102,29 @@ pub(crate) fn command(lua: &Lua, handle: EntityHandle, words: &[String]) -> bool
         },
     }
     true
+}
+
+/// `ent_fire <target> <input> [param] [delay]`, a cheat: the input goes to what the target
+/// names as an output's would (`!self` and `!activator` being the player, `!picker` what they
+/// look at), the player its activator.
+fn ent_fire(lua: &Lua, handle: EntityHandle, args: &[String]) {
+    if convar::value(lua, "sv_cheats").is_none_or(|v| convar::atof(&v) == 0.0) {
+        host(lua).print("Can't use cheat command ent_fire in multiplayer, unless the server has sv_cheats set to 1.\n");
+        return;
+    }
+    let (Some(target), Some(input)) = (args.first(), args.get(1)) else { return };
+    let param = args.get(2).map_or("", String::as_str);
+    let delay = args.get(3).map_or(0.0, |d| convar::atof(d));
+    if target.eq_ignore_ascii_case("!picker") {
+        let Some((eye, aim)) = eye(lua, handle) else { return };
+        let sweep = Sweep { mask: gmod_bsp::mask::SHOT, ..Sweep::line(eye, eye + aim * 8192.0, Filter::Entities(vec![handle])) };
+        let picked = trace::trace(lua, &sweep).entity;
+        if picked.index.is_some_and(|i| i != 0) {
+            crate::inputs::fire(lua, picked, input, param, delay, handle, handle);
+        }
+        return;
+    }
+    crate::inputs::fire_named(lua, target, input, param, delay, handle, handle, handle);
 }
 
 /// Runs a line of console commands as typed by a player: the engine's commands for players,

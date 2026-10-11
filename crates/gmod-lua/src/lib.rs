@@ -73,12 +73,14 @@ pub mod html;
 pub mod http;
 pub mod hud;
 pub mod inputs;
+pub mod logic;
 pub mod material;
 pub mod matrix;
 pub mod menu;
 pub mod meta;
 pub mod movedata;
 pub mod net;
+pub mod outputs;
 pub mod physgun;
 pub mod physics;
 pub mod player;
@@ -500,6 +502,7 @@ impl Runtime {
                 physgun::think(&self.lua);
                 physics::simulate(&self.lua);
                 inputs::service(&self.lua);
+                logic::tick(&self.lua);
             }
             ents::think(&self.lua);
             if server {

@@ -426,6 +426,7 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
     }
     if !scripted {
         crate::anim::spawned(lua, handle);
+        crate::logic::spawned(lua, handle);
     }
     if scripted && let Some(ud) = userdata(lua, handle) {
         call_method(lua, &ud, "Initialize", MultiValue::new());
@@ -610,6 +611,10 @@ pub(crate) fn key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str)
 }
 
 fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
+    // a connection of an output is kept as one; an entity may have many of one name
+    if crate::outputs::add(lua, handle, key, value) {
+        return;
+    }
     let lower = key.to_ascii_lowercase();
     let number = || crate::convar::atof(value);
     match lower.as_str() {
@@ -661,8 +666,8 @@ fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
 
 /// Loads a map's entities as the server does when the map starts: the world takes the
 /// `worldspawn` key-values, every other entity is made with its key-values, parents are set
-/// (`parentname`), all are spawned, parents before their children, then activated, and the
-/// `InitPostEntity` hook runs.
+/// (`parentname`), all are spawned, parents before their children, then activated, the
+/// `logic_auto`s fire, and the `InitPostEntity` hook runs.
 pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     {
         let host = host(lua);
@@ -740,6 +745,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     for &handle in &made {
         activate(lua, handle);
     }
+    crate::logic::map_spawned(lua);
     crate::call_hook(lua, "InitPostEntity", MultiValue::new());
 }
 
@@ -754,6 +760,16 @@ fn names_match(pattern: &str, name: &str) -> bool {
 /// The first entity with a name (Source's matching: a trailing `*` matches any end).
 pub(crate) fn named(lua: &Lua, name: &str) -> Option<EntityHandle> {
     find(lua, |ent| names_match(name, &ent.name)).into_iter().next()
+}
+
+/// The entities with a name (Source's matching), in index order.
+pub(crate) fn all_named(lua: &Lua, name: &str) -> Vec<EntityHandle> {
+    find(lua, |ent| names_match(name, &ent.name))
+}
+
+/// The entities of a class (Source's matching: a trailing `*` matches any end), in index order.
+pub(crate) fn all_of_class(lua: &Lua, class: &str) -> Vec<EntityHandle> {
+    find(lua, |ent| names_match(class, &ent.class))
 }
 
 /// The entities that are not being removed and pass a test, in index order.

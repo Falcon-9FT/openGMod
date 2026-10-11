@@ -139,6 +139,10 @@ pub struct Ent {
     pub bone_manipulations: Vec<BoneManipulation>,
     /// What it plays on its bones ([`crate::anim`]).
     pub anim: crate::anim::AnimState,
+    /// The connections of its outputs, for an engine's entity ([`crate::outputs`]).
+    pub outputs: Vec<crate::outputs::Output>,
+    /// What an entity of the map's logic keeps ([`crate::logic`]).
+    pub logic: Option<Box<crate::logic::State>>,
 }
 
 /// How a bone is moved from where its model has it.
@@ -219,6 +223,8 @@ impl Ent {
             flex_weights: Vec::new(),
             bone_manipulations: Vec::new(),
             anim: crate::anim::AnimState::default(),
+            outputs: Vec::new(),
+            logic: None,
         }
     }
 
