@@ -25,7 +25,8 @@
 //!   taking damage), [`effect`] (`EffectData`, `util.Effect`), [`sound`] (`EmitSound`,
 //!   `CreateSound`, the `sound` library, all quiet), [`trace`] (`util.TraceLine` and the like),
 //!   [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`),
-//!   [`constraint`] (welds, ropes, axes ... as joints), [`inputs`] (`Entity:Input`,
+//!   [`anim`] (what entities play on their bones: sequences, cycles, pose parameters, layers,
+//!   view models, the player's model), [`constraint`] (welds, ropes, axes ... as joints), [`inputs`] (`Entity:Input`,
 //!   `Entity:Fire`), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
 //!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`]
 //!   (`Material`), [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and
@@ -36,8 +37,8 @@
 //!   the map ([`Runtime::spawn_map`]); players joining ([`Runtime::join`]) and what they press
 //!   ([`Runtime::set_input`]); then [`Runtime::think`] moves time on, runs timers, and for
 //!   every tick the players' commands and movement, the bodies of physics, the inputs fired,
-//!   the entities that think and the `Tick` hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`])
-//!   and the models of the entities they see ([`Runtime::drawn`]).
+//!   the entities that think, the animations and the `Tick` hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`]),
+//!   the models of the entities they see, posed ([`Runtime::drawn`]), and what they hold before their eyes ([`Runtime::view_models`]).
 //!
 //! Errors in scripts are not errors of the runtime: as in GMod, a file that fails is
 //! reported ([`Output::Error`], [`Runtime::errors`]) and the files around it keep loading.

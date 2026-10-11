@@ -7,7 +7,7 @@
 //! itself - players, view models, NPCs, `prop_dynamic`, and scripted entities that ask
 //! (`ENT.AutomaticFrameAdvance`) - at the sequence's own rate
 //! ([`gmod_model::Rig::cycle_rate`]); others move when Lua says (`FrameAdvance`). Where the
-//! bones are follows ([`model_bones`]): what `GetBonePosition`, `GetAttachment` and drawing
+//! bones are follows (`model_bones`): what `GetBonePosition`, `GetAttachment` and drawing
 //! give. An entity merged onto its parent (`EF_BONEMERGE`: the hands on the view model) takes
 //! its parent's bones of the same names.
 //!
