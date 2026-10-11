@@ -441,3 +441,259 @@ fn physics_belongs_to_its_model() {
     assert!(other.contains("models/test/box.phy") && other.contains("another build"), "{other}");
     assert!(load_physics(&vfs, "models/test/none.mdl", CHECKSUM).unwrap().is_none());
 }
+
+use crate::anim::{AutoLayer, PoseParameter, euler_quaternion, flags};
+use crate::pose::{IDENTITY, transform};
+use crate::testmodel::{Keep, TestAnimation, TestBone, TestRig, TestSequence};
+
+fn bone(name: &str, parent: i32, position: [f32; 3]) -> TestBone {
+    TestBone { name: name.to_string(), parent, position, euler: [0.0; 3] }
+}
+
+/// One frame of one bone, the same for `frames` frames, kept as `keep` says.
+fn still(name: &str, bone: usize, position: [f32; 3], euler: [f32; 3], frames: usize, keep: Keep) -> TestAnimation {
+    TestAnimation { frames: vec![vec![(bone, Some(position), euler)]; frames], keep, ..TestAnimation::turning(name, bone, 1, 0.0, 0.0) }
+}
+
+/// An arm of three bones - root, upper (10 up), lower (10 along the upper's x) - with
+/// animations kept every way a model keeps them, and sequences that play them.
+fn arm() -> TestRig {
+    let mut long = TestAnimation::turning("@long", 1, 71, 0.0, 2.0);
+    long.section_frames = 30;
+    let mut blocked = TestAnimation::turning("@blocked", 1, 11, 0.0, -1.0);
+    blocked.block = 1;
+    let mut delta = still("@delta", 2, [0.0; 3], [0.0, 0.0, 0.25], 2, Keep::Streams);
+    delta.flags = flags::DELTA;
+    let mut walk = TestAnimation::turning("@walk", 1, 31, 0.0, 0.0);
+    walk.moves = Some([60.0, 0.0, 0.0]);
+    let mut aim = TestSequence::new("aim", "", 5);
+    aim.animations = vec![5, 6, 7];
+    aim.blend = [3, 1];
+    aim.parameters = [0, -1];
+    aim.parameter_start = [-45.0, 0.0];
+    aim.parameter_end = [45.0, 0.0];
+    let mut bend = TestSequence::new("bend", "", 8);
+    bend.flags = flags::DELTA;
+    let mut bent = TestSequence::new("idle_bent", "", 0);
+    bent.layers = vec![AutoLayer { sequence: 6, pose: None, flags: 0, start: 0.0, peak: 0.0, tail: 0.0, end: 0.0 }];
+    let mut idle = TestSequence::new("idle", "ACT_VM_IDLE", 0);
+    idle.flags = flags::LOOPING;
+    idle.weights = vec![1.0; 3];
+    TestRig {
+        name: "test/arm.mdl".into(),
+        checksum: 99,
+        bones: vec![bone("root", -1, [0.0; 3]), bone("upper", 0, [0.0, 0.0, 10.0]), bone("lower", 1, [10.0, 0.0, 0.0])],
+        animations: vec![
+            TestAnimation::turning("@idle", 1, 11, 0.0, 1.0),
+            still("@raw64", 2, [10.0, 1.0, 2.0], [0.3, -0.2, 0.5], 2, Keep::Raw64),
+            still("@raw48", 2, [10.0, 1.0, 2.0], [0.3, -0.2, 0.5], 2, Keep::Raw48),
+            long,
+            blocked,
+            still("@aim_left", 0, [0.0; 3], [0.0, 0.0, -0.5], 2, Keep::Streams),
+            still("@aim_middle", 0, [0.0; 3], [0.0; 3], 2, Keep::Streams),
+            still("@aim_right", 0, [0.0; 3], [0.0, 0.0, 0.5], 2, Keep::Streams),
+            delta,
+            walk,
+        ],
+        sequences: vec![
+            idle,
+            TestSequence::new("raw64", "ACT_VM_PRIMARYATTACK", 1),
+            TestSequence::new("raw48", "ACT_VM_PRIMARYATTACK", 2),
+            TestSequence::new("long", "", 3),
+            TestSequence::new("blocked", "", 4),
+            aim,
+            bend,
+            bent,
+            TestSequence::new("walk", "ACT_WALK", 9),
+        ],
+        pose_parameters: vec![PoseParameter { name: "aim_yaw".into(), flags: 0, start: -45.0, end: 45.0, wrap: 0.0 }],
+        attachments: vec![("tip".into(), 2, [5.0, 0.0, 0.0])],
+        animation_file: "models/test/arm.ani".into(),
+        ..TestRig::default()
+    }
+}
+
+fn arm_rig() -> Rig {
+    let (mdl, ani) = arm().files();
+    Rig::new(Mdl::parse(&mdl).unwrap(), ani)
+}
+
+/// The angle a rotation turns about z, for rotations about z only.
+fn yaw(q: [f32; 4]) -> f32 {
+    2.0 * q[2].atan2(q[3])
+}
+
+fn close(a: f32, b: f32, tolerance: f32) -> bool {
+    (a - b).abs() <= tolerance
+}
+
+#[test]
+fn reads_sequences_and_animations() {
+    let (bytes, ani) = arm().files();
+    assert!(ani.as_ref().is_some_and(|a| a.starts_with(b"IDAG")));
+    let mdl = Mdl::parse(&bytes).unwrap();
+    assert_eq!(mdl.bones[1].euler, [0.0; 3]);
+    assert_eq!(mdl.bones[1].rotation_scale, [testmodel::ROTATION_SCALE; 3]);
+    assert_eq!(mdl.sequences.len(), 9);
+    let idle = &mdl.sequences[0];
+    assert_eq!((idle.label.as_str(), idle.activity.as_str(), idle.activity_weight), ("idle", "ACT_VM_IDLE", 1));
+    assert!(idle.looping() && !idle.delta());
+    assert_eq!(idle.weights, [1.0; 3]);
+    assert_eq!(
+        (mdl.sequences[5].animations.clone(), mdl.sequences[5].blend, mdl.sequences[5].parameters),
+        (vec![5, 6, 7], [3, 1], [Some(0), None])
+    );
+    assert!(mdl.sequences[6].delta());
+    assert_eq!(mdl.sequences[7].layers[0].sequence, 6);
+    let anim = &mdl.animations[0];
+    assert_eq!((anim.name.as_str(), anim.fps, anim.frames), ("@idle", 30.0, 11));
+    assert_eq!((mdl.animations[3].section_frames, mdl.animations[3].sections.len()), (30, 71 / 30 + 2));
+    assert_eq!(mdl.animations[9].movements.last().map(|m| m.position), Some([60.0, 0.0, 0.0]));
+    assert_eq!(mdl.pose_parameters[0].name, "aim_yaw");
+    assert_eq!(mdl.animation_file.as_deref(), Some("models/test/arm.ani"));
+    assert_eq!(mdl.animation_blocks.len(), 2);
+}
+
+#[test]
+fn poses_follow_the_frames() {
+    let rig = arm_rig();
+    let params = rig.default_pose_parameters();
+    // the rest pose undoes what the model was made in: nothing moves
+    let rest = rig.skinning(&rig.bone_to_model(&rig.rest()));
+    assert!(rest.iter().flatten().flatten().zip(IDENTITY.iter().flatten().cycle()).all(|(a, b)| close(*a, *b, 1e-5)));
+
+    // idle turns the upper bone from 0 to 1 radian over 10 frames; between frames, between them
+    let step = testmodel::ROTATION_SCALE;
+    for (cycle, angle) in [(0.0, 0.0), (0.5, 0.5), (0.55, 0.55), (1.0, 1.0)] {
+        let pose = rig.pose(0, cycle, &params, &[]);
+        assert!(close(yaw(pose[1].rotation), angle, step), "at {cycle}: {}", yaw(pose[1].rotation));
+        assert_eq!(pose[1].position, [0.0, 0.0, 10.0], "a bone not moved stays where it is");
+    }
+    // the lower bone goes with it: 10 along the turned x, 10 up
+    let bones = rig.bone_to_model(&rig.pose(0, 0.5, &params, &[]));
+    let tip = transform(&bones[2], [0.0; 3]);
+    assert!((0..3).all(|i| close(tip[i], [10.0 * 0.5f32.cos(), 10.0 * 0.5f32.sin(), 10.0][i], 1e-2)), "{tip:?}");
+    let attachment = rig.attachment(0, &bones).map(|m| transform(&m, [0.0; 3])).unwrap();
+    assert!(close(attachment[0], 15.0 * 0.5f32.cos(), 1e-2), "{attachment:?}");
+
+    // a rotation and a position for every frame, in 64 and in 48 bits
+    let expected = euler_quaternion([0.3, -0.2, 0.5]);
+    for (sequence, tolerance) in [(1, 1e-5), (2, 1e-4)] {
+        let pose = rig.pose(sequence, 0.5, &params, &[]);
+        let q = pose[2].rotation;
+        let dot = (0..4).map(|i| q[i] * expected[i]).sum::<f32>().abs();
+        assert!(1.0 - dot < tolerance, "{sequence}: {q:?} for {expected:?}");
+        assert!((0..3).all(|i| close(pose[2].position[i], [10.0, 1.0, 2.0][i], 1e-2)), "{:?}", pose[2].position);
+    }
+
+    // a long animation in sections of 30 frames, the last one on its own; and one in a block
+    for frame in [0, 29, 30, 31, 45, 60, 69, 70] {
+        let pose = rig.pose(3, frame as f32 / 70.0, &params, &[]);
+        assert!(close(yaw(pose[1].rotation), 2.0 * frame as f32 / 70.0, step * 2.0), "frame {frame}: {}", yaw(pose[1].rotation));
+    }
+    assert!(close(yaw(rig.pose(4, 1.0, &params, &[])[1].rotation), -1.0, step));
+    assert_eq!(rig.read_all().unwrap(), 11 + 2 + 2 + 71 + 11 + 2 * 3 + 2 + 31);
+}
+
+#[test]
+fn sequences_blend_and_layer() {
+    let rig = arm_rig();
+    // the aim grid along aim_yaw from -45 to 45: -0.5, 0 and 0.5 radians about z
+    let aim = |value: f32| yaw(rig.pose(5, 0.0, &[rig.pose_parameters()[0].normalize(value)], &[])[0].rotation);
+    let step = testmodel::ROTATION_SCALE;
+    assert!(close(aim(-45.0), -0.5, step) && close(aim(0.0), 0.0, step) && close(aim(45.0), 0.5, step));
+    assert!(close(aim(22.5), 0.25, step), "half way between the middle and the right: {}", aim(22.5));
+    // without a value given, the parameter is at 0: the middle
+    assert!(close(yaw(rig.pose(5, 0.0, &[], &[])[0].rotation), 0.0, step));
+
+    // the bend is a delta: played on idle by its layer it turns the lower bone a quarter
+    // radian more, and the upper bone is idle's
+    let params = rig.default_pose_parameters();
+    let pose = rig.pose(7, 0.5, &params, &[]);
+    assert!(close(yaw(pose[2].rotation), 0.25, step) && close(yaw(pose[1].rotation), 0.5, step), "{pose:?}");
+    // a layer given (a gesture) weighs in: half the bend
+    let pose = rig.pose(0, 0.0, &params, &[Layer { sequence: 6, cycle: 0.0, weight: 0.5 }]);
+    assert!(close(yaw(pose[2].rotation), 0.125, step), "{}", yaw(pose[2].rotation));
+
+    // how long sequences take and how fast they move along the ground
+    assert!(close(rig.duration(0, &params), 10.0 / 30.0, 1e-6));
+    assert!(close(rig.duration(8, &params), 1.0, 1e-6) && close(rig.ground_speed(8, &params), 60.0, 1e-3));
+    assert_eq!(rig.ground_speed(0, &params), 0.0);
+    assert_eq!(rig.duration(1, &params), 1.0 / 30.0, "two frames: one step");
+    assert_eq!(rig.find_sequence("WALK"), Some(8));
+}
+
+#[test]
+fn included_models_play_on_the_bones_of_the_same_names() {
+    // the included model has the bones in another order, one the rig does not have, and
+    // a sequence of the same name as the rig's (left out) and one that overrides one
+    let mut wave = TestAnimation::turning("@wave", 2, 3, 0.0, 0.6);
+    wave.frames.iter_mut().flatten().for_each(|(bone, ..)| *bone = 2);
+    let mut raw = TestSequence::new("raw64", "", 0);
+    raw.flags = flags::OVERRIDE;
+    let anims = TestRig {
+        name: "test/anims.mdl".into(),
+        bones: vec![
+            bone("lower", 2, [10.0, 0.0, 0.0]),
+            bone("root", -1, [0.0; 3]),
+            bone("upper", 1, [0.0, 0.0, 10.0]),
+            bone("tail", 1, [0.0; 3]),
+        ],
+        animations: vec![wave],
+        sequences: vec![TestSequence::new("wave", "ACT_WAVE", 0), TestSequence::new("idle", "", 0), raw],
+        pose_parameters: vec![
+            PoseParameter { name: "AIM_YAW".into(), flags: 0, start: -45.0, end: 45.0, wrap: 0.0 },
+            PoseParameter { name: "lean".into(), flags: 0, start: -1.0, end: 1.0, wrap: 0.0 },
+        ],
+        ..TestRig::default()
+    };
+    let mut main = arm();
+    main.include_models = vec!["models/test/anims.mdl".into(), "models/test/gone.mdl".into(), "models/test/arm.mdl".into()];
+
+    let game = Game(std::env::temp_dir().join(format!("gmod-model-rig-{}", std::process::id())));
+    std::fs::create_dir_all(game.0.join("models/test")).unwrap();
+    let (mdl, ani) = main.files();
+    std::fs::write(game.0.join("models/test/arm.mdl"), mdl).unwrap();
+    std::fs::write(game.0.join("models/test/arm.ani"), ani.unwrap()).unwrap();
+    std::fs::write(game.0.join("models/test/anims.mdl"), anims.files().0).unwrap();
+    let mut vfs = Vfs::new();
+    vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(&game.0))));
+    let rig = Rig::load(&vfs, "models/test/arm.mdl").unwrap();
+
+    // the rig's nine, and wave: idle stays the rig's own, raw64 is the included model's
+    assert_eq!(rig.sequence_count(), 10);
+    assert_eq!(rig.sequence(0).map(|s| s.animations[0]), Some(0));
+    assert_eq!(rig.sequence(1).map(|s| s.flags), Some(flags::OVERRIDE));
+    assert_eq!(rig.pose_parameters().iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["aim_yaw", "lean"]);
+    let wave = rig.find_sequence("wave").unwrap();
+    let pose = rig.pose(wave, 1.0, &rig.default_pose_parameters(), &[]);
+    assert!(close(yaw(pose[1].rotation), 0.6, testmodel::ROTATION_SCALE), "the included model's upper is the rig's: {pose:?}");
+    // the rig's own animations from its .ani still read
+    assert!(close(yaw(rig.pose(4, 1.0, &[], &[])[1].rotation), -1.0, testmodel::ROTATION_SCALE));
+}
+
+#[test]
+fn animations_that_do_not_fit_are_errors_not_poses() {
+    let (mdl, ani) = arm().files();
+    // the .ani cut short: the blocked animation cannot be read, the others can
+    let ani = ani.unwrap();
+    let rig = Rig::new(Mdl::parse(&mdl).unwrap(), Some(ani[..90].to_vec()));
+    assert!(rig.read_all().is_err());
+    assert_eq!(rig.pose(4, 1.0, &[], &[])[1], rig.rest()[1], "what cannot be read does not move");
+    assert!(close(yaw(rig.pose(0, 1.0, &[], &[])[1].rotation), 1.0, testmodel::ROTATION_SCALE));
+    // without the .ani at all
+    assert!(Rig::new(Mdl::parse(&mdl).unwrap(), None).read_all().is_err());
+
+    // a record for a bone the model does not have
+    let mut broken = mdl.clone();
+    let parsed = Mdl::parse(&mdl).unwrap();
+    let first = parsed.animations[0].sections[0].at;
+    broken[first] = 7;
+    let rig = Rig::new(Mdl::parse(&broken).unwrap(), None);
+    let error = rig.read_all().unwrap_err().to_string();
+    assert!(error.contains("bone 7 of 3"), "{error}");
+    // a sequence playing an animation that is not there
+    let mut model = arm();
+    model.sequences[0].animations = vec![40];
+    assert!(Mdl::parse(&model.files().0).unwrap_err().to_string().contains("animation 40"));
+}

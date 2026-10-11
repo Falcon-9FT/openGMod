@@ -11,19 +11,26 @@
 //! | 80 | eye position, illumination position, hull and view box (`f32`×3 each) |
 //! | 152 | `i32` flags |
 //! | 156 | bones: count, offset (216-byte records) |
+//! | 180 | animations: count, offset (100-byte records, [`crate::anim`]) |
+//! | 188 | sequences: count, offset (212-byte records) |
 //! | 204 | textures: count, offset (64-byte records) |
 //! | 212 | texture folders: count, offset of a table of string offsets |
 //! | 220 | skins: textures per skin, skin count, offset of a `u16` table |
 //! | 232 | body parts: count, offset (16-byte records) |
 //! | 240 | attachments: count, offset (92-byte records) |
 //! | 260 | flex controllers' descriptions: count, offset (4-byte records, a name each) |
+//! | 300 | pose parameters: count, offset (20-byte records) |
 //! | 308 | surface property name, key values (offset, size), mass |
+//! | 336 | included models: count, offset (8-byte records: a label and a path) |
+//! | 348 | animation blocks: the `.ani` file's name, count, offset (8 bytes each: start, end) |
 //!
 //! A body part lists models, one of which is shown (chosen by the body group); a model has
 //! meshes, one per material, whose vertices are a run of the model's vertices in the `.vvd`.
 
 use std::io;
+use std::sync::Arc;
 
+use crate::anim::{self, Animation, PoseParameter, Sequence};
 use crate::reader::{Reader, invalid};
 
 const BONE_SIZE: usize = 216;
@@ -54,8 +61,14 @@ pub struct Bone {
     /// Position and rotation (a quaternion, x y z w) relative to the parent.
     pub position: [f32; 3],
     pub rotation: [f32; 4],
+    /// The rotation as Euler angles in radians, about x, y and z: what animations add to.
+    pub euler: [f32; 3],
+    /// What one step of an animation's stored values is in units and in radians.
+    pub position_scale: [f32; 3],
+    pub rotation_scale: [f32; 3],
     /// The rest pose: from model space into the bone's space (3 rows of 4).
     pub pose_to_bone: [[f32; 4]; 3],
+    pub flags: i32,
 }
 
 /// One mesh of a model: the vertices that use one material.
@@ -115,6 +128,27 @@ pub struct Mdl {
     /// The `$keyvalues` of the model (`prop_data` and others), as text.
     pub key_values: String,
     pub mass: f32,
+    pub sequences: Vec<Sequence>,
+    pub animations: Vec<Animation>,
+    pub pose_parameters: Vec<PoseParameter>,
+    /// Models whose sequences this one plays too (`models/m_anm.mdl`), in order.
+    pub include_models: Vec<String>,
+    /// The `.ani` file with the animations kept out of the model, and the byte range of each
+    /// of its blocks; block 0 is the model itself.
+    pub animation_file: Option<String>,
+    pub animation_blocks: Vec<(usize, usize)>,
+    /// The file itself, which animations read their frames from.
+    pub(crate) data: Data,
+}
+
+/// The bytes of a file, shared.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Data(pub Arc<[u8]>);
+
+impl std::fmt::Debug for Data {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{} bytes", self.0.len())
+    }
 }
 
 impl Mdl {
@@ -147,7 +181,11 @@ impl Mdl {
                     parent: r.i32(at + 4)?,
                     position: r.vec3(at + 32)?,
                     rotation: [r.f32(at + 44)?, r.f32(at + 48)?, r.f32(at + 52)?, r.f32(at + 56)?],
+                    euler: r.vec3(at + 60)?,
+                    position_scale: r.vec3(at + 72)?,
+                    rotation_scale: r.vec3(at + 84)?,
                     pose_to_bone: pose,
+                    flags: r.i32(at + 160)?,
                 })
             })
             .collect::<io::Result<Vec<Bone>>>()?;
@@ -248,6 +286,31 @@ impl Mdl {
             }
         };
 
+        // animations, and the blocks of the .ani some of them are kept in
+        let (animation_file, animation_blocks) = match r.count(352, "animation block")? {
+            0 => (None, Vec::new()),
+            count => {
+                let table = r.offset(0, 356)?;
+                r.table(table, count, 8, "animation blocks")?;
+                let blocks = (0..count)
+                    .map(|i| Ok((r.count(table + i * 8, "animation block start")?, r.count(table + i * 8 + 4, "animation block end")?)))
+                    .collect::<io::Result<Vec<(usize, usize)>>>()?;
+                (Some(r.string(r.offset(0, 348)?)?), blocks)
+            }
+        };
+        let animations = anim::animations(&r, &animation_blocks)?;
+        let sequences = anim::sequences(&r, bones.len(), animations.len())?;
+        let pose_parameters = anim::pose_parameters(&r)?;
+        let include_count = r.count(336, "included model")?;
+        let include_at = r.offset(0, 340)?;
+        r.table(include_at, include_count, 8, "included models")?;
+        let include_models = (0..include_count)
+            .map(|i| {
+                let at = include_at + i * 8;
+                r.string(r.offset(at, at + 4)?)
+            })
+            .collect::<io::Result<Vec<String>>>()?;
+
         Ok(Mdl {
             version,
             checksum: r.i32(8)?,
@@ -267,6 +330,13 @@ impl Mdl {
             surface_prop,
             key_values,
             mass: r.f32(328)?,
+            sequences,
+            animations,
+            pose_parameters,
+            include_models,
+            animation_file,
+            animation_blocks,
+            data: Data(Arc::from(data)),
         })
     }
 
