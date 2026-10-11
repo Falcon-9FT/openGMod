@@ -393,6 +393,20 @@ fn the_text_of_physics_models_is_read_leniently() {
     assert_eq!((phy.solids[0].name(), phy.solids[0].mass()), ("a", Some(3.0)));
     assert_eq!(phy.block("break").and_then(|b| b.get("model")), Some("gibs/a.mdl"));
     assert!(phy.ragdoll_constraints().is_empty());
+    assert!(phy.collision_pairs().is_empty());
+}
+
+#[test]
+fn the_parts_of_a_ragdoll_that_hit_each_other() {
+    let solids = vec![vec![testmodel::TestConvex::cuboid([0.0; 3], [1.0; 3])]; 3];
+    let rules = |text: &str| Phy::parse(&testmodel::phy(CHECKSUM, &solids, false, text)).unwrap().collision_pairs();
+    // the pairs named, but not those of solids it does not have
+    assert_eq!(
+        rules("collisionrules { \"collisionpair\" \"2,0\" \"collisionpair\" \" 1 , 2\" \"collisionpair\" \"1,9\" }"),
+        [[2, 0], [1, 2]]
+    );
+    assert!(rules("collisionrules { \"selfcollisions\" \"0\" \"collisionpair\" \"0,1\" }").is_empty());
+    assert!(rules("").is_empty());
 }
 
 #[test]

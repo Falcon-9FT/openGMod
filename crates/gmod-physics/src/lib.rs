@@ -12,16 +12,19 @@
 //!
 //! Bodies are held together by [`Joint`]s - welds, ropes, hinges, what the constraints of GMod
 //! are made of - to each other or to the world ([`Physics::ground`]); a joint given a strength
-//! breaks when pulled harder than that.
+//! breaks when pulled harder than that. The parts of a ragdoll hang together by
+//! [`Joint::Ragdoll`]s, each turning only as far as its limits about each axis, and go
+//! through each other unless told otherwise ([`Physics::set_apart`]).
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rapier3d::math::{Mat3, Pose, Rotation, Vector};
 use rapier3d::prelude::{
-    ColliderBuilder, ColliderHandle, GenericJoint, GenericJointBuilder, ImpulseJointHandle, InteractionGroups, JointAxesMask, JointAxis,
-    PhysicsWorld, QueryFilter, Ray, RigidBodyBuilder, RigidBodyHandle, RigidBodyType, SharedShape, SpringJointBuilder,
+    ActiveHooks, ColliderBuilder, ColliderHandle, GenericJoint, GenericJointBuilder, ImpulseJointHandle, InteractionGroups, JointAxesMask,
+    JointAxis, MassProperties, PairFilterContext, PhysicsHooks, PhysicsWorld, QueryFilter, Ray, RigidBodyBuilder, RigidBodyHandle,
+    RigidBodyType, SharedShape, SolverFlags, SpringJointBuilder,
 };
 
 pub type Vec3 = [f32; 3];
@@ -129,13 +132,16 @@ pub struct Body {
     /// and `rotdamping`).
     pub damping: f32,
     pub rot_damping: f32,
+    /// How much harder it is to turn than its shape makes it: a `.phy`'s `inertia`, which
+    /// ragdolls set to keep their light parts from spinning on their joints.
+    pub inertia: f32,
     /// Whatever the caller keeps with it: its entity.
     pub user: u64,
 }
 
 impl Body {
     pub fn new(shape: Shape, origin: Vec3, angles: Vec3) -> Body {
-        Body { shape, mass: None, origin, angles, damping: 0.0, rot_damping: 0.0, user: 0 }
+        Body { shape, mass: None, origin, angles, damping: 0.0, rot_damping: 0.0, inertia: 1.0, user: 0 }
     }
 }
 
@@ -173,6 +179,11 @@ pub enum Joint {
     Spring { start: Vec3, end: Vec3, length: f32, stiffness: f32, damping: f32 },
     /// Nothing held: the two only go through each other.
     NoCollide,
+    /// Turning about `point`, the second no farther from how it is now to the first than
+    /// `limits`: for each axis (x, y, z) of a frame turned by `angles`, the least and the most
+    /// degrees, -180 to 180. An axis whose limits are both 0 does not turn at all. A joint of a
+    /// ragdoll (a `.phy`'s `ragdollconstraint`), and `phys_ragdollconstraint`.
+    Ragdoll { point: Vec3, angles: Vec3, limits: [[f32; 2]; 3] },
 }
 
 /// A joint in a [`Physics`].
@@ -188,9 +199,15 @@ pub struct Physics {
     strengths: HashMap<JointId, [f32; 2]>,
     /// Joints broken since they were last asked for.
     broken: Vec<JointId>,
+    /// Bodies that go through each other, each pair both ways round ([`Physics::set_apart`]).
+    apart: HashSet<(RigidBodyHandle, RigidBodyHandle)>,
     /// Impacts since they were last asked for, and when each body last made one.
     impacts: Vec<Impact>,
     last_impact: HashMap<RigidBodyHandle, f32>,
+    /// The ragdoll joints and their limits.
+    limits: Vec<Limit>,
+    /// The bodies harder to turn than their shapes ([`Body::inertia`]), and how much.
+    inertia: HashMap<RigidBodyHandle, f32>,
     /// Seconds stepped.
     clock: f32,
 }
@@ -231,8 +248,11 @@ impl Physics {
             ground,
             strengths: HashMap::new(),
             broken: Vec::new(),
+            apart: HashSet::new(),
             impacts: Vec::new(),
             last_impact: HashMap::new(),
+            limits: Vec::new(),
+            inertia: HashMap::new(),
             clock: 0.0,
         }
     }
@@ -288,13 +308,33 @@ impl Physics {
             let collider = ColliderBuilder::new(shape).density(density).friction(DEFAULT_FRICTION);
             self.world.insert_collider(collider, Some(handle));
         }
+        if body.inertia > 0.0 && body.inertia != 1.0 {
+            self.inertia.insert(handle, body.inertia);
+        }
+        self.weigh(handle);
         Some(BodyId(handle))
+    }
+
+    /// Works out a body's mass and inertia from its colliders, and turns it as hard as it
+    /// should ([`Body::inertia`]): its inertia, scaled, about where its mass is.
+    fn weigh(&mut self, handle: RigidBodyHandle) {
+        let Some(body) = self.world.bodies.get_mut(handle) else { return };
+        body.set_additional_mass_properties(MassProperties::default(), false);
+        body.recompute_mass_properties_from_colliders(&self.world.colliders);
+        let Some(&scale) = self.inertia.get(&handle) else { return };
+        let own = body.mass_properties().local_mprops;
+        let more = own.inv_principal_inertia.map(|i| if i > 0.0 { (scale - 1.0) / i } else { 0.0 });
+        let extra = MassProperties::with_principal_inertia_frame(own.local_com, 0.0, more, own.principal_inertia_local_frame);
+        body.set_additional_mass_properties(extra, false);
+        body.recompute_mass_properties_from_colliders(&self.world.colliders);
     }
 
     /// Takes a body away, and its joints. The ground stays.
     pub fn remove(&mut self, id: BodyId) {
         if id.0 != self.ground {
             self.world.remove_body(id.0);
+            self.apart.retain(|&(a, b)| a != id.0 && b != id.0);
+            self.inertia.remove(&id.0);
         }
     }
 
@@ -472,10 +512,8 @@ impl Physics {
                 collider.set_density(collider.density() * mass / now);
             }
         }
-        if let Some(body) = self.world.bodies.get_mut(id.0) {
-            body.recompute_mass_properties_from_colliders(&self.world.colliders);
-            body.wake_up(true);
-        }
+        self.weigh(id.0);
+        self.wake(id);
     }
 
     /// Cubic units.
@@ -537,6 +575,51 @@ impl Physics {
         Some(Hit { body: BodyId(body), fraction: hit.time_of_impact / length, normal: hit.normal.to_array() })
     }
 
+    /// Whether a ray from `start` to `end` hits one body, and where; the world and other
+    /// bodies are not looked at. The body is found where it is now.
+    pub fn ray_into(&self, start: Vec3, end: Vec3, id: BodyId) -> Option<Hit> {
+        let (from, to) = (metres(start), metres(end));
+        let length = (to - from).length();
+        if length <= 0.0 {
+            return None;
+        }
+        let ray = Ray::new(from, (to - from) / length);
+        let hits = self.colliders(id).into_iter().filter_map(|handle| {
+            let collider = self.world.colliders.get(handle)?;
+            collider.shape().cast_ray_and_get_normal(collider.position(), &ray, length, true)
+        });
+        let hit = hits.min_by(|a, b| a.time_of_impact.total_cmp(&b.time_of_impact))?;
+        Some(Hit { body: id, fraction: hit.time_of_impact / length, normal: hit.normal.to_array() })
+    }
+
+    /// Whether two bodies go through each other from now on, joined or not: what keeps the
+    /// parts of a ragdoll from pushing each other apart.
+    pub fn set_apart(&mut self, a: BodyId, b: BodyId, apart: bool) {
+        if a == b {
+            return;
+        }
+        if apart {
+            self.apart.insert((a.0, b.0));
+            self.apart.insert((b.0, a.0));
+            // only colliders that ask are filtered
+            for handle in self.colliders(a).into_iter().chain(self.colliders(b)) {
+                if let Some(collider) = self.world.colliders.get_mut(handle) {
+                    collider.set_active_hooks(collider.active_hooks() | ActiveHooks::FILTER_CONTACT_PAIRS);
+                }
+            }
+        } else {
+            self.apart.remove(&(a.0, b.0));
+            self.apart.remove(&(b.0, a.0));
+        }
+        self.wake(a);
+        self.wake(b);
+    }
+
+    /// Whether two bodies go through each other ([`Physics::set_apart`]).
+    pub fn apart(&self, a: BodyId, b: BodyId) -> bool {
+        self.apart.contains(&(a.0, b.0))
+    }
+
     /// The bodies that move and are awake.
     pub fn awake(&self) -> Vec<BodyId> {
         self.world.active_bodies().map(|(handle, _)| BodyId(handle)).collect()
@@ -558,6 +641,7 @@ impl Physics {
             Pose::from_parts(metres(point), Rotation::from_rotation_arc(Vector::X, axis))
         };
         let at = |point: Vec3| Pose::from_parts(metres(point), Rotation::IDENTITY);
+        let mut held = None;
         let data: GenericJoint = match joint {
             Joint::Weld => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_FIXED_AXES), first).build(),
             Joint::Ball { point } => frames(GenericJointBuilder::new(JointAxesMask::LOCKED_SPHERICAL_AXES), at(point)).build(),
@@ -587,10 +671,24 @@ impl Physics {
                     .data
             }
             Joint::NoCollide => GenericJointBuilder::new(JointAxesMask::empty()).build(),
+            Joint::Ragdoll { point, angles, limits } => {
+                // the limits are set anew before every step ([`Physics::aim_limits`])
+                let ranges = limits.map(|[a, b]| [a.min(b), a.max(b)].map(|l| l.clamp(-180.0, 180.0).to_radians()));
+                let still = ranges.iter().all(|r| r[0].abs() < 1e-5 && r[1].abs() < 1e-5);
+                if !still {
+                    held = Some(ranges);
+                }
+                // what may not turn at all is welded
+                let mask = if still { JointAxesMask::LOCKED_FIXED_AXES } else { JointAxesMask::LOCKED_SPHERICAL_AXES };
+                frames(GenericJointBuilder::new(mask), Pose::from_parts(metres(point), rotation(angles))).build()
+            }
         };
         let mut data = data;
         data.set_contacts_enabled(collide && joint != Joint::NoCollide);
         let id = JointId(self.world.insert_impulse_joint(a.0, b.0, data));
+        if let Some(ranges) = held {
+            self.limits.push(Limit { joint: id, frame: data.local_frame1, ranges });
+        }
         // the weight of a kilogram as the game falls, on a lever of a unit
         let weight = DEFAULT_GRAVITY * METRES_PER_UNIT;
         let [force, torque] = strength;
@@ -604,6 +702,38 @@ impl Physics {
     pub fn unjoin(&mut self, id: JointId) {
         self.world.remove_impulse_joint(id.0);
         self.strengths.remove(&id);
+        self.limits.retain(|limit| limit.joint != id);
+    }
+
+    /// Sets the limits of the ragdoll joints for the step to come ([`Joint::Ragdoll`]). A turn
+    /// splits into a twist about the frame's x and a swing - a turn about an axis across x -
+    /// whose parts along y and z are limited each. The solver measures the turn about each
+    /// axis from the joint's frame, which holds near it but mixes the axes up as a joint
+    /// bends far, as knees and elbows do; so the frame is moved to where the second body is
+    /// turned now, and each axis limited to what is left of its range from there.
+    fn aim_limits(&mut self) {
+        let joints = &self.world.impulse_joints;
+        self.limits.retain(|limit| joints.get(limit.joint.0).is_some());
+        for limit in &self.limits {
+            let Some(joint) = self.world.impulse_joints.get(limit.joint.0) else { continue };
+            let (Some(first), Some(second)) = (self.world.bodies.get(joint.body1()), self.world.bodies.get(joint.body2())) else {
+                continue;
+            };
+            if first.is_sleeping() && second.is_sleeping() {
+                continue;
+            }
+            let turn = (*first.position() * limit.frame).rotation.inverse() * (*second.position() * joint.data.local_frame2).rotation;
+            let now = split(turn);
+            let Some(joint) = self.world.impulse_joints.get_mut(limit.joint.0, false) else { continue };
+            joint.data.set_local_frame1(Pose::from_parts(limit.frame.translation, (limit.frame.rotation * turn).normalize()));
+            for (i, axis) in [JointAxis::AngX, JointAxis::AngY, JointAxis::AngZ].into_iter().enumerate() {
+                let [least, most] = limit.ranges[i];
+                // all the way round is no limit
+                if most - least < std::f32::consts::TAU - 0.02 {
+                    joint.data.set_limits(axis, [least - now[i], most - now[i]]);
+                }
+            }
+        }
     }
 
     /// Whether a joint holds: it was not taken away, broken, or lost with a body.
@@ -674,7 +804,8 @@ impl Physics {
             return;
         }
         self.world.integration_parameters.dt = seconds;
-        self.world.step();
+        self.aim_limits();
+        self.world.step_with_events(&Apart(&self.apart), &());
         self.clock += seconds;
         self.find_impacts();
         let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
@@ -695,6 +826,37 @@ impl Physics {
         for id in snapped {
             self.world.remove_impulse_joint(id.0);
             self.broken.push(id);
+        }
+    }
+}
+
+/// What a ragdoll joint turns within ([`Physics::aim_limits`]).
+#[derive(Debug, Clone, Copy)]
+struct Limit {
+    joint: JointId,
+    /// Its frame in the first body, where the second turns from.
+    frame: Pose,
+    /// Radians: the twist about x, the swing about y and about z.
+    ranges: [[f32; 2]; 3],
+}
+
+/// A turn as the twist about x and the parts along y and z of the swing after it, radians.
+fn split(turn: Rotation) -> [f32; 3] {
+    let turn = if turn.w < 0.0 { -turn } else { turn };
+    let twist = Rotation::from_xyzw(turn.x, 0.0, 0.0, turn.w);
+    let twist = if twist.length() > 1e-6 { twist.normalize() } else { Rotation::IDENTITY };
+    let swing = (turn * twist.inverse()).to_scaled_axis();
+    [2.0 * twist.x.atan2(twist.w), swing.y, swing.z]
+}
+
+/// What keeps the bodies set apart from touching.
+struct Apart<'a>(&'a HashSet<(RigidBodyHandle, RigidBodyHandle)>);
+
+impl PhysicsHooks for Apart<'_> {
+    fn filter_contact_pair(&self, context: &PairFilterContext) -> Option<SolverFlags> {
+        match (context.rigid_body1, context.rigid_body2) {
+            (Some(a), Some(b)) if self.0.contains(&(a, b)) => None,
+            _ => Some(SolverFlags::COMPUTE_RIGID_IMPULSES),
         }
     }
 }

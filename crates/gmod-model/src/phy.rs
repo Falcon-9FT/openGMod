@@ -183,6 +183,26 @@ impl Phy {
             })
             .collect()
     }
+
+    /// The parts of a ragdoll that hit each other, by solid: the pairs its `collisionrules`
+    /// names (`"collisionpair" "2,5"`), none when it says `"selfcollisions" "0"`. Others go
+    /// through each other, as they do when the model has no rules at all.
+    pub fn collision_pairs(&self) -> Vec<[usize; 2]> {
+        let Some(rules) = self.block("collisionrules") else { return Vec::new() };
+        if rules.number("selfcollisions") == Some(0.0) {
+            return Vec::new();
+        }
+        let solid = |s: &str| s.trim().parse::<usize>().ok().filter(|&i| i < self.solids.len());
+        rules
+            .pairs
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("collisionpair"))
+            .filter_map(|(_, value)| {
+                let (a, b) = value.split_once(',')?;
+                Some([solid(a)?, solid(b)?])
+            })
+            .collect()
+    }
 }
 
 /// The convex pieces of one solid's collision data.
