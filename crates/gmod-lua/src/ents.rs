@@ -387,29 +387,31 @@ fn is_physics_prop(class: &str) -> bool {
     class.to_ascii_lowercase().starts_with("prop_physics")
 }
 
-/// `ent:Spawn()`: a SENT or SWEP runs its `Initialize`; a prop of physics takes its body; a
-/// player spawns again.
+/// `ent:Spawn()`: a SENT or SWEP runs its `Initialize`; a prop of physics takes its body, a
+/// `prop_ragdoll` its parts ([`crate::ragdoll`]); a player spawns again.
 pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
     if handle.kind == Kind::Player {
         crate::player::spawn(lua, handle);
         return;
     }
     let now = host(lua).clock.cur_time.get();
-    let Some((scripted, prop, flags)) = host(lua).entities.with_mut(handle, |ent| {
+    let Some((scripted, prop, ragdoll, flags)) = host(lua).entities.with_mut(handle, |ent| {
         ent.spawned = true;
         ent.next_think = now;
-        (ent.scripted, !ent.scripted && is_physics_prop(&ent.class), ent.spawn_flags)
+        let engine = !ent.scripted;
+        (ent.scripted, engine && is_physics_prop(&ent.class), engine && ent.class.eq_ignore_ascii_case("prop_ragdoll"), ent.spawn_flags)
     }) else {
         return;
     };
     // the engine's props take their bodies when they spawn: frozen when the map says "motion
     // disabled" (8), asleep when it says "start asleep" (1)
-    if prop {
+    if prop || ragdoll {
         host(lua).entities.with_mut(handle, |ent| {
             ent.solid = SOLID_VPHYSICS;
             ent.move_type = MOVETYPE_VPHYSICS;
         });
-        if crate::physics::init_model(lua, handle) {
+        let made = if ragdoll { crate::ragdoll::init(lua, handle, Vector::default()) } else { crate::physics::init_model(lua, handle) };
+        if made {
             if flags & 8 != 0 {
                 crate::physics::set_motion(lua, handle, false);
             } else if flags & 1 != 0 {
@@ -534,7 +536,7 @@ const EF_NODRAW: i64 = 32;
 
 /// The models of entities as `viewer` sees them, through its own eyes: not the viewer itself
 /// nor what it carries (its weapon, its view model and the hands on it), not what is hidden,
-/// not brush entities (the map draws those) and not ragdolls, which fall only with physics.
+/// not brush entities (the map draws those) and not a corpse that could not become a ragdoll.
 pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
     let entities = &host(lua).entities;
     // the viewer, or what goes with its eyes, all the way up the parents
@@ -558,7 +560,7 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
                 let hidden =
                     ent.removed || !ent.spawned || ent.no_draw || ent.effects & EF_NODRAW != 0 || ent.render_mode == RENDERMODE_NONE;
                 let studio = ent.model.len() > 4 && ent.model[ent.model.len() - 4..].eq_ignore_ascii_case(".mdl");
-                if hidden || !studio || ent.class == "hl2mp_ragdoll" {
+                if hidden || !studio || (ent.class == "hl2mp_ragdoll" && ent.physics.is_none()) {
                     return None;
                 }
                 (ent.model.clone(), ent.skin)

@@ -466,7 +466,8 @@ fn placement(lua: &Lua, handle: EntityHandle) -> Option<BoneMatrix> {
 
 /// Where the bones of an entity's model are now, bone to model: its sequence at its cycle,
 /// its layers, the bones Lua moved (`ManipulateBone*`), and for one merged onto its parent the
-/// parent's bones of the same names. None without a studio model.
+/// parent's bones of the same names; a ragdoll's where its parts are. None without a studio
+/// model.
 pub(crate) fn model_bones(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Rig>, Vec<BoneMatrix>)> {
     model_bones_at(lua, handle, 0)
 }
@@ -491,7 +492,8 @@ fn model_bones_at(lua: &Lua, handle: EntityHandle, depth: u32) -> Option<(Arc<Ri
             local.rotation = rig_pose::quaternion_multiply(local.rotation, turn);
         }
     }
-    let mut bones = rig.bone_to_model(&pose);
+    // a ragdoll's bones are where its parts are
+    let mut bones = crate::ragdoll::bones(lua, handle, &rig, &pose).unwrap_or_else(|| rig.bone_to_model(&pose));
     for m in manipulations.iter().filter(|m| m.scale != Vector::new(1.0, 1.0, 1.0)) {
         if let Some(bone) = usize::try_from(m.bone).ok().and_then(|b| bones.get_mut(b)) {
             for row in bone.iter_mut() {

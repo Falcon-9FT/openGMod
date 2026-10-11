@@ -1427,16 +1427,22 @@ pub(crate) fn forget(lua: &Lua, gone: EntityHandle) {
     }
 }
 
-/// The death ragdoll (`CreateRagdoll`): an `hl2mp_ragdoll` with the player's model where the
-/// player is, in place of the last one. It does not fall yet: there is no physics.
+/// The death ragdoll (`CreateRagdoll`): an `hl2mp_ragdoll` with the player's model, in place
+/// of the last one - a ragdoll ([`crate::ragdoll`]) posed as the player was drawn, falling on
+/// as the player moved. A model without the physics of one leaves the corpse unseen.
 fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
     let old = state(lua, handle, |_, p| p.ragdoll).unwrap_or(EntityHandle::NULL);
     if host(lua).entities.is_valid(old) {
         crate::ents::remove(lua, old);
     }
     let Some(ragdoll) = crate::ents::create_engine(lua, "hl2mp_ragdoll", Kind::Entity)? else { return Ok(()) };
-    let (pos, angles) = host(lua).entities.transform(handle).unwrap_or_default();
-    let (model, skin, color) = host(lua).entities.get(handle).map(|ent| (ent.model.clone(), ent.skin, ent.color)).unwrap_or_default();
+    let (pos, _) = host(lua).entities.transform(handle).unwrap_or_default();
+    let angles = state(lua, handle, |_, p| p.render_angles).unwrap_or_default();
+    let (model, skin, color, anim, velocity) = host(lua)
+        .entities
+        .get(handle)
+        .map(|ent| (ent.model.clone(), ent.skin, ent.color, ent.anim.clone(), ent.velocity))
+        .unwrap_or_default();
     entity::set_model(lua, ragdoll, &model);
     entity::set_world_pos(lua, ragdoll, pos);
     entity::set_world_angles(lua, ragdoll, angles);
@@ -1444,7 +1450,9 @@ fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
         ent.owner = handle;
         ent.skin = skin;
         ent.color = color;
+        ent.anim = anim;
     });
+    crate::ragdoll::init(lua, ragdoll, velocity);
     with_player(lua, handle, |_, p| p.ragdoll = ragdoll);
     Ok(())
 }

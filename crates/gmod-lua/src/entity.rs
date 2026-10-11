@@ -119,9 +119,9 @@ pub struct Ent {
     pub weapon: Option<crate::weapon::WeaponState>,
     /// Its body, when it has physics ([`crate::physics`]).
     pub physics: Option<gmod_physics::BodyId>,
-    /// What a constraint holds together, as `SetPhysConstraintObjects` gave it: the owners of
-    /// the two bodies ([`crate::constraint`]).
-    pub constrained: Option<[EntityHandle; 2]>,
+    /// What a constraint holds together, as `SetPhysConstraintObjects` gave it: the two
+    /// bodies ([`crate::constraint`]).
+    pub constrained: Option<[PhysObjHandle; 2]>,
     /// The joint a constraint made.
     pub joint: Option<gmod_physics::JointId>,
     /// Entities given for keys (`SetEntity`): a rope's ends.
@@ -444,10 +444,11 @@ const TYPES: &[(&str, i32, bool)] = {
 const ENTITY_KINDS: &[(&str, bool)] =
     &[("Player", false), ("Weapon", false), ("NPC", false), ("Vehicle", false), ("NextBot", false), ("CSEnt", true)];
 
-/// The physics object of an entity: valid while the entity has a body ([`crate::physics`]).
-/// That of an entity without one holds `NULL`.
+/// A physics object of an entity, by number - 0 its own body, others the parts of a ragdoll
+/// ([`crate::ragdoll`]): valid while the entity has that body ([`crate::physics`]). That of
+/// an entity without one holds `NULL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PhysObjHandle(pub EntityHandle);
+pub struct PhysObjHandle(pub EntityHandle, pub usize);
 
 impl UserData for PhysObjHandle {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
@@ -1404,9 +1405,21 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("GetPhysicsObject", |a| crate::physics::push(a.lua, this(a, 1)?))?;
     def("GetPhysicsObjectNum", |a| {
         let handle = this(a, 1)?;
-        if a.number(2)? as i64 == 0 { crate::physics::push(a.lua, handle) } else { crate::physics::push(a.lua, EntityHandle::NULL) }
+        match usize::try_from(a.number(2)? as i64) {
+            Ok(part) => crate::physics::push_part(a.lua, handle, part),
+            Err(_) => crate::physics::push(a.lua, EntityHandle::NULL),
+        }
     })?;
-    def("GetPhysicsObjectCount", |a| integer(i64::from(crate::physics::body(a.lua, this(a, 1)?).is_some())))?;
+    def("GetPhysicsObjectCount", |a| integer(crate::physics::count(a.lua, this(a, 1)?) as i64))?;
+    def("TranslatePhysBoneToBone", |a| {
+        let handle = this(a, 1)?;
+        let part = usize::try_from(a.number(2)? as i64).unwrap_or(usize::MAX);
+        integer(crate::ragdoll::bone_of_part(a.lua, handle, part))
+    })?;
+    def("TranslateBoneToPhysBone", |a| {
+        let handle = this(a, 1)?;
+        integer(crate::ragdoll::part_of_bone(a.lua, handle, a.number(2)? as i64))
+    })?;
 
     // flags
     def("GetFlags", |a| integer(read(a, |ent| ent.flags)?))?;

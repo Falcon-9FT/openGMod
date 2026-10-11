@@ -80,6 +80,7 @@ pub mod net;
 pub mod physgun;
 pub mod physics;
 pub mod player;
+pub mod ragdoll;
 pub mod sandbox;
 pub mod snapshot;
 pub mod sound;

@@ -12,6 +12,7 @@ use mlua::Value;
 use super::*;
 
 mod chat;
+mod ragdoll;
 
 /// A folder that is removed when dropped.
 struct TempDir(PathBuf);

@@ -1,7 +1,8 @@
 //! Traces as `util.TraceLine` and `util.TraceHull` make them: through the world of the map -
 //! what [`gmod_bsp::Collision`] has, brushes, displacements, the brush entities where the map
 //! put them and the static props - and through the boxes of the solid entities: a prop's box
-//! turned with it for a ray, the box around it for a hull. Players and NPCs are
+//! turned with it for a ray, the box around it for a hull. A ray hits a ragdoll's parts
+//! themselves, and says which (`PhysicsBone`); a hull the box around them. Players and NPCs are
 //! `CONTENTS_MONSTER`, everything else `CONTENTS_SOLID`. A trace has a collision group
 //! (`collisiongroup`, a player's movement `COLLISION_GROUP_PLAYER_MOVEMENT`), and the
 //! entities whose group does not collide with it (`should_collide`) are not hit; debris only
@@ -169,6 +170,8 @@ pub(crate) struct Hit {
     pub texture: String,
     pub surface_flags: i32,
     pub displacement: bool,
+    /// The part of a ragdoll hit; 0 for anything else.
+    pub physics_bone: usize,
 }
 
 impl Hit {
@@ -273,6 +276,7 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
         texture: "**empty**".into(),
         surface_flags: 0,
         displacement: false,
+        physics_bone: 0,
     };
     let collision = host(lua).world.collision.borrow().clone();
     if let Some(collision) = collision.filter(|_| !sweep.ignore_world) {
@@ -302,6 +306,7 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
                     texture,
                     surface_flags: t.surface_flags,
                     displacement: t.displacement,
+                    physics_bone: 0,
                 };
             }
         }
@@ -332,7 +337,22 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
     for (handle, contents) in candidates {
         let Some((pos, angles)) = host(lua).entities.transform(handle) else { continue };
         let Some((mins, maxs)) = host(lua).entities.get(handle).map(|ent| (ent.mins, ent.maxs)) else { continue };
-        let found = if hull {
+        let mut part = 0;
+        let found = if crate::ragdoll::is_ragdoll(lua, handle) {
+            if hull {
+                let Some((lo, hi)) = crate::ragdoll::world_bounds(lua, handle) else { continue };
+                through_box(sweep.start, sweep.end, lo - sweep.maxs, hi - sweep.mins)
+            } else {
+                crate::ragdoll::trace(lua, handle, sweep.start, sweep.end).map(|(fraction, normal, hit)| {
+                    part = hit;
+                    let start_solid = fraction <= 0.0;
+                    // a little before the face, as through a box
+                    let length = (sweep.end - sweep.start).length();
+                    let back = if length > 0.0 { EPSILON / length } else { 0.0 };
+                    BoxHit { fraction: (fraction - back).max(0.0), normal, start_solid, left: if start_solid { 1.0 } else { 0.0 } }
+                })
+            }
+        } else if hull {
             // the box around it in the world, grown by the box swept
             let (lo, hi) = entity::rotated_bounds(mins, maxs, angles);
             through_box(sweep.start, sweep.end, pos + lo - sweep.maxs, pos + hi - sweep.mins)
@@ -360,6 +380,7 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
             texture: "**studio**".into(),
             surface_flags: 0,
             displacement: false,
+            physics_bone: part,
         };
         if found.start_solid {
             break;
@@ -418,7 +439,7 @@ pub(crate) fn result(lua: &Lua, sweep: &Sweep, hit: &Hit, out: Option<Table>) ->
     };
     t.raw_set("MatType", mat_type)?;
     t.raw_set("Normal", entity::vector(lua, (sweep.end - sweep.start).normalized())?)?;
-    t.raw_set("PhysicsBone", 0)?;
+    t.raw_set("PhysicsBone", hit.physics_bone)?;
     t.raw_set("StartPos", entity::vector(lua, sweep.start)?)?;
     t.raw_set("SurfaceProps", surface.map_or(0, |(index, _)| index as i64))?;
     t.raw_set("StartSolid", hit.start_solid)?;

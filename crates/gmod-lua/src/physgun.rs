@@ -7,7 +7,8 @@
 //! drops it moving as it moved; `IN_ATTACK2` freezes it where it is (`OnPhysgunFreeze`) and
 //! lets go, and the gun takes nothing more until `IN_ATTACK` comes up; either way
 //! `PhysgunDrop`. `IN_RELOAD` with nothing held asks `OnPhysgunReload`,
-//! which unfreezes what the player looks at. A frozen body taken by the gun moves again.
+//! which unfreezes what the player looks at. A frozen body taken by the gun moves again. Of a
+//! ragdoll the gun takes the part aimed at (the trace's `PhysicsBone`), and freezes that.
 //!
 //! Every tick before the bodies move, what is held is dragged where it should be
 //! ([`gmod_physics::Physics::steer`]), no faster than `physgun_maxSpeed` and
@@ -50,6 +51,8 @@ const NEAREST: f32 = 24.0;
 #[derive(Debug, Clone, Copy)]
 struct Held {
     entity: EntityHandle,
+    /// Which of its bodies: a part of a ragdoll, 0 for others.
+    part: usize,
     weapon: EntityHandle,
     /// The point it was taken at, in its own space.
     point: Vector,
@@ -119,7 +122,7 @@ pub(crate) fn command(lua: &Lua, player: EntityHandle, weapon: EntityHandle, cmd
     match held(lua, player) {
         Some(_) if cmd.buttons & IN_ATTACK == 0 => drop(lua, player),
         Some(held) if pressed & IN_ATTACK2 != 0 => {
-            let phys = crate::physics::push(lua, held.entity).unwrap_or(Value::Nil);
+            let phys = crate::physics::push_part(lua, held.entity, held.part).unwrap_or(Value::Nil);
             let args = [entity::push(lua, weapon), Ok(phys), entity::push(lua, held.entity), entity::push(lua, player)];
             crate::call_hook(lua, "OnPhysgunFreeze", args.into_iter().map(|v| v.unwrap_or(Value::Nil)).collect());
             host(lua).physgun.waiting.borrow_mut().push(player);
@@ -163,8 +166,10 @@ fn pick_up(lua: &Lua, player: EntityHandle, weapon: EntityHandle) {
         return;
     }
     // the hook may have taken its body away
-    let Some(body) = crate::physics::body(lua, target) else { return };
-    let Some((origin, angles)) = host(lua).entities.transform(target) else { return };
+    let part = hit.physics_bone;
+    let Some(body) = crate::physics::part_body(lua, target, part) else { return };
+    let Some((origin, angles)) = host(lua).physics.physics.borrow().pose(body) else { return };
+    let (origin, angles) = (crate::physics::vector(origin), crate::physics::angle(angles));
     let yaw = player::eye_angles(lua, player).map_or(0.0, |a| a.y);
     let gravity = {
         let host = host(lua);
@@ -177,6 +182,7 @@ fn pick_up(lua: &Lua, player: EntityHandle, weapon: EntityHandle) {
     };
     let held = Held {
         entity: target,
+        part,
         weapon,
         point: local(hit.end, origin, angles),
         distance: (hit.end - eye).length().max(NEAREST),
@@ -191,7 +197,7 @@ fn pick_up(lua: &Lua, player: EntityHandle, weapon: EntityHandle) {
 /// Lets go of what a player holds: it moves on as it moved. `PhysgunDrop`.
 pub(crate) fn drop(lua: &Lua, player: EntityHandle) {
     let Some(held) = set_held(lua, player, None) else { return };
-    if let Some(body) = crate::physics::body(lua, held.entity) {
+    if let Some(body) = crate::physics::part_body(lua, held.entity, held.part) {
         host(lua).physics.physics.borrow_mut().set_gravity_enabled(body, held.gravity);
     }
     if host(lua).entities.is_valid(held.entity) {
@@ -206,7 +212,7 @@ pub(crate) fn think(lua: &Lua) {
     for (player, held) in all {
         let in_hands = player::active_weapon(lua, player) == Some(held.weapon) && player::alive(lua, player);
         // frozen while held (by Lua), it is let go
-        let body = crate::physics::body(lua, held.entity)
+        let body = crate::physics::part_body(lua, held.entity, held.part)
             .filter(|&b| host(lua).entities.is_valid(held.entity) && host(lua).physics.physics.borrow().motion(b));
         let (Some(body), true) = (body, in_hands) else {
             drop(lua, player);
