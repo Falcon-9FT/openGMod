@@ -7,8 +7,8 @@
 //! entity, `AddOutput` gives it a key-value (`key value`) or a connection of an output
 //! (`OnTrigger target:input:param:delay:times`, [`crate::outputs`]), `SetParent` (by name)
 //! and `ClearParent`, `Color`, `Alpha` and `Skin`, `FireUser1` to `FireUser4` fire its
-//! `OnUser1` to `OnUser4`, the entities of the map take theirs ([`crate::logic`]), and so do
-//! the constraints ([`crate::constraint`]). Inputs it does not know are dropped.
+//! `OnUser1` to `OnUser4`, the entities of the map take theirs ([`crate::logic`],
+//! [`crate::triggers`]), and so do the constraints ([`crate::constraint`]). Inputs it does not know are dropped.
 //!
 //! An output's input waits here with the name of its target, found when it is given
 //! ([`crate::outputs::targets`]).
@@ -106,6 +106,7 @@ fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str, activ
         "skin" => crate::ents::key_value(lua, target, "skin", param),
         _ => {
             return crate::logic::input(lua, target, input, param, activator, caller)
+                || crate::triggers::input(lua, target, input, param, activator, caller)
                 || crate::anim::input(lua, target, input, param)
                 || crate::constraint::input(lua, target, input);
         }

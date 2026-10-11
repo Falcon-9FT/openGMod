@@ -143,6 +143,8 @@ pub struct Ent {
     pub outputs: Vec<crate::outputs::Output>,
     /// What an entity of the map's logic keeps ([`crate::logic`]).
     pub logic: Option<Box<crate::logic::State>>,
+    /// What a trigger of the map keeps ([`crate::triggers`]).
+    pub trigger_state: Option<Box<crate::triggers::Trigger>>,
 }
 
 /// How a bone is moved from where its model has it.
@@ -225,6 +227,7 @@ impl Ent {
             anim: crate::anim::AnimState::default(),
             outputs: Vec::new(),
             logic: None,
+            trigger_state: None,
         }
     }
 

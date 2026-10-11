@@ -14,6 +14,7 @@ use super::*;
 mod chat;
 mod mapio;
 mod ragdoll;
+mod triggers;
 
 /// A folder that is removed when dropped.
 struct TempDir(PathBuf);

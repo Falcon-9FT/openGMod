@@ -94,6 +94,7 @@ pub mod surface;
 mod surfaceprops;
 pub mod timer;
 pub mod trace;
+pub mod triggers;
 pub mod util;
 pub mod vector;
 pub mod vgui;
@@ -279,6 +280,8 @@ pub(crate) struct Host {
     pub surfaces: surfaceprops::Surfaces,
     /// What is said: the server's messages for its players, a client's chat box.
     pub chat: chat::Chat,
+    /// What touched what last tick.
+    pub(crate) touching: triggers::Touching,
 }
 
 impl Host {
@@ -361,6 +364,7 @@ impl Runtime {
             sounds: sound::Sounds::default(),
             surfaces: surfaceprops::Surfaces::default(),
             chat: chat::Chat::default(),
+            touching: triggers::Touching::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -501,6 +505,7 @@ impl Runtime {
                 player::tick_all(&self.lua);
                 physgun::think(&self.lua);
                 physics::simulate(&self.lua);
+                triggers::tick(&self.lua);
                 inputs::service(&self.lua);
                 logic::tick(&self.lua);
             }

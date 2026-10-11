@@ -1311,6 +1311,41 @@ pub(crate) fn give(lua: &Lua, handle: EntityHandle, class: &str, no_ammo: bool) 
     Ok(item)
 }
 
+/// A player touches a weapon on the ground (`BumpWeapon`). Having one of its class, they take
+/// the ammo in it - what is in its clips, or what it would give without clips - and it goes
+/// if they took any; else they pick it up, if `PlayerCanPickupWeapon` lets them.
+pub(crate) fn bump_weapon(lua: &Lua, handle: EntityHandle, item: EntityHandle) {
+    let Some(class) = host(lua).entities.get(item).map(|ent| ent.class.clone()) else { return };
+    let data = weapon::data(lua, item).unwrap_or_default();
+    if weapon_of(lua, handle, &class).is_some() {
+        let clips = host(lua).entities.get(item).and_then(|ent| ent.weapon.as_ref().map(|w| w.clip)).unwrap_or([-1, -1]);
+        let mut took = 0;
+        for (i, clip) in clips.into_iter().enumerate() {
+            let amount = if clip >= 0 { clip } else { data.default_clip[i].max(0) };
+            took += give_ammo(lua, handle, weapon::ammo_id(lua, &data.ammo[i]), amount);
+        }
+        if took > 0 {
+            crate::ents::remove(lua, item);
+        }
+        return;
+    }
+    let allowed = hook(lua, "PlayerCanPickupWeapon", [ent_value(lua, handle), ent_value(lua, item)]);
+    if matches!(allowed.front(), Some(Value::Boolean(false))) || !host(lua).entities.is_valid(item) {
+        return;
+    }
+    crate::physics::destroy(lua, item);
+    equip(lua, handle, item, false);
+}
+
+/// Turns where a player looks (`SetEyeAngles`); their body turns with the yaw.
+pub(crate) fn set_eye_angles(lua: &Lua, handle: EntityHandle, angles: Angle) {
+    with_player(lua, handle, |_, p| {
+        p.eye_angles = angles;
+        p.input.view_angles = angles;
+    });
+    entity::set_world_angles(lua, handle, Angle::new(0.0, angles.y, 0.0));
+}
+
 /// A weapon goes into a player's hands (`Weapon_Equip`): it follows them, its ammo beyond a
 /// full clip goes to the player (none with `no_ammo`), the SWEP's `Equip` and the
 /// `WeaponEquip` hook run, and the player takes it up if it is better than what they hold.
@@ -2244,12 +2279,7 @@ fn install_view(def: &entity::Def) -> mlua::Result<()> {
     // the client's view snaps there too: the commands it sends look that way from now on
     def("SetEyeAngles", |a| {
         let angles = a.userdata::<Angle>(2, "Angle")?;
-        let handle = this(a)?;
-        with_player(a.lua, handle, |_, p| {
-            p.eye_angles = angles;
-            p.input.view_angles = angles;
-        });
-        entity::set_world_angles(a.lua, handle, Angle::new(0.0, angles.y, 0.0));
+        set_eye_angles(a.lua, this(a)?, angles);
         Ok(Value::Nil)
     })?;
     def("GetEyeTrace", |a| {

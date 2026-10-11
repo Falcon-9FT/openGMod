@@ -427,6 +427,7 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
     if !scripted {
         crate::anim::spawned(lua, handle);
         crate::logic::spawned(lua, handle);
+        crate::triggers::spawned(lua, handle);
     }
     if scripted && let Some(ud) = userdata(lua, handle) {
         call_method(lua, &ud, "Initialize", MultiValue::new());
@@ -749,8 +750,12 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     crate::call_hook(lua, "InitPostEntity", MultiValue::new());
 }
 
-/// Source's name matching: ASCII case ignored, a trailing `*` matches any end.
+/// Source's name matching: ASCII case ignored, a trailing `*` matches any end; an empty
+/// pattern matches nothing.
 fn names_match(pattern: &str, name: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
     match pattern.strip_suffix('*') {
         Some(prefix) => name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()),
         None => pattern.eq_ignore_ascii_case(name),
