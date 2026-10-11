@@ -503,6 +503,8 @@ struct App {
     /// The game's menus show the cursor (Q, C); and whether the mouse was captured before.
     ui_cursor: bool,
     captured_before_ui: bool,
+    /// Esc went down into the chat box: its going up goes there too.
+    chat_esc: bool,
     last_frame: Instant,
     frames: u32,
     counting_since: Instant,
@@ -1052,11 +1054,13 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(key), state, repeat, text, .. }, .. } => {
                 let pressed = state == ElementState::Pressed;
-                // Esc closes the chat box first
+                // Esc closes the chat box first; its going up follows it there, though the box is
+                // shut by then, so the game does not think it still held
                 if key == KeyCode::Escape
                     && !self.menu_shown()
-                    && let Some(game) = self.game.as_ref().filter(|game| game.chat_open())
+                    && let Some(game) = self.game.as_ref().filter(|game| game.chat_open() || (!pressed && self.chat_esc))
                 {
+                    self.chat_esc = pressed;
                     if let Some(code) = gmod_key(key) {
                         game.button(code, pressed);
                     }
@@ -1363,6 +1367,7 @@ fn main() -> ExitCode {
         focused: true,
         ui_cursor: false,
         captured_before_ui: false,
+        chat_esc: false,
         last_frame: now,
         frames: 0,
         counting_since: now,

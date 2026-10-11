@@ -11,6 +11,7 @@ const KEY_Y: i32 = 35;
 const KEY_ENTER: i32 = 64;
 const KEY_BACKSPACE: i32 = 66;
 const KEY_ESCAPE: i32 = 70;
+const KEY_HOME: i32 = 74;
 const KEY_PAGEUP: i32 = 76;
 const KEY_LEFT: i32 = 89;
 const MOUSE_WHEEL_UP: i32 = 112;
@@ -305,5 +306,66 @@ fn the_chat_box_is_drawn_and_its_lines_fade() {
     press(&g, KEY_Y);
     g.runtime.paint(0.016);
     assert!(drawn_in(&g, PANEL).is_empty());
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn a_client_tells_its_own_player_and_says_through_the_server() {
+    let (server, client, alice) = server_and_client();
+    // `ChatPrint` on a client goes into its box at once: nothing would take it from a queue
+    client.runtime.run_string("LocalPlayer():ChatPrint('x') LocalPlayer():PrintMessage(HUD_PRINTTALK, 'y')", "tell").unwrap();
+    assert_eq!(crate::chat::lines(client.runtime.lua()), ["x", "y"]);
+    assert!(client.runtime.take_chat().is_empty());
+    // what its player says goes to the server, as from the box
+    client.runtime.run_string("LocalPlayer():Say('hello \"you\"', true)", "say").unwrap();
+    assert!(client.runtime.take_chat().is_empty());
+    assert_eq!(client.runtime.take_server_commands(), ["say_team \"hello 'you'\""]);
+    assert!(client.eval::<bool>("return PrintMessage == nil"));
+
+    // the server's `PrintMessage` is for every player (a game has the one)
+    server.runtime.run_string("PrintMessage(HUD_PRINTTALK, 'to all') PrintMessage(2, 'to the console')", "print").unwrap();
+    let told = ChatMessage::Text { player: 0, name: String::new(), text: "to all".into(), kind: "none".into() };
+    assert_eq!(server.runtime.take_chat(), [(alice, told)]);
+    assert!(server.printed().contains("to the console\n"));
+    assert!(server.messages().is_empty(), "{:?}", server.messages());
+    assert!(client.messages().is_empty(), "{:?}", client.messages());
+}
+
+#[test]
+fn a_name_in_the_chat_has_the_colour_the_gamemode_gives() {
+    let (_server, client, alice) = server_and_client();
+    // TTT gives the dead the colour of the living, so the chat does not tell who died
+    client.runtime.run_string("HOOKS.GetTeamColor = function(p) return { r = 7, g = 8, b = 9, a = 255 } end", "color").unwrap();
+    client.runtime.run_string("chat.AddText(LocalPlayer(), ' hi')", "add").unwrap();
+    let alice_piece = ([7, 8, 9, 255], "Alice".to_string());
+    assert_eq!(crate::chat::last_pieces(client.runtime.lua()).first(), Some(&alice_piece));
+    // and the engine's own line, when `OnPlayerChat` does not take it
+    client.runtime.run_string("HOOKS.OnPlayerChat = nil", "own").unwrap();
+    client.runtime.receive_chat(&said(alice, "hey", false, true));
+    assert!(crate::chat::last_pieces(client.runtime.lua()).contains(&alice_piece));
+    // without the hook, the team's colour
+    client.runtime.run_string("HOOKS.GetTeamColor = nil", "none").unwrap();
+    client.runtime.receive_chat(&said(alice, "hey", false, false));
+    assert_eq!(crate::chat::last_pieces(client.runtime.lua()).first(), Some(&([10, 20, 30, 255], "Alice".to_string())));
+    assert!(client.messages().is_empty(), "{:?}", client.messages());
+}
+
+#[test]
+fn a_long_line_typed_stays_in_the_box() {
+    let g = chat_client();
+    let white = [255, 255, 255, 255];
+    open(&g, KEY_Y, "y");
+    g.runtime.type_text(&"W".repeat(200));
+    g.runtime.paint(0.016);
+    // the strip ends 4 pixels in from the box's right edge, at 500
+    let typed = drawn_in(&g, white);
+    assert!(!typed.is_empty() && typed.iter().all(|p| (20.0..=496.0).contains(&p[0])), "{typed:?}");
+    // the end of the line, and the caret, show
+    assert!(typed.iter().any(|p| p[0] > 480.0), "{typed:?}");
+    // the caret back at the start: the start shows
+    press(&g, KEY_HOME);
+    g.runtime.paint(0.016);
+    let typed = drawn_in(&g, white);
+    assert!(!typed.is_empty() && typed.iter().all(|p| (20.0..=496.0).contains(&p[0])), "{typed:?}");
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }

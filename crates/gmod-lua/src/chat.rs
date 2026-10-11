@@ -6,11 +6,14 @@
 //! player `PlayerCanSeePlayersChat` lets see it gets it (without the hook: everyone, or the
 //! speaker's team for `say_team`). What a player is told with `ChatPrint` or
 //! `PrintMessage(HUD_PRINTTALK)` goes the same way, and so does `Player X has joined the game`
-//! to the players already there. It all leaves through [`crate::Runtime::take_chat`].
+//! to the players already there. It all leaves through [`crate::Runtime::take_chat`]. A client
+//! has `ChatPrint` too: there it goes into its own box at once, and what its player says
+//! (`Player:Say`) is sent to the server as the box sends it.
 //!
 //! A client is handed a message with [`crate::Runtime::receive_chat`]: what a player said goes
 //! to `OnPlayerChat(ply, text, team, dead)` - the base gamemode makes a line of it with
-//! `chat.AddText`, the name in the colour of the player's team - and the engine's text to
+//! `chat.AddText`, a player's name in the colour the gamemode's `GetTeamColor` gives (TTT keeps
+//! the dead in the colour of the living) - and the engine's text to
 //! `ChatText(index, name, text, type)`; true from either and the engine does not show it itself.
 //! `chat.AddText` adds a line of coloured pieces to the box, and prints it to the console.
 //!
@@ -20,12 +23,13 @@
 //! line (`ChatTextChanged` hears every change, Tab asks `OnChatTab`), Enter sends it to the
 //! server as `say`, Esc only closes; either calls `FinishChat`. Closed, a line shows for
 //! `hud_saytext_time` seconds and then fades; open, the whole history shows over a dark panel,
-//! and the mouse wheel and PageUp/PageDown scroll it.
+//! and the mouse wheel and PageUp/PageDown scroll it. A line longer than the box slides left
+//! to keep the caret in it.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
-use gmod_ui::{FontId, FontSpec, Texture};
+use gmod_ui::{Clip, FontId, FontSpec, Texture};
 use mlua::{IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::args::Args;
@@ -57,7 +61,7 @@ const MAX_CHARS: usize = 127;
 const FADE: f64 = 1.0;
 /// Text no colour was given for.
 const WHITE: [u8; 4] = [255, 255, 255, 255];
-/// A player's name when `team.GetColor` cannot tell (`TEAM_UNASSIGNED`'s yellow).
+/// A player's name when neither `GetTeamColor` nor `team.GetColor` can tell (`TEAM_UNASSIGNED`'s yellow).
 const UNASSIGNED: [u8; 4] = [255, 255, 100, 255];
 const DEAD: [u8; 4] = [255, 30, 40, 255];
 const TEAM: [u8; 4] = [30, 160, 40, 255];
@@ -132,6 +136,13 @@ pub(crate) fn is_command(lua: &Lua, name: &str) -> bool {
 /// A player (`NULL`: the server's console) says something: `PlayerSay` has it first, then it
 /// goes to whoever may see it.
 pub(crate) fn say(lua: &Lua, speaker: EntityHandle, text: &str, team: bool) {
+    // the game has `Player:Say` on the server only; on a client the nearest is what the box does
+    if host(lua).realm != Realm::Server {
+        if speaker == host(lua).client.local_player.get() {
+            to_server(lua, text, team);
+        }
+        return;
+    }
     let mut text = text.to_string();
     let player = crate::player::state(lua, speaker, |_, _| ()).is_some();
     let ply = entity::push(lua, speaker).unwrap_or(Value::Nil);
@@ -157,25 +168,40 @@ pub(crate) fn say(lua: &Lua, speaker: EntityHandle, text: &str, team: bool) {
             _ => !team || (player && speaker_team == listener_team),
         };
         if sees {
-            let message = ChatMessage::Said { speaker, text: text.clone(), team, dead };
-            host(lua).chat.sent.borrow_mut().push((listener, message));
+            send(lua, listener, ChatMessage::Said { speaker, text: text.clone(), team, dead });
         }
     }
 }
 
 /// The engine tells a player something in the chat (`ChatPrint`, `HUD_PRINTTALK`).
 pub(crate) fn tell(lua: &Lua, listener: EntityHandle, text: &str) {
-    let message = ChatMessage::Text { player: 0, name: String::new(), text: text.to_string(), kind: "none".to_string() };
-    host(lua).chat.sent.borrow_mut().push((listener, message));
+    send(lua, listener, ChatMessage::Text { player: 0, name: String::new(), text: text.to_string(), kind: "none".to_string() });
 }
 
 /// A player joins or leaves: the others are told (`joinleave`).
 pub(crate) fn join_leave(lua: &Lua, who: EntityHandle, name: &str, text: &str) {
     let player = who.index.unwrap_or(0);
     for listener in crate::player::all(lua).into_iter().filter(|&p| p != who) {
-        let message = ChatMessage::Text { player, name: name.to_string(), text: text.to_string(), kind: "joinleave".to_string() };
-        host(lua).chat.sent.borrow_mut().push((listener, message));
+        send(lua, listener, ChatMessage::Text { player, name: name.to_string(), text: text.to_string(), kind: "joinleave".to_string() });
     }
+}
+
+/// A message for a player: the server sends it on; a client shows what is for its own player
+/// at once (nothing would take it from a client's queue).
+fn send(lua: &Lua, listener: EntityHandle, message: ChatMessage) {
+    let host = host(lua);
+    if host.realm == Realm::Server {
+        host.chat.sent.borrow_mut().push((listener, message));
+    } else if listener == host.client.local_player.get() {
+        receive(lua, &message);
+    }
+}
+
+/// What the box sends: `say` or `say_team` to the server, its double quotes made single so
+/// the line stays one argument.
+fn to_server(lua: &Lua, text: &str, team: bool) {
+    let command = if team { "say_team" } else { "say" };
+    host(lua).client.to_server.borrow_mut().push(format!("{command} \"{}\"", text.replace('"', "'")));
 }
 
 // --- the client's side ---------------------------------------------------------------------
@@ -220,9 +246,16 @@ fn phrase(lua: &Lua, token: &str, english: &str) -> String {
     if phrase == token { english.to_string() } else { phrase }
 }
 
-/// A player's name in the colour of their team (`team.GetColor`). None for what is not a player.
+/// A player's name in the colour the gamemode gives them, `GetTeamColor` (the base gamemode's
+/// is their team's, `team.GetColor`). None for what is not a player.
 fn player_piece(lua: &Lua, handle: EntityHandle) -> Option<([u8; 4], String)> {
     let (name, team) = crate::player::state(lua, handle, |_, p| (p.info.name.clone(), p.team))?;
+    let ply = entity::push(lua, handle).unwrap_or(Value::Nil);
+    if let Some(Value::Table(t)) = call_hook(lua, "GetTeamColor", ply.into_lua_multi(lua).unwrap_or_default()).front()
+        && let Ok(color) = crate::surface::color_table(t)
+    {
+        return Some((color, name));
+    }
     let color = || -> mlua::Result<Option<[u8; 4]>> {
         let Some(lib) = lua.globals().get::<Option<Table>>("team")? else { return Ok(None) };
         let Some(get) = lib.get::<Option<mlua::Function>>("GetColor")? else { return Ok(None) };
@@ -333,8 +366,7 @@ pub(crate) fn key(lua: &Lua, code: i32) -> Option<bool> {
             close(lua);
             host(lua).chat.swallow.set(true);
             if !text.trim().is_empty() {
-                let command = if team { "say_team" } else { "say" };
-                host(lua).client.to_server.borrow_mut().push(format!("{command} \"{}\"", text.replace('"', "'")));
+                to_server(lua, &text, team);
             }
         }
         KEY_ESCAPE => {
@@ -561,11 +593,19 @@ pub(crate) fn paint(lua: &Lua) {
         let prompt = if team { "Say (TEAM) :" } else { "Say :" };
         let text = host.chat.text.borrow().clone();
         let tx = x + 2.0 * PAD + screen.text(font, x + 2.0 * PAD, entry_top + 1.0, prompt, WHITE) + 4.0;
-        screen.text(font, tx, entry_top + 1.0, &text, WHITE);
+        // a line wider than the strip slides left as far as keeps the caret in it, and is cut
+        // at the strip's edges
+        let right = x + w - 2.0 * PAD;
         let before: String = text.chars().take(host.chat.caret.get()).collect();
         let cx = tx + screen.fonts.borrow_mut().text_size(font, &before).0 as f32;
+        let shift = (cx + 1.0 - right).max(0.0);
+        let strip = Clip::new(tx.floor() as i32, entry_top.floor() as i32, (right - tx.floor()).ceil() as i32, row_h.ceil() as i32);
+        let clip = screen.canvas.borrow().clip;
+        screen.canvas.borrow_mut().clip = Some(clip.map_or(strip, |c| c.intersect(strip)));
+        screen.text(font, tx - shift, entry_top + 1.0, &text, WHITE);
         let mut canvas = screen.canvas.borrow_mut();
-        canvas.image(Texture::White, false, [cx, entry_top + 1.0, 1.0, tall], [0.0, 0.0, 1.0, 1.0], screen.color(WHITE));
+        canvas.image(Texture::White, false, [cx - shift, entry_top + 1.0, 1.0, tall], [0.0, 0.0, 1.0, 1.0], screen.color(WHITE));
+        canvas.clip = clip;
     }
     let end = history.len() - scroll;
     let start = end.saturating_sub(fit);

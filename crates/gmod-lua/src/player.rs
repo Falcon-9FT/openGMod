@@ -1633,6 +1633,19 @@ pub(crate) fn install(lua: &Lua, realm: crate::Realm) -> mlua::Result<()> {
             let joined = join(a.lua, PlayerInfo { name, bot: true, ..PlayerInfo::default() });
             entity::push(a.lua, joined.unwrap_or(EntityHandle::NULL))
         })?;
+        // to every player: `HUD_PRINTTALK` into the chat (the base gamemode tells of a team
+        // changed so), the rest to the console
+        def_lib(lua, &globals, "PrintMessage", |a| {
+            let text = a.string(2)?;
+            if a.number(1)? as i64 == HUD_PRINTTALK {
+                for player in all(a.lua) {
+                    crate::chat::tell(a.lua, player, &text);
+                }
+            } else {
+                print_to(a, &text);
+            }
+            Ok(Value::Nil)
+        })?;
     }
     globals.raw_set("player", library)?;
 
