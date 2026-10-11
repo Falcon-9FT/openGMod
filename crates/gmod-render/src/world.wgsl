@@ -34,7 +34,8 @@ struct Surface {
     // rgb fog colour, w: 1 for water
     water: vec4<f32>,
     // x: alpha test reference (0: none), y: light (0 none, 1 light map, 2 vertex),
-    // z: 1 when the second texture blends in, w: 1 when it adds its light
+    // z: 1 when the second texture blends in, w: how fog covers it (0 towards its colour,
+    // 1 towards nothing for what adds its light, 2 not at all)
     options: vec4<f32>,
 };
 
@@ -192,9 +193,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 // fog, linear with the distance from the eye: towards its colour, or for what adds its light
-// towards nothing
+// towards nothing; `$nofog` surfaces it leaves as they are
 fn fogged(color: vec3<f32>, position: vec3<f32>) -> vec3<f32> {
-    if (camera.fog_range.z < 0.5) {
+    if (camera.fog_range.z < 0.5 || surface.options.w > 1.5) {
         return color;
     }
     let d = length(position - camera.eye.xyz) * camera.eye.w;

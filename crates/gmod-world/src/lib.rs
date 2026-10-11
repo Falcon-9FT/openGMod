@@ -93,6 +93,8 @@ pub struct Surface {
     pub alpha_test: Option<f32>,
     pub translucent: bool,
     pub additive: bool,
+    /// `$nofog`: fog does not cover it (glows and the like).
+    pub no_fog: bool,
     /// Lit by light (map or vertex); `UnlitGeneric` and water are not.
     pub lit: bool,
     /// Drawn from both sides.
@@ -118,6 +120,7 @@ impl Surface {
             alpha_test: None,
             translucent: false,
             additive: false,
+            no_fog: false,
             lit: true,
             no_cull: false,
             tint: [1.0; 3],
@@ -388,12 +391,16 @@ pub fn placed_models(bsp: &Bsp) -> Vec<(usize, Vec3, Vec3)> {
 /// Moves vertices from their own space into the world: turned by pitch, yaw and roll
 /// (degrees), then moved to `origin`.
 pub fn place(vertices: &mut [Vertex], origin: Vec3, angles: Vec3) {
-    let [forward, left, up] = axes(angles);
-    let turn = |v: Vec3| add(add(scale(forward, v[0]), scale(left, v[1])), scale(up, v[2]));
+    let axes = axes(angles);
     for vertex in vertices {
-        vertex.position = add(origin, turn(vertex.position));
-        vertex.normal = turn(vertex.normal);
+        vertex.position = add(origin, turn(axes, vertex.position));
+        vertex.normal = turn(axes, vertex.normal);
     }
+}
+
+/// A direction of a thing's own space in the world's, by the thing's `axes`.
+fn turn([forward, left, up]: [Vec3; 3], v: Vec3) -> Vec3 {
+    add(add(scale(forward, v[0]), scale(left, v[1])), scale(up, v[2]))
 }
 
 /// Where a thing turned by `angles` (pitch, yaw, roll in degrees, as the game gives them) has
@@ -488,6 +495,7 @@ impl Gather<'_> {
         s.additive = m.flag("$additive");
         s.translucent = m.flag("$translucent") || s.additive || s.alpha < 1.0;
         s.no_cull = m.flag("$nocull");
+        s.no_fog = m.flag("$nofog");
         s.tint = m.vector("$color").unwrap_or([1.0; 3]);
         s.lit = !m.shader.starts_with("unlit");
         if m.shader == "water" {
@@ -539,7 +547,7 @@ fn brushes(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>) -> [Vec<Piece>
         None => Vec::new(),
     };
     // the world in two when there is a sky box; a brush entity is where the middle of its
-    // bounds is
+    // bounds is, turned with it (the bounds are in its own space, around its origin)
     let mut placed = Vec::new();
     for (model, origin, angles) in placed_models(bsp) {
         if model == 0 {
@@ -549,7 +557,7 @@ fn brushes(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>) -> [Vec<Piece>
             }
             continue;
         }
-        let middle = bsp.models.get(model).map(|m| add(origin, scale(add(m.mins, m.maxs), 0.5)));
+        let middle = bsp.models.get(model).map(|m| add(origin, turn(axes(angles), scale(add(m.mins, m.maxs), 0.5))));
         placed.push((sky_area.is_some() && middle.is_some_and(|m| bsp.area_at(m) == sky_area), model, origin, angles));
     }
     for (sky, model, origin, angles) in placed {
@@ -791,7 +799,7 @@ mod tests {
         let files: [(&str, &[u8]); 7] = [
             ("materials/dev/dev_measuregeneric01.vmt", b"LightmappedGeneric { $basetexture dev/grid }"),
             ("materials/dev/grid.vtf", &texture()),
-            ("materials/brick/brickwall001a.vmt", b"LightmappedGeneric { $basetexture brick/gone $alphatest 1 }"),
+            ("materials/brick/brickwall001a.vmt", b"LightmappedGeneric { $basetexture brick/gone $alphatest 1 $nofog 1 }"),
             ("materials/nature/blendgroundtograss.vmt", b"WorldVertexTransition { $basetexture dev/grid $basetexture2 nature/grass }"),
             ("materials/nature/grass.vtf", &texture()),
             (
@@ -821,7 +829,7 @@ mod tests {
         assert_eq!(names, ["DEV/DEV_MEASUREGENERIC01", "BRICK/BRICKWALL001A", "NATURE/BLENDGROUNDTOGRASS"]);
         let (floor, wall, ground) = (&surfaces[0], &surfaces[1], &surfaces[2]);
         assert_eq!((floor.base, floor.missing, floor.lit), (Some(0), false, true));
-        assert_eq!((wall.base, wall.alpha_test), (None, Some(0.5)));
+        assert_eq!((wall.base, wall.alpha_test, wall.no_fog, floor.no_fog), (None, Some(0.5), true, false));
         assert_eq!((ground.base, ground.base2), (Some(0), Some(1)));
         assert_eq!(world.textures.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["dev/grid", "nature/grass"]);
         assert_eq!(world.missing_textures, ["brick/gone"]);

@@ -206,10 +206,15 @@ pub const LIGHT_NONE: f32 = 0.0;
 pub const LIGHT_MAP: f32 = 1.0;
 pub const LIGHT_VERTEX: f32 = 2.0;
 
+/// How fog covers a surface: towards the fog's colour; towards nothing, for what adds its
+/// light; not at all (`$nofog`).
+pub const FOG_COLOR: f32 = 0.0;
+pub const FOG_DARK: f32 = 1.0;
+pub const FOG_NONE: f32 = 2.0;
+
 /// The 12 floats a shader gets for a surface: tint and alpha; water colour and whether it is
 /// water; alpha test reference (0 for none), how it is lit, whether the second texture blends
-/// in, and whether it adds its light (fog fades it to nothing, where it fades the others to
-/// the fog's colour).
+/// in, and how fog covers it.
 pub fn surface_params(surface: &Surface, has_lightmap: bool) -> [f32; 12] {
     let light = match () {
         _ if !surface.lit => LIGHT_NONE,
@@ -230,7 +235,11 @@ pub fn surface_params(surface: &Surface, has_lightmap: bool) -> [f32; 12] {
         surface.alpha_test.unwrap_or(0.0),
         light,
         if surface.base2.is_some() { 1.0 } else { 0.0 },
-        if surface.additive { 1.0 } else { 0.0 },
+        match () {
+            _ if surface.no_fog => FOG_NONE,
+            _ if surface.additive => FOG_DARK,
+            _ => FOG_COLOR,
+        },
     ]
 }
 
@@ -443,9 +452,11 @@ mod tests {
         s.water = Some([0.1, 0.2, 0.3]);
         s.alpha_test = Some(0.4);
         let p = surface_params(&s, true);
-        assert_eq!((p[4], p[7], p[8], p[9], p[11]), (0.1, 1.0, 0.4, LIGHT_NONE, 0.0));
+        assert_eq!((p[4], p[7], p[8], p[9], p[11]), (0.1, 1.0, 0.4, LIGHT_NONE, FOG_COLOR));
         s.additive = true;
-        assert_eq!(surface_params(&s, true)[11], 1.0);
+        assert_eq!(surface_params(&s, true)[11], FOG_DARK);
+        s.no_fog = true;
+        assert_eq!(surface_params(&s, true)[11], FOG_NONE);
     }
 
     fn transform(m: &[f32; 16], p: Vec3) -> [f32; 4] {

@@ -981,8 +981,9 @@ impl Renderer {
         if let (Some((_, sky)), Some(eye)) = (&self.skybox, sky_eye) {
             // what is nearer than in the world, as the world counts it, is cut off
             let projection = Camera { eye, ..*camera }.view_projection_near(aspect, gpu::NEAR / sky.scale);
+            // its fog is counted in the world's units, `scale` to a unit of the sky box
             let fog = gpu::fog_params(sky.fog.as_ref());
-            sky_cameras.extend(camera_bytes(projection, [eye[0], eye[1], eye[2], 1.0], None, &[], None, &fog));
+            sky_cameras.extend(camera_bytes(projection, [eye[0], eye[1], eye[2], sky.scale], None, &[], None, &fog));
         }
         queue.write_buffer(&self.sky_camera_buffer, 0, &sky_cameras);
 

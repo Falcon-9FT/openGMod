@@ -11,8 +11,9 @@
 //!
 //! Fog is linear with the distance from the eye: none up to `start`, then more and more of its
 //! colour up to `end`, where it covers `max_density` of what is behind it. The world's is the
-//! `env_fog_controller`'s (the master one when there are several), the sky box's the sky
-//! camera's own keys. The sky box itself is not fogged.
+//! `env_fog_controller`'s (the master one when there are several), the 3D sky box's the sky
+//! camera's own keys, whose distances are in the world's units too. The sky's textures are not
+//! fogged.
 
 use gmod_bsp::{Bsp, Entity};
 
@@ -86,9 +87,9 @@ pub struct SkyCamera {
     pub scale: f32,
     /// The area of the leaf it stands in: what is there is the sky box.
     pub area: u16,
-    /// The sky box's own fog. Its distances are taken in the sky box's units, from the
-    /// camera's eye in the sky box (as drawing the room from there measures them), not in the
-    /// world's units.
+    /// The sky box's own fog. Its distances are in the world's units, as the room looks from
+    /// the world: a unit of the sky box counts `scale` (the game divides the keys by the scale
+    /// before it draws the room, so mappers give the sky camera the fog controller's numbers).
     pub fog: Option<Fog>,
 }
 
@@ -259,6 +260,30 @@ mod tests {
         // the floor and a prop each
         assert_eq!(world.missing_models, Vec::<String>::new());
         assert_eq!((world.pieces.len(), world.skybox.unwrap().pieces.len()), (2, 2));
+    }
+
+    #[test]
+    fn brush_entities_go_where_they_stand() {
+        // a brush entity turned around, its origin by the sky box's far wall: its bounds, 0 to
+        // 48 along its own x, reach back into the sky box; unturned, they would be in the wall
+        let top = TestFace {
+            corners: vec![[0.0, -4.0, 8.0], [0.0, 4.0, 8.0], [48.0, 4.0, 8.0], [48.0, -4.0, 8.0]],
+            material: "SKY/BRUSH",
+            flags: 0,
+        };
+        let mut test = map();
+        test.models.push(vec![TestBrush::cuboid([0.0, -4.0, 0.0], [48.0, 4.0, 8.0])]);
+        test.model_faces = vec![(1, top)];
+        test.entities += "{\n\"classname\" \"func_brush\"\n\"model\" \"*1\"\n\"origin\" \"2100 32 8\"\n\"angles\" \"0 180 0\"\n}\n";
+        let bsp = gmod_bsp::Bsp::parse("maps/test.bsp".into(), Arc::from(test.bytes())).unwrap();
+        let world = crate::load(&Vfs::new(), &bsp);
+        let materials =
+            |pieces: &[crate::Piece]| -> Vec<String> { pieces.iter().flat_map(|p| &p.surfaces).map(|s| s.material.clone()).collect() };
+        assert_eq!(materials(&world.pieces), ["ROOM/FLOOR"]);
+        let skybox = world.skybox.unwrap();
+        assert_eq!(materials(&skybox.pieces), ["SKY/FLOOR", "SKY/BRUSH"]);
+        // turned around its origin, into the sky box
+        assert!(skybox.pieces[1].vertices.iter().all(|v| (2051.0..2101.0).contains(&v.position[0])));
     }
 
     #[test]

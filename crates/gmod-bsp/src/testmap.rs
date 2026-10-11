@@ -320,6 +320,8 @@ pub struct TestMap {
     pub models: Vec<Vec<TestBrush>>,
     pub displacements: Vec<TestDisplacement>,
     pub faces: Vec<TestFace>,
+    /// Faces of the brush models after the first, in the model's own space: (model, face).
+    pub model_faces: Vec<(usize, TestFace)>,
     /// Areas of the world's leaves: a leaf whose middle is inside a box (mins, maxs) is in its
     /// area; the others in none (0).
     pub areas: Vec<([f32; 3], [f32; 3], u16)>,
@@ -508,9 +510,17 @@ impl TestMap {
             let head = tree.build(&boxed, &contents, region, 0, true);
             // areas are the world's
             tree.areas.clear();
-            let faces = if m == 0 { (self.displacements.len() + self.faces.len()) as i32 } else { 0 };
+            // the world's faces first, then each model's in turn
+            let world_faces = self.displacements.len() + self.faces.len();
+            let (first, faces) = match m {
+                0 => (0, world_faces),
+                _ => {
+                    let before = self.model_faces.iter().filter(|(model, _)| (1..m).contains(model)).count();
+                    (world_faces + before, self.model_faces.iter().filter(|(model, _)| *model == m).count())
+                }
+            };
             models.extend(f32s(&[lo, hi, [0.0; 3]].concat()));
-            models.extend(i32s(&[head, 0, faces]));
+            models.extend(i32s(&[head, first as i32, faces as i32]));
         }
 
         // the displacements: a four-sided face each, and the grid over it
@@ -546,7 +556,9 @@ impl TestMap {
             }
             vert_count += side * side;
         }
-        for test_face in &self.faces {
+        let mut model_faces: Vec<&(usize, TestFace)> = self.model_faces.iter().filter(|(m, _)| *m > 0 && *m < self.models.len()).collect();
+        model_faces.sort_by_key(|(m, _)| *m);
+        for test_face in self.faces.iter().chain(model_faces.into_iter().map(|(_, face)| face)) {
             let first_vertex = vertices.len() / 12;
             let first_edge = surfedges.len() / 4;
             let n = test_face.corners.len();

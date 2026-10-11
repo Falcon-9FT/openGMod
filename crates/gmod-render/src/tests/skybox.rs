@@ -21,6 +21,7 @@ fn wall(x: f32, y: [f32; 2], z: [f32; 2], light: [f32; 3]) -> Piece {
         alpha_test: None,
         translucent: false,
         additive: false,
+        no_fog: false,
         lit: true,
         no_cull: false,
         tint: [1.0; 3],
@@ -70,12 +71,14 @@ fn draws_the_3d_sky_box_behind_the_world() {
         origin: [-1000.0, 500.0, 200.0],
         scale: 16.0,
         area: 1,
-        fog: Some(Fog { color: GREEN, start: 10.0, end: 20.0, max_density: 0.5 }),
+        // in the world's units: what is 32 units of the sky box away is 512 of the world's
+        fog: Some(Fog { color: GREEN, start: 400.0, end: 500.0, max_density: 0.5 }),
     };
     let sky_eye = camera.eye(eye);
     assert_eq!(sky_eye, [-900.0, 480.0, 204.0]);
     // in the sky box, 32 units ahead: a red wall from 8 to 64 units to the right, which its
-    // fog half covers, and one to the left
+    // fog half covers (counted in the sky box's units, it would not have started), and one to
+    // the left
     let ahead = sky_eye[0] + 32.0;
     let z = [sky_eye[2] - 64.0, sky_eye[2] + 64.0];
     let skybox = Skybox {
@@ -129,4 +132,10 @@ fn fog_by_the_distance_from_the_eye() {
     assert!(all(&pixels, 4..28, 4..60, blue), "the near wall: {:?}", at(&pixels, 16, 32));
     assert!(all(&pixels, 36..60, 40..60, green), "the far wall: {:?}", at(&pixels, 48, 48));
     assert!(all(&pixels, 36..48, 16..28, green), "the far model: {:?}", at(&pixels, 42, 22));
+
+    // a surface of `$nofog` is shown as it is, however far
+    let mut far = wall(3000.0, [-3000.0, 0.0], [-3000.0, eye[2]], BLUE);
+    far.surfaces[0].no_fog = true;
+    let pixels = draw(&device, &queue, &world(vec![far], None, Some(fog)), &Camera { eye, yaw: 0.0, pitch: 0.0, fov: 90.0 });
+    assert!(all(&pixels, 36..60, 40..60, blue), "the far wall of $nofog: {:?}", at(&pixels, 48, 48));
 }
