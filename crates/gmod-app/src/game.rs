@@ -223,6 +223,20 @@ impl Game {
     pub fn drawn(&self) -> Vec<Drawn> {
         self.runtime.drawn(self.player)
     }
+
+    /// What the player holds before their eyes - the weapon's view model and the hands - put
+    /// where the client's Lua puts it from the eyes, and the field of view to draw it with.
+    pub fn view_models(&self, eye: [f32; 3], pitch: f32, yaw: f32) -> (Vec<Drawn>, f32) {
+        let (mut models, fov) = self.runtime.view_models(self.player);
+        if !models.is_empty() {
+            let (origin, angles) = self.client.view_model_view(Vector::new(eye[0], eye[1], eye[2]), Angle::new(pitch, yaw, 0.0));
+            for model in &mut models {
+                model.origin = origin;
+                model.angles = angles;
+            }
+        }
+        (models, fov)
+    }
 }
 
 /// The models of the game's entities, each read from the game's files the first time an entity
@@ -255,7 +269,14 @@ impl Models {
                     }
                 });
                 let (o, a) = (d.origin, d.angles);
-                Some(Placed { model: model?, origin: [o.x, o.y, o.z], angles: [a.p, a.y, a.r], scale: d.scale, ..Placed::default() })
+                Some(Placed {
+                    model: model?,
+                    origin: [o.x, o.y, o.z],
+                    angles: [a.p, a.y, a.r],
+                    scale: d.scale,
+                    bones: d.bones.clone(),
+                    ..Placed::default()
+                })
             })
             .collect()
     }
@@ -380,6 +401,7 @@ mod tests {
             origin: Vector::new(1.0, 2.0, 3.0),
             angles: Angle::new(0.0, 90.0, 0.0),
             scale: 1.0,
+            bones: Vec::new(),
         };
         // not in the game's files: not drawn, and not looked for again
         assert!(models.place(&[drawn.clone(), drawn.clone()], |_| unreachable!("nothing to upload")).is_empty());

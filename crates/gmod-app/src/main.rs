@@ -917,12 +917,16 @@ impl App {
         if self.lit.len() > 8192 {
             self.lit.clear();
         }
+        // what the player holds, lit as the eyes are
+        let (held, fov) = game.view_models(self.camera.eye, self.camera.pitch, self.camera.yaw);
+        let mut view_models = models.place(&held, |model| renderer.add_model(&gpu.device, &gpu.queue, model));
         let (Some(light), Some(collision)) = (&self.light, &self.collision) else { return };
-        for p in &mut placed {
+        for p in placed.iter_mut().chain(&mut view_models) {
             let key = p.origin.map(|v| (v / 8.0).round() as i32);
             p.light = self.lit.entry(key).or_insert_with(|| light.at(collision, p.origin)).clone();
         }
         renderer.set_entities(placed);
+        renderer.set_view_models(view_models, fov);
     }
 
     fn count_frame(&mut self) {
