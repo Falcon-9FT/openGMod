@@ -3,7 +3,7 @@ name = "gmod-render"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Draws a map on the GPU with wgpu: Direct3D 12, Vulkan as the fallback"
+description = "Draws a map on the GPU with wgpu (Direct3D 12, Vulkan as the fallback): the world, its 3D sky box and fog, posed models, view models"
 
 [dependencies]
 gmod-ui.workspace = true

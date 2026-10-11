@@ -3,7 +3,7 @@ name = "gmod-world"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "A map ready to draw and to walk in: world, brush entities and static props as triangles by material, with their light, textures and sky box; what is solid"
+description = "A map ready to draw and to walk in: world, brush entities and static props as triangles by material, with their light, textures, sky box, 3D sky box and fog; what is solid"
 
 [dependencies]
 gmod-fs.workspace = true

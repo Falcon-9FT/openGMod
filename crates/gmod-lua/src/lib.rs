@@ -26,7 +26,9 @@
 //!   `CreateSound`, the `sound` library, all quiet), [`trace`] (`util.TraceLine` and the like),
 //!   [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`),
 //!   [`anim`] (what entities play on their bones: sequences, cycles, pose parameters, layers,
-//!   view models, the player's model), [`constraint`] (welds, ropes, axes ... as joints), [`inputs`] (`Entity:Input`,
+//!   view models, the player's model), [`ragdoll`] (bodies on the bones of `prop_ragdoll` and
+//!   corpses), [`chat`] (`say` through `PlayerSay`, the chat box, `chat.AddText`),
+//!   [`constraint`] (welds, ropes, axes ... as joints), [`inputs`] (`Entity:Input`,
 //!   `Entity:Fire`), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
 //!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`]
 //!   (`Material`), [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and
