@@ -66,6 +66,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let data = bytes(a, 1)?;
         Ok(Value::String(a.lua.create_string(gmod_fs::crc32::crc32(&data).to_string())?))
     })?;
+    // Steam's filter of words is not there: text stays as it is
+    def("FilterText", |a| Ok(Value::String(a.lua.create_string(a.string(1)?)?)))?;
     def("Base64Encode", |a| {
         let encoded = base64_encode(&bytes(a, 1)?, !a.boolean(2));
         Ok(Value::String(a.lua.create_string(encoded)?))

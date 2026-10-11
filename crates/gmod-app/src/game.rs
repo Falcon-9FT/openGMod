@@ -143,9 +143,14 @@ impl Game {
         self.client.button(code, down)
     }
 
-    /// Text typed, for the text entry that has the keyboard: whether one took it.
+    /// Text typed, for the chat box or the text entry that has the keyboard: whether one took it.
     pub fn type_text(&self, text: &str) -> bool {
         self.client.type_text(text)
+    }
+
+    /// Whether the chat box is open: Esc closes it rather than opening the main menu.
+    pub fn chat_open(&self) -> bool {
+        self.client.chat_open()
     }
 
     /// The cursor moved over the window, to a pixel of it.
@@ -209,8 +214,14 @@ impl Game {
             self.command(&line);
         }
         self.runtime.think(seconds);
-        // the client has what the server has now, and thinks
+        // the client has what the server has now - its entities, what is said to its player -
+        // and thinks
         self.client.apply_snapshot(&self.runtime.snapshot());
+        for (to, message) in self.runtime.take_chat() {
+            if to == self.player {
+                self.client.receive_chat(&message);
+            }
+        }
         let view = self.runtime.view(self.player)?;
         let eye = between(view.previous_eye, view.eye, self.runtime.tick_fraction());
         self.client.set_view(gmod_lua::client::View { origin: Vector::new(eye[0], eye[1], eye[2]), angles: view.angles, fov: view.fov });

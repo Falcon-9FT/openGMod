@@ -5,11 +5,12 @@
 //! `resource/ClientScheme.res`; an installation without those files gets Half-Life 2's.
 //!
 //! Lua decides what shows: every element asks `HUDShouldDraw` (`CHudHealth`, `CHudBattery`,
-//! `CHudAmmo`, `CHudSecondaryAmmo`, `CHudCrosshair`, and `CHudGMod` for Lua's own HUD), a
+//! `CHudAmmo`, `CHudSecondaryAmmo`, `CHudCrosshair`, `CHudChat` - the chat box of
+//! [`crate::chat`] - and `CHudGMod` for Lua's own HUD), a
 //! weapon can hide its ammo (`SWEP.DrawAmmo`, `CustomAmmoDisplay`) and its crosshair
 //! (`SWEP.DrawCrosshair`, `DoDrawCrosshair`). Around the engine's elements Lua draws its own:
 //! `PreDrawHUD`, `HUDPaintBackground`, then the elements, `HUDPaint`, the weapon's `DrawHUD`,
-//! `HUDDrawScoreBoard`, `PostDrawHUD`.
+//! `HUDDrawScoreBoard`, the chat, `PostDrawHUD`.
 
 use gmod_ui::{FontId, Texture};
 use mlua::{IntoLuaMulti, Lua, MultiValue, ObjectLike, Table, Value};
@@ -370,6 +371,9 @@ pub(crate) fn paint(lua: &Lua) {
             crate::weapon::call(lua, weapon, "DrawHUD", MultiValue::new());
         }
         call_hook(lua, "HUDDrawScoreBoard", MultiValue::new());
+    }
+    if should_draw(lua, "CHudChat") {
+        crate::chat::paint(lua);
     }
     call_hook(lua, "PostDrawHUD", MultiValue::new());
 }

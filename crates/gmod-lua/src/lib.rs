@@ -55,6 +55,7 @@ use mlua::Lua;
 
 pub mod anim;
 mod args;
+pub mod chat;
 pub mod client;
 pub mod console;
 pub mod constraint;
@@ -97,6 +98,7 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
+pub use chat::ChatMessage;
 pub use entity::EntityHandle;
 pub use ents::{Drawn, Map};
 pub use html::{WebButton, WebEvent, WebPage, WebPages};
@@ -270,6 +272,8 @@ pub(crate) struct Host {
     pub sounds: sound::Sounds,
     /// What surfaces are made of.
     pub surfaces: surfaceprops::Surfaces,
+    /// What is said: the server's messages for its players, a client's chat box.
+    pub chat: chat::Chat,
 }
 
 impl Host {
@@ -351,6 +355,7 @@ impl Runtime {
             hud: RefCell::new(hud::Hud::default()),
             sounds: sound::Sounds::default(),
             surfaces: surfaceprops::Surfaces::default(),
+            chat: chat::Chat::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;

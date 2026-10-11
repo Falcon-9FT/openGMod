@@ -90,6 +90,8 @@ const EF_BONEMERGE: i64 = 1;
 const EF_DIMLIGHT: i64 = 4;
 const EF_NODRAW: i64 = 32;
 const DEFAULT_FOV: f32 = 75.0;
+/// `PrintMessage` into the chat.
+const HUD_PRINTTALK: i64 = 3;
 /// The impulse that toggles the flashlight.
 pub const IMPULSE_FLASHLIGHT: u8 = 100;
 
@@ -519,6 +521,7 @@ pub(crate) fn join(lua: &Lua, info: PlayerInfo) -> Option<EntityHandle> {
     if let (Ok(n), Ok(a)) = (lua.create_string(&name), lua.create_string(&info.address)) {
         hook(lua, "PlayerConnect", [Value::String(n), Value::String(a)]);
     }
+    crate::chat::join_leave(lua, EntityHandle::NULL, &name, &format!("Player {name} has joined the game"));
     let handle = {
         let host = host(lua);
         let now = host.clock.cur_time.get();
@@ -713,6 +716,8 @@ pub(crate) fn leave(lua: &Lua, handle: EntityHandle) {
         return;
     }
     hook(lua, "PlayerDisconnected", [ent_value(lua, handle)]);
+    let name = state(lua, handle, |_, p| p.info.name.clone()).unwrap_or_default();
+    crate::chat::join_leave(lua, handle, &name, &format!("Player {name} left the game (Disconnect by user.)"));
     strip_weapons(lua, handle);
     let view_models = state(lua, handle, |_, p| p.view_models).unwrap_or([EntityHandle::NULL; 3]);
     for vm in view_models {
@@ -2288,28 +2293,25 @@ fn install_view(def: &entity::Def) -> mlua::Result<()> {
 /// Chat and messages, and what has nothing to act on yet.
 fn install_rest(def: &entity::Def) -> mlua::Result<()> {
     def("ChatPrint", |a| {
-        this(a)?;
-        print_to(a, &a.string(2)?);
+        let handle = this(a)?;
+        crate::chat::tell(a.lua, handle, &a.string(2)?);
         Ok(Value::Nil)
     })?;
+    // `HUD_PRINTTALK` goes to the chat, the rest to the console
     def("PrintMessage", |a| {
-        this(a)?;
-        print_to(a, &a.string(3)?);
+        let handle = this(a)?;
+        let text = a.string(3)?;
+        if a.number(2)? as i64 == HUD_PRINTTALK {
+            crate::chat::tell(a.lua, handle, &text);
+        } else {
+            print_to(a, &text);
+        }
         Ok(Value::Nil)
     })?;
     // what the player says goes through `PlayerSay`, which may change it or keep it quiet
     def("Say", |a| {
         let handle = this(a)?;
-        let (text, team) = (a.string(2)?, a.boolean(3));
-        let said = hook(a.lua, "PlayerSay", [ent_value(a.lua, handle), Value::String(a.lua.create_string(&text)?), Value::Boolean(team)]);
-        let text = match said.front() {
-            Some(Value::String(s)) => s.to_string_lossy(),
-            _ => text,
-        };
-        if !text.is_empty() {
-            let name = read(a, |_, p| p.info.name.clone())?;
-            print_to(a, &format!("{name}: {text}"));
-        }
+        crate::chat::say(a.lua, handle, &a.string(2)?, a.boolean(3));
         Ok(Value::Nil)
     })?;
     // for the player's client, which is not there yet

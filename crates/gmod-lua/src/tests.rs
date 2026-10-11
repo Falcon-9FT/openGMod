@@ -11,6 +11,8 @@ use mlua::Value;
 
 use super::*;
 
+mod chat;
+
 /// A folder that is removed when dropped.
 struct TempDir(PathBuf);
 

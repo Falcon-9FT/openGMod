@@ -1052,6 +1052,16 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(key), state, repeat, text, .. }, .. } => {
                 let pressed = state == ElementState::Pressed;
+                // Esc closes the chat box first
+                if key == KeyCode::Escape
+                    && !self.menu_shown()
+                    && let Some(game) = self.game.as_ref().filter(|game| game.chat_open())
+                {
+                    if let Some(code) = gmod_key(key) {
+                        game.button(code, pressed);
+                    }
+                    return;
+                }
                 // Esc: the main menu over the game, and back
                 if key == KeyCode::Escape && self.menu.is_some() && self.collision.is_some() {
                     if pressed && !repeat {

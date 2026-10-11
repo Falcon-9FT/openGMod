@@ -58,6 +58,8 @@ const CLIENT_CONVARS: &[(&str, &str, &str)] = &[
     ("r_shadows", "1", ""),
     ("r_drawdetailprops", "1", ""),
     ("name", "Player", "Current user name"),
+    ("hud_saytext_time", "12", "How long lines of chat show"),
+    ("cl_chatfilters", "63", "What the chat shows"),
 ];
 
 /// A ConVar of a client the server is told of (`GetInfo`).
@@ -311,9 +313,11 @@ pub fn split_commands(text: &str) -> Vec<Vec<String>> {
     commands
 }
 
-/// Whether there is a ConVar or a command of Lua of that name.
+/// Whether there is a ConVar, a command of Lua or one of the chat of that name.
 pub(crate) fn is_known(lua: &Lua, name: &str) -> bool {
-    find(lua, name).is_some() || host(lua).console.commands.borrow().contains_key(&name.to_ascii_lowercase())
+    find(lua, name).is_some()
+        || host(lua).console.commands.borrow().contains_key(&name.to_ascii_lowercase())
+        || crate::chat::is_command(lua, name)
 }
 
 /// Runs one command now: sets a ConVar, or calls a command of Lua.
@@ -337,6 +341,9 @@ pub(crate) fn execute_as(lua: &Lua, words: &[String], player: EntityHandle) {
         return;
     }
     let known = host(lua).console.commands.borrow().contains_key(&name.to_ascii_lowercase());
+    if !known && crate::chat::command(lua, player, words) {
+        return;
+    }
     if !known {
         let host = host(lua);
         if host.realm != crate::Realm::Server {

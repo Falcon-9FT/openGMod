@@ -755,34 +755,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
 
     install_render(lua, &globals)?;
 
-    let chat = lua.create_table()?;
-    def(lua, &chat, "AddText", |a| {
-        let mut line = String::new();
-        for value in a.values.iter() {
-            match value {
-                Value::Table(_) => {}
-                Value::UserData(_) => {
-                    if let Some(handle) = entity::handle_of(Some(value)) {
-                        let name = host(a.lua).entities.get(handle).and_then(|ent| ent.player.as_ref().map(|p| p.info.name.clone()));
-                        line.push_str(&name.unwrap_or_else(|| "Console".to_string()));
-                    }
-                }
-                other => line.push_str(&a.lua.coerce_string(other.clone())?.map(|s| s.to_string_lossy()).unwrap_or_default()),
-            }
-        }
-        line.push('\n');
-        host(a.lua).print(&line);
-        Ok(Value::Nil)
-    })?;
-    def(lua, &chat, "PlaySound", nothing)?;
-    def(lua, &chat, "Open", nothing)?;
-    def(lua, &chat, "Close", nothing)?;
-    def_many(lua, &chat, "GetChatBoxPos", |a| {
-        let h = host(a.lua).screen.size.get().1 as i64;
-        Ok(MultiValue::from_iter([Value::Integer(20), Value::Integer(h - 340)]))
-    })?;
-    def_many(lua, &chat, "GetChatBoxSize", |_| Ok(MultiValue::from_iter([Value::Integer(480), Value::Integer(240)])))?;
-    globals.raw_set("chat", chat)?;
+    crate::chat::install(lua, &globals)?;
 
     let achievements = lua.create_table()?;
     for name in [
@@ -1055,22 +1028,31 @@ impl crate::Runtime {
         crate::vgui::cursor_moved(&self.lua);
     }
 
-    /// Whether the cursor is out - a menu that takes the mouse shows, or Lua asked for it
-    /// (`gui.EnableScreenClicker`) - so the mouse does not turn the view.
+    /// Whether the cursor is out - a menu that takes the mouse shows, the chat box is open, or
+    /// Lua asked for it (`gui.EnableScreenClicker`) - so the mouse does not turn the view.
     pub fn cursor_visible(&self) -> bool {
         let host = host(&self.lua);
-        host.panels.cursor_visible(host.client.screen_clicker.get())
+        host.panels.cursor_visible(host.client.screen_clicker.get()) || crate::chat::is_open(&self.lua)
     }
 
-    /// A key or mouse button (`KEY_*`, `MOUSE_*`) went down or up. The panels have it first;
-    /// then `PlayerBindPress` hears of the command bound to it, and a command of the client's
-    /// own runs (`+menu` with the key down, `-menu` with it up). True when the client took
-    /// it; the game has the rest (`+attack`, `noclip` ...).
+    /// A key or mouse button (`KEY_*`, `MOUSE_*`) went down or up. The open chat box has the
+    /// keys going down first ([`crate::chat`]), then the panels; then `PlayerBindPress` hears
+    /// of the command bound to it, and a command of the client's own runs (`+menu` with the
+    /// key down, `-menu` with it up, `messagemode`). True when the client took it; the game
+    /// has the rest (`+attack`, `noclip` ...).
     pub fn button(&self, code: i32, down: bool) -> bool {
         let lua = &self.lua;
         // a key held down repeats: for the text entries, not the binds
         let repeat = down && host(lua).client.is_down(code);
         host(lua).client.set_key(code, down);
+        if down {
+            crate::chat::key_down(lua);
+            if let Some(taken) = crate::chat::key(lua, code) {
+                return taken;
+            }
+        } else if crate::chat::key_up(lua, code) {
+            return true;
+        }
         let taken = match code {
             107..=111 => crate::vgui::mouse_button(lua, code, down),
             MOUSE_WHEEL_UP | MOUSE_WHEEL_DOWN => down && crate::vgui::mouse_wheel(lua, if code == MOUSE_WHEEL_UP { 1 } else { -1 }),
@@ -1105,10 +1087,10 @@ impl crate::Runtime {
         true
     }
 
-    /// Text was typed (what the keys made, after the keyboard's layout): it goes into the text
-    /// entry that has the keyboard. True when one took it.
+    /// Text was typed (what the keys made, after the keyboard's layout): it goes into the open
+    /// chat box, or the text entry that has the keyboard. True when one took it.
     pub fn type_text(&self, text: &str) -> bool {
-        crate::vgui::text_typed(&self.lua, text)
+        crate::chat::type_text(&self.lua, text) || crate::vgui::text_typed(&self.lua, text)
     }
 
     /// Draws the frame's 2D: the panels think and are laid out, then the HUD - the engine's
@@ -1122,6 +1104,7 @@ impl crate::Runtime {
             host.client.frame.set(host.client.frame.get() + 1);
             host.screen.begin();
         }
+        crate::chat::advance(lua, real_frame_time);
         crate::vgui::think(lua);
         crate::vgui::layout(lua);
         crate::hud::paint(lua);
