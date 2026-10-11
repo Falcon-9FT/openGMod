@@ -6,14 +6,16 @@
 //! A `ragdollconstraint` joins two solids at the child's bone, the child turning about its
 //! parent within limits about the axes of its bone, measured from the model's rest pose
 //! ([`gmod_physics::Joint::Ragdoll`]); one that lets nothing turn welds the child into its
-//! parent's body. The parts go through each other, but for the pairs the `.phy`'s
-//! `collisionrules` name (`collisionpair`).
+//! parent's body. The parts hit each other, but for those joined and those that start in each
+//! other; a `.phy` with `collisionrules` says which pairs alone do (`collisionpair`), or that
+//! none do (`selfcollisions 0`).
 //!
 //! The entity is where its first part (part 0, the root of the model) is, its box around all
 //! of them, and moving it moves them all. Drawn, a bone with a part is where that part is; one
 //! without follows its parent as the entity plays it. Lua sees the parts as the entity's
-//! `PhysObj`s by number (`GetPhysicsObjectNum`, `TranslatePhysBoneToBone`); a part welded
-//! into another's body is that body.
+//! `PhysObj`s by number (`GetPhysicsObjectNum`, `TranslatePhysBoneToBone`), each where its
+//! bone is. A part welded into another's body is where it is on that body and is not moved by
+//! itself: the first part of the body moves it (sandbox moves every part by the same offset).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,6 +117,8 @@ pub(crate) fn forget(lua: &Lua, handle: EntityHandle) {
 /// and moving as fast as `velocity`. Whether it became one: its model needs bones and a
 /// physics model whose every part has a shape.
 pub(crate) fn init(lua: &Lua, handle: EntityHandle, velocity: Vector) -> bool {
+    // kept by the entity's number, without which its bodies could never be taken away
+    let Some(index) = handle.index else { return false };
     crate::physics::destroy(lua, handle);
     let Some(model) = host(lua).entities.get(handle).map(|e| e.model.clone()) else { return false };
     let (Some(rig), Some(phy)) = (crate::anim::rig(lua, &model), crate::physics::phy(lua, &model)) else { return false };
@@ -194,15 +198,25 @@ pub(crate) fn init(lua: &Lua, handle: EntityHandle, velocity: Vector) -> bool {
                 continue;
             }
             let (point, angles) = pose_of(&rig_pose::multiply(&place, &at_rest(c.child)));
-            let joint = Joint::Ragdoll { point: array(point), angles: turn(angles), limits: c.limits };
+            let joint = Joint::Ragdoll { point: array(point), angles: turn(angles), limits: c.limits, free: false };
             physics.join(made[&a], made[&b], joint, false, [0.0; 2]);
         }
+        // which bodies hit each other: those the rules name, or without rules all but those
+        // joined and those in each other at rest or as posed, which would only be thrown apart
         let pairs = phy.collision_pairs();
+        let joined: Vec<[usize; 2]> = constraints.iter().filter_map(|c| Some([*group.get(c.parent)?, *group.get(c.child)?])).collect();
         let firsts: Vec<usize> = made.keys().copied().collect();
+        let between = |a: usize, b: usize, [i, j]: [usize; 2]| (i == a && j == b) || (i == b && j == a);
+        let mut hits: Vec<[usize; 2]> = Vec::new();
         for (n, &a) in firsts.iter().enumerate() {
             for &b in &firsts[n + 1..] {
-                let hit = pairs.iter().any(|&[i, j]| (group[i] == a && group[j] == b) || (group[i] == b && group[j] == a));
-                if !hit {
+                let hit = match &pairs {
+                    Some(pairs) => pairs.iter().any(|&[i, j]| between(a, b, [group[i], group[j]])),
+                    None => !joined.iter().any(|&p| between(a, b, p)) && !physics.overlapping(made[&a], made[&b]),
+                };
+                if hit {
+                    hits.push([a, b]);
+                } else {
                     physics.set_apart(made[&a], made[&b], true);
                 }
             }
@@ -215,10 +229,16 @@ pub(crate) fn init(lua: &Lua, handle: EntityHandle, velocity: Vector) -> bool {
             }
             physics.set_velocity(id, array(velocity));
         }
+        if pairs.is_none() {
+            for [a, b] in hits {
+                if physics.overlapping(made[&a], made[&b]) {
+                    physics.set_apart(made[&a], made[&b], true);
+                }
+            }
+        }
     }
 
     let root = parts[0].body;
-    let Some(index) = handle.index else { return false };
     host(lua).physics.ragdolls.borrow_mut().insert(index, Ragdoll { entity: handle, parts });
     host(lua).entities.with_mut(handle, |ent| ent.physics = Some(root));
     follow(lua, handle);
@@ -289,9 +309,37 @@ pub(crate) fn moved(lua: &Lua, handle: EntityHandle) -> bool {
     true
 }
 
-/// A part of a ragdoll was moved by itself (`PhysObj:SetPos`): the first takes the entity along.
-pub(crate) fn part_moved(lua: &Lua, handle: EntityHandle) {
+/// Where a part of a ragdoll is (`PhysObj:GetPos`, `GetAngles`): where its bone is, on its
+/// body. None when the entity is no ragdoll or has no such part.
+pub(crate) fn part_pose(lua: &Lua, handle: EntityHandle, part: usize) -> Option<(Vector, Angle)> {
+    let part = get(lua, handle, |r| r.parts.get(part).copied())??;
+    Some(pose_of(&rig_pose::multiply(&body_at(lua, part.body)?, &part.offset)))
+}
+
+/// Moves a part of a ragdoll by itself (`PhysObj:SetPos`, `SetAngles`) to a position and
+/// angles, each as it is when not given; the first part takes the entity along. A part welded
+/// into another's body stays on it, which the body's first part places. Whether the entity
+/// is a ragdoll.
+pub(crate) fn set_part_pose(lua: &Lua, handle: EntityHandle, part: usize, pos: Option<Vector>, angles: Option<Angle>) -> bool {
+    let Some(parts) = get(lua, handle, |r| r.parts.clone()) else { return false };
+    let Some(this) = parts.get(part) else { return true };
+    if parts[..part].iter().any(|p| p.body == this.body) {
+        return true;
+    }
+    let Some((was_pos, was_angles)) = part_pose(lua, handle, part) else { return true };
+    let to = placed(pos.unwrap_or(was_pos), angles.unwrap_or(was_angles));
+    let (origin, angles) = pose_of(&rig_pose::multiply(&to, &rig_pose::invert(&this.offset)));
+    host(lua).physics.physics.borrow_mut().set_pose(this.body, array(origin), turn(angles));
     follow(lua, handle);
+    true
+}
+
+/// A point in the space of a part's body in the part's own (`PhysObj:GetMassCenter`): another
+/// for a part welded into another's body. None when the entity is no ragdoll or has no such
+/// part.
+pub(crate) fn in_part(lua: &Lua, handle: EntityHandle, part: usize, point: Vector) -> Option<Vector> {
+    let offset = get(lua, handle, |r| r.parts.get(part).map(|p| p.offset))??;
+    Some(vector(rig_pose::transform(&rig_pose::invert(&offset), array(point))))
 }
 
 /// After the bodies moved on: the ragdolls whose parts move take their entities along.

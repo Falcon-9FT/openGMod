@@ -1429,7 +1429,9 @@ pub(crate) fn forget(lua: &Lua, gone: EntityHandle) {
 
 /// The death ragdoll (`CreateRagdoll`): an `hl2mp_ragdoll` with the player's model, in place
 /// of the last one - a ragdoll ([`crate::ragdoll`]) posed as the player was drawn, falling on
-/// as the player moved. A model without the physics of one leaves the corpse unseen.
+/// as the player moved. A model without the physics of one leaves the corpse unseen. In GMod
+/// the corpse is the client's alone, so here it lies on the world and on what does not move,
+/// but goes through props that move, which neither push it nor feel it.
 fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
     let old = state(lua, handle, |_, p| p.ragdoll).unwrap_or(EntityHandle::NULL);
     if host(lua).entities.is_valid(old) {
@@ -1452,7 +1454,14 @@ fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
         ent.color = color;
         ent.anim = anim;
     });
-    crate::ragdoll::init(lua, ragdoll, velocity);
+    if crate::ragdoll::init(lua, ragdoll, velocity) {
+        let bodies = crate::ragdoll::bodies(lua, ragdoll).unwrap_or_default();
+        let host = host(lua);
+        let mut physics = host.physics.physics.borrow_mut();
+        for id in bodies {
+            physics.set_aloof(id, true);
+        }
+    }
     with_player(lua, handle, |_, p| p.ragdoll = ragdoll);
     Ok(())
 }

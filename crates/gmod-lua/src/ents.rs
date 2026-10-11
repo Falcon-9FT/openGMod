@@ -404,19 +404,24 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         return;
     };
     // the engine's props take their bodies when they spawn: frozen when the map says "motion
-    // disabled" (8), asleep when it says "start asleep" (1)
+    // disabled", asleep when it says "start asleep" - 8 and 1 for a prop, 16384 and 65536
+    // for a ragdoll, whose "debris" (4, set on most in maps) players and debris go through
     if prop || ragdoll {
+        let (frozen, asleep) = if ragdoll { (16384, 65536) } else { (8, 1) };
         host(lua).entities.with_mut(handle, |ent| {
             ent.solid = SOLID_VPHYSICS;
             ent.move_type = MOVETYPE_VPHYSICS;
         });
         let made = if ragdoll { crate::ragdoll::init(lua, handle, Vector::default()) } else { crate::physics::init_model(lua, handle) };
         if made {
-            if flags & 8 != 0 {
+            if flags & frozen != 0 {
                 crate::physics::set_motion(lua, handle, false);
-            } else if flags & 1 != 0 {
+            } else if flags & asleep != 0 {
                 crate::physics::sleep(lua, handle);
             }
+        }
+        if ragdoll && flags & 4 != 0 {
+            host(lua).entities.with_mut(handle, |ent| ent.collision_group = crate::trace::group::DEBRIS);
         }
     }
     if !scripted {

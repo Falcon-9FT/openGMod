@@ -13,8 +13,9 @@
 //! Bodies are held together by [`Joint`]s - welds, ropes, hinges, what the constraints of GMod
 //! are made of - to each other or to the world ([`Physics::ground`]); a joint given a strength
 //! breaks when pulled harder than that. The parts of a ragdoll hang together by
-//! [`Joint::Ragdoll`]s, each turning only as far as its limits about each axis, and go
-//! through each other unless told otherwise ([`Physics::set_apart`]).
+//! [`Joint::Ragdoll`]s, each turning only as far as its limits about each axis. Two bodies can
+//! be set to go through each other ([`Physics::set_apart`]), and one through every body that
+//! moves ([`Physics::set_aloof`]), as a corpse that only lies on the world.
 
 #![forbid(unsafe_code)]
 
@@ -22,9 +23,9 @@ use std::collections::{HashMap, HashSet};
 
 use rapier3d::math::{Mat3, Pose, Rotation, Vector};
 use rapier3d::prelude::{
-    ActiveHooks, ColliderBuilder, ColliderHandle, GenericJoint, GenericJointBuilder, ImpulseJointHandle, InteractionGroups, JointAxesMask,
-    JointAxis, MassProperties, PairFilterContext, PhysicsHooks, PhysicsWorld, QueryFilter, Ray, RigidBodyBuilder, RigidBodyHandle,
-    RigidBodyType, SharedShape, SolverFlags, SpringJointBuilder,
+    ActiveHooks, Collider, ColliderBuilder, ColliderHandle, GenericJoint, GenericJointBuilder, ImpulseJointHandle, InteractionGroups,
+    JointAxesMask, JointAxis, MassProperties, PairFilterContext, PhysicsHooks, PhysicsWorld, QueryFilter, Ray, RigidBodyBuilder,
+    RigidBodyHandle, RigidBodyType, SharedShape, SolverFlags, SpringJointBuilder,
 };
 
 pub type Vec3 = [f32; 3];
@@ -181,9 +182,10 @@ pub enum Joint {
     NoCollide,
     /// Turning about `point`, the second no farther from how it is now to the first than
     /// `limits`: for each axis (x, y, z) of a frame turned by `angles`, the least and the most
-    /// degrees, -180 to 180. An axis whose limits are both 0 does not turn at all. A joint of a
-    /// ragdoll (a `.phy`'s `ragdollconstraint`), and `phys_ragdollconstraint`.
-    Ragdoll { point: Vec3, angles: Vec3, limits: [[f32; 2]; 3] },
+    /// degrees, -180 to 180. An axis whose limits are both 0 does not turn at all. A `free` one
+    /// holds only how the second turns, not where it goes. A joint of a ragdoll (a `.phy`'s
+    /// `ragdollconstraint`), and `phys_ragdollconstraint`.
+    Ragdoll { point: Vec3, angles: Vec3, limits: [[f32; 2]; 3], free: bool },
 }
 
 /// A joint in a [`Physics`].
@@ -201,6 +203,8 @@ pub struct Physics {
     broken: Vec<JointId>,
     /// Bodies that go through each other, each pair both ways round ([`Physics::set_apart`]).
     apart: HashSet<(RigidBodyHandle, RigidBodyHandle)>,
+    /// Bodies that go through every other body that moves ([`Physics::set_aloof`]).
+    aloof: HashSet<RigidBodyHandle>,
     /// Impacts since they were last asked for, and when each body last made one.
     impacts: Vec<Impact>,
     last_impact: HashMap<RigidBodyHandle, f32>,
@@ -249,6 +253,7 @@ impl Physics {
             strengths: HashMap::new(),
             broken: Vec::new(),
             apart: HashSet::new(),
+            aloof: HashSet::new(),
             impacts: Vec::new(),
             last_impact: HashMap::new(),
             limits: Vec::new(),
@@ -334,6 +339,7 @@ impl Physics {
         if id.0 != self.ground {
             self.world.remove_body(id.0);
             self.apart.retain(|&(a, b)| a != id.0 && b != id.0);
+            self.aloof.remove(&id.0);
             self.inertia.remove(&id.0);
         }
     }
@@ -545,19 +551,30 @@ impl Physics {
         }
     }
 
-    /// The box around a body in the world.
+    /// Where a collider is now: on its body as the body is. A collider follows its body only
+    /// when the world steps, so one whose body was just moved ([`Physics::set_pose`]) still
+    /// says where it was.
+    fn collider_pose(&self, collider: &Collider) -> Pose {
+        match (collider.parent().and_then(|b| self.world.bodies.get(b)), collider.position_wrt_parent()) {
+            (Some(body), Some(local)) => *body.position() * *local,
+            _ => *collider.position(),
+        }
+    }
+
+    /// The box around a body in the world, where it is now.
     pub fn bounds(&self, id: BodyId) -> Option<(Vec3, Vec3)> {
         let mut found: Option<(Vector, Vector)> = None;
         for handle in self.colliders(id) {
             let Some(collider) = self.world.colliders.get(handle) else { continue };
-            let aabb = collider.compute_aabb();
+            let aabb = collider.shape().compute_aabb(&self.collider_pose(collider));
             found = Some(found.map_or((aabb.mins, aabb.maxs), |(lo, hi)| (lo.min(aabb.mins), hi.max(aabb.maxs))));
         }
         found.map(|(lo, hi)| (units(lo), units(hi)))
     }
 
     /// The first body a ray from `start` to `end` hits, past `skip`; the world is not looked at.
-    /// Bodies are found where the last step left them.
+    /// Bodies are found where the last step left them, not where they were moved since
+    /// ([`Physics::ray_into`] finds one where it is now).
     pub fn ray(&self, start: Vec3, end: Vec3, skip: Option<BodyId>) -> Option<Hit> {
         let (from, to) = (metres(start), metres(end));
         let length = (to - from).length();
@@ -565,7 +582,7 @@ impl Physics {
             return None;
         }
         let ray = Ray::new(from, (to - from) / length);
-        let bodies_only = |_: ColliderHandle, c: &rapier3d::prelude::Collider| c.parent().is_some();
+        let bodies_only = |_: ColliderHandle, c: &Collider| c.parent().is_some();
         let mut filter = QueryFilter::new().predicate(&bodies_only);
         if let Some(skip) = skip {
             filter = filter.exclude_rigid_body(skip.0);
@@ -586,10 +603,22 @@ impl Physics {
         let ray = Ray::new(from, (to - from) / length);
         let hits = self.colliders(id).into_iter().filter_map(|handle| {
             let collider = self.world.colliders.get(handle)?;
-            collider.shape().cast_ray_and_get_normal(collider.position(), &ray, length, true)
+            collider.shape().cast_ray_and_get_normal(&self.collider_pose(collider), &ray, length, true)
         });
         let hit = hits.min_by(|a, b| a.time_of_impact.total_cmp(&b.time_of_impact))?;
         Some(Hit { body: id, fraction: hit.time_of_impact / length, normal: hit.normal.to_array() })
+    }
+
+    /// Whether two bodies are in each other where they are now.
+    pub fn overlapping(&self, a: BodyId, b: BodyId) -> bool {
+        let shapes = |id: BodyId| self.colliders(id).into_iter().filter_map(|h| self.world.colliders.get(h)).collect::<Vec<_>>();
+        let (a, b) = (shapes(a), shapes(b));
+        a.iter().any(|x| {
+            b.iter().any(|y| {
+                let hit = rapier3d::parry::query::intersection_test(&self.collider_pose(x), x.shape(), &self.collider_pose(y), y.shape());
+                hit.is_ok_and(|hit| hit.intersecting)
+            })
+        })
     }
 
     /// Whether two bodies go through each other from now on, joined or not: what keeps the
@@ -613,6 +642,26 @@ impl Physics {
         }
         self.wake(a);
         self.wake(b);
+    }
+
+    /// Whether a body goes through every other that moves from now on, as if it were alone with
+    /// the world and what does not move: those that move do not push it or feel it. Two such
+    /// bodies still hit each other.
+    pub fn set_aloof(&mut self, id: BodyId, aloof: bool) {
+        if id.0 == self.ground {
+            return;
+        }
+        if aloof {
+            self.aloof.insert(id.0);
+            for handle in self.colliders(id) {
+                if let Some(collider) = self.world.colliders.get_mut(handle) {
+                    collider.set_active_hooks(collider.active_hooks() | ActiveHooks::FILTER_CONTACT_PAIRS);
+                }
+            }
+        } else {
+            self.aloof.remove(&id.0);
+        }
+        self.wake(id);
     }
 
     /// Whether two bodies go through each other ([`Physics::set_apart`]).
@@ -671,21 +720,30 @@ impl Physics {
                     .data
             }
             Joint::NoCollide => GenericJointBuilder::new(JointAxesMask::empty()).build(),
-            Joint::Ragdoll { point, angles, limits } => {
+            Joint::Ragdoll { point, angles, limits, free } => {
                 // the limits are set anew before every step ([`Physics::aim_limits`])
                 let ranges = limits.map(|[a, b]| [a.min(b), a.max(b)].map(|l| l.clamp(-180.0, 180.0).to_radians()));
                 let still = ranges.iter().all(|r| r[0].abs() < 1e-5 && r[1].abs() < 1e-5);
                 if !still {
                     held = Some(ranges);
                 }
-                // what may not turn at all is welded
-                let mask = if still { JointAxesMask::LOCKED_FIXED_AXES } else { JointAxesMask::LOCKED_SPHERICAL_AXES };
+                // what may not turn at all is welded, but where a free one goes
+                let mask = match (still, free) {
+                    (true, false) => JointAxesMask::LOCKED_FIXED_AXES,
+                    (true, true) => JointAxesMask::ANG_AXES,
+                    (false, false) => JointAxesMask::LOCKED_SPHERICAL_AXES,
+                    (false, true) => JointAxesMask::empty(),
+                };
                 frames(GenericJointBuilder::new(mask), Pose::from_parts(metres(point), rotation(angles))).build()
             }
         };
         let mut data = data;
         data.set_contacts_enabled(collide && joint != Joint::NoCollide);
-        let id = JointId(self.world.insert_impulse_joint(a.0, b.0, data));
+        // the two wake now rather than at the next step, so that one put to sleep after
+        // (a ragdoll that starts asleep) stays asleep
+        let id = JointId(self.world.impulse_joints.insert(a.0, b.0, data, false));
+        self.wake(a);
+        self.wake(b);
         if let Some(ranges) = held {
             self.limits.push(Limit { joint: id, frame: data.local_frame1, ranges });
         }
@@ -805,7 +863,7 @@ impl Physics {
         }
         self.world.integration_parameters.dt = seconds;
         self.aim_limits();
-        self.world.step_with_events(&Apart(&self.apart), &());
+        self.world.step_with_events(&Apart { pairs: &self.apart, aloof: &self.aloof }, &());
         self.clock += seconds;
         self.find_impacts();
         let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
@@ -849,13 +907,20 @@ fn split(turn: Rotation) -> [f32; 3] {
     [2.0 * twist.x.atan2(twist.w), swing.y, swing.z]
 }
 
-/// What keeps the bodies set apart from touching.
-struct Apart<'a>(&'a HashSet<(RigidBodyHandle, RigidBodyHandle)>);
+/// What keeps the bodies set apart, and the aloof ones, from touching.
+struct Apart<'a> {
+    pairs: &'a HashSet<(RigidBodyHandle, RigidBodyHandle)>,
+    aloof: &'a HashSet<RigidBodyHandle>,
+}
 
 impl PhysicsHooks for Apart<'_> {
     fn filter_contact_pair(&self, context: &PairFilterContext) -> Option<SolverFlags> {
-        match (context.rigid_body1, context.rigid_body2) {
-            (Some(a), Some(b)) if self.0.contains(&(a, b)) => None,
+        let (a, b) = (context.rigid_body1, context.rigid_body2);
+        let aloof = |h: Option<RigidBodyHandle>| h.is_some_and(|h| self.aloof.contains(&h));
+        let moves = |h: Option<RigidBodyHandle>| h.and_then(|h| context.bodies.get(h)).is_some_and(|b| b.is_dynamic());
+        match (a, b) {
+            (Some(a), Some(b)) if self.pairs.contains(&(a, b)) => None,
+            _ if aloof(a) != aloof(b) && (aloof(a) && moves(b) || aloof(b) && moves(a)) => None,
             _ => Some(SolverFlags::COMPUTE_RIGID_IMPULSES),
         }
     }

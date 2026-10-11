@@ -339,9 +339,12 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
         let Some((mins, maxs)) = host(lua).entities.get(handle).map(|ent| (ent.mins, ent.maxs)) else { continue };
         let mut part = 0;
         let found = if crate::ragdoll::is_ragdoll(lua, handle) {
+            let Some((lo, hi)) = crate::ragdoll::world_bounds(lua, handle) else { continue };
             if hull {
-                let Some((lo, hi)) = crate::ragdoll::world_bounds(lua, handle) else { continue };
                 through_box(sweep.start, sweep.end, lo - sweep.maxs, hi - sweep.mins)
+            } else if through_box(sweep.start, sweep.end, lo, hi).is_none() {
+                // past the box around them all, no part is looked at
+                None
             } else {
                 crate::ragdoll::trace(lua, handle, sweep.start, sweep.end).map(|(fraction, normal, hit)| {
                     part = hit;

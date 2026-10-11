@@ -72,6 +72,8 @@ const CONSTRAINTS: &[&str] = &[
 const SF_NO_COLLISION: i64 = 1;
 /// A rope that does not get shorter.
 const SF_RIGID: i64 = 2;
+/// A ragdoll constraint that holds only how the two turn ("free movement").
+const SF_FREE: i64 = 2;
 /// Not held until `TurnOn`.
 const SF_START_INACTIVE: i64 = 4;
 
@@ -143,7 +145,8 @@ fn make(lua: &Lua, handle: EntityHandle) {
             "phys_ballsocket" => Joint::Ball { point: at },
             "phys_ragdollconstraint" => {
                 let limits = ["x", "y", "z"].map(|axis| [number(&format!("{axis}min")), number(&format!("{axis}max"))]);
-                Joint::Ragdoll { point: at, angles: [angles.p, angles.y, angles.r], limits }
+                // "only rotation" (constraint.AdvBallsocket's onlyrotation) lets it go anywhere
+                Joint::Ragdoll { point: at, angles: [angles.p, angles.y, angles.r], limits, free: ent.spawn_flags & SF_FREE != 0 }
             }
             "phys_hinge" => Joint::Hinge { point: at, axis: axis("hingeaxis") },
             "phys_slideconstraint" => Joint::Slider { point: at, axis: axis("slideaxis") },

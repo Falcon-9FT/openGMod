@@ -110,6 +110,8 @@ pub(crate) fn load_world(lua: &Lua, collision: Option<&gmod_bsp::Collision>) {
         for (_, kept) in host.physics.bodies.borrow_mut().drain() {
             host.entities.with_mut(kept.entity, |ent| ent.physics = None);
         }
+        // their bodies went with the old world, whose handles the new one gives out again
+        host.physics.ragdolls.borrow_mut().clear();
     }
     attach_world(lua);
 }
@@ -467,9 +469,15 @@ fn vector_value(lua: &Lua, v: Vector) -> mlua::Result<Value> {
     entity::vector(lua, v)
 }
 
-/// Where a body is, as an entity's position and angles.
+/// Where a `PhysObj` is, as an entity's position and angles: a part of a ragdoll where its
+/// bone is, which is not where its body is when welded into another part's.
 fn pose(a: &Args) -> mlua::Result<(Vector, Angle)> {
-    let (origin, angles) = with(a, |p, id| p.pose(id))?.unwrap_or_default();
+    let (handle, id) = this(a)?;
+    let part = a.userdata::<PhysObjHandle>(1, "PhysObj")?.1;
+    if let Some(found) = crate::ragdoll::part_pose(a.lua, handle, part) {
+        return Ok(found);
+    }
+    let (origin, angles) = host(a.lua).physics.physics.borrow().pose(id).unwrap_or_default();
     Ok((vector(origin), angle(angles)))
 }
 
@@ -521,35 +529,30 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let mass = a.number(2)? as f32;
         with(a, |p, id| p.set_mass(id, mass.max(0.001))).map(|_| Value::Nil)
     })?;
-    def("GetMassCenter", |a| vector_value(a.lua, vector(with(a, |p, id| p.mass_center(id))?)))?;
+    def("GetMassCenter", |a| {
+        let (handle, _) = this(a)?;
+        let part = a.userdata::<PhysObjHandle>(1, "PhysObj")?.1;
+        let center = vector(with(a, |p, id| p.mass_center(id))?);
+        vector_value(a.lua, crate::ragdoll::in_part(a.lua, handle, part, center).unwrap_or(center))
+    })?;
     def("GetVolume", |a| Ok(Value::Number(f64::from(with(a, |p, id| p.volume(id))?))))?;
     def("GetPos", |a| vector_value(a.lua, pose(a)?.0))?;
     def("GetAngles", |a| entity::angle(a.lua, pose(a)?.1))?;
     // a part of a ragdoll moves by itself; another body moves its entity
     def("SetPos", |a| {
         let (handle, _) = this(a)?;
+        let part = a.userdata::<PhysObjHandle>(1, "PhysObj")?.1;
         let pos = a.userdata::<Vector>(2, "Vector")?;
-        if crate::ragdoll::is_ragdoll(a.lua, handle) {
-            with(a, |p, id| {
-                let angles = p.pose(id).unwrap_or_default().1;
-                p.set_pose(id, array(pos), angles);
-            })?;
-            crate::ragdoll::part_moved(a.lua, handle);
-        } else {
+        if !crate::ragdoll::set_part_pose(a.lua, handle, part, Some(pos), None) {
             entity::set_world_pos(a.lua, handle, pos);
         }
         Ok(Value::Nil)
     })?;
     def("SetAngles", |a| {
         let (handle, _) = this(a)?;
+        let part = a.userdata::<PhysObjHandle>(1, "PhysObj")?.1;
         let angles = a.userdata::<Angle>(2, "Angle")?;
-        if crate::ragdoll::is_ragdoll(a.lua, handle) {
-            with(a, |p, id| {
-                let origin = p.pose(id).unwrap_or_default().0;
-                p.set_pose(id, origin, turn(angles));
-            })?;
-            crate::ragdoll::part_moved(a.lua, handle);
-        } else {
+        if !crate::ragdoll::set_part_pose(a.lua, handle, part, None, Some(angles)) {
             entity::set_world_angles(a.lua, handle, angles);
         }
         Ok(Value::Nil)

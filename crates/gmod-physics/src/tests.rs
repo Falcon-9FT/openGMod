@@ -316,7 +316,9 @@ fn ragdoll_joints_turn_as_far_as_their_limits() {
         let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
         physics.set_motion(post, false);
         let arm = physics.add(&stick([16.0, 0.0, 200.0])).unwrap();
-        physics.join(post, arm, Joint::Ragdoll { point: [16.0, 0.0, 200.0], angles: [0.0; 3], limits }, false, [0.0; 2]).unwrap();
+        physics
+            .join(post, arm, Joint::Ragdoll { point: [16.0, 0.0, 200.0], angles: [0.0; 3], limits, free: false }, false, [0.0; 2])
+            .unwrap();
         run(&mut physics, 4.0);
         let (origin, angles) = physics.pose(arm).unwrap();
         assert!(near(origin, [16.0, 0.0, 200.0], 1.0), "{limits:?}: {origin:?}");
@@ -331,9 +333,28 @@ fn ragdoll_joints_turn_as_far_as_their_limits() {
     physics.set_motion(post, false);
     let arm = physics.add(&stick([16.0, 0.0, 200.0])).unwrap();
     let limits = [[0.0, 0.0], [-90.0, 90.0], [-90.0, 90.0]];
-    physics.join(post, arm, Joint::Ragdoll { point: [16.0, 0.0, 200.0], angles: [0.0, 90.0, 0.0], limits }, false, [0.0; 2]).unwrap();
+    physics
+        .join(post, arm, Joint::Ragdoll { point: [16.0, 0.0, 200.0], angles: [0.0, 90.0, 0.0], limits, free: false }, false, [0.0; 2])
+        .unwrap();
     run(&mut physics, 2.0);
     assert!(physics.pose(arm).unwrap().1[0].abs() < 3.0, "{:?}", physics.pose(arm));
+}
+
+#[test]
+fn free_ragdoll_joints_hold_only_the_turn() {
+    // a stick that may not turn falls away from its frozen post, still not turning
+    for free in [false, true] {
+        let mut physics = floor();
+        let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
+        physics.set_motion(post, false);
+        let arm = physics.add(&stick([16.0, 0.0, 200.0])).unwrap();
+        let joint = Joint::Ragdoll { point: [16.0, 0.0, 200.0], angles: [0.0; 3], limits: [[0.0; 2]; 3], free };
+        physics.join(post, arm, joint, false, [0.0; 2]).unwrap();
+        run(&mut physics, 2.0);
+        let (origin, angles) = physics.pose(arm).unwrap();
+        let fell = if free { origin[2] < 10.0 } else { near(origin, [16.0, 0.0, 200.0], 1.0) };
+        assert!(fell && near(angles, [0.0; 3], 1.0), "{free}: {origin:?} {angles:?}");
+    }
 }
 
 #[test]
@@ -345,7 +366,9 @@ fn ragdoll_joints_bend_far_as_knees_do() {
     physics.set_motion(post, false);
     let arm = physics.add(&Body { angles: [-90.0, 0.0, 0.0], ..stick([0.0, 0.0, 216.0]) }).unwrap();
     let limits = [[-30.0, 30.0], [-12.0, 12.0], [-12.0, 145.0]];
-    physics.join(post, arm, Joint::Ragdoll { point: [0.0, 0.0, 216.0], angles: [-90.0, 0.0, 0.0], limits }, false, [0.0; 2]).unwrap();
+    physics
+        .join(post, arm, Joint::Ragdoll { point: [0.0, 0.0, 216.0], angles: [-90.0, 0.0, 0.0], limits, free: false }, false, [0.0; 2])
+        .unwrap();
     physics.set_angular_velocity(arm, [0.0, 0.0, 30.0]);
     run(&mut physics, 5.0);
     let (origin, angles) = physics.pose(arm).unwrap();
@@ -405,6 +428,26 @@ fn bodies_set_apart_go_through_each_other() {
 }
 
 #[test]
+fn aloof_bodies_go_through_what_moves() {
+    let mut physics = floor();
+    // through a crate that moves, which feels nothing, onto the floor
+    let below = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    let aloof = physics.add(&crate_body([0.0, 0.0, 100.0])).unwrap();
+    physics.set_aloof(aloof, true);
+    run(&mut physics, 2.0);
+    let (pa, pb) = (physics.pose(aloof).unwrap().0, physics.pose(below).unwrap().0);
+    assert!(near(pa, [0.0, 0.0, 16.0], 1.0) && near(pb, [0.0, 0.0, 16.0], 0.5), "{pa:?} {pb:?}");
+    // one that does not move holds it, and so does another aloof one
+    physics.set_motion(below, false);
+    physics.set_pose(aloof, [0.0, 0.0, 100.0], [0.0; 3]);
+    let other = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
+    physics.set_aloof(other, true);
+    run(&mut physics, 3.0);
+    let (pa, po) = (physics.pose(aloof).unwrap().0, physics.pose(other).unwrap().0);
+    assert!(near(pa, [0.0, 0.0, 48.0], 1.0) && near(po, [0.0, 0.0, 80.0], 2.0), "{pa:?} {po:?}");
+}
+
+#[test]
 fn rays_into_one_body() {
     let mut physics = floor();
     let a = physics.add(&crate_body([0.0, 0.0, 100.0])).unwrap();
@@ -412,4 +455,33 @@ fn rays_into_one_body() {
     let hit = physics.ray_into([-100.0, 0.0, 100.0], [200.0, 0.0, 100.0], b).unwrap();
     assert!(hit.body == b && (hit.fraction - 184.0 / 300.0).abs() < 0.01 && near(hit.normal, [-1.0, 0.0, 0.0], 0.01), "{hit:?}");
     assert!(physics.ray_into([-100.0, 0.0, 200.0], [200.0, 0.0, 200.0], a).is_none());
+    // a body just moved is found where it went, before any step moves its shape along
+    physics.set_pose(b, [100.0, 0.0, 300.0], [0.0; 3]);
+    assert!(physics.ray_into([-100.0, 0.0, 300.0], [200.0, 0.0, 300.0], b).is_some());
+    assert!(physics.ray_into([-100.0, 0.0, 100.0], [200.0, 0.0, 100.0], b).is_none());
+    let (lo, hi) = physics.bounds(b).unwrap();
+    assert!(lo[2] > 250.0 && hi[2] < 350.0 && lo[2] < 300.0 && hi[2] > 300.0, "{lo:?} {hi:?}");
+    // in each other or not, as they are now
+    assert!(!physics.overlapping(a, b));
+    physics.set_pose(b, [20.0, 0.0, 110.0], [0.0; 3]);
+    assert!(physics.overlapping(a, b) && physics.overlapping(b, a));
+}
+
+#[test]
+fn joined_bodies_put_to_sleep_stay_asleep() {
+    // a ragdoll that starts asleep: joined, then put to sleep before any step
+    let mut physics = floor();
+    let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
+    let arm = physics.add(&stick([16.0, 0.0, 200.0])).unwrap();
+    let joint =
+        Joint::Ragdoll { point: [16.0, 0.0, 200.0], angles: [0.0; 3], limits: [[0.0, 0.0], [-30.0, 30.0], [-45.0, 45.0]], free: false };
+    physics.join(post, arm, joint, false, [0.0; 2]).unwrap();
+    physics.sleep(post);
+    physics.sleep(arm);
+    run(&mut physics, 1.0);
+    assert!(physics.asleep(post) && physics.asleep(arm) && near(physics.pose(post).unwrap().0, [0.0, 0.0, 200.0], 0.01));
+    // woken, they fall together
+    physics.wake(arm);
+    run(&mut physics, 1.0);
+    assert!(physics.pose(post).unwrap().0[2] < 150.0 && physics.pose(arm).unwrap().0[2] < 150.0);
 }
