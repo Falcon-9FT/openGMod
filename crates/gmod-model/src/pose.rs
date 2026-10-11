@@ -567,8 +567,17 @@ impl Rig {
     /// Reads every frame of every animation of the rig's models: how many frames there were,
     /// or the first that could not be read.
     pub fn read_all(&self) -> io::Result<usize> {
+        self.read(&self.parts)
+    }
+
+    /// The same for the model's own animations, not those of the models it includes.
+    pub fn read_own(&self) -> io::Result<usize> {
+        self.read(&self.parts[..1])
+    }
+
+    fn read(&self, parts: &[Part]) -> io::Result<usize> {
         let mut frames = 0;
-        for part in &self.parts {
+        for part in parts {
             let mut pose = self.rest();
             for animation in &part.mdl.animations {
                 for frame in 0..animation.frames {

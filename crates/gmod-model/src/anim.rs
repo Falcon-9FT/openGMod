@@ -337,7 +337,15 @@ impl Animation {
         }
         for _ in 0..=u8::MAX as usize {
             let (bone, kind, next) = (usize::from(r.u8(at)?), r.u8(at + 1)?, r.i16(at + 2)?);
-            let rest = bones.get(bone).ok_or_else(|| invalid(format!("{what}: bone {bone} of {}", bones.len())))?;
+            // records go to bones by number: one for a bone the model does not have moves
+            // nothing (an animation that moves no bone has one for bone 255)
+            let Some(rest) = bones.get(bone) else {
+                if next <= 0 {
+                    return Ok(());
+                }
+                at += next as usize;
+                continue;
+            };
             let delta = kind & record::DELTA != 0;
             let mut data_at = at + 4;
             let rotation = if kind & record::RAW_ROTATION_64 != 0 {

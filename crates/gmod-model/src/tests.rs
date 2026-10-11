@@ -693,14 +693,17 @@ fn animations_that_do_not_fit_are_errors_not_poses() {
     // without the .ani at all
     assert!(Rig::new(Mdl::parse(&mdl).unwrap(), None).read_all().is_err());
 
-    // a record for a bone the model does not have
-    let mut broken = mdl.clone();
+    // a record for a bone the model does not have moves nothing, as the engine takes it (an
+    // animation that moves no bone has one for bone 255); one past the file is an error
+    let mut other = mdl.clone();
     let parsed = Mdl::parse(&mdl).unwrap();
     let first = parsed.animations[0].sections[0].at;
-    broken[first] = 7;
-    let rig = Rig::new(Mdl::parse(&broken).unwrap(), None);
-    let error = rig.read_all().unwrap_err().to_string();
-    assert!(error.contains("bone 7 of 3"), "{error}");
+    other[first] = 255;
+    let rig = Rig::new(Mdl::parse(&other).unwrap(), None);
+    assert_eq!(rig.pose(0, 1.0, &[], &[])[1], rig.rest()[1]);
+    other[first + 2..first + 4].copy_from_slice(&i16::MAX.to_le_bytes());
+    let error = Rig::new(Mdl::parse(&other).unwrap(), None).read_all().unwrap_err().to_string();
+    assert!(error.contains("past the end"), "{error}");
     // a sequence playing an animation that is not there
     let mut model = arm();
     model.sequences[0].animations = vec![40];

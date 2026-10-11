@@ -18,6 +18,27 @@ pub fn mdl(checksum: i32, hull: ([f32; 3], [f32; 3])) -> Vec<u8> {
     b
 }
 
+/// The vertices of a model without any (`.vvd`), to go with a header of the same checksum.
+pub fn empty_vvd(checksum: i32) -> Vec<u8> {
+    let mut b = vec![0u8; 64];
+    b[0..4].copy_from_slice(b"IDSV");
+    b[4..8].copy_from_slice(&4i32.to_le_bytes());
+    b[8..12].copy_from_slice(&checksum.to_le_bytes());
+    b[12..16].copy_from_slice(&1i32.to_le_bytes());
+    b[56..60].copy_from_slice(&64i32.to_le_bytes());
+    b
+}
+
+/// The triangles of a model without any body parts (`.vtx`).
+pub fn empty_vtx(checksum: i32) -> Vec<u8> {
+    let mut b = vec![0u8; 36];
+    b[0..4].copy_from_slice(&7i32.to_le_bytes());
+    b[16..20].copy_from_slice(&checksum.to_le_bytes());
+    b[20..24].copy_from_slice(&1i32.to_le_bytes());
+    b[32..36].copy_from_slice(&36i32.to_le_bytes());
+    b
+}
+
 /// A convex piece for [`phy`]: points in the model's units, and triangles in any winding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestConvex {
