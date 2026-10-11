@@ -140,6 +140,12 @@ fn pack(sizes: &[(u32, u32)]) -> (u32, u32, Vec<(u32, u32)>) {
 
 /// Builds the triangles of a brush model.
 pub fn build(bsp: &Bsp, options: Options) -> Mesh {
+    build_faces(bsp, options, |_| true)
+}
+
+/// The same, of the faces `keep` says yes to (by their index in the map's faces): the world
+/// split in two, the 3D sky box and the rest.
+pub fn build_faces(bsp: &Bsp, options: Options, keep: impl Fn(usize) -> bool) -> Mesh {
     let hdr = options.hdr && !bsp.faces_hdr.is_empty() && !bsp.lighting_hdr.is_empty();
     // a map compiled for HDR only has no LDR lighting
     let hdr = hdr || (bsp.lighting.is_empty() && !bsp.faces_hdr.is_empty());
@@ -150,7 +156,7 @@ pub fn build(bsp: &Bsp, options: Options) -> Mesh {
     // faces to draw, by material
     let mut drawn: Vec<(usize, usize)> = Vec::new();
     for index in model.first_face as usize..(model.first_face + model.num_faces) as usize {
-        let Some(face) = faces.get(index) else { continue };
+        let Some(face) = faces.get(index).filter(|_| keep(index)) else { continue };
         let Some(info) = usize::try_from(face.texinfo).ok().and_then(|i| bsp.texinfo.get(i)) else { continue };
         if info.flags & SKIPPED != 0 {
             if info.flags & surf::SKY != 0 {

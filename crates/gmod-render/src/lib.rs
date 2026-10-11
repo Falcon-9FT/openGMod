@@ -9,11 +9,14 @@
 //! moment - the game's `DynamicLight`s and the flashlight ([`Renderer::set_lights`]) - light
 //! the world and the models over their baked light. A model that moves is posed by the
 //! matrices of its bones ([`Placed::bones`]): the vertex shader moves each vertex by the bones
-//! it is weighted to. [`Renderer::render`] draws a frame: the sky box, the opaque surfaces of
-//! the world and the entities, then the translucent ones - the world's from the farthest,
-//! then the entities'; then the view models (the weapon in the player's hands) with their own
-//! field of view, over everything ([`Renderer::set_view_models`]). Depth runs from 1 at the
-//! eye to 0 at infinity. Over it an [`Overlay`] draws the 2D of the HUD and the panels.
+//! it is weighted to. [`Renderer::render`] draws a frame: the sky box, then the 3D sky box
+//! ([`gmod_world::sky`]) seen from its camera, then - depth cleared, so that all of it is
+//! behind - the opaque surfaces of the world and the entities, then the translucent ones - the
+//! world's from the farthest, then the entities'; then the view models (the weapon in the
+//! player's hands) with their own field of view, over everything
+//! ([`Renderer::set_view_models`]). Fog fades what is far towards its colour: the world's fog
+//! in the world, the sky camera's in the 3D sky box. Depth runs from 1 at the eye to 0 at
+//! infinity. Over it an [`Overlay`] draws the 2D of the HUD and the panels.
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +24,8 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use gmod_world::gpu::{self, Camera, Draw, PixelFormat, TextureData};
-use gmod_world::{Texture, World};
+use gmod_world::sky::SkyCamera;
+use gmod_world::{Piece, Texture, World};
 
 mod ui;
 
@@ -55,8 +59,8 @@ const PARAMS_STRIDE: u64 = 256;
 /// Bytes of a surface's parameters.
 const PARAMS_SIZE: u64 = 48;
 /// Bytes of a camera for the shaders: its matrix, its eye, where the light of models comes
-/// from, the lights of the moment, and where the bones of a posed model are.
-const CAMERA_SIZE: u64 = 432;
+/// from, the lights of the moment, where the bones of a posed model are, and the fog.
+const CAMERA_SIZE: u64 = 464;
 /// Bytes of a bone's matrix for the shaders: three rows of four.
 const BONE_SIZE: u64 = 48;
 /// Nothing of a view model closer than this is drawn: a weapon is held close to the eyes.
@@ -145,6 +149,13 @@ pub struct SpotLight {
     pub inner: f32,
 }
 
+/// A point of the world in a model's space, by the model's placement (origin, axes, scale).
+fn model_space(p: [f32; 3], origin: [f32; 3], axes: [[f32; 3]; 3], scale: f32) -> [f32; 3] {
+    let d = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+    let s = 1.0 / scale.max(1e-6);
+    axes.map(|a| (a[0] * d[0] + a[1] * d[1] + a[2] * d[2]) * s)
+}
+
 /// The lights of the moment in a space of their own: a model's, by its placement (origin,
 /// axes, scale); the world's is the identity.
 fn lights_bytes(
@@ -155,11 +166,7 @@ fn lights_bytes(
     axes: [[f32; 3]; 3],
     scale: f32,
 ) -> Vec<f32> {
-    let into = |p: [f32; 3]| {
-        let d = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
-        let s = 1.0 / scale.max(1e-6);
-        axes.map(|a| (a[0] * d[0] + a[1] * d[1] + a[2] * d[2]) * s)
-    };
+    let into = |p: [f32; 3]| model_space(p, origin, axes, scale);
     let turn = |d: [f32; 3]| axes.map(|a| a[0] * d[0] + a[1] * d[1] + a[2] * d[2]);
     let lit: Vec<&PointLight> = points.iter().filter(|p| if models { p.models } else { p.world }).take(MAX_POINT_LIGHTS).collect();
     let mut values = Vec::with_capacity(4 * (2 * MAX_POINT_LIGHTS + 3));
@@ -213,9 +220,14 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     camera_group: wgpu::BindGroup,
     camera_slots: usize,
+    /// The cameras of the sky box and of the 3D sky box.
     sky_camera_buffer: wgpu::Buffer,
     sky_camera_group: wgpu::BindGroup,
     world: Mesh,
+    /// The 3D sky box and its camera.
+    skybox: Option<(Mesh, SkyCamera)>,
+    /// The world's fog, as the shaders take it.
+    fog: [f32; 8],
     models: Vec<Mesh>,
     /// Textures by name, the world's and the models', each uploaded once.
     textures: HashMap<String, Uploaded>,
@@ -374,19 +386,21 @@ fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
     }
 }
 
-/// A camera for the shaders, padded to `CAMERA_STRIDE`: its matrix, its eye, and for a model
-/// its light in the model's space - the ambient cube (w 1 on the first side; 0 for the world,
-/// lit as it was baked), then the directions towards its lights (w 1 for a light) and their
-/// light; the lights of the moment; and for a posed model, its first bone in the frame's bones.
+/// A camera for the shaders, padded to `CAMERA_STRIDE`: its matrix; its eye in the space of
+/// the vertices and how many units of the world one of theirs is (for the distance of fog);
+/// for a model its light in the model's space - the ambient cube (w 1 on the first side; 0
+/// for the world, lit as it was baked), then the directions towards its lights (w 1 for a
+/// light) and their light; the lights of the moment; for a posed model, its first bone in
+/// the frame's bones; and the fog ([`gpu::fog_params`]).
 fn camera_bytes(
     matrix: [f32; 16],
-    eye: [f32; 3],
+    eye: [f32; 4],
     light: Option<&gmod_world::light::ModelLight>,
     moment: &[f32],
     first_bone: Option<usize>,
+    fog: &[f32; 8],
 ) -> Vec<u8> {
     let mut values: Vec<f32> = matrix.iter().chain(&eye).copied().collect();
-    values.push(1.0);
     match light {
         Some(light) => {
             for (i, side) in light.ambient.iter().enumerate() {
@@ -413,6 +427,7 @@ fn camera_bytes(
         Some(bone) => [bone as f32, 1.0, 0.0, 0.0],
         None => [0.0; 4],
     });
+    values.extend(fog);
     let mut bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     bytes.resize(CAMERA_STRIDE as usize, 0);
     bytes
@@ -480,16 +495,16 @@ impl Shared {
         Some((view, usize::from(data.clamp_s) | usize::from(data.clamp_t) << 1))
     }
 
-    /// Uploads the pieces of `world`, whose textures are `textures`.
-    fn mesh(&self, device: &wgpu::Device, queue: &wgpu::Queue, world: &World, textures: &[Uploaded]) -> Mesh {
+    /// Uploads pieces of a world or a model, whose textures are `textures`.
+    fn mesh(&self, device: &wgpu::Device, queue: &wgpu::Queue, pieces: &[Piece], textures: &[Uploaded]) -> Mesh {
         let texture = |index: Option<usize>| pick(textures, &self.missing, index);
-        let geometry = gpu::geometry(world);
+        let geometry = gpu::geometry(pieces);
         let vertices = buffer(device, queue, "vertices", wgpu::BufferUsages::VERTEX, &geometry.vertices);
         let indices = buffer(device, queue, "indices", wgpu::BufferUsages::INDEX, &geometry.indices);
         let mut params = vec![0u8; (geometry.draws.len() as u64 * PARAMS_STRIDE).max(PARAMS_STRIDE) as usize];
         let mut draws = Vec::with_capacity(geometry.draws.len());
         for (i, draw) in geometry.draws.iter().enumerate() {
-            let piece = &world.pieces[draw.piece];
+            let piece = &pieces[draw.piece];
             let surface = &piece.surfaces[draw.surface];
             let values = gpu::surface_params(surface, piece.lightmap.is_some());
             let at = i * PARAMS_STRIDE as usize;
@@ -511,7 +526,7 @@ impl Shared {
             .iter()
             .enumerate()
             .map(|(i, draw)| {
-                let surface = &world.pieces[draw.piece].surfaces[draw.surface];
+                let surface = &pieces[draw.piece].surfaces[draw.surface];
                 let (base, sampler_index) = texture(surface.base);
                 let (blend, _) = texture(surface.base2.or(surface.base));
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -534,8 +549,7 @@ impl Shared {
             })
             .collect();
         // light maps; what is lit per vertex gets the white one
-        let lightmap_groups = world
-            .pieces
+        let lightmap_groups = pieces
             .iter()
             .map(|piece| {
                 let view = piece
@@ -557,8 +571,8 @@ impl Shared {
             })
             .collect();
         // a model that moves takes the bones of its vertices along
-        let bone_count = gpu::bone_count(world);
-        let skin = (bone_count > 0).then(|| (buffer(device, queue, "skin", wgpu::BufferUsages::VERTEX, &gpu::skin(world)), bone_count));
+        let bone_count = gpu::bone_count(pieces);
+        let skin = (bone_count > 0).then(|| (buffer(device, queue, "skin", wgpu::BufferUsages::VERTEX, &gpu::skin(pieces)), bone_count));
         Mesh { vertices, indices, draws, surface_groups, lightmap_groups, skin }
     }
 }
@@ -754,7 +768,7 @@ impl Renderer {
         let (bones_buffer, bones_group) = bones_buffer(device, &layouts.bones, bones_room);
 
         let camera_slots = 1;
-        let sky_camera_buffer = camera_buffer(device, 1);
+        let sky_camera_buffer = camera_buffer(device, 2);
         let sky_camera_group = camera_group(device, &layouts.camera, &sky_camera_buffer);
         let camera_buffer = camera_buffer(device, camera_slots);
         let camera_group = camera_group(device, &layouts.camera, &camera_buffer);
@@ -789,7 +803,8 @@ impl Renderer {
                 uploaded
             })
             .collect();
-        let mesh = shared.mesh(device, queue, world, &textures);
+        let mesh = shared.mesh(device, queue, &world.pieces, &textures);
+        let skybox = world.skybox.as_ref().map(|skybox| (shared.mesh(device, queue, &skybox.pieces, &textures), skybox.camera));
 
         // the sky box: two triangles a face
         let quads = gpu::sky_quads(world);
@@ -821,6 +836,8 @@ impl Renderer {
             sky_camera_buffer,
             sky_camera_group,
             world: mesh,
+            skybox,
+            fog: gpu::fog_params(world.fog.as_ref()),
             models: Vec::new(),
             textures: by_name,
             entities: Vec::new(),
@@ -856,7 +873,7 @@ impl Renderer {
                 uploaded
             })
             .collect();
-        self.models.push(self.shared.mesh(device, queue, model, &textures));
+        self.models.push(self.shared.mesh(device, queue, &model.pieces, &textures));
         ModelId(self.models.len() - 1)
     }
 
@@ -924,7 +941,8 @@ impl Renderer {
         }
         let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let world_lights = lights_bytes(&self.points, self.spot.as_ref(), false, [0.0; 3], identity, 1.0);
-        let mut cameras = camera_bytes(view_projection, camera.eye, None, &world_lights, None);
+        let [x, y, z] = camera.eye;
+        let mut cameras = camera_bytes(view_projection, [x, y, z, 1.0], None, &world_lights, None, &self.fog);
         // the bones of the posed models, one after another
         let mut bones: Vec<u8> = Vec::new();
         let placements = self.entities.iter().map(|p| (p, &view_projection)).chain(self.view_models.iter().map(|p| (p, &held)));
@@ -943,7 +961,9 @@ impl Renderer {
                 }
                 _ => None,
             };
-            cameras.extend(camera_bytes(gpu::multiply(projection, &matrix), camera.eye, Some(&light), &moment, first_bone));
+            let [x, y, z] = model_space(camera.eye, placed.origin, axes, placed.scale);
+            let eye = [x, y, z, placed.scale];
+            cameras.extend(camera_bytes(gpu::multiply(projection, &matrix), eye, Some(&light), &moment, first_bone, &self.fog));
         }
         queue.write_buffer(&self.camera_buffer, 0, &cameras);
         let bone_count = bones.len() / BONE_SIZE as usize;
@@ -954,39 +974,21 @@ impl Renderer {
         if !bones.is_empty() {
             queue.write_buffer(&self.bones_buffer, 0, &bones);
         }
-        queue.write_buffer(&self.sky_camera_buffer, 0, &camera_bytes(camera.sky_projection(aspect), [0.0; 3], None, &[], None));
-        // translucent surfaces from the farthest
-        let distance = |draw: &Draw| {
-            let d = [draw.center[0] - camera.eye[0], draw.center[1] - camera.eye[1], draw.center[2] - camera.eye[2]];
-            d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
-        };
-        let draws = &self.world.draws;
-        let mut opaque: Vec<usize> = (0..draws.len()).filter(|&i| !draws[i].1.translucent()).collect();
-        // opaque ones by pipeline, to switch less
-        opaque.sort_by_key(|&i| draws[i].1 as u8);
-        let mut translucent: Vec<usize> = (0..draws.len()).filter(|&i| draws[i].1.translucent()).collect();
-        translucent.sort_by(|&a, &b| distance(&draws[b].0).total_cmp(&distance(&draws[a].0)));
+        // the sky box's camera, then the 3D sky box's: from the sky camera, with its fog and
+        // none of the lights of the moment, which light the world
+        let mut sky_cameras = camera_bytes(camera.sky_projection(aspect), [0.0, 0.0, 0.0, 1.0], None, &[], None, &[0.0; 8]);
+        let sky_eye = self.skybox.as_ref().map(|(_, sky)| sky.eye(camera.eye));
+        if let (Some((_, sky)), Some(eye)) = (&self.skybox, sky_eye) {
+            // what is nearer than in the world, as the world counts it, is cut off
+            let projection = Camera { eye, ..*camera }.view_projection_near(aspect, gpu::NEAR / sky.scale);
+            let fog = gpu::fog_params(sky.fog.as_ref());
+            sky_cameras.extend(camera_bytes(projection, [eye[0], eye[1], eye[2], 1.0], None, &[], None, &fog));
+        }
+        queue.write_buffer(&self.sky_camera_buffer, 0, &sky_cameras);
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("world"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.25, g: 0.35, b: 0.5, a: 1.0 }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        // the sky: the sky box, then the 3D sky box
+        let clear = wgpu::LoadOp::Clear(wgpu::Color { r: 0.25, g: 0.35, b: 0.5, a: 1.0 });
+        let mut pass = begin_pass(encoder, "sky", target, &depth, clear);
         if let Some(sky) = &self.sky_vertices {
             pass.set_pipeline(&self.pipelines.sky);
             pass.set_bind_group(0, &self.sky_camera_group, &[0]);
@@ -996,6 +998,19 @@ impl Renderer {
                 pass.draw(i as u32 * 6..i as u32 * 6 + 6, 0..1);
             }
         }
+        if let (Some((mesh, _)), Some(eye)) = (&self.skybox, sky_eye) {
+            let draw = Drawing { pipelines: &self.pipelines, camera: &self.sky_camera_group, bones: &self.bones_group };
+            let (opaque, translucent) = order(&mesh.draws, eye);
+            let mut current = None;
+            draw.mesh(&mut pass, &mut current, CAMERA_STRIDE as u32, mesh, opaque);
+            draw.mesh(&mut pass, &mut current, CAMERA_STRIDE as u32, mesh, translucent);
+        }
+        drop(pass);
+
+        // the world, its depth cleared: all of the sky is behind it, however near the 3D sky
+        // box was drawn
+        let mut pass = begin_pass(encoder, "world", target, &depth, wgpu::LoadOp::Load);
+        let (opaque, translucent) = order(&self.world.draws, camera.eye);
         let draw = Drawing { pipelines: &self.pipelines, camera: &self.camera_group, bones: &self.bones_group };
         let mut current = None;
         draw.mesh(&mut pass, &mut current, 0, &self.world, opaque);
@@ -1015,23 +1030,7 @@ impl Renderer {
         }
         // the view models over everything: what they hide of the world they hide, however near
         // a wall is
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("view models"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        let mut pass = begin_pass(encoder, "view models", target, &depth, wgpu::LoadOp::Load);
         let mut current = None;
         let first = 1 + self.entities.len();
         for translucent in [false, true] {
@@ -1042,6 +1041,47 @@ impl Renderer {
             }
         }
     }
+}
+
+/// A pass drawing into `target`, its colour loaded or cleared, its depth cleared.
+fn begin_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+/// The order to draw a mesh's surfaces seen from `eye`: the opaque ones by pipeline, to
+/// switch less, and the translucent ones from the farthest.
+fn order(draws: &[(Draw, Kind)], eye: [f32; 3]) -> (Vec<usize>, Vec<usize>) {
+    let distance = |draw: &Draw| {
+        let d = [draw.center[0] - eye[0], draw.center[1] - eye[1], draw.center[2] - eye[2]];
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+    };
+    let mut opaque: Vec<usize> = (0..draws.len()).filter(|&i| !draws[i].1.translucent()).collect();
+    opaque.sort_by_key(|&i| draws[i].1 as u8);
+    let mut translucent: Vec<usize> = (0..draws.len()).filter(|&i| draws[i].1.translucent()).collect();
+    translucent.sort_by(|&a, &b| distance(&draws[b].0).total_cmp(&distance(&draws[a].0)));
+    (opaque, translucent)
 }
 
 /// What every draw of a frame shares: the pipelines, the cameras and the bones.

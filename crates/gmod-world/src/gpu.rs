@@ -13,7 +13,8 @@ use gmod_material::decode::to_half;
 use gmod_material::vtf::flags;
 use gmod_material::{Format, Vtf};
 
-use crate::{SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
+use crate::sky::Fog;
+use crate::{Piece, SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
 
 /// Bytes of one vertex: position (3 `f32`), normal (3), texture coordinates (2), light map
 /// coordinates (2), blend alpha (1) and vertex light (3).
@@ -25,9 +26,9 @@ pub const SKIN_SIZE: usize = 16;
 
 /// The bones of every vertex, in the order of [`geometry`]'s vertices; vertices of pieces
 /// that do not move have their first bone's whole weight.
-pub fn skin(world: &World) -> Vec<u8> {
+pub fn skin(pieces: &[Piece]) -> Vec<u8> {
     let mut out = Vec::new();
-    for piece in &world.pieces {
+    for piece in pieces {
         for i in 0..piece.vertices.len() {
             let w = piece.skin.get(i).copied().unwrap_or(crate::Weights { bones: [0; 3], weights: [1.0, 0.0, 0.0] });
             out.extend([w.bones[0], w.bones[1], w.bones[2], 0]);
@@ -39,8 +40,8 @@ pub fn skin(world: &World) -> Vec<u8> {
 
 /// How many bones a world's vertices need: one past the highest they name; 0 for one that
 /// does not move.
-pub fn bone_count(world: &World) -> usize {
-    let named = world.pieces.iter().flat_map(|p| &p.skin).flat_map(|w| (0..3).filter(|&i| w.weights[i] > 0.0).map(|i| w.bones[i]));
+pub fn bone_count(pieces: &[Piece]) -> usize {
+    let named = pieces.iter().flat_map(|p| &p.skin).flat_map(|w| (0..3).filter(|&i| w.weights[i] > 0.0).map(|i| w.bones[i]));
     named.max().map_or(0, |b| usize::from(b) + 1)
 }
 
@@ -65,10 +66,10 @@ pub struct Geometry {
 }
 
 /// Lays out the world's triangles.
-pub fn geometry(world: &World) -> Geometry {
+pub fn geometry(pieces: &[Piece]) -> Geometry {
     let mut out = Geometry::default();
     let (mut vertex_count, mut index_count) = (0u32, 0u32);
-    for (p, piece) in world.pieces.iter().enumerate() {
+    for (p, piece) in pieces.iter().enumerate() {
         for v in &piece.vertices {
             let values = [
                 v.position[0],
@@ -207,7 +208,8 @@ pub const LIGHT_VERTEX: f32 = 2.0;
 
 /// The 12 floats a shader gets for a surface: tint and alpha; water colour and whether it is
 /// water; alpha test reference (0 for none), how it is lit, whether the second texture blends
-/// in, and 0.
+/// in, and whether it adds its light (fog fades it to nothing, where it fades the others to
+/// the fog's colour).
 pub fn surface_params(surface: &Surface, has_lightmap: bool) -> [f32; 12] {
     let light = match () {
         _ if !surface.lit => LIGHT_NONE,
@@ -228,8 +230,20 @@ pub fn surface_params(surface: &Surface, has_lightmap: bool) -> [f32; 12] {
         surface.alpha_test.unwrap_or(0.0),
         light,
         if surface.base2.is_some() { 1.0 } else { 0.0 },
-        0.0,
+        if surface.additive { 1.0 } else { 0.0 },
     ]
+}
+
+/// The 8 floats a shader gets for fog: its colour and how thick it gets at most; where it
+/// starts, one over how far it thickens, and 1 when there is fog (all 0 when there is none).
+pub fn fog_params(fog: Option<&Fog>) -> [f32; 8] {
+    match fog {
+        Some(fog) => {
+            let [r, g, b] = fog.color;
+            [r, g, b, fog.max_density, fog.start, fog.inverse_range(), 1.0, 0.0]
+        }
+        None => [0.0; 8],
+    }
 }
 
 /// The camera, with angles as Source counts them: yaw 0 looks along +x and 90 along +y,
@@ -360,7 +374,7 @@ pub fn sky_quads(world: &World) -> Vec<SkyQuad> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Piece, SkyFace, Transform, Vertex, sky_face};
+    use crate::{SkyFace, Transform, Vertex, sky_face};
 
     fn surface(first: usize, count: usize) -> Surface {
         Surface { base: Some(0), missing: false, ..Surface::plain("m", first, count) }
@@ -384,6 +398,8 @@ mod tests {
             pieces: vec![piece(0.0), piece(5.0)],
             textures: Vec::new(),
             sky: [None, None, None, None, Some(SkyFace { texture: 3, transform: None }), None],
+            skybox: None,
+            fog: None,
             missing_materials: Vec::new(),
             missing_textures: Vec::new(),
             missing_models: Vec::new(),
@@ -394,18 +410,18 @@ mod tests {
     fn the_bones_of_the_vertices() {
         let mut world = world();
         // the world does not move: every vertex its first bone's, and no bones needed
-        assert_eq!(skin(&world).len(), 8 * SKIN_SIZE);
-        assert_eq!(bone_count(&world), 0);
+        assert_eq!(skin(&world.pieces).len(), 8 * SKIN_SIZE);
+        assert_eq!(bone_count(&world.pieces), 0);
         world.pieces[1].skin = vec![crate::Weights { bones: [2, 7, 0], weights: [0.5, 0.5, 0.0] }; 4];
-        let bytes = skin(&world);
+        let bytes = skin(&world.pieces);
         assert_eq!(&bytes[..8], [0, 0, 0, 0, 0, 0, 0x80, 0x3f], "the first piece: bone 0, weight 1");
         assert_eq!(&bytes[4 * SKIN_SIZE..4 * SKIN_SIZE + 8], [2, 7, 0, 0, 0, 0, 0, 0x3f]);
-        assert_eq!(bone_count(&world), 8);
+        assert_eq!(bone_count(&world.pieces), 8);
     }
 
     #[test]
     fn one_buffer_for_all_pieces() {
-        let g = geometry(&world());
+        let g = geometry(&world().pieces);
         assert_eq!(g.vertices.len(), 8 * VERTEX_SIZE);
         let indices: Vec<u32> = g.indices.chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         assert_eq!(indices, [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
@@ -427,7 +443,9 @@ mod tests {
         s.water = Some([0.1, 0.2, 0.3]);
         s.alpha_test = Some(0.4);
         let p = surface_params(&s, true);
-        assert_eq!((p[4], p[7], p[8], p[9]), (0.1, 1.0, 0.4, LIGHT_NONE));
+        assert_eq!((p[4], p[7], p[8], p[9], p[11]), (0.1, 1.0, 0.4, LIGHT_NONE, 0.0));
+        s.additive = true;
+        assert_eq!(surface_params(&s, true)[11], 1.0);
     }
 
     fn transform(m: &[f32; 16], p: Vec3) -> [f32; 4] {

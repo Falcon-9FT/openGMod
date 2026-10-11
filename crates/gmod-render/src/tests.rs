@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use super::*;
 
+mod skybox;
+
 fn validate(name: &str, source: &str) {
     let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
@@ -171,6 +173,8 @@ fn draws_models_where_the_entities_are() {
         }],
         textures: Vec::new(),
         sky: Default::default(),
+        skybox: None,
+        fog: None,
         missing_materials: Vec::new(),
         missing_textures: Vec::new(),
         missing_models: Vec::new(),
@@ -281,6 +285,8 @@ fn square(bone: Option<u8>) -> World {
         pieces: vec![gmod_world::Piece { vertices, indices: vec![0, 1, 2, 0, 2, 3], lightmap: None, surfaces: vec![surface], skin }],
         textures: Vec::new(),
         sky: Default::default(),
+        skybox: None,
+        fog: None,
         missing_materials: Vec::new(),
         missing_textures: Vec::new(),
         missing_models: Vec::new(),

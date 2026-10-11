@@ -323,6 +323,38 @@ impl Bsp {
     pub fn worldspawn(&self) -> Option<&Entity> {
         self.entities.iter().find(|e| e.class_name() == "worldspawn")
     }
+
+    /// The leaf of the world's tree a point is in: its index in `leaves`.
+    pub fn leaf_at(&self, point: [f32; 3]) -> Option<usize> {
+        // `parse` made sure every node's children come after it: the walk ends
+        let mut node = self.models.first()?.head_node;
+        while let Ok(i) = usize::try_from(node) {
+            let n = self.nodes.get(i)?;
+            let plane = self.planes.get(usize::try_from(n.plane).ok()?)?;
+            node = n.children[usize::from(math::dot(plane.normal, point) < plane.dist)];
+        }
+        Some((-1 - node) as usize).filter(|&leaf| leaf < self.leaves.len())
+    }
+
+    /// The area of the leaf a point is in. Compilers flood areas through the open space, so a
+    /// sealed room of its own - the 3D sky box - is an area of its own; 0 is none (outside
+    /// the world, or in the solid).
+    pub fn area_at(&self, point: [f32; 3]) -> Option<u16> {
+        self.leaves.get(self.leaf_at(point)?).map(|leaf| leaf.area).filter(|&area| area != 0)
+    }
+
+    /// The area a face of the world is seen from: that of the open space a unit in front of
+    /// its middle.
+    pub fn face_area(&self, face: &Face) -> Option<u16> {
+        let plane = self.planes.get(usize::from(face.plane))?;
+        let first = usize::try_from(face.first_edge).ok()?;
+        let count = usize::try_from(face.num_edges).ok().filter(|&n| n > 0)?;
+        self.surfedges.get(first..first + count)?;
+        let sum = self.face_vertices(face).fold([0.0; 3], math::add);
+        let middle = math::scale(sum, 1.0 / count as f32);
+        let normal = if face.side != 0 { math::scale(plane.normal, -1.0) } else { plane.normal };
+        self.area_at(math::add(middle, normal))
+    }
 }
 
 /// A small map written for tests, also those of crates that read maps (feature `testmap`).

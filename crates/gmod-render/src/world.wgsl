@@ -1,8 +1,10 @@
 // The world, brush entities, props and the models of entities: base texture (blended with a
-// second one on displacements), times light from the light map or the vertex, times the tint.
+// second one on displacements), times light from the light map or the vertex, times the tint;
+// then fog by the distance from the eye.
 
 struct Camera {
     view_projection: mat4x4<f32>,
+    // in the space of the vertices; w: how many units of the world one of theirs is
     eye: vec4<f32>,
     // for a model of an entity, in the model's space: the ambient light cube (+x, -x, +y, -y,
     // +z, -z; w of the first 1), the directions towards its lights (w 1 for a light) and their
@@ -20,6 +22,10 @@ struct Camera {
     spot_color: vec4<f32>,
     // a posed model: x its first bone in `bones`, y 1 when it is posed
     skin: vec4<f32>,
+    // fog: rgb its colour, w how much it covers at most; x where it starts, y one over how
+    // far it thickens, z 1 when there is fog
+    fog_color: vec4<f32>,
+    fog_range: vec4<f32>,
 };
 
 struct Surface {
@@ -28,7 +34,7 @@ struct Surface {
     // rgb fog colour, w: 1 for water
     water: vec4<f32>,
     // x: alpha test reference (0: none), y: light (0 none, 1 light map, 2 vertex),
-    // z: 1 when the second texture blends in
+    // z: 1 when the second texture blends in, w: 1 when it adds its light
     options: vec4<f32>,
 };
 
@@ -170,7 +176,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
     if (surface.water.w > 0.5) {
-        return vec4<f32>(surface.water.rgb, 0.75);
+        return vec4<f32>(fogged(surface.water.rgb, input.position), 0.75);
     }
     var light = vec3<f32>(1.0, 1.0, 1.0);
     if (surface.options.y > 1.5) {
@@ -182,5 +188,19 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let n = input.normal / max(length(input.normal), 1e-6);
         light += moment_light(input.position, n);
     }
-    return vec4<f32>(albedo.rgb * surface.tint.rgb * light, albedo.a * surface.tint.a);
+    return vec4<f32>(fogged(albedo.rgb * surface.tint.rgb * light, input.position), albedo.a * surface.tint.a);
+}
+
+// fog, linear with the distance from the eye: towards its colour, or for what adds its light
+// towards nothing
+fn fogged(color: vec3<f32>, position: vec3<f32>) -> vec3<f32> {
+    if (camera.fog_range.z < 0.5) {
+        return color;
+    }
+    let d = length(position - camera.eye.xyz) * camera.eye.w;
+    let amount = clamp((d - camera.fog_range.x) * camera.fog_range.y, 0.0, 1.0) * camera.fog_color.w;
+    if (surface.options.w > 0.5) {
+        return color * (1.0 - amount);
+    }
+    return mix(color, camera.fog_color.rgb, amount);
 }

@@ -301,14 +301,28 @@ pub struct TestStaticProp {
     pub solid: u8,
 }
 
+/// A face of a [`TestMap`]'s world, without light map: its corners, clockwise seen from the
+/// front as the game winds them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestFace {
+    pub corners: Vec<[f32; 3]>,
+    pub material: &'static str,
+    /// `surf` flags.
+    pub flags: i32,
+}
+
 /// A map of brushes for tests, lump by lump: the world and brush entities, each with a BSP
-/// tree split along its brushes' bounds, displacements in the world, static props, and
-/// entities.
+/// tree split along its brushes' bounds, displacements and faces in the world, static props,
+/// and entities.
 #[derive(Debug, Clone, Default)]
 pub struct TestMap {
     /// The brushes of each brush model; the first are the world's.
     pub models: Vec<Vec<TestBrush>>,
     pub displacements: Vec<TestDisplacement>,
+    pub faces: Vec<TestFace>,
+    /// Areas of the world's leaves: a leaf whose middle is inside a box (mins, maxs) is in its
+    /// area; the others in none (0).
+    pub areas: Vec<([f32; 3], [f32; 3], u16)>,
     pub static_props: Vec<TestStaticProp>,
     /// The entities after `worldspawn`, as the entity lump writes them.
     pub entities: String,
@@ -336,6 +350,7 @@ struct Tree {
     leaf_brushes: Vec<u8>,
     leaf_brush_count: usize,
     old_leaves: bool,
+    areas: Vec<([f32; 3], [f32; 3], u16)>,
 }
 
 impl Tree {
@@ -351,7 +366,11 @@ impl Tree {
     fn leaf(&mut self, brushes: &[Boxed], contents: &[u32], region: ([f32; 3], [f32; 3])) -> i32 {
         let mut leaf = brushes.iter().fold(0u32, |c, b| c | contents[b.0]).to_le_bytes().to_vec();
         leaf.extend(0i16.to_le_bytes()); // cluster
-        leaf.extend(0u16.to_le_bytes()); // area and flags
+        let middle: [f32; 3] = std::array::from_fn(|i| (region.0[i] + region.1[i]) / 2.0);
+        let inside = |(lo, hi, _): &&([f32; 3], [f32; 3], u16)| (0..3).all(|i| lo[i] <= middle[i] && middle[i] <= hi[i]);
+        // leaf 0 is outside everything
+        let area = self.areas.iter().find(inside).filter(|_| self.leaf_count > 0).map_or(0, |a| a.2);
+        leaf.extend(area.to_le_bytes()); // area, and no flags
         for v in region.0.iter().chain(&region.1) {
             leaf.extend((v.clamp(-32768.0, 32767.0) as i16).to_le_bytes());
         }
@@ -391,8 +410,16 @@ impl Tree {
                 }
             }
         }
-        let (axis, value) = match best {
-            Some((axis, value, _)) => (axis, value),
+        // the areas split the tree too, so that no leaf is partly in one
+        let overlaps = |(lo, hi, _): &&([f32; 3], [f32; 3], u16)| (0..3).all(|i| lo[i] < region.1[i] && hi[i] > region.0[i]);
+        let area_side = self
+            .areas
+            .iter()
+            .filter(overlaps)
+            .flat_map(|(lo, hi, _)| (0..3).flat_map(move |axis| [(axis, lo[axis]), (axis, hi[axis])]))
+            .find(|&(axis, value)| region.0[axis] < value && value < region.1[axis]);
+        let (axis, value) = match area_side.or(best.map(|(axis, value, _)| (axis, value))) {
+            Some((axis, value)) => (axis, value),
             None if node_needed => (0, (region.0[0] + region.1[0]) / 2.0),
             None => return self.leaf(brushes, contents, region),
         };
@@ -423,7 +450,7 @@ impl Tree {
 impl TestMap {
     /// The map's bytes.
     pub fn bytes(&self) -> Vec<u8> {
-        let mut tree = Tree { old_leaves: self.old_leaves, ..Tree::default() };
+        let mut tree = Tree { old_leaves: self.old_leaves, areas: self.areas.clone(), ..Tree::default() };
         // leaf 0, as compilers write it: outside everything
         tree.leaf(&[], &[], ([0.0; 3], [0.0; 3]));
 
@@ -479,7 +506,9 @@ impl TestMap {
             }
             let region = (lo.map(|v| v - 1.0), hi.map(|v| v + 1.0));
             let head = tree.build(&boxed, &contents, region, 0, true);
-            let faces = if m == 0 { self.displacements.len() as i32 } else { 0 };
+            // areas are the world's
+            tree.areas.clear();
+            let faces = if m == 0 { (self.displacements.len() + self.faces.len()) as i32 } else { 0 };
             models.extend(f32s(&[lo, hi, [0.0; 3]].concat()));
             models.extend(i32s(&[head, 0, faces]));
         }
@@ -516,6 +545,27 @@ impl TestMap {
                 disp_verts.extend(f32s(&[0.0, 0.0, 1.0, *h, 0.0]));
             }
             vert_count += side * side;
+        }
+        for test_face in &self.faces {
+            let first_vertex = vertices.len() / 12;
+            let first_edge = surfedges.len() / 4;
+            let n = test_face.corners.len();
+            for (c, corner) in test_face.corners.iter().enumerate() {
+                vertices.extend(f32s(corner));
+                let edge = edges.len() / 4;
+                edges.extend(((first_vertex + c) as u16).to_le_bytes());
+                edges.extend(((first_vertex + (c + 1) % n) as u16).to_le_bytes());
+                surfedges.extend((edge as i32).to_le_bytes());
+            }
+            // clockwise from the front: the normal is the second edge across the first
+            let [a, b, c] = [0, 1, 2].map(|i| test_face.corners[i]);
+            let (ab, ac) = (crate::math::sub(b, a), crate::math::sub(c, a));
+            let normal = crate::math::normalize(crate::math::cross(ac, ab));
+            let plane = tree.plane(normal, crate::math::dot(normal, a));
+            let texinfo = surface(test_face.material, test_face.flags);
+            let mut bytes = face(plane as u16, first_edge as i32, texinfo, -1, -1, [0, 0], [0, 0]);
+            bytes[8..10].copy_from_slice(&(n as i16).to_le_bytes()); // the number of edges
+            faces.extend(bytes);
         }
 
         let mut string_data = Vec::new();

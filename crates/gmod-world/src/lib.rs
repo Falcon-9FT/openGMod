@@ -5,8 +5,9 @@
 //! (`func_brush`, doors ...) moved to where it stands, and every static prop with its model -
 //! each a list of triangles grouped into [`Surface`]s by material. Brushes are lit by their
 //! light maps, props by the light baked into the map for each of their vertices. Alongside
-//! come the textures the materials use, still as VTF files (a GPU takes DXT as it is), and the
-//! sky box.
+//! come the textures the materials use, still as VTF files (a GPU takes DXT as it is), the
+//! sky box, and the fog. What stands in the room of the 3D sky box is kept apart from the
+//! world, to be drawn behind it ([`sky`]).
 //!
 //! The map's pakfile holds materials, models and the props' light: mount it in front first
 //! ([`mount_pakfile`]), as the engine does while the map is played. [`gpu`] lays the world out
@@ -30,6 +31,7 @@ use gmod_model::{Mdl, Model, Vhv};
 
 pub mod gpu;
 pub mod light;
+pub mod sky;
 
 pub use gmod_bsp::mesh::Lightmap;
 
@@ -228,6 +230,10 @@ pub struct World {
     pub textures: Vec<Texture>,
     /// The sky box faces, in the order of [`SKY_FACES`].
     pub sky: [Option<SkyFace>; 6],
+    /// The 3D sky box, drawn between the sky box and the world ([`sky`]).
+    pub skybox: Option<sky::Skybox>,
+    /// The world's fog.
+    pub fog: Option<sky::Fog>,
     /// What the map needs but the game does not have.
     pub missing_materials: Vec<String>,
     pub missing_textures: Vec<String>,
@@ -235,8 +241,10 @@ pub struct World {
 }
 
 impl World {
+    /// The triangles drawn: the world's and the 3D sky box's.
     pub fn triangles(&self) -> usize {
-        self.pieces.iter().map(|p| p.indices.len() / 3).sum()
+        let pieces = self.pieces.iter().chain(self.skybox.iter().flat_map(|s| &s.pieces));
+        pieces.map(|p| p.indices.len() / 3).sum()
     }
 }
 
@@ -494,8 +502,10 @@ impl Gather<'_> {
 /// Gathers a map ready to draw. The map's pakfile should be mounted ([`mount_pakfile`]).
 pub fn load(vfs: &Vfs, bsp: &Bsp) -> World {
     let mut gather = Gather::new(vfs);
-    let mut pieces = brushes(bsp, &mut gather);
-    let missing_models = static_props(bsp, &mut gather, &mut pieces);
+    let camera = sky::sky_camera(bsp);
+    let sky_area = camera.map(|c| c.area);
+    let [mut pieces, mut sky_pieces] = brushes(bsp, &mut gather, sky_area);
+    let missing_models = static_props(bsp, &mut gather, sky_area, [&mut pieces, &mut sky_pieces]);
     let sky_name = bsp.worldspawn().and_then(|w| w.get("skyname")).unwrap_or("").to_string();
     let sky = std::array::from_fn(|i| {
         if sky_name.is_empty() {
@@ -509,18 +519,46 @@ pub fn load(vfs: &Vfs, bsp: &Bsp) -> World {
         pieces,
         textures: gather.textures,
         sky,
+        skybox: camera.map(|camera| sky::Skybox { camera, pieces: sky_pieces }),
+        fog: sky::fog(bsp),
         missing_materials: gather.missing_materials,
         missing_textures: gather.missing_textures,
         missing_models,
     }
 }
 
-/// The world and the brush entities, each moved to where it stands.
-fn brushes(bsp: &Bsp, gather: &mut Gather) -> Vec<Piece> {
+/// The world and the brush entities, each moved to where it stands: those outside the 3D sky
+/// box's area, and those in it.
+fn brushes(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>) -> [Vec<Piece>; 2] {
     let mut materials: HashMap<usize, Option<Arc<Material>>> = HashMap::new();
-    let mut pieces = Vec::new();
+    let mut pieces = [Vec::new(), Vec::new()];
+    // which faces of the world are the sky box's (the HDR faces go along with the others)
+    let faces = if bsp.faces.is_empty() { &bsp.faces_hdr } else { &bsp.faces };
+    let in_sky: Vec<bool> = match sky_area {
+        Some(area) => faces.iter().map(|face| bsp.face_area(face) == Some(area)).collect(),
+        None => Vec::new(),
+    };
+    // the world in two when there is a sky box; a brush entity is where the middle of its
+    // bounds is
+    let mut placed = Vec::new();
     for (model, origin, angles) in placed_models(bsp) {
-        let mesh = mesh::build(bsp, mesh::Options { model, ..mesh::Options::default() });
+        if model == 0 {
+            placed.push((false, model, origin, angles));
+            if sky_area.is_some() {
+                placed.push((true, model, origin, angles));
+            }
+            continue;
+        }
+        let middle = bsp.models.get(model).map(|m| add(origin, scale(add(m.mins, m.maxs), 0.5)));
+        placed.push((sky_area.is_some() && middle.is_some_and(|m| bsp.area_at(m) == sky_area), model, origin, angles));
+    }
+    for (sky, model, origin, angles) in placed {
+        let options = mesh::Options { model, ..mesh::Options::default() };
+        let mesh = if model == 0 {
+            mesh::build_faces(bsp, options, |i| in_sky.get(i).copied().unwrap_or(false) == sky)
+        } else {
+            mesh::build(bsp, options)
+        };
         if mesh.indices.is_empty() {
             continue;
         }
@@ -545,14 +583,15 @@ fn brushes(bsp: &Bsp, gather: &mut Gather) -> Vec<Piece> {
             let material = materials.entry(batch.material).or_insert_with(|| gather.material(name)).clone();
             surfaces.push(gather.surface(name, material.as_deref(), batch.first_index as usize, batch.index_count as usize));
         }
-        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces, skin: Vec::new() });
+        let piece = Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces, skin: Vec::new() };
+        pieces[usize::from(sky)].push(piece);
     }
     pieces
 }
 
-/// The static props, each with its model and baked light; returns the models that could not
-/// be read.
-fn static_props(bsp: &Bsp, gather: &mut Gather, pieces: &mut Vec<Piece>) -> Vec<String> {
+/// The static props, each with its model and baked light, into the pieces of the world or of
+/// the 3D sky box by their area; returns the models that could not be read.
+fn static_props(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>, [world, skybox]: [&mut Vec<Piece>; 2]) -> Vec<String> {
     let mut models: HashMap<u16, Option<Model>> = HashMap::new();
     let mut missing = Vec::new();
     let hdr = !bsp.lighting_hdr.is_empty();
@@ -600,7 +639,13 @@ fn static_props(bsp: &Bsp, gather: &mut Gather, pieces: &mut Vec<Piece>) -> Vec<
             }
         }
         let surfaces = model_surfaces(gather, model, &mesh);
-        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: None, surfaces, skin: Vec::new() });
+        // in the area of the leaves the map lists for it, else of where it stands
+        let first = usize::from(prop.first_leaf);
+        let leaves = bsp.static_props.leaves.get(first..first + usize::from(prop.leaf_count)).unwrap_or(&[]);
+        let listed = leaves.iter().filter_map(|&leaf| bsp.leaves.get(usize::from(leaf))).map(|leaf| leaf.area).find(|&area| area != 0);
+        let sky = sky_area.is_some() && listed.or_else(|| bsp.area_at(prop.origin)) == sky_area;
+        let piece = Piece { vertices, indices: mesh.indices, lightmap: None, surfaces, skin: Vec::new() };
+        if sky { skybox.push(piece) } else { world.push(piece) }
     }
     missing
 }
@@ -664,6 +709,8 @@ pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
         pieces: vec![Piece { vertices, indices: mesh.indices, lightmap: None, surfaces, skin: bones }],
         textures: gather.textures,
         sky: Default::default(),
+        skybox: None,
+        fog: None,
         missing_materials: gather.missing_materials,
         missing_textures: gather.missing_textures,
         missing_models: Vec::new(),
