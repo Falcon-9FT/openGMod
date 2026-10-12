@@ -149,6 +149,8 @@ pub struct Ent {
     pub mover: Option<Box<crate::movers::Mover>>,
     /// What a charger on a wall keeps ([`crate::items`]).
     pub charger: Option<Box<crate::items::Charger>>,
+    /// What an NPC keeps ([`crate::npc`]).
+    pub npc: Option<Box<crate::npc::Npc>>,
 }
 
 /// How a bone is moved from where its model has it.
@@ -234,6 +236,7 @@ impl Ent {
             trigger_state: None,
             mover: None,
             charger: None,
+            npc: None,
         }
     }
 
@@ -691,8 +694,8 @@ pub(crate) fn set_model(lua: &Lua, handle: EntityHandle, model: &str) {
     let bounds = crate::ents::model_bounds(lua, model);
     host(lua).entities.with_mut(handle, |ent| {
         ent.model = model.to_string();
-        // a player's box is its hull, whatever the model
-        if let Some((mins, maxs)) = bounds.filter(|_| ent.player.is_none()) {
+        // a player's box is its hull, whatever the model, and so is an NPC's
+        if let Some((mins, maxs)) = bounds.filter(|_| ent.player.is_none() && ent.npc.is_none()) {
             ent.mins = mins;
             ent.maxs = maxs;
         }

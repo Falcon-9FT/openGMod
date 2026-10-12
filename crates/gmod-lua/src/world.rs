@@ -1,6 +1,6 @@
-//! The libraries about the world that still answer as if it were empty - `ai` (there are no
-//! NPCs and no node graph yet) and `motionsensor` (no Kinect, ever). Entities are in
-//! [`crate::ents`], players in [`crate::player`].
+//! The libraries about the world that still answer as if it were empty - `ai` (there is no
+//! node graph yet; its squads are [`crate::npc`]'s) and `motionsensor` (no Kinect, ever).
+//! Entities are in [`crate::ents`], players in [`crate::player`].
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

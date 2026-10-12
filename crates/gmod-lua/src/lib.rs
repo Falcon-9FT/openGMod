@@ -33,10 +33,11 @@
 //!   `Entity:Fire`), [`outputs`] (the map's wiring: `OnTrigger` and the like), [`logic`]
 //!   (`logic_relay`, `logic_timer`, `math_counter` ...), [`triggers`] (touching: `trigger_*`,
 //!   `StartTouch`, weapons picked up), [`movers`] (doors, buttons, platforms, the brushes that
-//!   move), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
+//!   move), [`npc`] (the engine's NPCs: standing, hurt, dying into corpses, the `NPC`
+//!   methods), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
 //!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`]
 //!   (`Material`), [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and
-//!   [`world`] (`ai` and `motionsensor`, as they answer while there are no NPCs). They grow towards the whole
+//!   [`world`] (`ai` and `motionsensor`, as they answer without a node graph). They grow towards the whole
 //!   API - `gmod-check lua` counts how much of it is there.
 //! * starting the game ([`Runtime::start`]): `includes/init.lua`, autorun, the gamemode and
 //!   its bases, scripted entities and weapons, the hooks up to `Initialize`; the entities of
@@ -87,6 +88,7 @@ pub mod meta;
 pub mod movedata;
 pub mod movers;
 pub mod net;
+pub mod npc;
 pub mod outputs;
 pub mod physgun;
 pub mod physics;
@@ -296,6 +298,8 @@ pub(crate) struct Host {
     pub(crate) movers: movers::Moving,
     /// The classes of breakable props.
     pub(crate) props: breakable::Props,
+    /// The corpses of NPCs that fade.
+    pub(crate) npcs: npc::Npcs,
 }
 
 impl Host {
@@ -382,6 +386,7 @@ impl Runtime {
             touching: triggers::Touching::default(),
             movers: movers::Moving::default(),
             props: breakable::Props::default(),
+            npcs: npc::Npcs::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -412,6 +417,7 @@ impl Runtime {
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
         weapon::install(&lua)?;
+        npc::install(&lua)?;
         if realm != Realm::Server {
             surface::install(&lua)?;
             client::install(&lua)?;
@@ -527,6 +533,7 @@ impl Runtime {
                 inputs::service(&self.lua);
                 logic::tick(&self.lua);
                 movers::tick(&self.lua);
+                npc::tick(&self.lua);
             }
             ents::think(&self.lua);
             if server {

@@ -32,6 +32,8 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     globals.raw_set("VERSION", VERSION)?;
     globals.raw_set("VERSIONSTR", VERSION_STR)?;
     globals.raw_set("BRANCH", "x86-64")?;
+    // the bits of an entity's index: what `net.WriteEntity` writes
+    globals.raw_set("MAX_EDICT_BITS", crate::entity::MAX_EDICTS.trailing_zeros())?;
     if realm == Realm::Menu {
         globals.raw_set("NETVERSIONSTR", VERSION_STR)?;
     }

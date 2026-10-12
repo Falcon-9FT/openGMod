@@ -15,6 +15,7 @@ mod chat;
 mod items;
 mod mapio;
 mod movers;
+mod npc;
 mod ragdoll;
 mod shapes;
 mod triggers;

@@ -429,6 +429,7 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         }
     }
     if !scripted {
+        crate::npc::spawned(lua, handle);
         crate::anim::spawned(lua, handle);
         crate::logic::spawned(lua, handle);
         crate::triggers::spawned(lua, handle);
@@ -473,6 +474,7 @@ pub(crate) fn remove(lua: &Lua, handle: EntityHandle) {
     crate::player::forget(lua, handle);
     crate::constraint::removed(lua, handle);
     crate::physics::destroy(lua, handle);
+    crate::npc::removed(lua, handle);
     if let Ok(Some(list)) = ud.named_user_value::<Option<Table>>("delete-on-remove") {
         for other in list.sequence_values::<Value>().flatten() {
             if let Some(other) = entity::handle_of(Some(&other)) {

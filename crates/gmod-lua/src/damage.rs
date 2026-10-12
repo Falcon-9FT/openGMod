@@ -1,8 +1,9 @@
 //! `CTakeDamageInfo`: what a hit does - how much, of what type, by whom and with what -
 //! made by `DamageInfo()` and handed to the hooks of damage and death (`DoPlayerDeath`); and
 //! taking damage (`Entity:TakeDamageInfo`): the `EntityTakeDamage` hook may stop it or change
-//! it, then a player is hurt ([`crate::player`]), a SENT gets `OnTakeDamage`, and the
-//! engine's own entities are pushed and broken ([`crate::breakable`]).
+//! it, then a player is hurt ([`crate::player`]), a SENT gets `OnTakeDamage`, an engine NPC
+//! is hurt ([`crate::npc`]), and the engine's other entities are pushed and broken
+//! ([`crate::breakable`]).
 
 use mlua::{AnyUserData, Lua, MultiValue, ObjectLike, UserData, UserDataFields, UserDataMethods, Value};
 
@@ -111,10 +112,14 @@ pub(crate) fn take(lua: &Lua, target: EntityHandle, info: DamageInfo) {
     let (player, scripted) = host(lua).entities.get(target).map(|e| (e.player.is_some(), e.scripted)).unwrap_or_default();
     if player {
         crate::player::hurt(lua, target, info, &ud);
-    } else if !scripted {
+    } else if scripted {
+        if let Ok(Value::Function(f)) = ent.get::<Value>("OnTakeDamage") {
+            let _ = files::call_reporting(lua, f, MultiValue::from_iter([Value::UserData(ent), Value::UserData(ud)]));
+        }
+    } else if target.kind == entity::Kind::Npc {
+        crate::npc::hurt(lua, target, info, &ud);
+    } else {
         crate::breakable::damaged(lua, target, &info);
-    } else if let Ok(Value::Function(f)) = ent.get::<Value>("OnTakeDamage") {
-        let _ = files::call_reporting(lua, f, MultiValue::from_iter([Value::UserData(ent), Value::UserData(ud)]));
     }
 }
 
