@@ -25,7 +25,8 @@
 //!   taking damage), [`effect`] (`EffectData`, `util.Effect`), [`sound`] (`EmitSound`,
 //!   `CreateSound`, the `sound` library, all quiet), [`trace`] (`util.TraceLine` and the like),
 //!   [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`), [`pickup`]
-//!   (props carried with the use key),
+//!   (props carried with the use key), [`breakable`] (props and brushes that break and blow
+//!   up), [`items`] (HL2's items and wall chargers),
 //!   [`anim`] (what entities play on their bones: sequences, cycles, pose parameters, layers,
 //!   view models, the player's model), [`ragdoll`] (bodies on the bones of `prop_ragdoll` and
 //!   corpses), [`chat`] (`say` through `PlayerSay`, the chat box, `chat.AddText`),
@@ -62,7 +63,7 @@ use mlua::Lua;
 
 pub mod anim;
 mod args;
-mod breakable;
+pub mod breakable;
 pub mod chat;
 pub mod client;
 pub mod console;
@@ -79,7 +80,7 @@ pub mod html;
 pub mod http;
 pub mod hud;
 pub mod inputs;
-mod items;
+pub mod items;
 pub mod logic;
 pub mod material;
 pub mod matrix;
