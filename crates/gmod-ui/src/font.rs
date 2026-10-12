@@ -7,10 +7,13 @@
 //!
 //! Font files come from the game (`resource/*.ttf` - the HUD's `HALFLIFE2.ttf`, Derma's
 //! `marlett.ttf` - and `resource/fonts/`, where addons put theirs; the program hands them in
-//! with [`Fonts::add_font`]) and from the system's font folders, read when a family is asked
-//! for that the game does not have. A family is found by any of its names - the family, the
-//! typographic family or the full name ("Roboto Bold") - and the face nearest to the weight
-//! asked for; a family that is nowhere is replaced by one of [`FALLBACKS`], and characters a
+//! with [`Fonts::add_game_font`]) and from the system's font folders, read when a family is
+//! asked for that the game does not have. A family is found by any of its names - the family,
+//! the typographic family or the full name ("Roboto Bold") - and the face nearest to the weight
+//! asked for (weight 0 is "any": the regular one). The engine finds a font of the game by its
+//! file's name, as its schemes name them (`"HalfLife2"` is `HALFLIFE2.ttf`): that file comes
+//! first of all the faces of the name, as `HL2MP.ttf` - Half-Life 2's font with the icons of
+//! weapons where the digits were - goes by it too. A family that is nowhere is replaced by one of [`FALLBACKS`], and characters a
 //! font does not have come from them too. Bold asked of a family without a bold face is made
 //! bolder by hand, as Windows does.
 
@@ -142,6 +145,9 @@ struct Face {
     index: u32,
     /// Family, typographic family and full name, lower case.
     names: Vec<String>,
+    /// For a font of the game, its file's name without the extension, lower case: the name
+    /// the engine finds it by.
+    file: Option<String>,
     full_name: String,
     weight: u16,
     italic: bool,
@@ -247,6 +253,17 @@ impl Fonts {
 
     /// Adds the faces of a font file (`.ttf`, `.otf`, or a `.ttc` collection): how many.
     pub fn add_font(&mut self, data: Vec<u8>) -> usize {
+        self.add_faces(data, None)
+    }
+
+    /// Adds the faces of a font file of the game (`resource/HALFLIFE2.ttf`): they go by the
+    /// file's name too, before any other face of that name.
+    pub fn add_game_font(&mut self, data: Vec<u8>, file_name: &str) -> usize {
+        let stem = Path::new(file_name).file_stem().map(|s| s.to_string_lossy().trim().to_lowercase()).filter(|s| !s.is_empty());
+        self.add_faces(data, stem)
+    }
+
+    fn add_faces(&mut self, data: Vec<u8>, file: Option<String>) -> usize {
         let data: Arc<[u8]> = data.into();
         let count = ttf_parser::fonts_in_collection(&data).unwrap_or(1);
         let mut added = 0;
@@ -254,7 +271,7 @@ impl Fonts {
             let Ok(face) = ttf_parser::Face::parse(&data, index) else { continue };
             let names = face_names(face.names());
             let style = (face.weight().to_number(), face.is_italic());
-            self.push_face(Source::Memory(data.clone()), index, names, style);
+            self.push_face(Source::Memory(data.clone()), index, names, style, file.clone());
             added += 1;
         }
         added
@@ -271,13 +288,13 @@ impl Fonts {
         self.system_read = false;
     }
 
-    fn push_face(&mut self, source: Source, index: u32, names: (Vec<String>, String), style: (u16, bool)) {
+    fn push_face(&mut self, source: Source, index: u32, names: (Vec<String>, String), style: (u16, bool), file: Option<String>) {
         let (names, full_name) = names;
         let at = self.faces.len();
-        for name in &names {
+        for name in names.iter().chain(file.iter().filter(|f| !names.contains(f))) {
             self.by_family.entry(name.clone()).or_default().push(at);
         }
-        self.faces.push(Face { source, index, names, full_name, weight: style.0, italic: style.1, loaded: None });
+        self.faces.push(Face { source, index, names, file, full_name, weight: style.0, italic: style.1, loaded: None });
     }
 
     fn read_system_fonts(&mut self) {
@@ -291,7 +308,7 @@ impl Fonts {
         }
         for path in files {
             for (index, names, style) in describe_file(&path) {
-                self.push_face(Source::File(path.clone()), index, names, style);
+                self.push_face(Source::File(path.clone()), index, names, style, None);
             }
         }
     }
@@ -307,7 +324,10 @@ impl Fonts {
         if let Some(&exact) = candidates.iter().find(|&&i| self.faces[i].full_name == key && self.faces[i].names[0] != key) {
             return Some(exact);
         }
-        candidates.iter().copied().min_by_key(|&i| {
+        // the file of the game of that name, over the others that go by it
+        let by_file: Vec<usize> = candidates.iter().copied().filter(|&i| self.faces[i].file.as_deref() == Some(key.as_str())).collect();
+        let candidates = if by_file.is_empty() { candidates.clone() } else { by_file };
+        candidates.into_iter().min_by_key(|&i| {
             let face = &self.faces[i];
             (u32::from(face.weight)).abs_diff(weight) + if face.italic == italic { 0 } else { 1000 }
         })
@@ -323,7 +343,8 @@ impl Fonts {
 
     /// The face for a spec: its family's, or a fallback's.
     fn resolve(&mut self, spec: &FontSpec) -> Option<usize> {
-        let weight = spec.weight.clamp(1, 1000);
+        // 0 is Windows' FW_DONTCARE: the regular face
+        let weight = if spec.weight == 0 { 400 } else { spec.weight.min(1000) };
         if let Some(face) = self.find(&spec.family, weight, spec.italic).filter(|&f| self.loaded(f).is_some()) {
             return Some(face);
         }
