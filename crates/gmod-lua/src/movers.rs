@@ -3,7 +3,7 @@
 //!
 //! A brush entity that may move ([`gmod_bsp::Entity::moves`]: the movers, and any `func_`
 //! brush with a name or a parent) is not part of the world baked into the map: it is drawn
-//! where its entity is ([`crate::ents::drawn`]), and every tick what is solid follows it - its
+//! where its entity is (`ents::drawn`), and every tick what is solid follows it - its
 //! brushes for traces and players ([`gmod_bsp::Collision::place_model`]) and a body that
 //! pushes props ([`gmod_physics::Physics::add_mover`]). A removed one, or a `func_brush`
 //! turned off (`Disable`, `Toggle`), is neither seen nor solid.

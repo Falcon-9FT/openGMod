@@ -11,7 +11,7 @@
 //! [`crate::triggers`], [`crate::movers`]), and so do the constraints ([`crate::constraint`]). Inputs it does not know are dropped.
 //!
 //! An output's input waits here with the name of its target, found when it is given
-//! ([`crate::outputs::targets`]).
+//! (`outputs::targets`).
 
 use std::cell::RefCell;
 

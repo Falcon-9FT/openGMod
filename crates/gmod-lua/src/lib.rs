@@ -29,7 +29,10 @@
 //!   view models, the player's model), [`ragdoll`] (bodies on the bones of `prop_ragdoll` and
 //!   corpses), [`chat`] (`say` through `PlayerSay`, the chat box, `chat.AddText`),
 //!   [`constraint`] (welds, ropes, axes ... as joints), [`inputs`] (`Entity:Input`,
-//!   `Entity:Fire`), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
+//!   `Entity:Fire`), [`outputs`] (the map's wiring: `OnTrigger` and the like), [`logic`]
+//!   (`logic_relay`, `logic_timer`, `math_counter` ...), [`triggers`] (touching: `trigger_*`,
+//!   `StartTouch`, weapons picked up), [`movers`] (doors, buttons, platforms, the brushes that
+//!   move), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
 //!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`]
 //!   (`Material`), [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and
 //!   [`world`] (`ai` and `motionsensor`, as they answer while there are no NPCs). They grow towards the whole

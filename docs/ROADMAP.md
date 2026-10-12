@@ -99,8 +99,24 @@
     `ENT:AcceptInput`, `Kill`, `KillHierarchy`, `AddOutput`, `SetParent`, `Color`, `Alpha`,
     `Skin`, входы констрейнтов и `prop_dynamic` (`SetAnimation`, `SetDefaultAnimation`,
     `SetPlaybackRate`).
-  * Дальше: подбор оружия касанием, NPC, поведение энтити движка (двери, триггеры, выводы
-    `OnTrigger`... и `AddOutput` с ними), трупы NPC.
+  * Энтити карты оживают ✅:
+    * выводы — `gmod-lua::outputs`: связи из ключей карты (`"OnTrigger" "door,Open,,2,-1"`,
+      старый и новый разделитель) и из `AddOutput`, цели по имени с `*`, по классу и
+      `!self`, `!activator`, `!caller`, `!player`, задержки, счётчики, `FireUser1`…`4`;
+      `ent_fire` (с `sv_cheats 1`);
+    * логика — `gmod-lua::logic`: `logic_auto`, `logic_relay`, `logic_timer`, `math_counter`,
+      `logic_branch`, `logic_compare`, `logic_case`;
+    * триггеры — `gmod-lua::triggers`: объём по брашам модели, флаги и фильтры
+      (`filter_activator_name`, `filter_activator_class`, `filter_multi`), `trigger_once`,
+      `trigger_multiple`, `trigger_teleport`, `trigger_push`, `trigger_hurt`, `trigger_remove`;
+      касание SENT с `SetTrigger` (`StartTouch`, `Touch`, `EndTouch`); подбор оружия касанием;
+    * двери, кнопки, платформы — `gmod-lua::movers`: `func_door`, `func_door_rotating`,
+      `prop_door_rotating`, `func_button`, `func_movelinear`, `func_rotating`, включение и
+      выключение `func_brush`; подвижные браши рисуются, твёрдые и толкают пропы там, где их
+      энтити; клавиша E (`+use`): `FindUseEntity`, `PlayerUse`, `ENT:Use`, вход `Use`.
+  * Дальше: NPC и их трупы, что мешает двери (сейчас она проходит сквозь игрока), игрок,
+    которого везёт то, на чём он стоит, `func_tracktrain`, `func_breakable`, `env_global`,
+    подбор пропов клавишей E, предметы HL2 (аптечки, батареи, патроны).
 * Игра в `opengmod` ✅: при запуске карты работает Lua сервера с `sandbox` и аддонами
   воркшопа, игрок одиночной игры ходит через хуки геймода, мышь и клавиши — его команды
   (`IN_ATTACK`, `IN_RELOAD`, выбор оружия, фонарик, noclip, `gmod_undo`), терминал — консоль
@@ -141,8 +157,8 @@
   (игрок проходит сквозь оружие и обломки). Формы моделей — вместе с физикой.
 * Движение игрока — `gmod-movement` ✅, ходьба в `opengmod`: трение и разгон, бег, ступеньки,
   склоны, скольжение по стенам, прыжок, приседание, плавание, лестницы-браши, noclip. Дальше —
-  лестницы HL2 по кнопке E (`func_useableladder`), движущиеся опоры, толчки конвейеров и
-  триггеров, сверка чисел с игрой.
+  лестницы HL2 по кнопке E (`func_useableladder`), движущиеся опоры, толчки конвейеров,
+  сверка чисел с игрой. Толчки `trigger_push` ✅.
 * Анимации моделей ✅ — `gmod-model::anim`, `gmod-model::pose`, `gmod-lua::anim`:
   * чтение ✅: последовательности, анимации со всеми способами хранения кадров (потоки значений,
     сжатые кватернионы, секции), блоки `.ani`, включаемые модели (`$includemodel`: модели игроков
