@@ -38,6 +38,7 @@ mod audio;
 mod browser;
 mod client;
 mod game;
+mod keys;
 mod menu;
 mod proto;
 mod server;
@@ -170,8 +171,9 @@ struct Setup {
     /// Players a game started here takes: more than one, it listens for them on `port`.
     max_players: u32,
     port: u16,
-    /// The player's name.
+    /// The player's name, and their key: who they are on every server.
     name: String,
+    identity: gmod_net::Identity,
 }
 
 impl Setup {
@@ -256,7 +258,7 @@ fn prepare_join_telling(
 ) -> Result<Joining, String> {
     let addr = server_address(address)?;
     say(&format!("Connecting to {addr}"));
-    let mut connection = client::Connection::open(addr, &setup.name)?;
+    let mut connection = client::Connection::open(addr, &setup.name, &setup.identity, &keys::KnownServers::open())?;
     let welcome = connection.welcome.clone();
     println!("{}: {} ({}, {} players)", welcome.server, welcome.map, welcome.gamemode, welcome.max_players);
     let install = Install::locate(setup.gmod.as_deref()).map_err(|e| e.to_string())?;
@@ -391,7 +393,9 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
     let started = Instant::now();
     let mut server = server::Server::start(Arc::new(vfs), &lua_map, &setup.gamemode, setup.max_players, true)?;
     server.name = hostname.to_string();
-    let at = server.listen(SocketAddr::from(([0, 0, 0, 0], setup.port))).map_err(|e| format!("port {}: {e}", setup.port))?;
+    let identity = keys::server_identity();
+    let key = identity.public();
+    let at = server.listen(SocketAddr::from(([0, 0, 0, 0], setup.port)), identity).map_err(|e| format!("port {}: {e}", setup.port))?;
     println!(
         "{hostname}: {name} ({}) for {} players, started in {:.1} s, on UDP port {}; type status, quit or the server's commands",
         setup.gamemode,
@@ -399,6 +403,7 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
         started.elapsed().as_secs_f64(),
         at.port()
     );
+    println!("Its key, which players know it by: {key}");
     let tick = Duration::from_secs_f64(gmod_lua::timer::TICK_INTERVAL);
     let mut next = Instant::now();
     loop {
@@ -412,8 +417,8 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
                 "status" => {
                     let players = server.remote_players();
                     println!("{} of {} players", players.len(), setup.max_players);
-                    for (name, rtt) in players {
-                        println!("  {name}: {} ms", rtt.map_or(0, |r| r.as_millis()));
+                    for (name, steam_id, rtt) in players {
+                        println!("  {name} ({steam_id}): {} ms", rtt.map_or(0, |r| r.as_millis()));
                     }
                 }
                 text => match text.strip_prefix("lua_run ") {
@@ -956,7 +961,8 @@ impl App {
         let listen = (setup.max_players > 1).then(|| SocketAddr::from(([0, 0, 0, 0], setup.port)));
         let game = loaded.lua.as_ref().and_then(|(vfs, map)| {
             let started = Instant::now();
-            match Game::start(vfs.clone(), map, &setup.gamemode, pages, setup.max_players, listen, &setup.name) {
+            let player = (setup.name.as_str(), setup.identity.public());
+            match Game::start(vfs.clone(), map, &setup.gamemode, pages, setup.max_players, listen, player) {
                 Ok(game) => {
                     println!("The game started in {:.1} s", started.elapsed().as_secs_f64());
                     Some(game)
@@ -1761,6 +1767,8 @@ fn main() -> ExitCode {
         max_players: args.max_players.unwrap_or(if args.dedicated { 16 } else { 1 }),
         port: args.port,
         name: args.name.clone().unwrap_or_else(default_name),
+        // a dedicated server has no player of its own
+        identity: if args.dedicated { gmod_net::Identity::generate() } else { keys::player_identity() },
     };
     if args.dedicated {
         let Some(map) = &args.map else { return fail(&format!("--dedicated needs a map\n\n{USAGE}")) };

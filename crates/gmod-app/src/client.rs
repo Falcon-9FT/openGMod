@@ -15,6 +15,7 @@ use gmod_lua::sound::SoundEvent;
 use gmod_lua::{ChatMessage, EntityHandle, Snapshot, ToClient, UserCmd};
 use gmod_net::ClientEvent;
 
+use crate::keys::KnownServers;
 use crate::proto::{self, FileInfo, FromServer, Hello, SnapshotReceiver, ToServer, Welcome};
 
 /// How far behind the newest snapshot the picture is: a snapshot or two lost on the way
@@ -60,6 +61,9 @@ pub struct Connection {
     inbox: VecDeque<FromServer>,
     /// Why the connection closed, once it has.
     pub closed: Option<String>,
+    /// The server's key, once it let us in; or the key it has instead of the one it had.
+    pub key: Option<gmod_net::PublicKey>,
+    changed: Option<gmod_net::PublicKey>,
     /// The client Lua the server has, by game path ([`download`](Self::download)): what of
     /// the player's addons it may run.
     pub listed_lua: Vec<String>,
@@ -88,11 +92,15 @@ pub fn addon_lua_hidden(listed: &[String]) -> gmod_fs::Hide {
 }
 
 impl Connection {
-    /// Connects to a server as `name`, waiting until it lets us in or says why not.
-    pub fn open(server: SocketAddr, name: &str) -> Result<Connection, String> {
+    /// Connects to a server as `name` and `identity`, waiting until it lets us in or says why
+    /// not. A server that has another key than `known` says it had is not joined; one not
+    /// known is, and its key is kept.
+    pub fn open(server: SocketAddr, name: &str, identity: &gmod_net::Identity, known: &KnownServers) -> Result<Connection, String> {
         let hello = proto::encode(&Hello { version: proto::VERSION, name: name.to_string() });
         let started = Instant::now();
-        let net = gmod_net::Client::connect(server, &hello, started).map_err(|e| format!("{server}: {e}"))?;
+        let address = server.to_string();
+        let net =
+            gmod_net::Client::connect(server, &hello, identity, known.key(&address), started).map_err(|e| format!("{server}: {e}"))?;
         let mut connection = Connection {
             net,
             welcome: Welcome {
@@ -112,11 +120,19 @@ impl Connection {
             shown: None,
             inbox: VecDeque::new(),
             closed: None,
+            key: None,
+            changed: None,
         };
         loop {
             if let Some(welcome) = connection.receive() {
                 connection.welcome = proto::decode::<Welcome>(&welcome).ok_or("the server is not an openGMOD server")?;
+                if let Some(key) = connection.key {
+                    known.remember(&address, key);
+                }
                 return Ok(connection);
+            }
+            if let Some(key) = &connection.changed {
+                return Err(known.changed(&address, key));
             }
             if let Some(reason) = &connection.closed {
                 return Err(format!("{server}: {reason}"));
@@ -135,7 +151,14 @@ impl Connection {
         let mut welcomed = None;
         for event in self.net.poll(now) {
             match event {
-                ClientEvent::Accepted { welcome } => welcomed = Some(welcome),
+                ClientEvent::Accepted { welcome, key } => {
+                    self.key = Some(key);
+                    welcomed = Some(welcome);
+                }
+                ClientEvent::KeyChanged { key } => {
+                    self.changed = Some(key);
+                    self.closed = Some(format!("the server's key is {key}, not the one it had"));
+                }
                 ClientEvent::Message { data } => match proto::decode::<FromServer>(&data) {
                     Some(FromServer::Snapshot(delta)) => self.snapshot(delta),
                     Some(message) => self.inbox.push_back(message),

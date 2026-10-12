@@ -129,16 +129,16 @@ impl Game {
         pages: Option<gmod_lua::WebPages>,
         max_players: u32,
         listen: Option<SocketAddr>,
-        name: &str,
+        (name, key): (&str, gmod_net::PublicKey),
     ) -> Result<Game, String> {
         let mut server = Server::start(vfs.clone(), map, gamemode, max_players, false)?;
         if let Some(addr) = listen {
-            match server.listen(addr) {
+            match server.listen(addr, crate::keys::server_identity()) {
                 Ok(at) => println!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port()),
                 Err(e) => println!("Others cannot join: {addr}: {e}"),
             }
         }
-        let player = server.join_host(name).ok_or("no player could join the game")?;
+        let player = server.join_host(name, Some(key)).ok_or("no player could join the game")?;
         let client = client(vfs, map, gamemode, max_players, pages)?;
         client.set_local_player(player);
         client.apply_snapshot(&server.runtime().snapshot());
@@ -558,7 +558,8 @@ mod tests {
         let mut map = Map::from_bsp("gm_test", &bsp, Arc::new(Collision::new(&bsp)));
         let start = [("classname", "info_player_start"), ("origin", "0 0 0"), ("angles", "0 90 0")];
         map.entities.push(start.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
-        let mut game = Game::start(Arc::new(vfs), &map, "sandbox", None, 1, None, "Player").unwrap();
+        let me = gmod_net::Identity::generate().public();
+        let mut game = Game::start(Arc::new(vfs), &map, "sandbox", None, 1, None, ("Player", me)).unwrap();
 
         // the camera turns to where the spawn point looks, and sees from the player's eyes
         let still = (Keys::default(), Buttons::default());
@@ -595,7 +596,7 @@ mod tests {
         end
         function net.Incoming(len, from)
             local name = util.NetworkIDToString(net.ReadHeader())
-            if CLIENT then GOT = name .. ': ' .. net.ReadString() else HEARD = from:Nick() .. ' ' .. name end
+            if CLIENT then GOT = name .. ': ' .. net.ReadString() else HEARD = from:Nick() .. ' ' .. from:SteamID64() .. ' ' .. name end
         end
     ";
 
@@ -671,7 +672,7 @@ mod tests {
                 .runtime()
                 .run_string("AddCSLuaFile('autorun/client/hello.lua') resource.AddFile('materials/test/thing.vmt')", "files")
                 .unwrap();
-            let at = server.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+            let at = server.listen("127.0.0.1:0".parse().unwrap(), gmod_net::Identity::generate()).unwrap();
             to_test.send(at.to_string()).unwrap();
             while stopped.try_recv().is_err() {
                 server.frame(0.015);
@@ -691,8 +692,18 @@ mod tests {
         });
         let at: SocketAddr = from_server.recv().unwrap().parse().unwrap();
 
+        // a server known by another key is not joined: it may be another one in its place
+        let alice = gmod_net::Identity::generate();
+        let lists = Folder::new("known-servers", &[]);
+        let known = crate::keys::KnownServers::at(Some(lists.0.join("known.txt")));
+        let wrong = crate::keys::KnownServers::at(Some(lists.0.join("wrong.txt")));
+        wrong.remember(&at.to_string(), gmod_net::Identity::generate().public());
+        let refused = Connection::open(at, "Alice", &alice, &wrong).err().unwrap();
+        assert!(refused.contains("is not the server that was there"), "{refused}");
+
         // connecting: what the client lacks comes, the Lua into memory, the rest saved
-        let mut connection = Connection::open(at, "Alice").unwrap();
+        let mut connection = Connection::open(at, "Alice", &alice, &known).unwrap();
+        assert_eq!(known.key(&at.to_string()), connection.key, "the server's key is kept");
         assert_eq!((connection.welcome.map.as_str(), connection.welcome.max_players), ("gm_test", 4));
         let mut vfs = client_files.vfs();
         vfs.push(Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&download.0))));
@@ -753,7 +764,7 @@ mod tests {
         }
         game.leave();
         stop.send(()).unwrap();
-        assert_eq!(from_server.recv().unwrap(), "Alice thanks");
+        assert_eq!(from_server.recv().unwrap(), format!("Alice {} thanks", crate::keys::steam_id64(&alice.public())), "known by her key");
         assert_eq!(from_server.recv().unwrap(), "0", "the player left with the client");
         server.join().unwrap();
     }
@@ -767,7 +778,7 @@ mod tests {
         );
         let mut server = Server::start(Arc::new(server_files.vfs()), &test_map(), "sandbox", 4, true).unwrap();
         server.name = "Alice's game".into();
-        let at = server.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+        let at = server.listen("127.0.0.1:0".parse().unwrap(), gmod_net::Identity::generate()).unwrap();
         server.runtime().join(gmod_lua::PlayerInfo { name: "Bob".into(), bot: true, ..Default::default() }).unwrap();
 
         let saved = Folder::new("browse-lists", &[]);

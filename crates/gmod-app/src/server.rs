@@ -19,8 +19,9 @@ use gmod_fs::Vfs;
 use gmod_lua::net::NetMessage;
 use gmod_lua::sound::SoundEvent;
 use gmod_lua::{ChatMessage, EntityHandle, Map, Output, PlayerInfo, Realm, Runtime, ToClient};
-use gmod_net::{ClientId, ServerEvent};
+use gmod_net::{ClientId, Identity, PublicKey, ServerEvent};
 
+use crate::keys;
 use crate::proto::{self, FileInfo, FromServer, Hello, ServerInfo, SnapshotSender, ToServer, Welcome};
 
 /// How much of a file goes in one message.
@@ -57,6 +58,8 @@ struct Remote {
     id: ClientId,
     addr: SocketAddr,
     name: String,
+    /// Who the player is: their key, proven as they connected.
+    key: PublicKey,
     /// Its player, once it has loaded and joined.
     player: Option<EntityHandle>,
     snapshots: SnapshotSender,
@@ -86,6 +89,8 @@ pub struct Server {
     net: Option<gmod_net::Server>,
     remotes: Vec<Remote>,
     host: Option<EntityHandle>,
+    /// The key of the player at this computer, who plays with it here already.
+    host_key: Option<PublicKey>,
     files: Option<Files>,
     /// The tick of the last snapshot sent.
     last_tick: i64,
@@ -115,6 +120,7 @@ impl Server {
             net: None,
             remotes: Vec::new(),
             host: None,
+            host_key: None,
             files: None,
             last_tick: -1,
             told: None,
@@ -131,9 +137,10 @@ impl Server {
         &self.runtime
     }
 
-    /// Takes clients from the network at `addr` from now on: where it listens.
-    pub fn listen(&mut self, addr: SocketAddr) -> std::io::Result<SocketAddr> {
-        let net = gmod_net::Server::bind(addr)?;
+    /// Takes clients from the network at `addr` from now on, known to them by `identity`:
+    /// where it listens.
+    pub fn listen(&mut self, addr: SocketAddr, identity: Identity) -> std::io::Result<SocketAddr> {
+        let net = gmod_net::Server::bind(addr, identity)?;
         let at = net.local_addr()?;
         self.net = Some(net);
         Ok(at)
@@ -144,17 +151,23 @@ impl Server {
         self.net.is_some()
     }
 
-    /// The player at this computer joins.
-    pub fn join_host(&mut self, name: &str) -> Option<EntityHandle> {
-        let player = self.runtime.join(PlayerInfo { name: name.to_string(), ..PlayerInfo::default() })?;
+    /// The player at this computer joins, known by `key` when they have one.
+    pub fn join_host(&mut self, name: &str, key: Option<PublicKey>) -> Option<EntityHandle> {
+        let steam_id64 = key.as_ref().map(keys::steam_id64);
+        let player = self.runtime.join(PlayerInfo { name: name.to_string(), steam_id64, ..PlayerInfo::default() })?;
         self.host = Some(player);
+        self.host_key = key;
         Some(player)
     }
 
-    /// The players connected over the network, by name, with their round trip.
-    pub fn remote_players(&self) -> Vec<(String, Option<std::time::Duration>)> {
+    /// The players connected over the network: their names, their `SteamID`s, and their
+    /// round trips.
+    pub fn remote_players(&self) -> Vec<(String, String, Option<std::time::Duration>)> {
         let net = self.net.as_ref();
-        self.remotes.iter().map(|r| (r.name.clone(), net.and_then(|n| n.client_info(r.id)).map(|(_, rtt)| rtt))).collect()
+        self.remotes
+            .iter()
+            .map(|r| (r.name.clone(), keys::steam_id(keys::steam_id64(&r.key)), net.and_then(|n| n.client_info(r.id)).map(|(_, rtt)| rtt)))
+            .collect()
     }
 
     /// One frame of `seconds`: what the clients sent, the game, and what goes to them.
@@ -209,7 +222,7 @@ impl Server {
         let Some(net) = &mut self.net else { return };
         for event in net.poll(now) {
             match event {
-                ServerEvent::Request { addr, hello } => self.request(addr, &hello),
+                ServerEvent::Request { addr, hello, key } => self.request(addr, &hello, key),
                 ServerEvent::Message { client, data } => match proto::decode::<ToServer>(&data) {
                     Some(message) => self.message(client, message),
                     None => self.drop_client(client, "sent what is no message"),
@@ -220,7 +233,7 @@ impl Server {
     }
 
     /// Someone asks to connect: let in if there is room and they speak our messages.
-    fn request(&mut self, addr: SocketAddr, hello: &[u8]) {
+    fn request(&mut self, addr: SocketAddr, hello: &[u8], key: PublicKey) {
         let now = self.now();
         let Some(hello) = proto::decode::<Hello>(hello) else {
             self.deny(addr, "not an openGMOD client");
@@ -229,6 +242,21 @@ impl Server {
         if hello.version != proto::VERSION {
             self.deny(addr, &format!("the server runs openGMOD's messages {}, the client {}", proto::VERSION, hello.version));
             return;
+        }
+        if self.host_key == Some(key) {
+            self.deny(
+                addr,
+                "the player of this server's own computer has your key: another openGMOD folder (OPENGMOD_HOME) is another player",
+            );
+            return;
+        }
+        // the same player again (their game went, and came back before the server noticed):
+        // the new connection is theirs
+        if let Some(old) = self.remotes.iter().find(|r| r.key == key).map(|r| r.id) {
+            if let Some(net) = &mut self.net {
+                net.disconnect(old, "you connected again from elsewhere");
+            }
+            self.gone(old, "connected again");
         }
         let max = self.runtime.max_players() as usize;
         let taken = self.runtime.players().len() + self.remotes.iter().filter(|r| r.player.is_none()).count();
@@ -252,7 +280,16 @@ impl Server {
         let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
         let name = clean_name(&hello.name);
         println!("{name} is connecting from {addr}");
-        self.remotes.push(Remote { id, addr, name, player: None, snapshots: SnapshotSender::default(), known: HashMap::new(), command: 0 });
+        self.remotes.push(Remote {
+            id,
+            addr,
+            name,
+            key,
+            player: None,
+            snapshots: SnapshotSender::default(),
+            known: HashMap::new(),
+            command: 0,
+        });
         let (lua, content) = {
             let files = self.files();
             (files.lua.clone(), files.content.clone())
@@ -306,8 +343,13 @@ impl Server {
         match message {
             ToServer::Want(paths) => self.send_files(client, &paths),
             ToServer::Ready if player.is_none() => {
-                let (name, addr) = (remote.name.clone(), remote.addr);
-                let joined = self.runtime.join(PlayerInfo { name: name.clone(), address: addr.to_string(), ..PlayerInfo::default() });
+                let (name, addr, steam_id64) = (remote.name.clone(), remote.addr, keys::steam_id64(&remote.key));
+                let joined = self.runtime.join(PlayerInfo {
+                    name: name.clone(),
+                    address: addr.to_string(),
+                    steam_id64: Some(steam_id64),
+                    ..PlayerInfo::default()
+                });
                 match joined {
                     Some(player) => {
                         if let Some(remote) = self.remote(client) {

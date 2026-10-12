@@ -53,6 +53,9 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 # that scans HTTPS adds its root there). Pinned exactly: the resolver that keeps requests off
 # private networks uses ureq's `unversioned` API
 ureq = { version = "=3.4.2", features = ["platform-verifier"] }
+# the network's keys and seals: X25519, Ed25519, HKDF-SHA256 and ChaCha20-Poly1305 - the same
+# library HTTPS already uses, nothing more to build
+ring = "0.17.14"
 # sounds: WAV (PCM, ADPCM), MP3 and OGG decoded in pure Rust
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "pcm", "adpcm", "mp3", "ogg", "vorbis"] }
 # JPEG images (the menu's backgrounds, screenshots, workshop previews): pure Rust

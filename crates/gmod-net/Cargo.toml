@@ -3,6 +3,7 @@ name = "gmod-net"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "openGMOD's network: its own protocol over UDP - connections, reliable ordered messages and unreliable ones of any size"
+description = "openGMOD's network: its own protocol over UDP - private connections between known keys, reliable ordered messages and unreliable ones of any size"
 
 [dependencies]
+ring.workspace = true

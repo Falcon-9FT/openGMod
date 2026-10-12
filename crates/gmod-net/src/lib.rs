@@ -11,20 +11,31 @@
 //!   it would be sent again (where entities are, the keys a player holds). One too big for a
 //!   packet goes in fragments, and is lost if any is.
 //!
+//! A connection is private, and each side knows who the other is: by its key ([`Identity`],
+//! [`crypto`]) - a player's is theirs on every server, as a Steam account would be, and a
+//! server's tells it from one that would stand in for it. No one else vouches for either.
+//!
 //! A packet starts with `OGMN` and its kind:
 //!
-//! * `CONNECT` (client to server): the protocol's version, a number the client picked for this
-//!   attempt, and what the client has to say (its name...). Sent again every quarter second
-//!   until it is answered, for ten seconds.
-//! * `ACCEPT`: the client's number, the connection's (picked by the server), and what the
-//!   server answers (the map...). `DENY`: the client's number and why not.
-//! * `DATA`: the connection, the packet's sequence number and the newest one received from the
-//!   other side (for the round trip), the reliable chunks received - all before a number, and
-//!   up to eight ranges of those that came early - then the messages. Every packet
-//!   acknowledges what arrived, so a packet lost costs nothing more than what was in it: its
-//!   reliable chunks are sent again when they have waited longer than the round trip. A packet
-//!   that comes twice is dropped the second time.
-//! * `DISCONNECT`: the connection, and why.
+//! * `CONNECT` (client to server): the protocol's version and a number the client picked for
+//!   this attempt (the salt), padded with zeros to a whole packet - every answer is shorter.
+//!   Sent again every quarter second until it is answered, for ten seconds.
+//! * `CHALLENGE`: the salt, the server's key for this connection (X25519), its own key
+//!   (Ed25519), and its signature of the salt and the connection's key.
+//! * `JOIN` (client to server, again until answered): the salt, the client's key for this
+//!   connection, its own key, its signature of all the keys, and what the client has to say
+//!   (its name...) sealed with the connection's key (ChaCha20-Poly1305, number 0). Only the
+//!   one who got the challenge can answer it: a forged sender address gets nowhere.
+//! * `ACCEPT`: the salt, the connection's number (picked by the server), and what the server
+//!   answers (the map...) sealed. `DENY`: the salt and why not.
+//! * `DATA`: the connection, the packet's number, and the rest sealed: the packet's sequence
+//!   number and the newest one received from the other side (for the round trip), the reliable
+//!   chunks received - all before a number, and up to eight ranges of those that came early -
+//!   then the messages. Every packet acknowledges what arrived, so a packet lost costs nothing
+//!   more than what was in it: its reliable chunks are sent again when they have waited longer
+//!   than the round trip. A packet that comes twice is dropped the second time, and one that
+//!   does not open - changed, or no one's of this connection - is never there.
+//! * `DISCONNECT`: the connection, the packet's number, and why, sealed.
 //! * `QUERY` (anyone to a server, no connection needed): a number the asker picked, padded with
 //!   zeros to a whole packet. `INFO`: that number, and what the server says of itself (its name,
 //!   its map...: [`Server::set_info`]). The question is as long as any answer can be, so a
@@ -42,8 +53,13 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
+pub mod crypto;
+
+use crypto::{Ephemeral, KEY, Opener, SIGNATURE, Sealer, SessionKeys, TAG};
+pub use crypto::{Identity, PublicKey};
+
 /// The version of the protocol: a client and a server of different ones do not connect.
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
 
 const MAGIC: [u8; 4] = *b"OGMN";
 const CONNECT: u8 = 1;
@@ -53,6 +69,8 @@ const DATA: u8 = 4;
 const DISCONNECT: u8 = 5;
 const QUERY: u8 = 6;
 const INFO: u8 = 7;
+const CHALLENGE: u8 = 8;
+const JOIN: u8 = 9;
 
 const RELIABLE: u8 = 1;
 const UNRELIABLE: u8 = 2;
@@ -60,9 +78,13 @@ const FRAGMENT: u8 = 3;
 
 /// The most a packet holds: under what any path between two computers carries whole.
 pub const MAX_PACKET: usize = 1200;
-/// The header of a `DATA` packet at its longest: magic, kind, connection, sequence, the newest
-/// packet received, the chunks received and their ranges.
-const DATA_HEADER: usize = 4 + 1 + 8 + 2 + 2 + 4 + 1 + RANGES * 6;
+/// The most a sealed packet holds before it is sealed.
+const SEALED: usize = MAX_PACKET - TAG;
+/// Where a sealed packet's number is: after the magic, the kind and the connection.
+const NUMBER_AT: usize = 4 + 1 + 8;
+/// The header of a `DATA` packet at its longest: magic, kind, connection, number, sequence,
+/// the newest packet received, the chunks received and their ranges.
+const DATA_HEADER: usize = NUMBER_AT + 8 + 2 + 2 + 4 + 1 + RANGES * 6;
 /// How many ranges of chunks that came early a packet acknowledges.
 const RANGES: usize = 8;
 /// How many packets back one that comes twice is still known.
@@ -70,7 +92,7 @@ const SEEN: usize = 1024;
 /// What a reliable chunk carries at most.
 const CHUNK: usize = 1000;
 /// What a fragment of an unreliable message carries at most.
-const FRAGMENT_BYTES: usize = MAX_PACKET - DATA_HEADER - 1 - 2 - 1 - 1 - 2;
+const FRAGMENT_BYTES: usize = SEALED - DATA_HEADER - 1 - 2 - 1 - 1 - 2;
 /// The largest reliable message.
 pub const MAX_RELIABLE: usize = 64 << 20;
 /// The most a client's hello and a server's welcome may hold: each goes in one packet.
@@ -97,6 +119,9 @@ const RESEND_MIN: Duration = Duration::from_millis(100);
 const CONNECT_EVERY: Duration = Duration::from_millis(250);
 const CONNECT_FOR: Duration = Duration::from_secs(10);
 const FRAGMENTS_KEPT: Duration = Duration::from_secs(2);
+/// How many new challenges a server makes in a second at most: each costs it a key pair and a
+/// signature, which a flood of requests should not make it spend all its time on.
+const CHALLENGES_PER_SECOND: u32 = 200;
 
 /// Where packets go and come from: a UDP socket, or a network of tests.
 pub trait Wire {
@@ -151,11 +176,7 @@ impl Wire for Udp {
 
 /// A number no one can guess beforehand.
 fn random() -> u64 {
-    use std::hash::{BuildHasher, RandomState};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    RandomState::new().hash_one((n, std::time::SystemTime::now()))
+    u64::from_le_bytes(crypto::random_bytes())
 }
 
 /// Whether sequence number `a` comes after `b`, the numbers going round.
@@ -219,6 +240,9 @@ struct Fragments {
 struct Peer {
     addr: SocketAddr,
     id: u64,
+    /// What seals the packets sent, and opens those received.
+    sealer: Sealer,
+    opener: Opener,
     /// The sequence number of the next packet sent.
     seq: u16,
     /// The newest packet received, and the numbers of those received lately by their place in
@@ -252,10 +276,14 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(addr: SocketAddr, id: u64, now: Instant) -> Peer {
+    /// A side of a connection whose packets go sealed with `send` and come with `receive`:
+    /// numbered from 1, 0 having been the handshake's.
+    fn new(addr: SocketAddr, id: u64, send: &[u8; KEY], receive: &[u8; KEY], now: Instant) -> Peer {
         Peer {
             addr,
             id,
+            sealer: Sealer::new(send, 1),
+            opener: Opener::new(receive, 1),
             seq: 0,
             newest: None,
             seen: vec![None; SEEN],
@@ -311,7 +339,13 @@ impl Peer {
         self.queue.push_back(Chunk { id, last, data, sent_at: None });
     }
 
-    /// A `DATA` packet's body arrived (after the connection's number).
+    /// What a sealed packet of this connection holds, when it opens: `None` when it is not
+    /// whole, not this connection's, or came before.
+    fn open<'a>(&mut self, packet: &'a mut [u8]) -> Option<&'a [u8]> {
+        self.opener.open(packet, NUMBER_AT)
+    }
+
+    /// A `DATA` packet's body arrived, opened.
     fn receive(&mut self, r: &mut Reader, now: Instant) {
         let (Some(seq), Some(ack), Some(received), Some(count)) = (r.u16(), r.u16(), r.u32(), r.u8()) else { return };
         let mut ranges = Vec::with_capacity(usize::from(count).min(RANGES));
@@ -404,6 +438,8 @@ impl Peer {
         p.extend_from_slice(&MAGIC);
         p.push(DATA);
         p.extend_from_slice(&self.id.to_le_bytes());
+        // the packet's number, when it is sealed
+        p.extend_from_slice(&[0; 8]);
         p.extend_from_slice(&self.seq.to_le_bytes());
         p.extend_from_slice(&self.newest.unwrap_or(0xffff).to_le_bytes());
         p.extend_from_slice(&self.expect.to_le_bytes());
@@ -446,7 +482,7 @@ impl Peer {
         let mut packets: Vec<Vec<u8>> = Vec::new();
         let mut current: Option<Vec<u8>> = None;
         let mut put = |peer: &mut Peer, bytes: &[u8], packets: &mut Vec<Vec<u8>>| -> bool {
-            if current.as_ref().is_some_and(|p| p.len() + bytes.len() > MAX_PACKET) {
+            if current.as_ref().is_some_and(|p| p.len() + bytes.len() > SEALED) {
                 packets.extend(current.take());
             }
             if current.is_none() {
@@ -482,7 +518,7 @@ impl Peer {
             self.queue[i].sent_at = Some(now);
         }
         for message in std::mem::take(&mut self.unreliable) {
-            if message.len() + 3 <= MAX_PACKET - DATA_HEADER {
+            if message.len() + 3 <= SEALED - DATA_HEADER {
                 let mut bytes = vec![UNRELIABLE];
                 bytes.extend_from_slice(&(message.len() as u16).to_le_bytes());
                 bytes.extend_from_slice(&message);
@@ -513,7 +549,18 @@ impl Peer {
             self.owe_ack = false;
             self.last_sent = Some(now);
         }
+        for packet in &mut packets {
+            self.sealer.seal(packet, NUMBER_AT);
+        }
         packets
+    }
+
+    /// A `DISCONNECT` packet saying why.
+    fn bye(&mut self, reason: &str) -> Vec<u8> {
+        let reason = &reason.as_bytes()[..reason.len().min(MAX_HELLO)];
+        let mut packet = control(DISCONNECT, &[&self.id.to_le_bytes(), &[0; 8], reason]);
+        self.sealer.seal(&mut packet, NUMBER_AT);
+        packet
     }
 }
 
@@ -544,11 +591,12 @@ pub type ClientId = u64;
 /// What happened on a server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEvent {
-    /// Someone asks to connect, saying `hello`: answer with [`Server::accept`] or
-    /// [`Server::deny`].
+    /// Someone asks to connect, saying `hello`, known by `key` (they have proven it is theirs):
+    /// answer with [`Server::accept`] or [`Server::deny`].
     Request {
         addr: SocketAddr,
         hello: Vec<u8>,
+        key: PublicKey,
     },
     Message {
         client: ClientId,
@@ -564,31 +612,73 @@ pub enum ServerEvent {
 struct Asked {
     addr: SocketAddr,
     salt: u64,
-    /// What they were answered: the connection made, or why not.
+    /// The connection's key pair, until the challenge is answered.
+    ephemeral: Option<Ephemeral>,
+    /// The challenge, sent again when asked again.
+    challenge: Vec<u8>,
+    /// Who answered the challenge.
+    client: Option<PublicKey>,
+    /// The connection's keys, from the answer to its acceptance.
+    keys: Option<SessionKeys>,
+    /// What they were answered: the connection made (and the packet that said so), or why not.
     answer: Option<Result<(ClientId, Vec<u8>), String>>,
 }
+
+/// What a server signs of a challenge: the client's salt and the connection's key.
+fn challenge_signed(salt: u64, server_ephemeral: &[u8; KEY]) -> Vec<u8> {
+    [&b"openGMOD challenge"[..], &salt.to_le_bytes(), server_ephemeral].concat()
+}
+
+/// What a client signs of its answer, and what the connection's keys are made over: every key
+/// the handshake named.
+fn transcript(salt: u64, server: &PublicKey, server_ephemeral: &[u8; KEY], client: &PublicKey, client_ephemeral: &[u8; KEY]) -> Vec<u8> {
+    [&b"openGMOD join"[..], &salt.to_le_bytes(), &server.0, server_ephemeral, &client.0, client_ephemeral].concat()
+}
+
+/// Where what a `JOIN` seals starts: after the magic, the kind, the salt, two keys and the
+/// signature.
+const JOIN_HEADER: usize = 4 + 1 + 8 + KEY + KEY + SIGNATURE;
+/// Where what an `ACCEPT` seals starts: after the magic, the kind, the salt and the connection.
+const ACCEPT_HEADER: usize = 4 + 1 + 8 + 8;
 
 /// A server: it listens for clients and keeps a connection with each it accepts.
 pub struct Server<W: Wire = Udp> {
     wire: W,
+    identity: Identity,
     peers: Vec<Peer>,
     asked: Vec<Asked>,
     events: Vec<ServerEvent>,
     rate: u32,
     /// What it answers queries with; nothing while it is empty.
     info: Vec<u8>,
+    /// The second the latest challenges were made in, and how many.
+    challenged: (Option<Instant>, u32),
 }
 
 impl Server<Udp> {
-    /// A server listening at `addr` (`0.0.0.0:27015`).
-    pub fn bind(addr: SocketAddr) -> io::Result<Server<Udp>> {
-        Ok(Server::with_wire(Udp::bind(addr)?))
+    /// A server listening at `addr` (`0.0.0.0:27015`), known by `identity`.
+    pub fn bind(addr: SocketAddr, identity: Identity) -> io::Result<Server<Udp>> {
+        Ok(Server::with_wire(Udp::bind(addr)?, identity))
     }
 }
 
 impl<W: Wire> Server<W> {
-    pub fn with_wire(wire: W) -> Server<W> {
-        Server { wire, peers: Vec::new(), asked: Vec::new(), events: Vec::new(), rate: DEFAULT_RATE, info: Vec::new() }
+    pub fn with_wire(wire: W, identity: Identity) -> Server<W> {
+        Server {
+            wire,
+            identity,
+            peers: Vec::new(),
+            asked: Vec::new(),
+            events: Vec::new(),
+            rate: DEFAULT_RATE,
+            info: Vec::new(),
+            challenged: (None, 0),
+        }
+    }
+
+    /// What clients know this server by.
+    pub fn key(&self) -> PublicKey {
+        self.identity.public()
     }
 
     /// What it answers those who ask what it is ([`Query`]): no more than [`MAX_INFO`], or it
@@ -605,8 +695,8 @@ impl<W: Wire> Server<W> {
     pub fn poll(&mut self, now: Instant) -> Vec<ServerEvent> {
         let mut buf = [0u8; 2048];
         while let Ok(Some((n, from))) = self.wire.recv_from(&mut buf) {
-            let packet = buf[..n.min(buf.len())].to_vec();
-            self.packet(&packet, from, now);
+            let mut packet = buf[..n.min(buf.len())].to_vec();
+            self.packet(&mut packet, from, now);
         }
         // the clients who went quiet, or broke the rules
         let mut gone = Vec::new();
@@ -629,7 +719,8 @@ impl<W: Wire> Server<W> {
         std::mem::take(&mut self.events)
     }
 
-    fn packet(&mut self, packet: &[u8], from: SocketAddr, now: Instant) {
+    fn packet(&mut self, packet: &mut [u8], from: SocketAddr, now: Instant) {
+        let length = packet.len();
         let mut r = Reader { data: packet };
         if r.take(4) != Some(&MAGIC[..]) {
             return;
@@ -637,57 +728,121 @@ impl<W: Wire> Server<W> {
         match r.u8() {
             Some(CONNECT) => {
                 let (Some(version), Some(salt)) = (r.u16(), r.u64()) else { return };
-                let hello = r.rest().to_vec();
-                if let Some(asked) = self.asked.iter().find(|a| a.addr == from && a.salt == salt) {
-                    // asked again: the answer was lost, or is not made yet
-                    match &asked.answer {
-                        Some(Ok((id, welcome))) => {
-                            let reply = control(ACCEPT, &[&salt.to_le_bytes(), &id.to_le_bytes(), welcome]);
-                            let _ = self.wire.send_to(&reply, from);
-                        }
-                        Some(Err(reason)) => {
-                            let _ = self.wire.send_to(&control(DENY, &[&salt.to_le_bytes(), reason.as_bytes()]), from);
-                        }
-                        None => {}
-                    }
-                    return;
-                }
-                if version != PROTOCOL {
-                    let reason = format!("the server speaks protocol {PROTOCOL}, the client {version}");
-                    let _ = self.wire.send_to(&control(DENY, &[&salt.to_le_bytes(), reason.as_bytes()]), from);
-                    return;
-                }
-                // a new attempt from the same place replaces the old one
-                self.asked.retain(|a| a.addr != from);
-                if self.asked.len() >= 256 {
-                    self.asked.remove(0);
-                }
-                self.asked.push(Asked { addr: from, salt, answer: None });
-                self.events.push(ServerEvent::Request { addr: from, hello });
+                self.connect(version, salt, length, from, now);
             }
+            Some(JOIN) => self.join(packet, from),
             Some(DATA) => {
                 let Some(id) = r.u64() else { return };
-                if let Some(peer) = self.peers.iter_mut().find(|p| p.id == id && p.addr == from) {
-                    peer.receive(&mut r, now);
+                if let Some(peer) = self.peers.iter_mut().find(|p| p.id == id && p.addr == from)
+                    && let Some(opened) = peer.open(packet)
+                {
+                    peer.receive(&mut Reader { data: opened }, now);
                 }
             }
             Some(QUERY) => {
                 let Some(nonce) = r.u64() else { return };
-                if packet.len() >= MAX_PACKET && !self.info.is_empty() {
+                if length >= MAX_PACKET && !self.info.is_empty() {
                     let _ = self.wire.send_to(&control(INFO, &[&nonce.to_le_bytes(), &self.info]), from);
                 }
             }
             Some(DISCONNECT) => {
                 let Some(id) = r.u64() else { return };
-                if let Some(i) = self.peers.iter().position(|p| p.id == id && p.addr == from) {
-                    let reason = String::from_utf8_lossy(r.rest()).into_owned();
-                    self.peers.remove(i);
-                    self.asked.retain(|a| a.addr != from);
-                    self.events.push(ServerEvent::Disconnected { client: id, reason });
-                }
+                let Some(i) = self.peers.iter().position(|p| p.id == id && p.addr == from) else { return };
+                let Some(reason) = self.peers[i].open(packet).map(|r| String::from_utf8_lossy(r).into_owned()) else { return };
+                self.peers.remove(i);
+                self.asked.retain(|a| a.addr != from);
+                self.events.push(ServerEvent::Disconnected { client: id, reason });
             }
             _ => {}
         }
+    }
+
+    /// Someone asks to connect: they are challenged to prove who they are, and that they get
+    /// what is sent to the address they ask from.
+    fn connect(&mut self, version: u16, salt: u64, length: usize, from: SocketAddr, now: Instant) {
+        if let Some(asked) = self.asked.iter().find(|a| a.addr == from && a.salt == salt) {
+            // asked again: the challenge was lost (or the answer, when there is one)
+            let again = match &asked.answer {
+                Some(Err(reason)) => control(DENY, &[&salt.to_le_bytes(), reason.as_bytes()]),
+                _ => asked.challenge.clone(),
+            };
+            let _ = self.wire.send_to(&again, from);
+            return;
+        }
+        if version != PROTOCOL {
+            // an older client's request may be short: the answer is no longer than it
+            let reason = format!("the server speaks protocol {PROTOCOL}, the client {version}");
+            let mut deny = control(DENY, &[&salt.to_le_bytes(), reason.as_bytes()]);
+            deny.truncate(length.max(4 + 1 + 8));
+            let _ = self.wire.send_to(&deny, from);
+            return;
+        }
+        // a request shorter than its answers would make this server an amplifier
+        if length < MAX_PACKET {
+            return;
+        }
+        // too many at once: those asking ask again in a quarter second
+        match &mut self.challenged {
+            (Some(since), count) if now.duration_since(*since) < Duration::from_secs(1) => {
+                if *count >= CHALLENGES_PER_SECOND {
+                    return;
+                }
+                *count += 1;
+            }
+            challenged => *challenged = (Some(now), 1),
+        }
+        // a new attempt from the same place replaces the old one
+        self.asked.retain(|a| a.addr != from);
+        if self.asked.len() >= 256 {
+            self.asked.remove(0);
+        }
+        let ephemeral = Ephemeral::generate();
+        let signature = self.identity.sign(&challenge_signed(salt, &ephemeral.public));
+        let challenge = control(CHALLENGE, &[&salt.to_le_bytes(), &ephemeral.public, &self.identity.public().0, &signature]);
+        let _ = self.wire.send_to(&challenge, from);
+        self.asked.push(Asked { addr: from, salt, ephemeral: Some(ephemeral), challenge, client: None, keys: None, answer: None });
+    }
+
+    /// A client answers its challenge: who it is, proven, and its hello.
+    fn join(&mut self, packet: &mut [u8], from: SocketAddr) {
+        let mut r = Reader { data: packet };
+        r.take(5);
+        let (Some(salt), Some(theirs), Some(client), Some(signature)) = (r.u64(), r.take(KEY), r.take(KEY), r.take(SIGNATURE)) else {
+            return;
+        };
+        let (Ok(theirs), Ok(client)) = (<[u8; KEY]>::try_from(theirs), <[u8; KEY]>::try_from(client)) else { return };
+        let client = PublicKey(client);
+        let server = self.identity.public();
+        let Some(i) = self.asked.iter().position(|a| a.addr == from && a.salt == salt) else { return };
+        let asked = &mut self.asked[i];
+        if asked.client.is_some() {
+            // answered again: what it was answered was lost, or is not made yet
+            let again = match &asked.answer {
+                Some(Ok((_, accept))) => Some(accept.clone()),
+                Some(Err(reason)) => Some(control(DENY, &[&salt.to_le_bytes(), reason.as_bytes()])),
+                None => None,
+            };
+            if let Some(again) = again {
+                let _ = self.wire.send_to(&again, from);
+            }
+            return;
+        }
+        let Some(ours) = asked.ephemeral.as_ref().map(|e| e.public) else { return };
+        let said = transcript(salt, &server, &ours, &client, &theirs);
+        if !client.verify(&said, signature) {
+            return;
+        }
+        let keys = asked.ephemeral.take().and_then(|e| e.agree(&theirs, &said));
+        let hello = keys.as_ref().and_then(|k| Opener::open_numbered(&k.client, 0, packet, JOIN_HEADER)).map(<[u8]>::to_vec);
+        let (Some(keys), Some(hello)) = (keys, hello) else {
+            // the connection's key pair is spent: whoever it was starts again
+            self.asked.remove(i);
+            return;
+        };
+        let asked = &mut self.asked[i];
+        asked.client = Some(client);
+        asked.keys = Some(keys);
+        self.events.push(ServerEvent::Request { addr: from, hello, key: client });
     }
 
     /// Lets in someone who asked, answering `welcome`: their connection, or none if they did
@@ -698,17 +853,19 @@ impl<W: Wire> Server<W> {
             self.deny(addr, "the server's welcome is too long");
             return None;
         }
-        let asked = self.asked.iter_mut().find(|a| a.addr == addr && a.answer.is_none())?;
+        let asked = self.asked.iter_mut().find(|a| a.addr == addr && a.answer.is_none() && a.keys.is_some())?;
+        let keys = asked.keys.take()?;
         let id = random();
-        asked.answer = Some(Ok((id, welcome.to_vec())));
-        let reply = control(ACCEPT, &[&asked.salt.to_le_bytes(), &id.to_le_bytes(), welcome]);
+        let mut reply = control(ACCEPT, &[&asked.salt.to_le_bytes(), &id.to_le_bytes(), welcome]);
+        Sealer::seal_numbered(&keys.server, 0, &mut reply, ACCEPT_HEADER);
         let _ = self.wire.send_to(&reply, addr);
+        asked.answer = Some(Ok((id, reply)));
         // someone coming back from the same address: their old connection is gone
         if let Some(i) = self.peers.iter().position(|p| p.addr == addr) {
             let old = self.peers.remove(i);
             self.events.push(ServerEvent::Disconnected { client: old.id, reason: "reconnected".to_string() });
         }
-        let mut peer = Peer::new(addr, id, now);
+        let mut peer = Peer::new(addr, id, &keys.server, &keys.client, now);
         peer.rate = self.rate;
         self.peers.push(peer);
         Some(id)
@@ -717,8 +874,10 @@ impl<W: Wire> Server<W> {
     /// Turns away someone who asked, saying why.
     pub fn deny(&mut self, addr: SocketAddr, reason: &str) {
         let Some(asked) = self.asked.iter_mut().find(|a| a.addr == addr && a.answer.is_none()) else { return };
-        asked.answer = Some(Err(reason.to_string()));
+        let reason = String::from_utf8_lossy(&reason.as_bytes()[..reason.len().min(MAX_HELLO)]).into_owned();
+        asked.keys = None;
         let _ = self.wire.send_to(&control(DENY, &[&asked.salt.to_le_bytes(), reason.as_bytes()]), addr);
+        asked.answer = Some(Err(reason));
     }
 
     /// Sends a client a message, reliable or not.
@@ -741,10 +900,10 @@ impl<W: Wire> Server<W> {
     /// Closes a client's connection, telling them why.
     pub fn disconnect(&mut self, client: ClientId, reason: &str) {
         let Some(i) = self.peers.iter().position(|p| p.id == client) else { return };
-        let peer = self.peers.remove(i);
-        let bye = control(DISCONNECT, &[&peer.id.to_le_bytes(), reason.as_bytes()]);
+        let mut peer = self.peers.remove(i);
+        // three times, each its own packet: one that comes twice would be dropped
         for _ in 0..3 {
-            let _ = self.wire.send_to(&bye, peer.addr);
+            let _ = self.wire.send_to(&peer.bye(reason), peer.addr);
         }
         self.asked.retain(|a| a.addr != peer.addr);
     }
@@ -776,12 +935,19 @@ impl<W: Wire> Server<W> {
 /// What happened on a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEvent {
-    /// The server let us in, saying `welcome`.
+    /// The server let us in, saying `welcome`; it is known by `key` (it has proven it is
+    /// its).
     Accepted {
         welcome: Vec<u8>,
+        key: PublicKey,
     },
     Denied {
         reason: String,
+    },
+    /// The server is known by another key than the one it was expected to have
+    /// ([`Client::connect`]): it may not be the server, and was not answered.
+    KeyChanged {
+        key: PublicKey,
     },
     Message {
         data: Vec<u8>,
@@ -792,7 +958,18 @@ pub enum ClientEvent {
 }
 
 enum State {
-    Connecting { since: Instant, tried: Option<Instant> },
+    Connecting {
+        since: Instant,
+        tried: Option<Instant>,
+    },
+    /// The challenge is answered, again until the server says yes or no.
+    Joining {
+        since: Instant,
+        tried: Option<Instant>,
+        join: Vec<u8>,
+        keys: SessionKeys,
+        server: PublicKey,
+    },
     Connected(Box<Peer>),
     Closed,
 }
@@ -803,29 +980,41 @@ pub struct Client<W: Wire = Udp> {
     server: SocketAddr,
     salt: u64,
     hello: Vec<u8>,
+    identity: Identity,
+    /// The key the server is expected to have.
+    expect: Option<PublicKey>,
     state: State,
     rate: u32,
 }
 
 impl Client<Udp> {
-    /// Starts connecting to a server, saying `hello`.
-    pub fn connect(server: SocketAddr, hello: &[u8], now: Instant) -> io::Result<Client<Udp>> {
+    /// Starts connecting to a server as `identity`, saying `hello`; with `expect`, only to a
+    /// server known by that key.
+    pub fn connect(
+        server: SocketAddr,
+        hello: &[u8],
+        identity: &Identity,
+        expect: Option<PublicKey>,
+        now: Instant,
+    ) -> io::Result<Client<Udp>> {
         if hello.len() > MAX_HELLO {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "the hello is too long"));
         }
         let any: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse() } else { "[::]:0".parse() }.map_err(io::Error::other)?;
-        Ok(Client::with_wire(Udp::bind(any)?, server, hello, now))
+        Ok(Client::with_wire(Udp::bind(any)?, server, hello, identity, expect, now))
     }
 }
 
 impl<W: Wire> Client<W> {
-    pub fn with_wire(wire: W, server: SocketAddr, hello: &[u8], now: Instant) -> Client<W> {
+    pub fn with_wire(wire: W, server: SocketAddr, hello: &[u8], identity: &Identity, expect: Option<PublicKey>, now: Instant) -> Client<W> {
         debug_assert!(hello.len() <= MAX_HELLO, "a hello of {} bytes", hello.len());
         Client {
             wire,
             server,
             salt: random(),
             hello: hello.to_vec(),
+            identity: identity.clone(),
+            expect,
             state: State::Connecting { since: now, tried: None },
             rate: DEFAULT_RATE,
         }
@@ -867,41 +1056,11 @@ impl<W: Wire> Client<W> {
             if from != self.server {
                 continue;
             }
-            let mut r = Reader { data: &buf[..n.min(buf.len())] };
-            if r.take(4) != Some(&MAGIC[..]) {
-                continue;
-            }
-            match (r.u8(), &mut self.state) {
-                (Some(ACCEPT), State::Connecting { .. }) => {
-                    let (Some(salt), Some(id)) = (r.u64(), r.u64()) else { continue };
-                    if salt == self.salt {
-                        let mut peer = Peer::new(self.server, id, now);
-                        peer.rate = self.rate;
-                        self.state = State::Connected(Box::new(peer));
-                        events.push(ClientEvent::Accepted { welcome: r.rest().to_vec() });
-                    }
-                }
-                (Some(DENY), State::Connecting { .. }) => {
-                    if r.u64() == Some(self.salt) {
-                        self.state = State::Closed;
-                        events.push(ClientEvent::Denied { reason: String::from_utf8_lossy(r.rest()).into_owned() });
-                    }
-                }
-                (Some(DATA), State::Connected(peer)) => {
-                    if r.u64() == Some(peer.id) {
-                        peer.receive(&mut r, now);
-                    }
-                }
-                (Some(DISCONNECT), State::Connected(peer)) if r.u64() == Some(peer.id) => {
-                    let reason = String::from_utf8_lossy(r.rest()).into_owned();
-                    self.state = State::Closed;
-                    events.push(ClientEvent::Disconnected { reason });
-                }
-                _ => {}
-            }
+            let mut packet = buf[..n.min(buf.len())].to_vec();
+            self.packet(&mut packet, now, &mut events);
         }
         match &mut self.state {
-            State::Connecting { since, .. } if now.duration_since(*since) > CONNECT_FOR => {
+            State::Connecting { since, .. } | State::Joining { since, .. } if now.duration_since(*since) > CONNECT_FOR => {
                 self.state = State::Closed;
                 events.push(ClientEvent::Denied { reason: "the server did not answer".into() });
             }
@@ -921,6 +1080,75 @@ impl<W: Wire> Client<W> {
         events
     }
 
+    fn packet(&mut self, packet: &mut [u8], now: Instant, events: &mut Vec<ClientEvent>) {
+        let mut r = Reader { data: packet };
+        if r.take(4) != Some(&MAGIC[..]) {
+            return;
+        }
+        match (r.u8(), &mut self.state) {
+            (Some(CHALLENGE), State::Connecting { since, .. }) => {
+                let (Some(salt), Some(theirs), Some(server), Some(signature)) = (r.u64(), r.take(KEY), r.take(KEY), r.take(SIGNATURE))
+                else {
+                    return;
+                };
+                let (Ok(theirs), Ok(server)) = (<[u8; KEY]>::try_from(theirs), <[u8; KEY]>::try_from(server)) else { return };
+                let server = PublicKey(server);
+                if salt != self.salt || !server.verify(&challenge_signed(salt, &theirs), signature) {
+                    return;
+                }
+                if self.expect.is_some_and(|k| k != server) {
+                    self.state = State::Closed;
+                    events.push(ClientEvent::KeyChanged { key: server });
+                    return;
+                }
+                let since = *since;
+                let ours = Ephemeral::generate();
+                let mine = ours.public;
+                let said = transcript(salt, &server, &theirs, &self.identity.public(), &mine);
+                let Some(keys) = ours.agree(&theirs, &said) else {
+                    self.state = State::Closed;
+                    events.push(ClientEvent::Denied { reason: "the server's key for the connection is no key".into() });
+                    return;
+                };
+                let signature = self.identity.sign(&said);
+                let mut join = control(JOIN, &[&salt.to_le_bytes(), &mine, &self.identity.public().0, &signature, &self.hello]);
+                Sealer::seal_numbered(&keys.client, 0, &mut join, JOIN_HEADER);
+                self.state = State::Joining { since, tried: None, join, keys, server };
+            }
+            (Some(ACCEPT), State::Joining { keys, server, .. }) => {
+                let (Some(salt), Some(id)) = (r.u64(), r.u64()) else { return };
+                if salt != self.salt {
+                    return;
+                }
+                let Some(welcome) = Opener::open_numbered(&keys.server, 0, packet, ACCEPT_HEADER).map(<[u8]>::to_vec) else { return };
+                let mut peer = Peer::new(self.server, id, &keys.client, &keys.server, now);
+                peer.rate = self.rate;
+                let key = *server;
+                self.state = State::Connected(Box::new(peer));
+                events.push(ClientEvent::Accepted { welcome, key });
+            }
+            (Some(DENY), State::Connecting { .. } | State::Joining { .. }) => {
+                if r.u64() == Some(self.salt) {
+                    self.state = State::Closed;
+                    events.push(ClientEvent::Denied { reason: String::from_utf8_lossy(r.rest()).into_owned() });
+                }
+            }
+            (Some(DATA), State::Connected(peer)) => {
+                if r.u64() == Some(peer.id)
+                    && let Some(opened) = peer.open(packet)
+                {
+                    peer.receive(&mut Reader { data: opened }, now);
+                }
+            }
+            (Some(DISCONNECT), State::Connected(peer)) if r.u64() == Some(peer.id) => {
+                let Some(reason) = peer.open(packet).map(|r| String::from_utf8_lossy(r).into_owned()) else { return };
+                self.state = State::Closed;
+                events.push(ClientEvent::Disconnected { reason });
+            }
+            _ => {}
+        }
+    }
+
     /// Sends the server a message, reliable or not; nothing is sent before the connection is
     /// made.
     pub fn send(&mut self, data: &[u8], reliable: bool) -> Result<(), TooBig> {
@@ -930,14 +1158,27 @@ impl<W: Wire> Client<W> {
         }
     }
 
-    /// Sends what is due: asking to connect again, or the connection's packets.
+    /// Sends what is due: asking to connect again, answering the challenge again, or the
+    /// connection's packets.
     pub fn flush(&mut self, now: Instant) {
+        let due = |tried: &mut Option<Instant>| {
+            let due = tried.is_none_or(|at| now.duration_since(at) >= CONNECT_EVERY);
+            if due {
+                *tried = Some(now);
+            }
+            due
+        };
         match &mut self.state {
             State::Connecting { tried, .. } => {
-                if tried.is_none_or(|at| now.duration_since(at) >= CONNECT_EVERY) {
-                    *tried = Some(now);
-                    let ask = control(CONNECT, &[&PROTOCOL.to_le_bytes(), &self.salt.to_le_bytes(), &self.hello]);
+                if due(tried) {
+                    let mut ask = control(CONNECT, &[&PROTOCOL.to_le_bytes(), &self.salt.to_le_bytes()]);
+                    ask.resize(MAX_PACKET, 0);
                     let _ = self.wire.send_to(&ask, self.server);
+                }
+            }
+            State::Joining { tried, join, .. } => {
+                if due(tried) {
+                    let _ = self.wire.send_to(join, self.server);
                 }
             }
             State::Connected(peer) => {
@@ -951,9 +1192,9 @@ impl<W: Wire> Client<W> {
 
     /// Leaves the server, telling it why.
     pub fn disconnect(&mut self, reason: &str) {
-        if let State::Connected(peer) = &self.state {
-            let bye = control(DISCONNECT, &[&peer.id.to_le_bytes(), reason.as_bytes()]);
+        if let State::Connected(peer) = &mut self.state {
             for _ in 0..3 {
+                let bye = peer.bye(reason);
                 let _ = self.wire.send_to(&bye, self.server);
             }
         }

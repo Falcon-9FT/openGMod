@@ -1158,6 +1158,9 @@ dependencies = [
 [[package]]
 name = "gmod-net"
 version = "0.4.4"
+dependencies = [
+ "ring",
+]
 
 [[package]]
 name = "gmod-physics"

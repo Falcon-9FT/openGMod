@@ -163,7 +163,8 @@ pub(crate) fn to_client(lua: &Lua, player: EntityHandle, what: ToClient) {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlayerInfo {
     pub name: String,
-    /// The player's Steam ID, when Steam vouches for them; bots have none.
+    /// The player's `SteamID64`. openGMOD's own, made from the key the player proved is
+    /// theirs as they connected - no Steam vouches for anyone; bots have none.
     pub steam_id64: Option<u64>,
     pub bot: bool,
     /// `IPAddress`: `loopback` for the player of a single-player game.
@@ -370,7 +371,7 @@ impl PlayerState {
         }
     }
 
-    /// `SteamID64`: the Steam ID, the bot's number, or 0 for a player Steam does not know.
+    /// `SteamID64`: the player's ID, the bot's number, or 0 for a player with none.
     fn steam_id64(&self) -> u64 {
         if self.info.bot { self.bot_id } else { self.info.steam_id64.unwrap_or(0) }
     }
