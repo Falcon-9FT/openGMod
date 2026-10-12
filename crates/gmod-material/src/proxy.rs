@@ -19,10 +19,11 @@
 //!
 //! Proxies read here: `AnimatedTexture`, `TextureScroll`, `TextureTransform`, `Sine`,
 //! `LinearRamp`, `CurrentTime`, `UniformNoise`, `GaussianNoise`, `Add`, `Subtract`,
-//! `Multiply`, `Divide`, `Equals`, `Clamp`, `Abs`, `Frac`, `Int`. The others read the entity
-//! being drawn or the game (`PlayerColor`, `ToggleTexture`, `MaterialModify`, `WaterLOD`,
-//! `Camo` ...): they are listed in [`Proxies::ignored`] and leave the parameters as the
-//! material sets them.
+//! `Multiply`, `Divide`, `Equals`, `Clamp`, `Abs`, `Frac`, `Int`, `Exponential`,
+//! `LessOrEqual`, `SelectFirstIfNonZero`, `WrapMinMax`. The others read the entity being
+//! drawn or the game (`PlayerColor`, `ToggleTexture`, `MaterialModify`, `WaterLOD`, `Camo`
+//! ...), or are not known here: they are listed in [`Proxies::ignored`] and leave the
+//! parameters as the material sets them.
 
 use gmod_kv::Block;
 
@@ -89,6 +90,15 @@ impl Var {
     fn map(self, f: impl Fn(f32) -> f32) -> Var {
         self.zip(self, |a, _| f(a))
     }
+
+    /// Zero in every component; a transform never is.
+    fn zero(self) -> bool {
+        match self {
+            Var::Number(n) => n == 0.0,
+            Var::Vector(v) => v == [0.0; 3],
+            Var::Matrix(_) => false,
+        }
+    }
 }
 
 /// Reads a texture transform as materials write it: `center`, `scale`, `rotate` (degrees)
@@ -154,6 +164,9 @@ enum Op {
     GaussianNoise { mean: Input, half_width: Input, min: Input, max: Input, result: Ref },
     Math { kind: MathKind, a: Ref, b: Ref, result: Ref },
     Clamp { min: Input, max: Input, src: Ref, result: Ref },
+    Exponential { scale: Input, offset: Input, min: Input, max: Input, src: Ref, result: Ref },
+    WrapMinMax { min: Input, max: Input, src: Ref, result: Ref },
+    LessOrEqual { a: Ref, b: Ref, less_equal: Ref, greater: Ref, result: Ref },
     Each { kind: EachKind, src: Ref, result: Ref },
     AnimatedTexture { frame: Ref, rate: Input },
     TextureScroll { result: Ref, rate: Input, angle: Input, scale: Input },
@@ -166,6 +179,8 @@ enum MathKind {
     Subtract,
     Multiply,
     Divide,
+    /// The first unless it is zero (every component), else the second.
+    SelectFirst,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -183,7 +198,8 @@ pub struct Proxies {
     names: Vec<String>,
     initial: Vec<Var>,
     ops: Vec<Op>,
-    /// Proxies not run: those that need an entity or the game, and unknown ones (lower case).
+    /// Proxies not run: those that need an entity or the game, and the ones not known here
+    /// (lower case).
     pub ignored: Vec<String>,
 }
 
@@ -272,6 +288,9 @@ impl Proxies {
             | Op::GaussianNoise { result, .. }
             | Op::Math { result, .. }
             | Op::Clamp { result, .. }
+            | Op::Exponential { result, .. }
+            | Op::WrapMinMax { result, .. }
+            | Op::LessOrEqual { result, .. }
             | Op::Each { result, .. }
             | Op::TextureScroll { result, .. }
             | Op::TextureTransform { result, .. } => written(result),
@@ -316,6 +335,7 @@ impl Proxies {
             "subtract" => Some(MathKind::Subtract),
             "multiply" => Some(MathKind::Multiply),
             "divide" => Some(MathKind::Divide),
+            "selectfirstifnonzero" => Some(MathKind::SelectFirst),
             _ => None,
         };
         if let Some(kind) = math {
@@ -357,6 +377,27 @@ impl Proxies {
                 min: self.input(m, p, "min", 0.0),
                 max: self.input(m, p, "max", 1.0),
                 src: var(self, "srcvar1")?,
+                result: result?,
+            },
+            "exponential" => Op::Exponential {
+                scale: self.input(m, p, "scale", 1.0),
+                offset: self.input(m, p, "offset", 0.0),
+                min: self.input(m, p, "minval", f32::MIN),
+                max: self.input(m, p, "maxval", f32::MAX),
+                src: var(self, "srcvar1")?,
+                result: result?,
+            },
+            "wrapminmax" => Op::WrapMinMax {
+                min: self.input(m, p, "minval", 0.0),
+                max: self.input(m, p, "maxval", 1.0),
+                src: var(self, "srcvar1")?,
+                result: result?,
+            },
+            "lessorequal" => Op::LessOrEqual {
+                a: var(self, "srcvar1")?,
+                b: var(self, "srcvar2")?,
+                less_equal: var(self, "lessequalvar")?,
+                greater: var(self, "greatervar")?,
                 result: result?,
             },
             "animatedtexture" => Op::AnimatedTexture {
@@ -434,12 +475,32 @@ impl Proxies {
                         MathKind::Multiply => a.zip(b, |x, y| x * y),
                         // nothing comes of dividing by 0, as the engine has it
                         MathKind::Divide => a.zip(b, |x, y| if y == 0.0 { x } else { x / y }),
+                        MathKind::SelectFirst if a.zero() => b,
+                        MathKind::SelectFirst => a,
                     };
                     write(&mut values, result, v);
                 }
                 Op::Clamp { min, max, src, result } => {
                     let (min, max) = (input(&values, min), input(&values, max));
                     let v = read(&values, src).map(|x| x.max(min).min(max));
+                    write(&mut values, result, v);
+                }
+                Op::Exponential { scale, offset, min, max, src, result } => {
+                    let (scale, offset) = (input(&values, scale), input(&values, offset));
+                    let (min, max) = (input(&values, min), input(&values, max));
+                    let v = read(&values, src).map(|x| (scale * (x + offset).exp()).max(min).min(max));
+                    write(&mut values, result, v);
+                }
+                Op::WrapMinMax { min, max, src, result } => {
+                    // into [min, max), from either side; an empty range leaves only min
+                    let (min, max) = (input(&values, min), input(&values, max));
+                    let wrap = |x: f32| if max <= min { min } else { min + (x - min).rem_euclid(max - min) };
+                    let v = read(&values, src).map(wrap);
+                    write(&mut values, result, v);
+                }
+                Op::LessOrEqual { a, b, less_equal, greater, result } => {
+                    let pick = if read(&values, a).number() <= read(&values, b).number() { less_equal } else { greater };
+                    let v = read(&values, pick);
                     write(&mut values, result, v);
                 }
                 Op::Each { kind, src, result } => {
@@ -460,7 +521,9 @@ impl Proxies {
                 Op::TextureScroll { result, rate, angle, scale } => {
                     let (s, c) = input(&values, angle).to_radians().sin_cos();
                     // whole repeats change nothing; dropping them keeps precision as time goes on
-                    let offset = |d: f32| (d * input(&values, rate) * time).fract();
+                    // and the offset stays in [0, 1) whichever way it scrolls (a hair below 0
+                    // rounds up to 1, which is 0 again)
+                    let offset = |d: f32| Some((d * input(&values, rate) * time).rem_euclid(1.0)).filter(|&o| o < 1.0).unwrap_or(0.0);
                     let (u, v) = (offset(c), offset(s));
                     let scale = input(&values, scale);
                     let var = match values[result.var] {

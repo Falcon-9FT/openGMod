@@ -90,6 +90,38 @@ fn texture_scroll_moves_the_transform() {
     // into a vector
     let p = proxies(r#""TextureScroll" { "texturescrollvar" "$offset" "texturescrollrate" 0.5 }"#, r#""$offset" "[0 0 0]""#);
     assert_eq!(p.at(1.0).vector("$offset"), Some([0.5, 0.0, 0.0]));
+    // backwards, the offset still in [0, 1)
+    let p =
+        proxies(r#""TextureScroll" { "texturescrollvar" "$basetexturetransform" "texturescrollrate" 0.25 "texturescrollangle" 180 }"#, "");
+    let m = p.at(1.0).matrix("$basetexturetransform").unwrap();
+    assert!(close_matrix(m, [[1.0, 0.0, 0.75], [0.0, 1.0, 0.0]]), "{m:?}");
+    let m = p.at(5.0).matrix("$basetexturetransform").unwrap();
+    assert!(close(m[0][2], 0.75), "{m:?}");
+}
+
+#[test]
+fn more_math_proxies() {
+    let p = proxies(
+        r#""Exponential" { "srcvar1" "$one" "scale" 2 "offset" -1 "resultvar" "$exp" }
+           "Exponential" { "srcvar1" "$one" "maxval" 2 "resultvar" "$capped" }
+           "LinearRamp" { "rate" 1 "initialvalue" 0 "resultvar" "$t" }
+           "WrapMinMax" { "srcvar1" "$t" "minval" 1 "maxval" 3 "resultvar" "$wrapped" }
+           "LessOrEqual" { "srcvar1" "$t" "srcvar2" "$two" "lessequalvar" "$one" "greatervar" "$zero" "resultvar" "$early" }
+           "SelectFirstIfNonZero" { "srcvar1" "$zero" "srcvar2" "$two" "resultvar" "$second" }
+           "SelectFirstIfNonZero" { "srcvar1" "$color" "srcvar2" "$two" "resultvar" "$first" }"#,
+        r#""$one" 1 "$two" 2 "$zero" 0 "$color" "[0 0.5 0]""#,
+    );
+    let at = p.at(0.5);
+    assert!(close(at.number("$exp").unwrap(), 2.0), "2 * e^0");
+    assert_eq!(at.number("$capped"), Some(2.0), "e, capped at 2");
+    assert_eq!(at.number("$wrapped"), Some(2.5), "0.5 wraps up into [1, 3)");
+    assert_eq!(at.number("$early"), Some(1.0));
+    assert_eq!(at.number("$second"), Some(2.0));
+    assert_eq!(at.vector("$first"), Some([0.0, 0.5, 0.0]), "a vector with a component that is not 0");
+    let at = p.at(3.5);
+    assert_eq!(at.number("$wrapped"), Some(1.5));
+    assert_eq!(at.number("$early"), Some(0.0));
+    assert!(p.ignored.is_empty());
 }
 
 #[test]

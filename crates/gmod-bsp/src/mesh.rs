@@ -11,8 +11,10 @@
 //! * Only the first lightmap of a face is used (style 0; with bump mapping the first of four
 //!   is the unbumped one). Faces without one are lit by a white luxel.
 //! * Faces flagged nodraw, sky, trigger, hint or skip are left out.
-//! * The overlays on the faces built come after them, a batch each, lifted a little off their
-//!   faces and lit by their light maps ([`crate::overlay`]).
+//! * The overlays on the faces built come after them, a batch each from the lowest render
+//!   order up, lifted a little off their faces and lit by their light maps
+//!   ([`crate::overlay`]). Only the world has them: brush entities' faces are in their own
+//!   space.
 
 use std::collections::HashMap;
 
@@ -242,7 +244,9 @@ pub fn build_faces(bsp: &Bsp, options: Options, keep: impl Fn(usize) -> bool) ->
         }
     }
     mesh.batches.extend(current);
-    if !bsp.overlays.is_empty() {
+    // overlays lie on the world in its coordinates; a brush entity's faces are in its own,
+    // and the entity moves them about, so none are put on them
+    if options.model == 0 && !bsp.overlays.is_empty() {
         let placed = drawn.iter().enumerate().map(|(k, &(_, index))| {
             (index, slot[k].map(|slot| Placement { x: positions[slot].0, y: positions[slot].1, face: faces[index] }))
         });

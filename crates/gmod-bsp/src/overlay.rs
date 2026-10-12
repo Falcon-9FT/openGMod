@@ -91,6 +91,10 @@ pub fn on_face(bsp: &Bsp, overlay: &Overlay, face: &Face) -> Vec<Point> {
     let middle = scale(corners.iter().fold([0.0; 3], |sum, &c| add(sum, c)), 1.0 / corners.len() as f32);
     for (i, &a) in corners.iter().enumerate() {
         let b = corners[(i + 1) % corners.len()];
+        // a vertex written twice makes an edge with no direction, which would clip anywhere
+        if length(sub(b, a)) < 1e-3 {
+            continue;
+        }
         let mut inward = normalize(cross(n, sub(b, a)));
         if dot(inward, sub(middle, a)) < 0.0 {
             inward = scale(inward, -1.0);

@@ -56,6 +56,8 @@ pub struct Draw {
     pub index_count: u32,
     /// The middle of the surface, to sort translucent ones by distance.
     pub center: Vec3,
+    /// An overlay ([`crate::Surface::overlay`]): drawn in order, not by distance.
+    pub overlay: bool,
 }
 
 /// Every piece in one vertex buffer and one index buffer (`u32`).
@@ -100,6 +102,7 @@ pub fn geometry(pieces: &[Piece]) -> Geometry {
                 first_index: index_count + surface.first as u32,
                 index_count: surface.count as u32,
                 center: scale(sum, 1.0 / indices.len().max(1) as f32),
+                overlay: surface.overlay,
             });
         }
         vertex_count += piece.vertices.len() as u32;

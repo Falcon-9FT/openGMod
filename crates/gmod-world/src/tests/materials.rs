@@ -93,6 +93,10 @@ fn overlays_are_drawn_with_the_world() {
     let piece = &world.pieces[0];
     let names: Vec<&str> = piece.surfaces.iter().map(|s| s.material.as_str()).collect();
     assert_eq!(names, ["CONCRETE/FLOOR", "DECALS/SIGN", "DECALS/CRACK"]);
+    let overlays: Vec<bool> = piece.surfaces.iter().map(|s| s.overlay).collect();
+    assert_eq!(overlays, [false, true, true]);
+    let draws: Vec<bool> = crate::gpu::geometry(&world.pieces).draws.iter().map(|d| d.overlay).collect();
+    assert_eq!(draws, [false, true, true], "the renderer draws overlays in order");
     assert_eq!(world.triangles(), 2 + 2 + 2);
 
     // the sign: a square of its own texture, translucent, lifted off the floor and lit by its

@@ -60,6 +60,7 @@ fn square(proxies: &str, frames: &[Vec<[u8; 4]>]) -> World {
         frame: 0,
         proxies: Proxies::new(&material).map(Arc::new),
         modulate: false,
+        overlay: false,
     };
     let vtf = Vtf::parse(vtf_bytes(4, frames)).unwrap();
     World {
@@ -123,11 +124,23 @@ impl Drop for Game {
     }
 }
 
+/// A game folder named after `name` with `files`, mounted.
+fn game(name: &str, files: &[(&str, Vec<u8>)]) -> (Game, gmod_fs::Vfs) {
+    let root = std::env::temp_dir().join(format!("gmod-render-{name}-{}", std::process::id()));
+    let game = Game(root.clone());
+    for (path, data) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, data).unwrap();
+    }
+    let mut vfs = gmod_fs::Vfs::new();
+    vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(&root))));
+    (game, vfs)
+}
+
 #[test]
 fn overlays_show_on_walls() {
     let Some((device, queue)) = device_or_skip() else { return };
-    let root = std::env::temp_dir().join(format!("gmod-render-overlays-{}", std::process::id()));
-    let game = Game(root.clone());
     let files: [(&str, Vec<u8>); 6] = [
         ("materials/brick/wall.vmt", b"LightmappedGeneric { $basetexture brick/red }".to_vec()),
         ("materials/brick/red.vtf", vtf_bytes(4, &[vec![RED; 16]])),
@@ -136,13 +149,7 @@ fn overlays_show_on_walls() {
         ("materials/decals/crack.vmt", b"DecalModulate { $basetexture decals/dark }".to_vec()),
         ("materials/decals/dark.vtf", vtf_bytes(4, &[vec![[64, 64, 64, 255]; 16]])),
     ];
-    for (path, data) in &files {
-        let path = game.0.join(path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, data).unwrap();
-    }
-    let mut vfs = gmod_fs::Vfs::new();
-    vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(&root))));
+    let (_game, vfs) = game("overlays", &files);
 
     // a wall at x = 128 facing -x, filling half the picture across; a green sign in its
     // middle, a dark crack higher up
@@ -165,4 +172,40 @@ fn overlays_show_on_walls() {
     let darker = |p: &[u8]| (90..170).contains(&p[0]) && p[1] < 30 && p[2] < 30;
     let cracked = (0..64 * 64).filter(|i| darker(at(&pixels, i % 64, i / 64))).count();
     assert!(cracked > 10, "{cracked} darker pixels");
+}
+
+#[test]
+fn overlays_keep_their_order_wherever_the_eye_is() {
+    let Some((device, queue)) = device_or_skip() else { return };
+    let files: [(&str, Vec<u8>); 6] = [
+        ("materials/floor/red.vmt", b"LightmappedGeneric { $basetexture floor/red }".to_vec()),
+        ("materials/floor/red.vtf", vtf_bytes(4, &[vec![RED; 16]])),
+        ("materials/decals/under.vmt", b"LightmappedGeneric { $basetexture decals/green $translucent 1 }".to_vec()),
+        ("materials/decals/green.vtf", vtf_bytes(4, &[vec![GREEN; 16]])),
+        ("materials/decals/over.vmt", b"LightmappedGeneric { $basetexture decals/blue $translucent 1 }".to_vec()),
+        ("materials/decals/blue.vtf", vtf_bytes(4, &[vec![[0, 0, 255, 255]; 16]])),
+    ];
+    let (_game, vfs) = game("overlay-order", &files);
+    // a long floor; two overlays overlapping from x = 200 to 232, the one of the higher
+    // render order first in the lump
+    let corners = vec![[0.0, -64.0, 0.0], [0.0, 64.0, 0.0], [512.0, 64.0, 0.0], [512.0, -64.0, 0.0]];
+    let on_floor = |material, x| TestOverlay::square(material, vec![0], [x, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 64.0);
+    let mut over = on_floor("DECALS/OVER", 232.0);
+    over.overlay.render_order = 1;
+    let map = TestMap {
+        faces: vec![TestFace { corners, material: "FLOOR/RED", flags: 0 }],
+        overlays: vec![over, on_floor("DECALS/UNDER", 200.0)],
+        ..TestMap::default()
+    };
+    let bsp = gmod_bsp::Bsp::parse("t.bsp".into(), Arc::from(map.bytes())).unwrap();
+    let world = gmod_world::load(&vfs, &bsp);
+    assert!(world.missing_materials.is_empty() && world.missing_textures.is_empty());
+
+    // from either end, either one the nearer: the higher order on top
+    let blue = |p: &[u8]| p[2] > 200 && p[0] < 40 && p[1] < 40;
+    let mut renderer = Renderer::new(&device, &queue, FORMAT, &world);
+    for eye in [[100.0, 0.0, 80.0], [332.0, 0.0, 80.0]] {
+        let pixels = picture(&device, &queue, &mut renderer, &Camera::looking_at(eye, [216.0, 0.0, 0.0], 60.0));
+        assert!((30..34).all(|y| (30..34).all(|x| blue(at(&pixels, x, y)))), "from {eye:?}: {:?}", at(&pixels, 32, 32));
+    }
 }

@@ -190,8 +190,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     if (surface.transform_v.w > 0.5) {
         // the game modulates in gamma space, where grey (0.5) changes nothing: half of what
-        // multiplies the linear colour behind, the blend doubling it; transparent is grey
-        let gamma = mix(vec3<f32>(0.5), pow(albedo.rgb * surface.tint.rgb, vec3<f32>(1.0 / 2.2)), albedo.a * surface.tint.a);
+        // multiplies the linear colour behind, the blend doubling it; transparent is grey, and
+        // so is what fog covers. The target keeps what the shader gives to 1, so the light
+        // parts lighten what is behind twice at most, where the game goes further.
+        let shown = albedo.a * surface.tint.a * (1.0 - fog_amount(input.position));
+        let gamma = mix(vec3<f32>(0.5), pow(albedo.rgb * surface.tint.rgb, vec3<f32>(1.0 / 2.2)), shown);
         return vec4<f32>(0.5 * pow(2.0 * gamma, vec3<f32>(2.2)), 1.0);
     }
     var light = vec3<f32>(1.0, 1.0, 1.0);
@@ -210,13 +213,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 // fog, linear with the distance from the eye: towards its colour, or for what adds its light
 // towards nothing; `$nofog` surfaces it leaves as they are
 fn fogged(color: vec3<f32>, position: vec3<f32>) -> vec3<f32> {
-    if (camera.fog_range.z < 0.5 || surface.options.w > 1.5) {
-        return color;
-    }
-    let d = length(position - camera.eye.xyz) * camera.eye.w;
-    let amount = clamp((d - camera.fog_range.x) * camera.fog_range.y, 0.0, 1.0) * camera.fog_color.w;
+    let amount = fog_amount(position);
     if (surface.options.w > 0.5) {
         return color * (1.0 - amount);
     }
     return mix(color, camera.fog_color.rgb, amount);
+}
+
+// how much fog covers what is at `position`: none without fog or for `$nofog` surfaces
+fn fog_amount(position: vec3<f32>) -> f32 {
+    if (camera.fog_range.z < 0.5 || surface.options.w > 1.5) {
+        return 0.0;
+    }
+    let d = length(position - camera.eye.xyz) * camera.eye.w;
+    return clamp((d - camera.fog_range.x) * camera.fog_range.y, 0.0, 1.0) * camera.fog_color.w;
 }

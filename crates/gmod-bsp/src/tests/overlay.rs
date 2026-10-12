@@ -1,5 +1,5 @@
 use super::*;
-use crate::testmap::{TestFace, TestOverlay};
+use crate::testmap::{TestBrush, TestFace, TestOverlay};
 
 /// A floor of 128 units from the origin, and a wall along x at y = 128.
 fn faces() -> Vec<TestFace> {
@@ -99,4 +99,38 @@ fn overlays_on_walls_and_nowhere() {
     bytes[at..at + 4].copy_from_slice(&(length - 1).to_le_bytes());
     let bsp = Bsp::parse("t.bsp".into(), Arc::from(bytes)).unwrap();
     assert!(bsp.overlays.is_empty());
+}
+
+#[test]
+fn overlays_skip_edges_of_no_length() {
+    // a wall facing -y whose left edge has a vertex at half height written twice
+    let wall =
+        vec![[128.0, 128.0, 128.0], [128.0, 128.0, 0.0], [0.0, 128.0, 0.0], [0.0, 128.0, 64.0], [0.0, 128.0, 64.0], [0.0, 128.0, 128.0]];
+    let sign = TestOverlay::square("DECALS/SIGN", vec![0], [64.0, 128.0, 64.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], 32.0);
+    let map =
+        TestMap { faces: vec![TestFace { corners: wall, material: "BRICK/WALL", flags: 0 }], overlays: vec![sign], ..TestMap::default() };
+    let bsp = Bsp::parse("t.bsp".into(), Arc::from(map.bytes())).unwrap();
+    let polygon = crate::overlay::on_face(&bsp, &bsp.overlays[0], &bsp.faces[0]);
+    let (low, high) = polygon.iter().fold((f32::MAX, f32::MIN), |(low, high), (p, _)| (low.min(p[2]), high.max(p[2])));
+    assert!((low - 48.0).abs() < 1e-3 && (high - 80.0).abs() < 1e-3, "{polygon:?}");
+}
+
+#[test]
+fn brush_entities_carry_no_overlays() {
+    // a door's face in its own space; an overlay names it and the floor
+    let door = TestFace {
+        corners: vec![[100.0, -32.0, 0.0], [100.0, 32.0, 0.0], [100.0, 32.0, 64.0], [100.0, -32.0, 64.0]],
+        material: "TEST/DOOR",
+        flags: 0,
+    };
+    let models = vec![
+        vec![TestBrush::cuboid([-512.0, -512.0, -32.0], [1024.0, 512.0, 0.0])],
+        vec![TestBrush::cuboid([100.0, -32.0, 0.0], [108.0, 32.0, 64.0])],
+    ];
+    let sign = TestOverlay::square("DECALS/SIGN", vec![0, 2], [100.0, 0.0, 32.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 32.0);
+    let map = TestMap { models, faces: faces(), model_faces: vec![(1, door)], overlays: vec![sign], ..TestMap::default() };
+    let bsp = Bsp::parse("t.bsp".into(), Arc::from(map.bytes())).unwrap();
+    let door = mesh::build(&bsp, mesh::Options { model: 1, ..mesh::Options::default() });
+    assert_eq!(door.batches.len(), 1);
+    assert!(door.batches.iter().all(|b| !b.overlay));
 }

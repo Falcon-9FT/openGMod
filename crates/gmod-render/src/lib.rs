@@ -11,10 +11,10 @@
 //! matrices of its bones ([`Placed::bones`]): the vertex shader moves each vertex by the bones
 //! it is weighted to. [`Renderer::render`] draws a frame: the sky box, then the 3D sky box
 //! ([`gmod_world::sky`]) seen from its camera, then - depth cleared, so that all of it is
-//! behind - the opaque surfaces of the world and the entities, then the translucent ones - the
-//! world's from the farthest, then the entities'; then the view models (the weapon in the
-//! player's hands) with their own field of view, over everything
-//! ([`Renderer::set_view_models`]). Fog fades what is far towards its colour: the world's fog
+//! behind - the opaque surfaces of the world, its overlays in their render order and the
+//! opaque surfaces of the entities, then the translucent ones - the world's from the farthest,
+//! then the entities'; then the view models (the weapon in the player's hands) with their own
+//! field of view, over everything ([`Renderer::set_view_models`]). Fog fades what is far towards its colour: the world's fog
 //! in the world, the sky camera's in the 3D sky box. Depth runs from 1 at the eye to 0 at
 //! infinity. Over it an [`Overlay`] draws the 2D of the HUD and the panels.
 //!
@@ -1089,9 +1089,9 @@ impl Renderer {
         }
         if let (Some((mesh, _)), Some(eye)) = (&self.skybox, sky_eye) {
             let draw = Drawing { pipelines: &self.pipelines, camera: &self.sky_camera_group, bones: &self.bones_group };
-            let (opaque, translucent) = order(&mesh.draws, eye);
+            let (first, translucent) = order(&mesh.draws, eye);
             let mut current = None;
-            draw.mesh(&mut pass, &mut current, CAMERA_STRIDE as u32, mesh, opaque);
+            draw.mesh(&mut pass, &mut current, CAMERA_STRIDE as u32, mesh, first);
             draw.mesh(&mut pass, &mut current, CAMERA_STRIDE as u32, mesh, translucent);
         }
         drop(pass);
@@ -1099,10 +1099,10 @@ impl Renderer {
         // the world, its depth cleared: all of the sky is behind it, however near the 3D sky
         // box was drawn
         let mut pass = begin_pass(encoder, "world", target, &depth, wgpu::LoadOp::Load);
-        let (opaque, translucent) = order(&self.world.draws, camera.eye);
+        let (first, translucent) = order(&self.world.draws, camera.eye);
         let draw = Drawing { pipelines: &self.pipelines, camera: &self.camera_group, bones: &self.bones_group };
         let mut current = None;
-        draw.mesh(&mut pass, &mut current, 0, &self.world, opaque);
+        draw.mesh(&mut pass, &mut current, 0, &self.world, first);
         let slot = |slot: usize| (slot as u64 * CAMERA_STRIDE) as u32;
         for (i, placed) in self.entities.iter().enumerate() {
             let mesh = &self.models[placed.model.0];
@@ -1159,18 +1159,21 @@ fn begin_pass<'a>(
     })
 }
 
-/// The order to draw a mesh's surfaces seen from `eye`: the opaque ones by pipeline, to
-/// switch less, and the translucent ones from the farthest.
+/// The order to draw a mesh's surfaces seen from `eye`, in two lists: the opaque ones by
+/// pipeline, to switch less, then the overlays in the mesh's order (they are all as far off
+/// the faces they lie on, so their render order decides which shows over which, not where the
+/// eye is); and the other translucent ones, from the farthest.
 fn order(draws: &[(Draw, Kind)], eye: [f32; 3]) -> (Vec<usize>, Vec<usize>) {
     let distance = |draw: &Draw| {
         let d = [draw.center[0] - eye[0], draw.center[1] - eye[1], draw.center[2] - eye[2]];
         d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
     };
-    let mut opaque: Vec<usize> = (0..draws.len()).filter(|&i| !draws[i].1.translucent()).collect();
-    opaque.sort_by_key(|&i| draws[i].1 as u8);
-    let mut translucent: Vec<usize> = (0..draws.len()).filter(|&i| draws[i].1.translucent()).collect();
+    let mut first: Vec<usize> = (0..draws.len()).filter(|&i| !draws[i].0.overlay && !draws[i].1.translucent()).collect();
+    first.sort_by_key(|&i| draws[i].1 as u8);
+    first.extend((0..draws.len()).filter(|&i| draws[i].0.overlay));
+    let mut translucent: Vec<usize> = (0..draws.len()).filter(|&i| !draws[i].0.overlay && draws[i].1.translucent()).collect();
     translucent.sort_by(|&a, &b| distance(&draws[b].0).total_cmp(&distance(&draws[a].0)));
-    (opaque, translucent)
+    (first, translucent)
 }
 
 /// What every draw of a frame shares: the pipelines, the cameras and the bones.

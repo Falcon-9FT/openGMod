@@ -168,6 +168,7 @@ fn draws_models_where_the_entities_are() {
         frame: 0,
         proxies: None,
         modulate: false,
+        overlay: false,
     };
     let square = World {
         pieces: vec![gmod_world::Piece {
@@ -290,6 +291,7 @@ fn square(bone: Option<u8>) -> World {
         frame: 0,
         proxies: None,
         modulate: false,
+        overlay: false,
     };
     let skin = bone.map_or(Vec::new(), |b| vec![gmod_world::Weights { bones: [b, 0, 0], weights: [1.0, 0.0, 0.0] }; 4]);
     World {

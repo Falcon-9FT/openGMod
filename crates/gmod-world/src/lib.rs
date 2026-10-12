@@ -121,6 +121,10 @@ pub struct Surface {
     /// `DecalModulate`: darkens and lightens what is behind it, by twice its colour (cracks,
     /// dirt); grey changes nothing.
     pub modulate: bool,
+    /// An overlay's, lying on faces of the world: drawn just after the opaque surfaces, in the
+    /// order of the piece (the overlays' render order), as they are all as far off their faces
+    /// and only that order decides which shows over which.
+    pub overlay: bool,
 }
 
 /// How a surface looks at a moment, its material's proxies run.
@@ -155,6 +159,7 @@ impl Surface {
             frame: 0,
             proxies: None,
             modulate: false,
+            overlay: false,
         }
     }
 
@@ -668,7 +673,8 @@ fn brush_piece(bsp: &Bsp, gather: &mut Gather, materials: &mut HashMap<usize, Op
     for batch in &mesh.batches {
         let name = bsp.materials.get(batch.material).map_or("", String::as_str);
         let material = materials.entry(batch.material).or_insert_with(|| gather.material(name)).clone();
-        surfaces.push(gather.surface(name, material.as_deref(), batch.first_index as usize, batch.index_count as usize));
+        let surface = gather.surface(name, material.as_deref(), batch.first_index as usize, batch.index_count as usize);
+        surfaces.push(Surface { overlay: batch.overlay, ..surface });
     }
     Some(Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces, skin: Vec::new() })
 }
