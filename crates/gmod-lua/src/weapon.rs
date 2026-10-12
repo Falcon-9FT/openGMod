@@ -174,7 +174,7 @@ impl Default for WeaponData {
 }
 
 /// What the engine keeps for a weapon entity.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct WeaponState {
     /// Rounds in the primary and secondary clip; -1 for no clip.
     pub clip: [i64; 2],

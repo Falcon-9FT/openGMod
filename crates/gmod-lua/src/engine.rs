@@ -57,6 +57,10 @@ pub(crate) struct Game {
     pub chain: RefCell<Vec<String>>,
     /// What `DeriveGamemode` named while the gamemode being loaded ran.
     pub derived: RefCell<Vec<String>>,
+    /// Player slots: entity indices 1 to this (`game.MaxPlayers`); 0 is 1.
+    pub max_players: std::cell::Cell<u32>,
+    /// A server without a player of its own at the screen (`game.IsDedicated`).
+    pub dedicated: std::cell::Cell<bool>,
 }
 
 /// The active gamemode's table, or nil.
@@ -94,9 +98,9 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     globals.raw_set("gmod", gmod)?;
 
     let game = lua.create_table()?;
-    def(lua, &game, "SinglePlayer", |_| Ok(Value::Boolean(crate::player::MAX_PLAYERS == 1)))?;
-    def(lua, &game, "MaxPlayers", |_| Ok(Value::Integer(crate::player::MAX_PLAYERS.into())))?;
-    def(lua, &game, "IsDedicated", |_| Ok(Value::Boolean(false)))?;
+    def(lua, &game, "SinglePlayer", |a| Ok(Value::Boolean(crate::player::max_players(a.lua) == 1)))?;
+    def(lua, &game, "MaxPlayers", |a| Ok(Value::Integer(crate::player::max_players(a.lua).into())))?;
+    def(lua, &game, "IsDedicated", |a| Ok(Value::Boolean(host(a.lua).game.dedicated.get())))?;
     def(lua, &game, "GetMap", |a| string(a, &host(a.lua).game.map.borrow()))?;
     def(lua, &game, "GetIPAddress", |a| string(a, "loopback"))?;
     def(lua, &game, "GetWorld", |a| crate::entity::push(a.lua, EntityHandle::WORLD))?;

@@ -464,6 +464,7 @@ mod tests {
             weapon: Some(gmod_lua::WeaponView { class: "weapon_pistol".into(), name: "#HL2_Pistol".into(), clip: 12, ammo: 36 }),
             holding: false,
             flashlight: false,
+            turned: 0,
         };
         assert_eq!(status(&view), "health 80 - weapon_pistol 12/36");
         view.weapon = None;

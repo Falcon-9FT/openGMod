@@ -96,6 +96,7 @@ pub mod physics;
 pub mod pickup;
 pub mod player;
 pub mod ragdoll;
+pub mod recipients;
 pub mod sandbox;
 pub mod snapshot;
 pub mod sound;
@@ -122,8 +123,8 @@ pub use html::{WebButton, WebEvent, WebPage, WebPages};
 pub use menu::{Addon, MountableGame};
 pub use mlua;
 pub use movedata::UserCmd;
-pub use player::{PlayerInfo, PlayerView, WeaponView};
-pub use snapshot::{NetValue, Snapshot};
+pub use player::{PlayerInfo, PlayerView, ToClient, WeaponView};
+pub use snapshot::{EntityState, NetValue, Snapshot};
 
 /// Which of GMod's Lua states a [`Runtime`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -381,7 +382,7 @@ impl Runtime {
             pages: html::Pages::default(),
             menu: menu::Menu::default(),
             hud: RefCell::new(hud::Hud::default()),
-            sounds: sound::Sounds::default(),
+            sounds: sound::Sounds::new(realm),
             surfaces: surfaceprops::Surfaces::default(),
             chat: chat::Chat::default(),
             touching: triggers::Touching::default(),
@@ -415,6 +416,9 @@ impl Runtime {
         sql::install(&lua)?;
         http::install(&lua)?;
         net::install(&lua, realm)?;
+        if realm == Realm::Server {
+            recipients::install(&lua)?;
+        }
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
         weapon::install(&lua)?;
@@ -562,8 +566,21 @@ impl Runtime {
         }
     }
 
+    /// How many players the server takes (`game.MaxPlayers`, 1 to [`player::MAX_PLAYERS`]):
+    /// entity indices 1 to this are theirs. Given before the map spawns; 1 is a single-player
+    /// game.
+    pub fn set_max_players(&self, count: u32) {
+        host(&self.lua).game.max_players.set(count.clamp(1, player::MAX_PLAYERS));
+    }
+
+    /// Whether the server runs without a player of its own at the screen (`game.IsDedicated`):
+    /// no player is then the host, with its `lua_run`.
+    pub fn set_dedicated(&self, dedicated: bool) {
+        host(&self.lua).game.dedicated.set(dedicated);
+    }
+
     /// A player joins the game, as a client connecting does, and spawns. None when every
-    /// player slot is taken ([`player::MAX_PLAYERS`]).
+    /// player slot is taken ([`set_max_players`](Self::set_max_players)).
     pub fn join(&self, info: PlayerInfo) -> Option<EntityHandle> {
         player::join(&self.lua, info)
     }
@@ -576,13 +593,31 @@ impl Runtime {
     pub fn run_player_command(&self, player: EntityHandle, line: &str) {
         let trimmed = line.trim_start();
         if let Some(code) = trimmed.get(..8).filter(|start| start.eq_ignore_ascii_case("lua_run ")).map(|_| &trimmed[8..])
-            && player.index == Some(1)
+            && player::is_host(&self.lua, player)
         {
             // errors are reported as they happen
             let _ = self.run_string(code, "lua_run");
             return;
         }
         player::console(&self.lua, player, line);
+    }
+
+    /// What the server asked of its players' clients since the last call, oldest first
+    /// (`SendLua`, `ConCommand`, `PrintMessage` to the console).
+    pub fn take_to_clients(&self) -> Vec<(EntityHandle, player::ToClient)> {
+        std::mem::take(&mut *host(&self.lua).players.outbox.borrow_mut())
+    }
+
+    /// A client does what its server asked.
+    pub fn from_server(&self, what: &player::ToClient) {
+        match what {
+            player::ToClient::Lua(code) => {
+                // errors are reported as they happen
+                let _ = self.run_string(code, "SendLua");
+            }
+            player::ToClient::Command(line) => self.run_command(line),
+            player::ToClient::Print(text) => host(&self.lua).print(&format!("{text}\n")),
+        }
     }
 
     /// A player's client says a value of its user info (`gmod_toolmode`), which `GetInfo`

@@ -37,7 +37,7 @@ use crate::entity::{self, EntityHandle};
 use crate::{Realm, call_hook, host};
 
 /// A message of the server's chat for one player.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ChatMessage {
     /// A player said something (`say`, `say_team`); `NULL` is the server's console.
     Said { speaker: EntityHandle, text: String, team: bool, dead: bool },

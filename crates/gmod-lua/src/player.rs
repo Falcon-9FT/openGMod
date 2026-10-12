@@ -16,7 +16,8 @@
 //! and `PostPlayerDeath`, then the weapons go - the active one dropped when it should be.
 //! Leaving ([`Runtime::leave`](crate::Runtime::leave)) runs `PlayerDisconnected`.
 //!
-//! The server has one slot ([`MAX_PLAYERS`]): openGMOD is a single-player game until stage 6.
+//! The server has as many slots as the program gives it ([`Runtime::set_max_players`](crate::Runtime::set_max_players)), one
+//! by default: a single-player game.
 //! Not yet: fall damage, using things (`+use`), vehicles, animations, the client's side of
 //! anything (`SendLua` goes to a client that is not there).
 //!
@@ -41,8 +42,19 @@ use crate::trace::{self, Filter, Sweep};
 use crate::vector::{Angle, Vector};
 use crate::{convar, host, weapon};
 
-/// Player slots: entity indices 1 to this.
-pub const MAX_PLAYERS: u32 = 1;
+/// The most player slots a server may have.
+pub const MAX_PLAYERS: u32 = 128;
+
+/// Player slots: entity indices 1 to this (`game.MaxPlayers`).
+pub(crate) fn max_players(lua: &Lua) -> u32 {
+    host(lua).game.max_players.get().clamp(1, MAX_PLAYERS)
+}
+
+/// Whether a player is the one at the server's own screen: the first, unless the server is
+/// dedicated.
+pub(crate) fn is_host(lua: &Lua, player: EntityHandle) -> bool {
+    player.index == Some(1) && !host(lua).game.dedicated.get()
+}
 
 /// The Steam ID 64 of `STEAM_0:0:0`.
 const STEAM_ID64_BASE: u64 = 76561197960265728;
@@ -120,10 +132,35 @@ pub(crate) struct Players {
     pub last_user_id: Cell<i64>,
     /// Bots that have joined, which number their `SteamID64`.
     pub bots: Cell<u64>,
+    /// What the server asks of the players' clients, oldest first.
+    pub outbox: RefCell<Vec<(EntityHandle, ToClient)>>,
+}
+
+/// What the server asks of a player's client beside the entities, the chat and `net`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ToClient {
+    /// `SendLua`, `BroadcastLua`: Lua for it to run.
+    Lua(String),
+    /// `ConCommand`: a line for its console, which sends the server what it does not know.
+    Command(String),
+    /// `PrintMessage` to the console: a line for it.
+    Print(String),
+}
+
+/// Asks a player's client something. A bot has none: the server runs its console lines
+/// itself, and the rest goes nowhere.
+pub(crate) fn to_client(lua: &Lua, player: EntityHandle, what: ToClient) {
+    if state(lua, player, |_, p| p.info.bot).unwrap_or(true) {
+        if let ToClient::Command(line) = what {
+            console(lua, player, &line);
+        }
+        return;
+    }
+    host(lua).players.outbox.borrow_mut().push((player, what));
 }
 
 /// Who joins: what a client tells the server about itself.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlayerInfo {
     pub name: String,
     /// The player's Steam ID, when Steam vouches for them; bots have none.
@@ -137,7 +174,7 @@ pub struct PlayerInfo {
 }
 
 /// What the engine keeps for a player, beside what every entity has.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlayerState {
     pub info: PlayerInfo,
     pub user_id: i64,
@@ -152,6 +189,9 @@ pub struct PlayerState {
     pub max_armor: i64,
     /// Where the player looks; the entity faces the same way, upright.
     pub eye_angles: Angle,
+    /// How many times the game turned the player itself (a spawn, `SetEyeAngles`): a client
+    /// takes the angles the server has then, and otherwise looks where its mouse says.
+    pub turned: u32,
     /// Movement between ticks: ducking, the eyes, water, ladder. Its origin and velocity are
     /// the entity's.
     pub moving: gmod_movement::Player,
@@ -248,6 +288,7 @@ impl PlayerState {
             armor: 0,
             max_armor: 100,
             eye_angles: Angle::default(),
+            turned: 0,
             moving: gmod_movement::Player {
                 origin: [0.0; 3],
                 velocity: [0.0; 3],
@@ -343,8 +384,8 @@ impl PlayerState {
     }
 
     /// `UniqueID`: 1 in a single-player game, else the CRC of `gm_<SteamID>_gm`.
-    fn unique_id(&self) -> u32 {
-        if MAX_PLAYERS == 1 { 1 } else { crc32(format!("gm_{}_gm", self.steam_id()).as_bytes()) }
+    fn unique_id(&self, single_player: bool) -> u32 {
+        if single_player { 1 } else { crc32(format!("gm_{}_gm", self.steam_id()).as_bytes()) }
     }
 
     fn user_info(&self, name: &str) -> Option<String> {
@@ -423,7 +464,7 @@ fn truthy(values: &MultiValue) -> bool {
 /// Every player there is, in index order.
 pub(crate) fn all(lua: &Lua) -> Vec<EntityHandle> {
     let entities = &host(lua).entities;
-    (1..=MAX_PLAYERS)
+    (1..=max_players(lua))
         .filter_map(|i| entities.at(i))
         .filter(|&h| entities.get(h).is_some_and(|ent| ent.player.is_some() && !ent.removed))
         .collect()
@@ -535,7 +576,7 @@ pub(crate) fn water_level(lua: &Lua, handle: EntityHandle) -> Option<u8> {
 /// A player joins: `PlayerConnect`, the entity, `PlayerAuthed`, `PlayerInitialSpawn` and the
 /// first spawn. None when every slot is taken.
 pub(crate) fn join(lua: &Lua, info: PlayerInfo) -> Option<EntityHandle> {
-    let index = (1..=MAX_PLAYERS).find(|&i| host(lua).entities.at(i).is_none())?;
+    let index = (1..=max_players(lua)).find(|&i| host(lua).entities.at(i).is_none())?;
     let address =
         if info.address.is_empty() { if info.bot { "BOT".to_string() } else { "loopback".to_string() } } else { info.address.clone() };
     let info = PlayerInfo { address, ..info };
@@ -564,7 +605,8 @@ pub(crate) fn join(lua: &Lua, info: PlayerInfo) -> Option<EntityHandle> {
     };
     crate::ents::announce(lua, handle);
     let ply = ent_value(lua, handle);
-    let (bot, steam_id, unique_id) = state(lua, handle, |_, p| (p.info.bot, p.steam_id(), p.unique_id().to_string()))?;
+    let single = max_players(lua) == 1;
+    let (bot, steam_id, unique_id) = state(lua, handle, |_, p| (p.info.bot, p.steam_id(), p.unique_id(single).to_string()))?;
     if !bot && let (Ok(s), Ok(u)) = (lua.create_string(&steam_id), lua.create_string(&unique_id)) {
         hook(lua, "PlayerAuthed", [ply.clone(), Value::String(s), Value::String(u)]);
     }
@@ -641,6 +683,7 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         with_player(lua, handle, |_, p| {
             p.eye_angles = eye;
             p.input.view_angles = eye;
+            p.turned = p.turned.wrapping_add(1);
         });
     }
     hook(lua, "PlayerSpawn", [ply, Value::Boolean(false)]);
@@ -1162,6 +1205,8 @@ pub struct PlayerView {
     pub holding: bool,
     /// The flashlight is on (`EF_DIMLIGHT`).
     pub flashlight: bool,
+    /// How many times the game turned the player itself ([`PlayerState::turned`]).
+    pub turned: u32,
 }
 
 /// The weapon in a player's hands.
@@ -1177,8 +1222,8 @@ pub struct WeaponView {
 
 pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
     let (eye, _) = eye(lua, handle)?;
-    let (previous_eye, angles, fov, alive, armor, active) =
-        state(lua, handle, |_, p| (p.previous_eye.unwrap_or(eye), p.eye_angles, p.fov, p.alive, p.armor, p.active_weapon))?;
+    let (previous_eye, angles, fov, alive, armor, active, turned) =
+        state(lua, handle, |_, p| (p.previous_eye.unwrap_or(eye), p.eye_angles, p.fov, p.alive, p.armor, p.active_weapon, p.turned))?;
     let health = host(lua).entities.get(handle).map_or(0, |ent| ent.health);
     let weapon = host(lua).entities.get(active).filter(|ent| !ent.removed).map(|ent| {
         let data = weapon::data(lua, active).unwrap_or_default();
@@ -1188,7 +1233,7 @@ pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
     });
     let holding = crate::physgun::holding(lua, handle).is_some();
     let flashlight = host(lua).entities.get(handle).is_some_and(|ent| ent.effects & EF_DIMLIGHT != 0);
-    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon, holding, flashlight })
+    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon, holding, flashlight, turned })
 }
 
 /// The engine's commands a player types into the console: `noclip`, `kill` and `explode`,
@@ -1566,6 +1611,7 @@ pub(crate) fn set_eye_angles(lua: &Lua, handle: EntityHandle, angles: Angle) {
     with_player(lua, handle, |_, p| {
         p.eye_angles = angles;
         p.input.view_angles = angles;
+        p.turned = p.turned.wrapping_add(1);
     });
     entity::set_world_angles(lua, handle, Angle::new(0.0, angles.y, 0.0));
 }
@@ -1834,8 +1880,11 @@ fn weapon_arg(a: &Args, handle: EntityHandle, position: usize) -> mlua::Result<E
 
 /// Prints what a player was sent to read: the player of a single-player game reads the
 /// server's console.
-fn print_to(a: &Args, text: &str) {
-    host(a.lua).print(&format!("{text}\n"));
+/// A line for the consoles of players' clients.
+fn print_to(a: &Args, players: Vec<EntityHandle>, text: &str) {
+    for player in players {
+        to_client(a.lua, player, ToClient::Print(text.to_string()));
+    }
 }
 
 macro_rules! float_field {
@@ -1943,7 +1992,14 @@ pub(crate) fn install(lua: &Lua, realm: crate::Realm) -> mlua::Result<()> {
                     crate::chat::tell(a.lua, player, &text);
                 }
             } else {
-                print_to(a, &text);
+                print_to(a, all(a.lua), &text);
+            }
+            Ok(Value::Nil)
+        })?;
+        def_lib(lua, &globals, "BroadcastLua", |a| {
+            let code = a.string(1)?;
+            for player in all(a.lua) {
+                to_client(a.lua, player, ToClient::Lua(code.clone()));
             }
             Ok(Value::Nil)
         })?;
@@ -1997,9 +2053,13 @@ fn install_identity(def: &entity::Def) -> mlua::Result<()> {
         let id = read(a, |_, p| p.steam_id64())?;
         integer(if id == 0 { 0 } else { i64::from(id as u32) })
     })?;
-    def("UniqueID", |a| integer(read(a, |_, p| p.unique_id())?.into()))?;
+    def("UniqueID", |a| {
+        let single = max_players(a.lua) == 1;
+        integer(read(a, |_, p| p.unique_id(single))?.into())
+    })?;
     def("UniqueIDTable", |a| {
-        let (unique, key) = (read(a, |_, p| p.unique_id())?, a.string(2)?);
+        let single = max_players(a.lua) == 1;
+        let (unique, key) = (read(a, |_, p| p.unique_id(single))?, a.string(2)?);
         let tables: Table = match a.lua.named_registry_value::<Option<Table>>("gmod-lua.unique-id-tables")? {
             Some(t) => t,
             None => {
@@ -2027,7 +2087,7 @@ fn install_identity(def: &entity::Def) -> mlua::Result<()> {
     def("IsFullyAuthenticated", |a| boolean(read(a, |_, p| !p.info.bot && p.info.steam_id64.is_some())?))?;
     def("IsListenServerHost", |a| {
         let handle = this(a)?;
-        boolean(handle.index == Some(1) && read(a, |_, p| !p.info.bot)?)
+        boolean(is_host(a.lua, handle) && read(a, |_, p| !p.info.bot)?)
     })?;
     def("GetInfo", |a| {
         let name = a.string(2)?;
@@ -2613,7 +2673,7 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
         if a.number(2)? as i64 == HUD_PRINTTALK {
             crate::chat::tell(a.lua, handle, &text);
         } else {
-            print_to(a, &text);
+            print_to(a, vec![handle], &text);
         }
         Ok(Value::Nil)
     })?;
@@ -2623,13 +2683,18 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
         crate::chat::say(a.lua, handle, &a.string(2)?, a.boolean(3));
         Ok(Value::Nil)
     })?;
-    // for the player's client, which is not there yet
+    // for the player's client: it runs the line, and sends the server what it does not know
     def("ConCommand", |a| {
         let (handle, line) = (this(a)?, a.string(2)?);
-        console(a.lua, handle, &line);
+        to_client(a.lua, handle, ToClient::Command(line));
         Ok(Value::Nil)
     })?;
-    for name in ["SendLua", "SendHint", "SuppressHint", "ScreenFade", "LagCompensation", "PlayStepSound", "SprayDecal"] {
+    def("SendLua", |a| {
+        let (handle, code) = (this(a)?, a.string(2)?);
+        to_client(a.lua, handle, ToClient::Lua(code));
+        Ok(Value::Nil)
+    })?;
+    for name in ["SendHint", "SuppressHint", "ScreenFade", "LagCompensation", "PlayStepSound", "SprayDecal"] {
         def(name, nothing)?;
     }
     def("AllowImmediateDecalPainting", nothing)?;

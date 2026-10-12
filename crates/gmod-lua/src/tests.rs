@@ -15,6 +15,7 @@ mod chat;
 mod items;
 mod mapio;
 mod movers;
+mod multiplayer;
 mod npc;
 mod ragdoll;
 mod shapes;
@@ -1905,6 +1906,10 @@ fn what_a_players_client_would_say() {
     // typed in the console, or run by `ConCommand`, it is set
     g.runtime.run_player_command(alice, "gmod_toolmode weld; weld_forcelimit 1000; gmod_toolmode");
     g.runtime.run_string("Entity(1):ConCommand('cl_playerskin 3; finger_0 1 2')", "concommand").unwrap();
+    // the client runs it, and sends the server what it does not know
+    let asked = g.runtime.take_to_clients();
+    assert_eq!(asked, [(alice, ToClient::Command("cl_playerskin 3; finger_0 1 2".into()))]);
+    g.runtime.run_player_command(alice, "cl_playerskin 3; finger_0 1 2");
     assert!(g.eval::<bool>(
         "local p = Entity(1)
          return p:GetInfo('gmod_toolmode') == 'weld' and p:GetInfoNum('weld_forcelimit', 0) == 1000 and p:GetInfoNum('cl_playerskin', 0) == 3"

@@ -295,7 +295,9 @@ fn invalidate_cache(lua: &Lua, player: bool) {
 
 /// The first index of entities that are not players: after the world and the player slots
 /// (`game.MaxPlayers()`).
-const FIRST_INDEX: u32 = crate::player::MAX_PLAYERS + 1;
+fn first_index(lua: &Lua) -> u32 {
+    crate::player::max_players(lua) + 1
+}
 
 /// Makes an entity of a class, as `ents.Create` does; none when the class is unknown (or every
 /// index is used). The entities of a map pass their map creation ID and are made whatever
@@ -315,7 +317,7 @@ pub(crate) fn create(lua: &Lua, class: &str, map_creation_id: Option<i32>) -> ml
         let mut ent = Ent::new(class, kind, host.entities.next_creation_id(), host.clock.cur_time.get());
         ent.scripted = script.is_some();
         ent.map_creation_id = map_creation_id;
-        match host.entities.insert(ent, FIRST_INDEX) {
+        match host.entities.insert(ent, first_index(lua)) {
             Some(handle) => handle,
             None => {
                 host.print(&format!("ERROR: no free entity slots for {class}!\n"));
@@ -379,7 +381,7 @@ pub(crate) fn create_engine(lua: &Lua, class: &str, kind: Kind) -> mlua::Result<
     let handle = {
         let host = host(lua);
         let ent = Ent::new(class, kind, host.entities.next_creation_id(), host.clock.cur_time.get());
-        match host.entities.insert(ent, FIRST_INDEX) {
+        match host.entities.insert(ent, first_index(lua)) {
             Some(handle) => handle,
             None => return Ok(None),
         }
@@ -592,7 +594,10 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
                 let studio = ent.model.len() > 4 && ent.model[ent.model.len() - 4..].eq_ignore_ascii_case(".mdl");
                 // the brushes that may move are drawn where their entities are; the others are the map's
                 let moving_brush = crate::movers::moving_brush(&ent).is_some();
-                if hidden || !(studio || moving_brush) || (ent.class == "hl2mp_ragdoll" && ent.physics.is_none()) {
+                if hidden
+                    || !(studio || moving_brush)
+                    || (ent.class == "hl2mp_ragdoll" && ent.physics.is_none() && ent.ragdoll_pose.is_empty())
+                {
                     return None;
                 }
                 (ent.model.clone(), ent.skin)

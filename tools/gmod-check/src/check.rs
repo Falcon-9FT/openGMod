@@ -421,7 +421,7 @@ fn verify_archives(vfs: &Vfs) -> Tally {
             Err(e) => tally.failed.push(format!("{path} [{}]: {e}", mount_name(vfs, index))),
         };
         match &mount.backing {
-            Backing::Dir(_) => {}
+            Backing::Dir(_) | Backing::Memory(_) => {}
             Backing::Vpk(vpk) => vpk.entries().iter().for_each(|e| check(&e.path, vpk.verify(e))),
             Backing::Gma(gma) => gma.entries().iter().for_each(|e| check(&e.path, gma.verify(e))),
             Backing::Zip(zip) => zip.entries().iter().for_each(|e| check(&e.path, zip.verify(e))),

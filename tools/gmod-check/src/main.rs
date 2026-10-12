@@ -516,6 +516,7 @@ fn entries(backing: &Backing) -> Option<usize> {
         Backing::Vpk(v) => Some(v.len()),
         Backing::Gma(g) => Some(g.len()),
         Backing::Zip(z) => Some(z.len()),
+        Backing::Memory(m) => Some(m.len()),
     }
 }
 
@@ -535,6 +536,10 @@ fn print_mount_summary(out: &mut Out, vfs: &Vfs) {
             Backing::Zip(z) => {
                 packs += 1;
                 pack_files += z.len();
+            }
+            Backing::Memory(m) => {
+                packs += 1;
+                pack_files += m.len();
             }
         }
     }

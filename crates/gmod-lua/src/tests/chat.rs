@@ -213,7 +213,8 @@ fn the_engine_tells_players_things_in_the_chat() {
             "tell",
         )
         .unwrap();
-    assert!(server.printed().contains("console\n") && !server.printed().contains("welcome"));
+    assert!(!server.printed().contains("welcome"));
+    assert_eq!(server.runtime.take_to_clients(), [(alice, ToClient::Print("console".into()))]);
     deliver(&server, &client, alice);
     assert_eq!(client.eval::<String>("return TOLD"), "none");
     // `ChatText` returning true keeps a line out
@@ -326,7 +327,7 @@ fn a_client_tells_its_own_player_and_says_through_the_server() {
     server.runtime.run_string("PrintMessage(HUD_PRINTTALK, 'to all') PrintMessage(2, 'to the console')", "print").unwrap();
     let told = ChatMessage::Text { player: 0, name: String::new(), text: "to all".into(), kind: "none".into() };
     assert_eq!(server.runtime.take_chat(), [(alice, told)]);
-    assert!(server.printed().contains("to the console\n"));
+    assert_eq!(server.runtime.take_to_clients(), [(alice, ToClient::Print("to the console".into()))]);
     assert!(server.messages().is_empty(), "{:?}", server.messages());
     assert!(client.messages().is_empty(), "{:?}", client.messages());
 }

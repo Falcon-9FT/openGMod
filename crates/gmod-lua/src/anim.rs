@@ -49,7 +49,7 @@ pub(crate) const EVENT_JUMP: i64 = 6;
 pub(crate) const EVENT_CUSTOM: i64 = 19;
 
 /// A sequence played over an entity's own.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnimLayer {
     /// Its number, 0 to [`MAX_LAYERS`].
     pub id: usize,
@@ -104,7 +104,7 @@ impl AnimLayer {
 }
 
 /// What an entity plays.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnimState {
     pub sequence: i64,
     pub cycle: f32,

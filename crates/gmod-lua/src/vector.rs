@@ -10,14 +10,14 @@ use mlua::{AnyUserData, IntoLuaMulti, Lua, MultiValue, Table, UserData, UserData
 use crate::args::{self, Args};
 use crate::meta::{self, type_id};
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Vector {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Angle {
     pub p: f32,
     pub y: f32,

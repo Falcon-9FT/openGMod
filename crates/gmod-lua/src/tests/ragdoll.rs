@@ -12,7 +12,7 @@ use super::*;
 /// turn), an arm off the chest as the doll's and a leg 10 below the body, swinging about y.
 /// Its bones are root, body, chest, arm, hand and leg; its solids body, chest, arm and leg, of
 /// 10, 5, 2 and 3 kg. `models/apart.mdl` is the same with `"selfcollisions" "0"`.
-fn ragdoll_files() -> Vec<(&'static str, Vec<u8>)> {
+pub(super) fn ragdoll_files() -> Vec<(&'static str, Vec<u8>)> {
     use gmod_model::testmodel::{self, TestBone, TestConvex, TestRig};
     let bone = |name: &str, parent: i32, position: [f32; 3]| TestBone { name: name.into(), parent, position, euler: [0.0; 3] };
     let rig = TestRig {

@@ -25,7 +25,7 @@ const SCRIPTS: &str = "opengmod.sound_scripts";
 const SND_STOP: i64 = 4;
 
 /// A sound to play, as the game asked for it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SoundPlay {
     /// What it was asked for by (a script or a file), to stop it by.
     pub name: String,
@@ -47,7 +47,7 @@ pub struct SoundPlay {
 }
 
 /// What Lua did with sounds, for the program to hear.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SoundEvent {
     Play(SoundPlay),
     /// `StopSound`: an entity's sounds (or those of nobody) asked for by this name.
@@ -78,6 +78,16 @@ pub(crate) struct Sounds {
 }
 
 impl Sounds {
+    /// The sounds of a realm: a client numbers its patches apart from its server's, whose
+    /// sounds it plays beside its own.
+    pub(crate) fn new(realm: crate::Realm) -> Sounds {
+        let sounds = Sounds::default();
+        if realm != crate::Realm::Server {
+            sounds.next_patch.set(1 << 63);
+        }
+        sounds
+    }
+
     fn new_patch(&self, entity: Option<EntityHandle>, name: String) -> u64 {
         let id = self.next_patch.get() + 1;
         self.next_patch.set(id);

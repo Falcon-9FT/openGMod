@@ -6,7 +6,12 @@
 //! `NetworkVar`). The client puts each at the index and serial number it has on the server, so
 //! a handle means the same entity in both; an entity new to the client takes its class's
 //! table (`scripted_ents.Get`, `weapons.Get`) and runs `Initialize` as on the server, one gone
-//! from the server runs `OnRemove` and goes. Bodies of physics stay on the server.
+//! from the server runs `OnRemove` and goes. Bodies of physics stay on the server, and with
+//! them what only the server's engine keeps of an entity (the outputs of the map's entities,
+//! the state of triggers, doors and NPCs); a ragdoll goes with where its parts are.
+//!
+//! Every type here crosses the network with serde. Between two snapshots a client sees the
+//! entities moving smoothly ([`Snapshot::between`]).
 
 use mlua::{AnyUserData, Lua, Table, Value};
 
@@ -15,7 +20,7 @@ use crate::host;
 use crate::vector::{Angle, Vector};
 
 /// A networked variable's value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum NetValue {
     Bool(bool),
     Int(i64),
@@ -30,21 +35,21 @@ pub enum NetValue {
 const STORES: [&str; 3] = ["nw", "nw2", "dt"];
 
 /// One entity as a client receives it.
-#[derive(Debug, Clone)]
-struct EntityState {
-    index: u32,
-    serial: u32,
-    ent: Ent,
-    /// The variables of each of [`STORES`].
-    vars: [Vec<(Vec<u8>, NetValue)>; 3],
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntityState {
+    pub index: u32,
+    pub serial: u32,
+    pub ent: Ent,
+    /// The variables of each store: `SetNW*`, `SetNW2*`, `SetDT*`.
+    pub vars: [Vec<(Vec<u8>, NetValue)>; 3],
 }
 
-/// The entities of the server at one moment, for a client.
-#[derive(Debug, Clone, Default)]
+/// The entities of the server at one moment, for a client, in index order.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     /// The server's `CurTime`.
     pub time: f64,
-    entities: Vec<EntityState>,
+    pub entities: Vec<EntityState>,
 }
 
 impl Snapshot {
@@ -56,6 +61,59 @@ impl Snapshot {
     pub fn is_empty(&self) -> bool {
         self.entities.is_empty()
     }
+
+    /// What a client sees `t` of the way (0 to 1) from `a` to `b`: the entities of `b`, those
+    /// also in `a` moved and turned between where they were, the cycles of what they play, the
+    /// eyes of players and the parts of ragdolls with them.
+    pub fn between(a: &Snapshot, b: &Snapshot, t: f32) -> Snapshot {
+        let t = t.clamp(0.0, 1.0);
+        let mut out = b.clone();
+        out.time = a.time + (b.time - a.time) * f64::from(t);
+        let mut before = a.entities.iter().peekable();
+        for state in &mut out.entities {
+            while before.next_if(|e| e.index < state.index).is_some() {}
+            let Some(old) = before.peek().filter(|e| e.index == state.index && e.serial == state.serial) else { continue };
+            let (from, to) = (&old.ent, &mut state.ent);
+            // what jumped (a teleport) is where it is now
+            if (to.local_pos - from.local_pos).length() > TELEPORTED {
+                continue;
+            }
+            to.local_pos = lerp(from.local_pos, to.local_pos, t);
+            to.local_angles = lerp_angle(from.local_angles, to.local_angles, t);
+            if from.anim.sequence == to.anim.sequence {
+                // a cycle that went round goes on from the end
+                let end = if to.anim.cycle < from.anim.cycle { to.anim.cycle + 1.0 } else { to.anim.cycle };
+                to.anim.cycle = (from.anim.cycle + (end - from.anim.cycle) * t).fract();
+            }
+            if let (Some(from), Some(to)) = (&from.player, &mut to.player) {
+                to.eye_angles = lerp_angle(from.eye_angles, to.eye_angles, t);
+                to.render_angles = lerp_angle(from.render_angles, to.render_angles, t);
+                to.moving.view_height = from.moving.view_height + (to.moving.view_height - from.moving.view_height) * t;
+            }
+            if from.ragdoll_pose.len() == to.ragdoll_pose.len() {
+                for (old, new) in from.ragdoll_pose.iter().zip(&mut to.ragdoll_pose) {
+                    if old.0 == new.0 {
+                        new.1 = lerp(old.1, new.1, t);
+                        new.2 = lerp_angle(old.2, new.2, t);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// How far an entity moves between two snapshots before it is taken to have jumped there.
+const TELEPORTED: f32 = 256.0;
+
+fn lerp(a: Vector, b: Vector, t: f32) -> Vector {
+    a + (b - a) * t
+}
+
+/// Between two angles the short way round.
+fn lerp_angle(a: Angle, b: Angle, t: f32) -> Angle {
+    let turn = |from: f32, to: f32| from + ((to - from + 180.0).rem_euclid(360.0) - 180.0) * t;
+    Angle::new(turn(a.p, b.p), turn(a.y, b.y), turn(a.r, b.r))
 }
 
 /// Classes only the server has: the engine sends clients nothing of them.
@@ -99,6 +157,11 @@ fn to_lua(lua: &Lua, value: &NetValue) -> mlua::Result<Value> {
     })
 }
 
+/// An entity without what only the server's engine keeps of it.
+fn for_clients(ent: Ent) -> Ent {
+    Ent { physics: None, joint: None, outputs: Vec::new(), logic: None, trigger_state: None, mover: None, charger: None, npc: None, ..ent }
+}
+
 /// The variables of one store of an entity, in a stable order.
 fn read_store(ud: &AnyUserData, store: &str) -> Vec<(Vec<u8>, NetValue)> {
     let Ok(Some(table)) = ud.named_user_value::<Option<Table>>(store) else { return Vec::new() };
@@ -129,11 +192,9 @@ impl crate::Runtime {
                 if ent.removed || (index != 0 && server_only(&ent.class)) {
                     continue;
                 }
-                let mut ent = ent.clone();
-                ent.physics = None;
-                ent.joint = None;
-                ent
+                for_clients(ent.clone())
             };
+            let ent = Ent { ragdoll_pose: crate::ragdoll::pose(lua, handle), ..ent };
             let vars = match entity::push(lua, handle) {
                 Ok(Value::UserData(ud)) => STORES.map(|store| read_store(&ud, store)),
                 _ => Default::default(),

@@ -42,6 +42,9 @@ gmod-ui = { path = "crates/gmod-ui" }
 gmod-audio = { path = "crates/gmod-audio" }
 gmod-web = { path = "crates/gmod-web" }
 gmod-render = { path = "crates/gmod-render" }
+# what crosses the network: types serialized, in postcard's compact format
+serde = { version = "1.0.229", features = ["derive"] }
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 # LuaJIT 2.1, built from source with the crate
 mlua = { version = "0.12.1", features = ["luajit", "vendored"] }
 # SQLite for Lua's `sql`, built from source; `hooks` for the authorizer that keeps queries in their database

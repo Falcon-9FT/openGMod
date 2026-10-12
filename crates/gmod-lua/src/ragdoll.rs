@@ -360,7 +360,15 @@ pub(crate) fn moved_on(lua: &Lua) {
 /// bone with a part where it is, others on their parents as `pose` has them. None when the
 /// entity is no ragdoll.
 pub(crate) fn bones(lua: &Lua, handle: EntityHandle, rig: &Arc<Rig>, pose: &[gmod_model::Local]) -> Option<Vec<BoneMatrix>> {
-    let parts = get(lua, handle, |r| r.parts.clone())?;
+    // the bones of the parts in the world: where the bodies are, or on a client where the
+    // server said
+    let parts: Vec<(usize, BoneMatrix)> = match get(lua, handle, |r| r.parts.clone()) {
+        Some(parts) => parts.iter().filter_map(|p| Some((p.bone?, rig_pose::multiply(&body_at(lua, p.body)?, &p.offset)))).collect(),
+        None => {
+            let sent = host(lua).entities.get(handle).map(|e| e.ragdoll_pose.clone()).filter(|pose| !pose.is_empty())?;
+            sent.iter().map(|&(bone, origin, angles)| (usize::from(bone), placed(origin, angles))).collect()
+        }
+    };
     let (pos, angles) = host(lua).entities.transform(handle)?;
     let scale = host(lua).entities.get(handle).map_or(1.0, |e| e.model_scale);
     let mut place = placed(pos, angles);
@@ -373,8 +381,7 @@ pub(crate) fn bones(lua: &Lua, handle: EntityHandle, rig: &Arc<Rig>, pose: &[gmo
     let played = rig.bone_to_model(pose);
     let mut out: Vec<BoneMatrix> = Vec::with_capacity(rig.bones().len());
     for (b, bone) in rig.bones().iter().enumerate() {
-        let part = parts.iter().find(|p| p.bone == Some(b));
-        let world = part.and_then(|p| Some(rig_pose::multiply(&body_at(lua, p.body)?, &p.offset)));
+        let world = parts.iter().find(|(bone, _)| *bone == b).map(|(_, m)| *m);
         let m = match (world, usize::try_from(bone.parent).ok().filter(|&p| p < b)) {
             (Some(world), _) => rig_pose::multiply(&to_model, &world),
             (None, Some(parent)) => match pose.get(b) {
@@ -386,6 +393,20 @@ pub(crate) fn bones(lua: &Lua, handle: EntityHandle, rig: &Arc<Rig>, pose: &[gmo
         out.push(m);
     }
     Some(out)
+}
+
+/// Where the bones of a ragdoll's parts are in the world - bone, origin, angles - for its
+/// clients; nothing for an entity that is no ragdoll.
+pub(crate) fn pose(lua: &Lua, handle: EntityHandle) -> Vec<(u16, Vector, Angle)> {
+    let Some(parts) = get(lua, handle, |r| r.parts.clone()) else { return Vec::new() };
+    parts
+        .iter()
+        .filter_map(|p| {
+            let bone = u16::try_from(p.bone?).ok()?;
+            let (origin, angles) = pose_of(&rig_pose::multiply(&body_at(lua, p.body)?, &p.offset));
+            Some((bone, origin, angles))
+        })
+        .collect()
 }
 
 /// The bone of a part (`TranslatePhysBoneToBone`): -1 for none. A body of one part is the

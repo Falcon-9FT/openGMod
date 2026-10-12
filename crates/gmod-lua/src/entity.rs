@@ -24,7 +24,7 @@ use crate::{Realm, host};
 pub const MAX_EDICTS: u32 = 8192;
 
 /// What an entity is to Lua: which named metatable it has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Entity,
     Player,
@@ -48,7 +48,7 @@ impl Kind {
 }
 
 /// A handle to an entity: its index and serial number, or none for `NULL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityHandle {
     pub index: Option<u32>,
     pub serial: u32,
@@ -62,7 +62,7 @@ impl EntityHandle {
 
 /// One entity, as the engine keeps it. Position and angles are relative to the parent, if
 /// there is one.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Ent {
     pub class: String,
     pub kind: Kind,
@@ -118,16 +118,21 @@ pub struct Ent {
     /// What only weapons have.
     pub weapon: Option<crate::weapon::WeaponState>,
     /// Its body, when it has physics ([`crate::physics`]).
+    #[serde(skip)]
     pub physics: Option<gmod_physics::BodyId>,
     /// What a constraint holds together, as `SetPhysConstraintObjects` gave it: the two
     /// bodies ([`crate::constraint`]).
     pub constrained: Option<[PhysObjHandle; 2]>,
     /// The joint a constraint made.
+    #[serde(skip)]
     pub joint: Option<gmod_physics::JointId>,
     /// Entities given for keys (`SetEntity`): a rope's ends.
     pub links: Vec<(String, EntityHandle)>,
     /// Whether it shows the effect of being spawned (`SetSpawnEffect`).
     pub spawn_effect: bool,
+    /// Where the bones of a ragdoll's parts are in the world - bone, origin, angles - as a
+    /// snapshot carries them: a client has no bodies to read them from ([`crate::ragdoll`]).
+    pub ragdoll_pose: Vec<(u16, Vector, Angle)>,
     /// How it is drawn changing (`kRenderFx`): pulsing, fading, a hologram.
     pub render_fx: i64,
     /// Materials in place of the model's own, by slot (`SetSubMaterial`).
@@ -140,21 +145,27 @@ pub struct Ent {
     /// What it plays on its bones ([`crate::anim`]).
     pub anim: crate::anim::AnimState,
     /// The connections of its outputs, for an engine's entity ([`crate::outputs`]).
+    #[serde(skip)]
     pub outputs: Vec<crate::outputs::Output>,
     /// What an entity of the map's logic keeps ([`crate::logic`]).
+    #[serde(skip)]
     pub logic: Option<Box<crate::logic::State>>,
     /// What a trigger of the map keeps ([`crate::triggers`]).
+    #[serde(skip)]
     pub trigger_state: Option<Box<crate::triggers::Trigger>>,
     /// What a door, a button or a platform keeps ([`crate::movers`]).
+    #[serde(skip)]
     pub mover: Option<Box<crate::movers::Mover>>,
     /// What a charger on a wall keeps ([`crate::items`]).
+    #[serde(skip)]
     pub charger: Option<Box<crate::items::Charger>>,
     /// What an NPC keeps ([`crate::npc`]).
+    #[serde(skip)]
     pub npc: Option<Box<crate::npc::Npc>>,
 }
 
 /// How a bone is moved from where its model has it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BoneManipulation {
     pub bone: i64,
     pub position: Vector,
@@ -225,6 +236,7 @@ impl Ent {
             joint: None,
             links: Vec::new(),
             spawn_effect: false,
+            ragdoll_pose: Vec::new(),
             render_fx: 0,
             sub_materials: Vec::new(),
             flex_scale: 1.0,
@@ -465,7 +477,7 @@ const ENTITY_KINDS: &[(&str, bool)] =
 /// A physics object of an entity, by number - 0 its own body, others the parts of a ragdoll
 /// ([`crate::ragdoll`]): valid while the entity has that body ([`crate::physics`]). That of
 /// an entity without one holds `NULL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PhysObjHandle(pub EntityHandle, pub usize);
 
 impl UserData for PhysObjHandle {

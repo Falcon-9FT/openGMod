@@ -1,10 +1,11 @@
 //! The `net` library: messages built bit by bit and read back the same way.
 //!
 //! A message is a 16-bit ID (from `util.AddNetworkString`) and the bits written after it,
-//! least significant bit first. The network itself comes with stage 6; until then a message
-//! that is sent leaves through [`crate::Runtime::take_net_messages`], and one that arrives is
-//! handed in with [`crate::Runtime::receive_net_message`], which runs `net.Incoming` as the
-//! engine does. Vectors and angles are sent as three 32-bit floats, without the precision
+//! least significant bit first. A message that is sent leaves through
+//! [`crate::Runtime::take_net_messages`] with the players it is for (`net.Send` takes a player,
+//! a table of them or a `RecipientFilter`, [`crate::recipients`]), and the program carries it;
+//! one that arrives is handed in with [`crate::Runtime::receive_net_message`], which runs
+//! `net.Incoming` as the engine does. Vectors and angles are sent as three 32-bit floats, without the precision
 //! Source's encoding loses; a matrix is its sixteen floats, row by row.
 
 use std::cell::RefCell;
@@ -23,7 +24,7 @@ const MAX_BYTES: usize = 65533;
 const OVERHEAD_BITS: usize = 24;
 
 /// Bits, least significant first.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Bits {
     pub bytes: Vec<u8>,
     pub len: usize,
@@ -79,12 +80,12 @@ impl Reader {
 }
 
 /// A message that was sent: its name, its data after the ID, and who it is for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NetMessage {
     pub name: String,
     pub data: Bits,
     pub unreliable: bool,
-    /// The players it went to; empty when there was nobody to send it to.
+    /// The players it goes to, by entity index; on a client, empty: it goes to the server.
     pub to: Vec<u32>,
 }
 
@@ -134,7 +135,8 @@ fn uint_bits(a: &Args, position: usize) -> mlua::Result<usize> {
 }
 
 /// Sends the message being built to `to`; it is done with either way.
-fn send(a: &Args, to: Vec<u32>) -> mlua::Result<Value> {
+fn send(a: &Args, to: Vec<EntityHandle>) -> mlua::Result<Value> {
+    let to = to.into_iter().filter_map(|p| p.index).collect();
     let net = &host(a.lua).net;
     let Some(message) = net.outgoing.borrow_mut().take() else {
         return Err(crate::args::error(a.lua, "net message not started (net.Start)"));
@@ -321,10 +323,12 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     })?;
 
     if realm == Realm::Server {
-        // players come with stage 4: until then there is nobody to send to
-        for name in ["Send", "SendOmit", "SendPAS", "SendPVS", "Broadcast"] {
-            def(lua, &net, name, |a| send(a, Vec::new()))?;
+        def(lua, &net, "Send", |a| send(a, crate::recipients::players_of(a.lua, a.get(1))))?;
+        def(lua, &net, "SendOmit", |a| send(a, crate::recipients::all_but(a.lua, a.get(1))))?;
+        for name in ["SendPAS", "SendPVS"] {
+            def(lua, &net, name, |a| send(a, crate::recipients::near(a.lua, a.get(1))))?;
         }
+        def(lua, &net, "Broadcast", |a| send(a, crate::player::all(a.lua)))?;
     } else {
         def(lua, &net, "SendToServer", |a| send(a, Vec::new()))?;
     }
