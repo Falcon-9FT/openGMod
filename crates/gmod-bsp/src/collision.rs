@@ -872,27 +872,7 @@ impl Collision {
         if !overlap(lo, hi, s.mins, s.maxs) {
             return;
         }
-        // in the prop's space, the box keeps the world's axes
-        let mut sweep = Sweep {
-            start: s.frame.local_point(from),
-            end: s.frame.local_point(to),
-            extents,
-            axes: s.frame.world_axes(),
-            point: extents == [0.0; 3],
-            mask,
-            fraction: found.fraction,
-            hit: None,
-            start_solid: false,
-            all_solid: false,
-            left_solid: 0.0,
-        };
-        let (lo, hi) = sweep.bounds(1.0);
-        for hull in &self.shapes[s.shape] {
-            if overlap(lo, hi, hull.mins, hull.maxs) {
-                sweep.clip(hull.bounds(&sweep).into_iter(), contents::SOLID, false, false);
-            }
-        }
-        found.take(&sweep, &s.frame, None, Some(s.prop));
+        sweep_hulls(&self.shapes[s.shape], &s.frame, from, to, extents, mask, found, Some(s.prop));
     }
 
     /// Walks the tree from `head` down the leaves the sweep passes through, the near ones
@@ -1109,6 +1089,45 @@ fn displacements(bsp: &Bsp, surface: &impl Fn(i16) -> Surface) -> Vec<Displaceme
         out.push(Displacement { contents, surface: surface(face.texinfo), mins, maxs, triangles });
     }
     out
+}
+
+/// Sweeps a box (its middle from `from` to `to`, half as big as `extents`) through convex
+/// hulls in the space of `frame`; what it hits goes into `found` if nearer, as the static prop
+/// `prop` if it is one.
+#[allow(clippy::too_many_arguments)]
+fn sweep_hulls(hulls: &[Hull], frame: &Frame, from: Vec3, to: Vec3, extents: Vec3, mask: u32, found: &mut Found, prop: Option<usize>) {
+    // in the hulls' space, the box keeps the world's axes
+    let mut sweep = Sweep {
+        start: frame.local_point(from),
+        end: frame.local_point(to),
+        extents,
+        axes: frame.world_axes(),
+        point: extents == [0.0; 3],
+        mask,
+        fraction: found.fraction,
+        hit: None,
+        start_solid: false,
+        all_solid: false,
+        left_solid: 0.0,
+    };
+    let (lo, hi) = sweep.bounds(1.0);
+    for hull in hulls {
+        if overlap(lo, hi, hull.mins, hull.maxs) {
+            sweep.clip(hull.bounds(&sweep).into_iter(), contents::SOLID, false, false);
+        }
+    }
+    found.take(&sweep, frame, None, prop);
+}
+
+/// Sweeps the box `mins` to `maxs` from `start` to `end` through convex hulls - a model's, in
+/// its own space - standing where `origin` and `angles` (pitch, yaw, roll) put them, as
+/// [`Collision::trace`] sweeps through the world: the shape of a prop that moves.
+pub fn trace_hulls(hulls: &[Hull], origin: Vec3, angles: Vec3, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> Trace {
+    let offset = scale(add(mins, maxs), 0.5);
+    let extents = abs(scale(sub(maxs, mins), 0.5));
+    let mut found = Found::default();
+    sweep_hulls(hulls, &Frame::new(origin, angles), add(start, offset), add(end, offset), extents, contents::SOLID, &mut found, None);
+    found.trace(start, end)
 }
 
 /// The world, and the brush entities solid when the map starts, where the map puts them -

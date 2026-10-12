@@ -15,6 +15,7 @@ mod chat;
 mod mapio;
 mod movers;
 mod ragdoll;
+mod shapes;
 mod triggers;
 
 /// A folder that is removed when dropped.

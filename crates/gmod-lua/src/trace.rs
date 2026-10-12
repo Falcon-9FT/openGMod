@@ -1,7 +1,9 @@
 //! Traces as `util.TraceLine` and `util.TraceHull` make them: through the world of the map -
 //! what [`gmod_bsp::Collision`] has, brushes, displacements, the brush entities where the map
-//! put them and the static props - and through the boxes of the solid entities: a prop's box
-//! turned with it for a ray, the box around it for a hull. A ray hits a ragdoll's parts
+//! put them and the static props - and through the solid entities: one with a body of its
+//! model's physics shape through that shape where it stands (a barrel on its side is round to
+//! a bullet and to a player's feet), another's box turned with it for a ray, the box around it
+//! for a hull. A ray hits a ragdoll's parts
 //! themselves, and says which (`PhysicsBone`); a hull the box around them. Players and NPCs are
 //! `CONTENTS_MONSTER`, everything else `CONTENTS_SOLID`. A trace has a collision group
 //! (`collisiongroup`, a player's movement `COLLISION_GROUP_PLAYER_MOVEMENT`), and the
@@ -11,8 +13,7 @@
 //! What was hit is made of a surface ([`crate::surfaceprops`]): the map's material's
 //! `$surfaceprop`, an entity's body's; `SurfaceProps` is its number, `MatType` its `MAT_*`.
 //!
-//! Not yet: the shapes of models (physics, stage 4), hit boxes and hit groups, the
-//! `ShouldCollide` hook.
+//! Not yet: hit boxes and hit groups, the `ShouldCollide` hook.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -353,6 +354,30 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
                     let length = (sweep.end - sweep.start).length();
                     let back = if length > 0.0 { EPSILON / length } else { 0.0 };
                     BoxHit { fraction: (fraction - back).max(0.0), normal, start_solid, left: if start_solid { 1.0 } else { 0.0 } }
+                })
+            }
+        } else if let Some((hulls, lo, hi)) = crate::physics::shape(lua, handle) {
+            // the shape of its model where it stands, past the box around it
+            let (lo, hi) = entity::rotated_bounds(lo, hi, angles);
+            if through_box(sweep.start, sweep.end, pos + lo - sweep.maxs, pos + hi - sweep.mins).is_none() {
+                None
+            } else {
+                let turned = [angles.p, angles.y, angles.r];
+                let t = gmod_bsp::collision::trace_hulls(
+                    &hulls,
+                    array(pos),
+                    turned,
+                    array(sweep.start),
+                    array(sweep.end),
+                    array(sweep.mins),
+                    array(sweep.maxs),
+                );
+                let normal = Vector::new(t.normal[0], t.normal[1], t.normal[2]);
+                (t.fraction < 1.0 || t.start_solid).then_some(BoxHit {
+                    fraction: t.fraction,
+                    normal,
+                    start_solid: t.start_solid,
+                    left: t.fraction_left_solid,
                 })
             }
         } else if hull {

@@ -51,6 +51,8 @@ struct PhysModel {
     material: String,
     /// All of it: the solids of a ragdoll, how they hang together.
     phy: Arc<gmod_model::Phy>,
+    /// Its shape for traces: the convex hulls of its first solid.
+    hulls: Arc<Vec<gmod_bsp::collision::Hull>>,
 }
 
 /// What Lua keeps with a body.
@@ -66,6 +68,9 @@ struct Kept {
     game_flags: i64,
     contents: i64,
     drag: bool,
+    /// The shape of its model, which traces sweep through; none for a box, a ball or hulls
+    /// Lua made.
+    hulls: Option<Arc<Vec<gmod_bsp::collision::Hull>>>,
 }
 
 pub(crate) fn array(v: Vector) -> [f32; 3] {
@@ -133,6 +138,7 @@ fn attach_world(lua: &Lua) {
         game_flags: 0,
         contents: 0,
         drag: false,
+        hulls: None,
     };
     host.physics.bodies.borrow_mut().insert(ground, kept);
     host.entities.with_mut(world, |ent| ent.physics = Some(ground));
@@ -152,6 +158,11 @@ fn phys_model(lua: &Lua, model: &str) -> Option<PhysModel> {
         let mdl = gmod_model::Mdl::parse(&host.vfs.read(&path, "GAME").ok()?).ok()?;
         let phy = Arc::new(gmod_model::load_physics(&host.vfs, &path, mdl.checksum).ok()??);
         let solid = phy.solids.first()?;
+        let hulls = solid
+            .convexes
+            .iter()
+            .filter_map(|c| gmod_bsp::collision::Hull::new(&c.points, &c.triangles.iter().map(|t| t.map(usize::from)).collect::<Vec<_>>()))
+            .collect();
         Some(PhysModel {
             shape: Shape::Hulls(solid.convexes.iter().map(|c| c.points.clone()).collect()),
             mass: solid.mass(),
@@ -159,6 +170,7 @@ fn phys_model(lua: &Lua, model: &str) -> Option<PhysModel> {
             rot_damping: solid.keys.number("rotdamping").unwrap_or(0.0),
             material: solid.surface_prop().unwrap_or("default").to_string(),
             phy: phy.clone(),
+            hulls: Arc::new(hulls),
         })
     };
     let found = read();
@@ -180,7 +192,7 @@ pub(crate) fn phy(lua: &Lua, model: &str) -> Option<Arc<gmod_model::Phy>> {
 /// Keeps a body of an entity: what Lua keeps with it, the bounds of its shape in its own space.
 pub(crate) fn keep(lua: &Lua, id: BodyId, entity: EntityHandle, part: usize, shape: &Shape, material: &str) {
     let (mins, maxs) = bounds(shape);
-    let kept = Kept { entity, part, material: material.to_string(), mins, maxs, game_flags: 0, contents: 0, drag: true };
+    let kept = Kept { entity, part, material: material.to_string(), mins, maxs, game_flags: 0, contents: 0, drag: true, hulls: None };
     host(lua).physics.bodies.borrow_mut().insert(id, kept);
 }
 
@@ -229,10 +241,21 @@ fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>
     };
     let Some(id) = host.physics.physics.borrow_mut().add(&body) else { return false };
     let material = model.map_or("default", |m| &m.material).to_string();
-    let kept = Kept { entity: handle, part: 0, material, mins, maxs, game_flags: 0, contents: 0, drag: true };
+    let hulls = model.map(|m| m.hulls.clone()).filter(|h| !h.is_empty());
+    let kept = Kept { entity: handle, part: 0, material, mins, maxs, game_flags: 0, contents: 0, drag: true, hulls };
     host.physics.bodies.borrow_mut().insert(id, kept);
     host.entities.with_mut(handle, |ent| ent.physics = Some(id));
     true
+}
+
+/// The shape of an entity's model that its body has, for traces: its convex hulls in its own
+/// space, and their bounds. None for an entity without a body, or with a body of another shape.
+pub(crate) fn shape(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Vec<gmod_bsp::collision::Hull>>, Vector, Vector)> {
+    let id = body(lua, handle)?;
+    let host = host(lua);
+    let bodies = host.physics.bodies.borrow();
+    let kept = bodies.get(&id)?;
+    Some((kept.hulls.clone()?, kept.mins, kept.maxs))
 }
 
 /// `PhysicsInit(SOLID_VPHYSICS)`: a body of the entity's model. Whether it got one.
