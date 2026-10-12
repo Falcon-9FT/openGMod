@@ -52,7 +52,11 @@ jobs:
           foreach ($needed in "libcef.dll", "icudtl.dat", "resources.pak", "locales/en-US.pak") {
             if (-not (Test-Path (Join-Path $dist $needed))) { Write-Error "$needed is missing from the release"; exit 1 }
           }
-          Compress-Archive -Path "$dist/*" -DestinationPath openGMOD-windows-x64.zip -Force
+          # Windows' own tar.exe (bsdtar) makes the zip: Compress-Archive calls .NET methods,
+          # which PowerShell's Constrained Language mode (on the self-hosted runner) forbids
+          Remove-Item openGMOD-windows-x64.zip -ErrorAction SilentlyContinue
+          tar.exe -a -c -f openGMOD-windows-x64.zip -C $dist (Get-ChildItem $dist).Name
+          if ($LASTEXITCODE -ne 0) { Write-Error "zipping the release failed"; exit 1 }
           $programs = @("openGMOD-windows-x64.zip", "target/release/gmod-check.exe")
           if ($env:REF_TYPE -eq "tag") {
             $tag = $env:REF_NAME
