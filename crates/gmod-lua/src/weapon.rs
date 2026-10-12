@@ -190,6 +190,58 @@ pub struct WeaponState {
     pub idle_time: f64,
 }
 
+/// The activities of the player's model a hold type plays, from the first (`ACT_HL2MP_IDLE_*`),
+/// for those the player's animation asks for: standing, walking, running, crouching and
+/// walking so, shooting either way, reloading either way, jumping, swimming still and moving.
+const HOLD_ACTIVITIES: &[(&str, i64)] = &[
+    ("ACT_MP_STAND_IDLE", 0),
+    ("ACT_MP_WALK", 1),
+    ("ACT_MP_RUN", 2),
+    ("ACT_MP_CROUCH_IDLE", 3),
+    ("ACT_MP_CROUCHWALK", 4),
+    ("ACT_MP_ATTACK_STAND_PRIMARYFIRE", 5),
+    ("ACT_MP_ATTACK_CROUCH_PRIMARYFIRE", 5),
+    ("ACT_MP_RELOAD_STAND", 6),
+    ("ACT_MP_RELOAD_CROUCH", 6),
+    ("ACT_MP_JUMP", 7),
+    ("ACT_RANGE_ATTACK1", 8),
+    ("ACT_MP_SWIM", 9),
+];
+
+/// What a player's weapon in hand makes of an activity of the player's model
+/// (`Player:TranslateWeaponActivity`): a SWEP's `TranslateActivity`, an engine weapon's by its
+/// hold type. What it does not translate (-1, nothing) stays as it was.
+pub(crate) fn translate_activity(lua: &Lua, player: EntityHandle, act: i64) -> i64 {
+    let Some(active) = crate::player::state(lua, player, |_, p| p.active_weapon) else { return act };
+    let Some((scripted, hold)) = host(lua)
+        .entities
+        .get(active)
+        .filter(|e| !e.removed)
+        .map(|e| (e.scripted, e.weapon.as_ref().map(|w| w.hold_type.clone()).unwrap_or_default()))
+    else {
+        return act;
+    };
+    let number = |value: Option<&Value>| match value {
+        Some(Value::Integer(n)) => Some(*n),
+        Some(Value::Number(n)) => Some(*n as i64),
+        _ => None,
+    };
+    if scripted {
+        let Ok(Value::UserData(ud)) = entity::push(lua, active) else { return act };
+        let translated = crate::ents::call_method(lua, &ud, "TranslateActivity", MultiValue::from_iter([Value::Integer(act)]));
+        return translated.and_then(|values| number(values.front())).filter(|&n| n >= 0).unwrap_or(act);
+    }
+    let globals = lua.globals();
+    let enum_value = |name: &str| number(globals.raw_get::<Value>(name).ok().as_ref());
+    let suffix = match hold.as_str() {
+        "" | "normal" => String::new(),
+        "smg" => "_SMG1".to_string(),
+        other => format!("_{}", other.to_ascii_uppercase()),
+    };
+    let Some(first) = enum_value(&format!("ACT_HL2MP_IDLE{suffix}")) else { return act };
+    HOLD_ACTIVITIES.iter().find(|(name, _)| enum_value(name) == Some(act)).map_or(act, |(_, offset)| first + offset)
+}
+
 /// Weapon scripts and ammo types, kept with the [`crate::Host`].
 #[derive(Default)]
 pub(crate) struct Weapons {

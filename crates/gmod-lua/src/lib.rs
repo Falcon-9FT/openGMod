@@ -97,6 +97,7 @@ pub mod pickup;
 pub mod player;
 pub mod ragdoll;
 pub mod recipients;
+pub mod resource;
 pub mod sandbox;
 pub mod snapshot;
 pub mod sound;
@@ -302,6 +303,8 @@ pub(crate) struct Host {
     pub(crate) props: breakable::Props,
     /// The corpses of NPCs that fade.
     pub(crate) npcs: npc::Npcs,
+    /// What clients download.
+    pub(crate) resources: resource::Resources,
 }
 
 impl Host {
@@ -389,6 +392,7 @@ impl Runtime {
             movers: movers::Moving::default(),
             props: breakable::Props::default(),
             npcs: npc::Npcs::default(),
+            resources: resource::Resources::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -418,6 +422,7 @@ impl Runtime {
         net::install(&lua, realm)?;
         if realm == Realm::Server {
             recipients::install(&lua)?;
+            resource::install(&lua)?;
         }
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
@@ -571,6 +576,11 @@ impl Runtime {
     /// game.
     pub fn set_max_players(&self, count: u32) {
         host(&self.lua).game.max_players.set(count.clamp(1, player::MAX_PLAYERS));
+    }
+
+    /// How many players the server takes.
+    pub fn max_players(&self) -> u32 {
+        player::max_players(&self.lua)
     }
 
     /// Whether the server runs without a player of its own at the screen (`game.IsDedicated`):

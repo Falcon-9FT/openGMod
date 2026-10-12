@@ -1,19 +1,22 @@
 //! `opengmod`: Garry's Mod's main menu ([`menu`], drawn by Chromium), and the maps it starts on
 //! the screen - the world, brush entities and static props with their textures and light, and
 //! the sky box - with the game running in them: the Lua of the server, the gamemode and the
-//! addons ([`game`]), and the player of a single-player game walking through it as the game
-//! moves them. Drawn with Direct3D 12 on Windows (Vulkan when that is missing). Without the
-//! game's Lua (`--no-lua`, or a map file without the game) the player only walks
-//! ([`gmod_movement`]).
+//! addons ([`game`]), and the player walking through it as the game moves them - alone, as
+//! the host of a game others join over the network, or on another computer's server
+//! (`--connect`, [`client`]). A dedicated server (`--dedicated`) runs a game without a window
+//! for those who join ([`server`]). Drawn with Direct3D 12 on Windows (Vulkan when that is
+//! missing). Without the game's Lua (`--no-lua`, or a map file without the game) the player
+//! only walks ([`gmod_movement`]).
 
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -32,8 +35,11 @@ use gmod_world::World;
 use gmod_world::gpu::Camera;
 
 mod audio;
+mod client;
 mod game;
 mod menu;
+mod proto;
+mod server;
 mod walk;
 
 use game::{Buttons, Game, Models};
@@ -44,6 +50,8 @@ opengmod - Garry's Mod's menu and maps from your installation, with the game's L
 
 USAGE:
     opengmod [OPTIONS] [MAP]
+    opengmod --connect <ADDRESS> [OPTIONS]
+    opengmod --dedicated [OPTIONS] MAP
 
     MAP                  a map to start in: one of the game (gm_construct), or a .bsp file;
                          without one, the main menu
@@ -53,6 +61,17 @@ OPTIONS:
     --no-addons          the game only: no workshop items, no addon files
     --no-lua             no Lua: only walk through the map
     --no-html            no Chromium: no main menu (gm_construct starts) and no HTML panels
+    --gamemode <NAME>    the gamemode of a game started here (default: sandbox)
+    --maxplayers <N>     players a game started here takes; more than 1: others join it over
+                         the network (a listen server)
+    --port <PORT>        the UDP port a server here listens on (default: 27015)
+    --name <NAME>        the player's name (default: the user's)
+    --connect <ADDRESS>  plays on a server: host or host:port
+    --dedicated          a server without a window or a player of its own (16 players
+                         unless --maxplayers says otherwise); lines typed are its console,
+                         status lists the players, lua_run runs Lua, quit
+                         stops it
+    --hostname <NAME>    the server's name its players see
     -h, --help           this text
 
 CONTROLS:
@@ -67,7 +86,8 @@ CONTROLS:
     F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)
 
     Lines typed into this terminal are the game's console: give weapon_crowbar,
-    gm_spawn models/props_c17/oildrum001.mdl, the commands of the addons.";
+    gm_spawn models/props_c17/oildrum001.mdl, the commands of the addons; connect <address>
+    joins a server, disconnect leaves it, lua_run_cl runs Lua in your client.";
 
 /// Degrees the view turns per pixel the mouse moves.
 const MOUSE_DEGREES: f32 = 0.12;
@@ -86,10 +106,30 @@ struct Args {
     addons: bool,
     lua: bool,
     html: bool,
+    gamemode: Option<String>,
+    max_players: Option<u32>,
+    port: u16,
+    name: Option<String>,
+    connect: Option<String>,
+    dedicated: bool,
+    hostname: Option<String>,
 }
 
 fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
-    let mut args = Args { map: None, gmod: None, addons: true, lua: true, html: true };
+    let mut args = Args {
+        map: None,
+        gmod: None,
+        addons: true,
+        lua: true,
+        html: true,
+        gamemode: None,
+        max_players: None,
+        port: proto::DEFAULT_PORT,
+        name: None,
+        connect: None,
+        dedicated: false,
+        hostname: None,
+    };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "--gmod" => args.gmod = Some(raw.next().ok_or("--gmod needs a folder")?.into()),
@@ -97,6 +137,16 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
             "--no-addons" => args.addons = false,
             "--no-lua" => args.lua = false,
             "--no-html" => args.html = false,
+            "--gamemode" => args.gamemode = Some(raw.next().ok_or("--gamemode needs a gamemode")?),
+            "--maxplayers" => {
+                let n = raw.next().and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=gmod_lua::player::MAX_PLAYERS).contains(n));
+                args.max_players = Some(n.ok_or(format!("--maxplayers needs a number from 1 to {}", gmod_lua::player::MAX_PLAYERS))?);
+            }
+            "--port" => args.port = raw.next().and_then(|p| p.parse().ok()).ok_or("--port needs a port")?,
+            "--name" => args.name = Some(raw.next().ok_or("--name needs a name")?),
+            "--connect" => args.connect = Some(raw.next().ok_or("--connect needs an address")?),
+            "--dedicated" => args.dedicated = true,
+            "--hostname" => args.hostname = Some(raw.next().ok_or("--hostname needs a name")?),
             "-h" | "--help" => return Ok(None),
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if args.map.is_none() => args.map = Some(arg),
@@ -114,6 +164,11 @@ struct Setup {
     gamemode: String,
     /// Addons switched off in the menu.
     disabled: HashSet<String>,
+    /// Players a game started here takes: more than one, it listens for them on `port`.
+    max_players: u32,
+    port: u16,
+    /// The player's name.
+    name: String,
 }
 
 impl Setup {
@@ -144,18 +199,23 @@ struct Loaded {
 
 /// Reads the map and everything it needs from the game.
 fn load(setup: &Setup, map: &str) -> Result<Loaded, String> {
-    let started = Instant::now();
     let on_disk = Path::new(map).is_file();
-    let install = Install::locate(setup.gmod.as_deref());
-    let mut vfs = match &install {
-        Ok(install) => setup.mount(install),
+    let (vfs, game) = match Install::locate(setup.gmod.as_deref()) {
+        Ok(install) => (setup.mount(&install), true),
         // a map file can be shown without the game, only not with its materials
         Err(e) if on_disk => {
             println!("{e}\nThe map is drawn without the game's materials.");
-            gmod_fs::Vfs::new()
+            (gmod_fs::Vfs::new(), false)
         }
         Err(e) => return Err(e.to_string()),
     };
+    load_from(vfs, map, setup.lua && game)
+}
+
+/// Reads a map - a file, or one of the game's - and mounts its pakfile: the map, and where it
+/// was.
+fn read_map(vfs: &mut Vfs, map: &str) -> Result<(gmod_bsp::Bsp, String), String> {
+    let on_disk = Path::new(map).is_file();
     let path = if on_disk {
         map.to_string()
     } else {
@@ -164,7 +224,14 @@ fn load(setup: &Setup, map: &str) -> Result<Loaded, String> {
     };
     let bytes = if on_disk { std::fs::read(&path) } else { vfs.read(&path, "GAME") }.map_err(|e| format!("{path}: {e}"))?;
     let bsp = gmod_bsp::Bsp::parse(PathBuf::from(&path), Arc::from(bytes)).map_err(|e| e.to_string())?;
-    gmod_world::mount_pakfile(&mut vfs, &bsp).map_err(|e| format!("{path}: pakfile: {e}"))?;
+    gmod_world::mount_pakfile(vfs, &bsp).map_err(|e| format!("{path}: pakfile: {e}"))?;
+    Ok((bsp, path))
+}
+
+/// Reads a map from these files with everything it needs; with the game's Lua when `lua`.
+fn load_from(mut vfs: Vfs, map: &str, lua: bool) -> Result<Loaded, String> {
+    let started = Instant::now();
+    let (bsp, path) = read_map(&mut vfs, map)?;
     let world = gmod_world::load(&vfs, &bsp);
     let (collision, unread_physics) = gmod_world::collision(&vfs, &bsp);
     println!("{path}: {} triangles, {} textures, in {:.1} s", world.triangles(), world.textures.len(), started.elapsed().as_secs_f64());
@@ -192,7 +259,7 @@ fn load(setup: &Setup, map: &str) -> Result<Loaded, String> {
         .filter_map(|e| e.brush_model())
         .map(|m| (m, gmod_world::brush_model(&vfs, &bsp, m)))
         .collect();
-    let lua = (setup.lua && install.is_ok()).then(|| {
+    let lua = lua.then(|| {
         let map = gmod_lua::Map::from_bsp(&name, &bsp, collision.clone());
         (Arc::new(vfs), map)
     });
@@ -207,6 +274,89 @@ fn load(setup: &Setup, map: &str) -> Result<Loaded, String> {
         name,
         brushes,
     })
+}
+
+/// A dedicated server: the game on a map for those who join over the network, without a
+/// window; lines typed are its console. Runs until `quit`.
+fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
+    let install = Install::locate(setup.gmod.as_deref()).map_err(|e| e.to_string())?;
+    println!("Garry's Mod: {}", install.root.display());
+    let mut vfs = setup.mount(&install);
+    let (bsp, path) = read_map(&mut vfs, map)?;
+    let (collision, unread_physics) = gmod_world::collision(&vfs, &bsp);
+    if !unread_physics.is_empty() {
+        println!("Physics models that could not be read, their props not solid: {}", unread_physics.len());
+    }
+    let name = Path::new(&path).file_stem().map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned());
+    let lua_map = gmod_lua::Map::from_bsp(&name, &bsp, Arc::new(collision));
+    let started = Instant::now();
+    let mut server = server::Server::start(Arc::new(vfs), &lua_map, &setup.gamemode, setup.max_players, true)?;
+    server.name = hostname.to_string();
+    let at = server.listen(SocketAddr::from(([0, 0, 0, 0], setup.port))).map_err(|e| format!("port {}: {e}", setup.port))?;
+    println!(
+        "{hostname}: {name} ({}) for {} players, started in {:.1} s, on UDP port {}; type status, quit or the server's commands",
+        setup.gamemode,
+        setup.max_players,
+        started.elapsed().as_secs_f64(),
+        at.port()
+    );
+    let tick = Duration::from_secs_f64(gmod_lua::timer::TICK_INTERVAL);
+    let mut next = Instant::now();
+    loop {
+        server.frame(gmod_lua::timer::TICK_INTERVAL);
+        for line in game::typed_lines() {
+            match line.trim() {
+                "quit" | "exit" => {
+                    server.shut_down("the server is shutting down");
+                    return Ok(());
+                }
+                "status" => {
+                    let players = server.remote_players();
+                    println!("{} of {} players", players.len(), setup.max_players);
+                    for (name, rtt) in players {
+                        println!("  {name}: {} ms", rtt.map_or(0, |r| r.as_millis()));
+                    }
+                }
+                text => match text.strip_prefix("lua_run ") {
+                    Some(code) => {
+                        // errors are reported as they happen
+                        let _ = server.runtime().run_string(code, "lua_run");
+                    }
+                    None => server.runtime().run_command(&line),
+                },
+            }
+        }
+        // a tick a tick; one that ran late is not made up for long after
+        next += tick;
+        let now = Instant::now();
+        match next.checked_duration_since(now) {
+            Some(wait) => std::thread::sleep(wait),
+            None if now - next > Duration::from_secs(1) => next = now,
+            None => {}
+        }
+    }
+}
+
+/// An address to connect to: `host` or `host:port`.
+fn server_address(address: &str) -> Result<SocketAddr, String> {
+    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, proto::DEFAULT_PORT));
+    }
+    let with_port = if address.parse::<SocketAddr>().is_ok() || address.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+        address.to_string()
+    } else {
+        format!("{address}:{}", proto::DEFAULT_PORT)
+    };
+    with_port.to_socket_addrs().map_err(|e| format!("{address}: {e}"))?.next().ok_or_else(|| format!("{address}: no such host"))
+}
+
+/// The player's name when none is given: the user's.
+fn default_name() -> String {
+    ["OPENGMOD_NAME", "USERNAME", "USER"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "Player".to_string())
 }
 
 /// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
@@ -556,6 +706,8 @@ struct App {
     web: Option<Rc<gmod_web::Web>>,
     /// A map the menu asked for, loaded on the next frame (after one that says so).
     pending_map: Option<String>,
+    /// A server to join, likewise.
+    pending_connect: Option<String>,
     /// The menu said to quit.
     quit: bool,
     /// When the menu started, whether Chromium drew it, and whether it was said that it did not.
@@ -695,9 +847,12 @@ impl App {
             }
         };
         let pages = self.web.clone().map(menu::web_pages);
-        self.game = loaded.lua.as_ref().and_then(|(vfs, map)| {
+        let setup = &self.setup;
+        // more than one player: the others join over the network
+        let listen = (setup.max_players > 1).then(|| SocketAddr::from(([0, 0, 0, 0], setup.port)));
+        let game = loaded.lua.as_ref().and_then(|(vfs, map)| {
             let started = Instant::now();
-            match Game::start(vfs.clone(), map, &self.setup.gamemode, pages) {
+            match Game::start(vfs.clone(), map, &setup.gamemode, pages, setup.max_players, listen, &setup.name) {
                 Ok(game) => {
                     println!("The game started in {:.1} s", started.elapsed().as_secs_f64());
                     Some(game)
@@ -708,6 +863,49 @@ impl App {
                 }
             }
         });
+        self.show_map(loaded, game);
+    }
+
+    /// Joins a server over the network: what it says to have is fetched, its map loaded, and
+    /// the player plays there.
+    fn connect(&mut self, address: &str) {
+        self.leave_map();
+        if let Err(e) = self.try_connect(address) {
+            eprintln!("Could not join {address}: {e}");
+        }
+    }
+
+    fn try_connect(&mut self, address: &str) -> Result<(), String> {
+        let addr = server_address(address)?;
+        println!("Connecting to {addr}");
+        let mut connection = client::Connection::open(addr, &self.setup.name)?;
+        let welcome = connection.welcome.clone();
+        println!("{}: {} ({}, {} players)", welcome.server, welcome.map, welcome.gamemode, welcome.max_players);
+        let install = Install::locate(self.setup.gmod.as_deref()).map_err(|e| e.to_string())?;
+        let mut vfs = self.setup.mount(&install);
+        // what servers had downloaded is kept, behind the game's own files
+        let download = UserDir::default_root().map(|root| root.join("download"));
+        if let Some(dir) = &download {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(dir))));
+        }
+        let lua = connection.download(&vfs, download.as_deref())?;
+        // the server's client Lua before the client's own
+        if !lua.is_empty() {
+            vfs.insert(0, gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Memory(gmod_fs::MemoryMount::new("server", lua))));
+        }
+        println!("Loading {}", welcome.map);
+        let loaded = load_from(vfs, &welcome.map, true)?;
+        let pages = self.web.clone().map(menu::web_pages);
+        let (vfs, map) = loaded.lua.as_ref().ok_or("no Lua")?;
+        let game = Game::join(vfs.clone(), map, connection, pages)?;
+        self.show_map(loaded, Some(game));
+        Ok(())
+    }
+
+    /// A map loaded comes on the screen, with its game if there is one.
+    fn show_map(&mut self, loaded: Loaded, game: Option<Game>) {
+        self.game = game;
         self.models = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone()).with_brushes(loaded.brushes));
         self.audio = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| audio::Audio::new(vfs.clone()));
         self.collision = Some(loaded.collision);
@@ -746,6 +944,9 @@ impl App {
     fn leave_map(&mut self) {
         if self.collision.is_none() {
             return;
+        }
+        if let Some(game) = &mut self.game {
+            game.leave();
         }
         self.game = None;
         self.models = None;
@@ -816,6 +1017,12 @@ impl App {
             let words: Vec<&str> = line.split_whitespace().map(|w| w.trim_matches('"')).collect();
             match words.as_slice() {
                 ["map", map, ..] => self.pending_map = Some(map.to_string()),
+                ["connect", address, ..] => self.pending_connect = Some(address.to_string()),
+                ["maxplayers", n, ..] => {
+                    if let Some(n) = n.parse::<u32>().ok().filter(|n| (1..=gmod_lua::player::MAX_PLAYERS).contains(n)) {
+                        self.setup.max_players = n;
+                    }
+                }
                 ["gamemode", name, ..] => {
                     self.setup.gamemode = name.to_string();
                     if let Some(menu) = &self.menu {
@@ -830,11 +1037,7 @@ impl App {
                     }
                 }
                 // what a new game is set up with that openGMOD has no use for yet
-                [
-                    "progress_enable" | "maxplayers" | "sv_cheats" | "hostname" | "p2p_enabled" | "p2p_friendsonly" | "sv_lan"
-                    | "commentary",
-                    ..,
-                ] => {}
+                ["progress_enable" | "sv_cheats" | "hostname" | "p2p_enabled" | "p2p_friendsonly" | "sv_lan" | "commentary", ..] => {}
                 _ => match &self.game {
                     Some(game) => game.command(&line),
                     None => println!("Unknown command \"{line}\""),
@@ -869,12 +1072,42 @@ impl App {
 
     /// A frame of the game: the player's command, the ticks, and the eyes to see from.
     fn play(&mut self, seconds: f32) {
-        let (keys, mut buttons) = (self.movement_keys(), self.buttons());
+        // under the menu nothing is pressed
+        let (keys, mut buttons) =
+            if self.menu_shown() { (Keys::default(), Buttons::default()) } else { (self.movement_keys(), self.buttons()) };
         buttons.wheel = std::mem::take(&mut self.wheel);
         buttons.mouse = self.mouse_moved.map(|counts| counts.trunc() as i32);
         self.mouse_moved = self.mouse_moved.map(f64::fract);
+        // what the program does itself of the lines typed; the rest is the player's console
+        let mut lines = Vec::new();
+        for line in game::typed_lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            match words.as_slice() {
+                ["connect", address] => self.pending_connect = Some(address.to_string()),
+                ["disconnect"] => {
+                    self.leave_map();
+                    return;
+                }
+                ["quit" | "exit"] => self.quit = true,
+                ["screenshot" | "jpeg"] => self.screenshot = true,
+                // Lua for the player's own client, typed here only
+                ["lua_run_cl", ..] => {
+                    if let (Some(game), Some(code)) = (&self.game, line.trim_start().get("lua_run_cl ".len()..)) {
+                        let _ = game.client().run_string(code, "lua_run_cl");
+                    }
+                }
+                _ => lines.push(line),
+            }
+        }
         let Some(game) = &mut self.game else { return };
-        let Some(shown) = game.frame(&keys, &buttons, self.camera.pitch, self.camera.yaw, f64::from(seconds)) else { return };
+        game.type_lines(lines);
+        let shown = game.frame(&keys, &buttons, self.camera.pitch, self.camera.yaw, f64::from(seconds));
+        if let Some(reason) = game.closed() {
+            println!("Disconnected: {reason}");
+            self.leave_map();
+            return;
+        }
+        let Some(shown) = shown else { return };
         self.holding = shown.view.holding;
         self.camera.eye = shown.eye;
         if let Some((pitch, yaw)) = shown.turned {
@@ -1157,11 +1390,15 @@ impl ApplicationHandler for App {
                 if let Some(map) = self.pending_map.take() {
                     self.enter_map(&map);
                 }
+                if let Some(address) = self.pending_connect.take() {
+                    self.connect(&address);
+                }
                 let now = Instant::now();
                 let seconds = (now - self.last_frame).as_secs_f32().min(0.25);
                 self.last_frame = now;
-                // the game waits while the menu shows over it, as a single-player game does
-                if !self.menu_shown() {
+                // a single-player game waits while the menu shows over it; one with others in it
+                // goes on
+                if !self.menu_shown() || self.game.as_ref().is_some_and(Game::multiplayer) {
                     self.advance(seconds);
                 }
                 self.show_entities();
@@ -1336,7 +1573,24 @@ fn main() -> ExitCode {
     };
     println!("openGMOD {}", env!("CARGO_PKG_VERSION"));
     let disabled = menu::disabled_file().map(|file| gmod_fs::workshop::read_disabled(&file)).unwrap_or_default();
-    let setup = Setup { gmod: args.gmod.clone(), addons: args.addons, lua: args.lua, gamemode: "sandbox".into(), disabled };
+    let setup = Setup {
+        gmod: args.gmod.clone(),
+        addons: args.addons,
+        lua: args.lua,
+        gamemode: args.gamemode.clone().unwrap_or_else(|| "sandbox".into()),
+        disabled,
+        max_players: args.max_players.unwrap_or(if args.dedicated { 16 } else { 1 }),
+        port: args.port,
+        name: args.name.clone().unwrap_or_else(default_name),
+    };
+    if args.dedicated {
+        let Some(map) = &args.map else { return fail(&format!("--dedicated needs a map\n\n{USAGE}")) };
+        let hostname = args.hostname.clone().unwrap_or_else(|| "openGMOD".to_string());
+        return match dedicated(&setup, map, &hostname) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
 
     // the main menu, drawn by Chromium, on the game's files
     let (mut web, mut main_menu) = (None, None);
@@ -1368,6 +1622,7 @@ fn main() -> ExitCode {
     }
     let map = match (&args.map, &main_menu) {
         (Some(map), _) => Some(map.clone()),
+        _ if args.connect.is_some() => None,
         (None, None) => Some(DEFAULT_MAP.to_string()),
         (None, Some(_)) => None,
     };
@@ -1414,6 +1669,7 @@ fn main() -> ExitCode {
         menu_open: false,
         web: web.take(),
         pending_map: None,
+        pending_connect: None,
         quit: false,
         menu_started: now,
         menu_drawn: false,
@@ -1426,9 +1682,17 @@ fn main() -> ExitCode {
             return fail(&format!("{map} could not be loaded"));
         }
     }
+    if let Some(address) = &args.connect {
+        app.connect(address);
+        if app.collision.is_none() && app.menu.is_none() {
+            return fail(&format!("{address}: could not join"));
+        }
+    }
     if let Err(e) = event_loop.run_app(&mut app) {
         return fail(&format!("window system: {e}"));
     }
+    // a server here tells its clients it goes, a client its server that the player does
+    app.leave_map();
     // the pages go before Chromium does
     let error = app.error.take();
     drop(app);

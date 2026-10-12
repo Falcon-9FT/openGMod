@@ -66,6 +66,8 @@ const CHUNK: usize = 1000;
 const FRAGMENT_BYTES: usize = MAX_PACKET - DATA_HEADER - 1 - 2 - 1 - 1 - 2;
 /// The largest reliable message.
 pub const MAX_RELIABLE: usize = 64 << 20;
+/// The most a client's hello and a server's welcome may hold: each goes in one packet.
+pub const MAX_HELLO: usize = 1000;
 /// The largest unreliable message: 255 fragments.
 pub const MAX_UNRELIABLE: usize = FRAGMENT_BYTES * 255;
 /// How many reliable chunks may be out at once, waiting to be acknowledged.
@@ -661,8 +663,13 @@ impl<W: Wire> Server<W> {
     }
 
     /// Lets in someone who asked, answering `welcome`: their connection, or none if they did
-    /// not ask (or no longer wait).
+    /// not ask (or no longer wait) - or if the welcome is longer than [`MAX_HELLO`], when they
+    /// are turned away.
     pub fn accept(&mut self, addr: SocketAddr, welcome: &[u8], now: Instant) -> Option<ClientId> {
+        if welcome.len() > MAX_HELLO {
+            self.deny(addr, "the server's welcome is too long");
+            return None;
+        }
         let asked = self.asked.iter_mut().find(|a| a.addr == addr && a.answer.is_none())?;
         let id = random();
         asked.answer = Some(Ok((id, welcome.to_vec())));
@@ -775,6 +782,9 @@ pub struct Client<W: Wire = Udp> {
 impl Client<Udp> {
     /// Starts connecting to a server, saying `hello`.
     pub fn connect(server: SocketAddr, hello: &[u8], now: Instant) -> io::Result<Client<Udp>> {
+        if hello.len() > MAX_HELLO {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the hello is too long"));
+        }
         let any: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse() } else { "[::]:0".parse() }.map_err(io::Error::other)?;
         Ok(Client::with_wire(Udp::bind(any)?, server, hello, now))
     }
@@ -782,6 +792,7 @@ impl Client<Udp> {
 
 impl<W: Wire> Client<W> {
     pub fn with_wire(wire: W, server: SocketAddr, hello: &[u8], now: Instant) -> Client<W> {
+        debug_assert!(hello.len() <= MAX_HELLO, "a hello of {} bytes", hello.len());
         Client {
             wire,
             server,

@@ -1054,9 +1054,12 @@ dependencies = [
  "gmod-lua",
  "gmod-material",
  "gmod-movement",
+ "gmod-net",
  "gmod-render",
  "gmod-web",
  "gmod-world",
+ "postcard",
+ "serde",
  "wgpu",
  "winit",
 ]

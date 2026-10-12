@@ -194,7 +194,10 @@ impl crate::Runtime {
                 }
                 for_clients(ent.clone())
             };
-            let ent = Ent { ragdoll_pose: crate::ragdoll::pose(lua, handle), ..ent };
+            let mut ent = Ent { ragdoll_pose: crate::ragdoll::pose(lua, handle), ..ent };
+            if let Some(player) = &mut ent.player {
+                player.physgun = crate::physgun::holding(lua, handle).unwrap_or(EntityHandle::NULL);
+            }
             let vars = match entity::push(lua, handle) {
                 Ok(Value::UserData(ud)) => STORES.map(|store| read_store(&ud, store)),
                 _ => Default::default(),

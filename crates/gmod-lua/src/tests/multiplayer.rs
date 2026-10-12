@@ -204,3 +204,43 @@ fn the_server_asks_things_of_clients() {
     assert_eq!(client.printed(), "hello\n");
     assert_eq!(client.runtime.take_server_commands(), ["say hi"]);
 }
+
+#[test]
+fn resources_name_what_clients_download() {
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/thing.mdl", &mdl),
+            ("models/thing.vvd", b"v"),
+            ("models/thing.dx90.vtx", b"x"),
+            ("materials/thing/skin.vmt", b"\"VertexLitGeneric\" {}"),
+            ("materials/thing/skin.vtf", b"t"),
+            ("sound/thing/hum.wav", b"w"),
+        ],
+    );
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "resource.AddFile('models/Thing.mdl') resource.AddFile('materials/thing/skin.vmt')
+             resource.AddSingleFile('sound/thing/hum.wav') resource.AddSingleFile('sound/missing.wav')
+             resource.AddFile('models/thing.mdl') resource.AddFile('models/none.mdl')
+             resource.AddWorkshop('104603291') resource.AddWorkshop('104603291')",
+            "resources",
+        )
+        .unwrap();
+    assert_eq!(
+        g.runtime.downloads(),
+        [
+            "models/thing.mdl",
+            "models/thing.vvd",
+            "models/thing.dx90.vtx",
+            "materials/thing/skin.vmt",
+            "materials/thing/skin.vtf",
+            "sound/thing/hum.wav"
+        ]
+    );
+    assert_eq!(g.runtime.workshop_downloads(), ["104603291"]);
+    assert!(g.printed().contains("resource.AddFile: couldn't find 'models/none.mdl'"));
+}

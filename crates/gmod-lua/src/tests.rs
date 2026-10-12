@@ -2887,3 +2887,38 @@ fn dynamic_props_play_what_the_map_says() {
     assert!(g.eval::<bool>("return D:GetSequence() == 4 and D:GetPlaybackRate() == 2"), "the new default, at the rate set");
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
+
+#[test]
+fn weapons_translate_the_activities_of_their_holders() {
+    let g = player_game();
+    // as the base gamemode's: the gamemode asks the player, who asks the weapon
+    g.runtime
+        .run_string("HOOKS.TranslateActivity = function(p, act) CALLS = (CALLS or 0) + 1 return p:TranslateWeaponActivity(act) end", "base")
+        .unwrap();
+    g.runtime.join(alice()).unwrap();
+    g.runtime.think(0.1);
+    // the engine's pistol, by its hold type
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetActiveWeapon():GetClass() == 'weapon_pistol' and p:TranslateWeaponActivity(ACT_MP_RUN) == ACT_HL2MP_RUN_PISTOL
+             and p:TranslateWeaponActivity(ACT_MP_JUMP) == ACT_HL2MP_JUMP_PISTOL and p:TranslateWeaponActivity(ACT_LAND) == ACT_LAND
+             and hook.Call('TranslateActivity', nil, p, ACT_MP_WALK) == ACT_HL2MP_WALK_PISTOL and CALLS == 1"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+    // a SWEP's own, and what it leaves
+    g.runtime
+        .run_string(
+            "weapons.list.weapon_mine = { Base = 'weapon_base', TranslateActivity = function(self, act) return act == ACT_MP_RUN and 4242 or -1 end }
+             local p = Entity(1) p:StripWeapons() p:Give('weapon_mine')",
+            "mine",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetActiveWeapon():GetClass() == 'weapon_mine' and p:TranslateWeaponActivity(ACT_MP_RUN) == 4242
+             and p:TranslateWeaponActivity(ACT_MP_WALK) == ACT_MP_WALK"
+    ));
+    // nothing in hand: as it was
+    g.runtime.run_string("Entity(1):StripWeapons()", "strip").unwrap();
+    assert!(g.eval::<bool>("return Entity(1):TranslateWeaponActivity(ACT_MP_RUN) == ACT_MP_RUN"));
+}

@@ -192,6 +192,9 @@ pub struct PlayerState {
     /// How many times the game turned the player itself (a spawn, `SetEyeAngles`): a client
     /// takes the angles the server has then, and otherwise looks where its mouse says.
     pub turned: u32,
+    /// What the physics gun holds, as a snapshot carries it to a client, which has no guns
+    /// of its own ([`crate::physgun`]).
+    pub physgun: EntityHandle,
     /// Movement between ticks: ducking, the eyes, water, ladder. Its origin and velocity are
     /// the entity's.
     pub moving: gmod_movement::Player,
@@ -289,6 +292,7 @@ impl PlayerState {
             max_armor: 100,
             eye_angles: Angle::default(),
             turned: 0,
+            physgun: EntityHandle::NULL,
             moving: gmod_movement::Player {
                 origin: [0.0; 3],
                 velocity: [0.0; 3],
@@ -1231,7 +1235,8 @@ pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
         let ammo = ammo_count(lua, handle, weapon::ammo_id(lua, &data.ammo[0]));
         WeaponView { class: ent.class.clone(), name: data.print_name, clip, ammo }
     });
-    let holding = crate::physgun::holding(lua, handle).is_some();
+    let held = state(lua, handle, |_, p| p.physgun).filter(|&h| host(lua).entities.is_valid(h));
+    let holding = crate::physgun::holding(lua, handle).or(held).is_some();
     let flashlight = host(lua).entities.get(handle).is_some_and(|ent| ent.effects & EF_DIMLIGHT != 0);
     Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon, holding, flashlight, turned })
 }
@@ -2526,15 +2531,11 @@ fn install_weapons(def: &entity::Def) -> mlua::Result<()> {
         write(a, |_, p| p.activity = act)
     })?;
     // the gamemode's `TranslateActivity` says what the weapon's hold type makes of it
+    // the weapon's, not the gamemode's: the base gamemode's `TranslateActivity` asks this
     def("TranslateWeaponActivity", |a| {
         let handle = this(a)?;
         let act = a.number(2)? as i64;
-        let translated = hook(a.lua, "TranslateActivity", [ent_value(a.lua, handle), Value::Integer(act)]);
-        match translated.front() {
-            Some(Value::Integer(n)) => integer(*n),
-            Some(Value::Number(n)) => integer(*n as i64),
-            _ => integer(act),
-        }
+        integer(weapon::translate_activity(a.lua, handle, act))
     })?;
     bool_field!(def, "GetAllowWeaponsInVehicle", "SetAllowWeaponsInVehicle", allow_weapons_in_vehicle);
     def("ShouldDropWeapon", |a| {
