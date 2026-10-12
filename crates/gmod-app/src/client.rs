@@ -3,9 +3,10 @@
 //! the entities, drawn a little behind the newest and between two of them, so that what
 //! moves moves smoothly whatever the network does - and what the player does, sent back.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gmod_fs::Vfs;
@@ -14,6 +15,7 @@ use gmod_lua::sound::SoundEvent;
 use gmod_lua::{ChatMessage, EntityHandle, Snapshot, ToClient, UserCmd};
 use gmod_net::ClientEvent;
 
+use crate::keys::KnownServers;
 use crate::proto::{self, FileInfo, FromServer, Hello, SnapshotReceiver, ToServer, Welcome};
 
 /// How far behind the newest snapshot the picture is: a snapshot or two lost on the way
@@ -51,6 +53,8 @@ pub struct Connection {
     last_command: u32,
     /// The last command the newest snapshot answers.
     answered: u32,
+    /// How long the commands done with were the player's, all told.
+    played: f64,
     /// Snapshots received, oldest first, to draw between.
     buffer: VecDeque<Snapshot>,
     /// The server's time the picture shows.
@@ -59,6 +63,19 @@ pub struct Connection {
     inbox: VecDeque<FromServer>,
     /// Why the connection closed, once it has.
     pub closed: Option<String>,
+    /// The server's key, once it let us in; or the key it has instead of the one it had.
+    pub key: Option<gmod_net::PublicKey>,
+    changed: Option<gmod_net::PublicKey>,
+    /// The client Lua the server has, by game path ([`download`](Self::download)): what of
+    /// the player's addons it may run.
+    pub listed_lua: Vec<String>,
+}
+
+/// What fetching a server's files comes to, as it goes: the files it is to fetch, then each as
+/// it starts coming.
+pub enum Fetching<'a> {
+    Listed(&'a [String]),
+    Coming(&'a str),
 }
 
 /// Waits a moment between looks at the network while blocking on it.
@@ -66,28 +83,59 @@ fn nap() {
     std::thread::sleep(Duration::from_millis(5));
 }
 
+/// What of the player's addons a server's client does not run, as in GMod: their Lua that the
+/// server does not have (`listed`). Their content is used all the same.
+pub fn addon_lua_hidden(listed: &[String]) -> gmod_fs::Hide {
+    let listed: HashSet<String> = listed.iter().filter_map(|p| gmod_fs::path::normalize(p)).collect();
+    Arc::new(move |path: &str| {
+        let path = path.to_ascii_lowercase();
+        path.ends_with(".lua") && (path.starts_with("lua/") || path.starts_with("gamemodes/")) && !listed.contains(&path)
+    })
+}
+
 impl Connection {
-    /// Connects to a server as `name`, waiting until it lets us in or says why not.
-    pub fn open(server: SocketAddr, name: &str) -> Result<Connection, String> {
+    /// Connects to a server as `name` and `identity`, waiting until it lets us in or says why
+    /// not. A server that has another key than `known` says it had is not joined; one not
+    /// known is, and its key is kept.
+    pub fn open(server: SocketAddr, name: &str, identity: &gmod_net::Identity, known: &KnownServers) -> Result<Connection, String> {
         let hello = proto::encode(&Hello { version: proto::VERSION, name: name.to_string() });
         let started = Instant::now();
-        let net = gmod_net::Client::connect(server, &hello, started).map_err(|e| format!("{server}: {e}"))?;
+        let address = server.to_string();
+        let net =
+            gmod_net::Client::connect(server, &hello, identity, known.key(&address), started).map_err(|e| format!("{server}: {e}"))?;
         let mut connection = Connection {
             net,
-            welcome: Welcome { server: String::new(), map: String::new(), gamemode: String::new(), max_players: 1 },
+            welcome: Welcome {
+                server: String::new(),
+                map: String::new(),
+                gamemode: String::new(),
+                max_players: 1,
+                allow_cs_lua: false,
+                loading_url: String::new(),
+            },
+            listed_lua: Vec::new(),
             snapshots: SnapshotReceiver::default(),
             commands: VecDeque::new(),
             last_command: 0,
             answered: 0,
+            played: 0.0,
             buffer: VecDeque::new(),
             shown: None,
             inbox: VecDeque::new(),
             closed: None,
+            key: None,
+            changed: None,
         };
         loop {
             if let Some(welcome) = connection.receive() {
                 connection.welcome = proto::decode::<Welcome>(&welcome).ok_or("the server is not an openGMOD server")?;
+                if let Some(key) = connection.key {
+                    known.remember(&address, key);
+                }
                 return Ok(connection);
+            }
+            if let Some(key) = &connection.changed {
+                return Err(known.changed(&address, key));
             }
             if let Some(reason) = &connection.closed {
                 return Err(format!("{server}: {reason}"));
@@ -106,7 +154,14 @@ impl Connection {
         let mut welcomed = None;
         for event in self.net.poll(now) {
             match event {
-                ClientEvent::Accepted { welcome } => welcomed = Some(welcome),
+                ClientEvent::Accepted { welcome, key } => {
+                    self.key = Some(key);
+                    welcomed = Some(welcome);
+                }
+                ClientEvent::KeyChanged { key } => {
+                    self.changed = Some(key);
+                    self.closed = Some(format!("the server's key is {key}, not the one it had"));
+                }
                 ClientEvent::Message { data } => match proto::decode::<FromServer>(&data) {
                     Some(FromServer::Snapshot(delta)) => self.snapshot(delta),
                     Some(message) => self.inbox.push_back(message),
@@ -160,7 +215,7 @@ impl Connection {
     /// the game does not have, saved into `download` (mounted behind the game's own files, so
     /// that what is there is downloaded again only when the server has it otherwise). Waits
     /// until all came.
-    pub fn download(&mut self, vfs: &Vfs, download: Option<&Path>) -> Result<Vec<(String, Vec<u8>)>, String> {
+    pub fn download(&mut self, vfs: &Vfs, download: Option<&Path>, told: &dyn Fn(Fetching)) -> Result<Vec<(String, Vec<u8>)>, String> {
         let (listed_lua, listed_content) = self.wait_for("saying what files to have", |c| {
             c.take(
                 |m| matches!(m, FromServer::Files { .. }),
@@ -170,6 +225,7 @@ impl Connection {
                 },
             )
         })?;
+        self.listed_lua = listed_lua.iter().map(|f| f.path.clone()).collect();
         let same = |f: &FileInfo| vfs.read(&f.path, "GAME").is_ok_and(|data| FileInfo::of(&f.path, &data) == *f);
         let downloaded = |f: &FileInfo| download.is_some_and(|dir| vfs.locate(&f.path, "GAME").is_some_and(|m| m.origin() == dir));
         let lua: Vec<FileInfo> = listed_lua.into_iter().filter(|f| !same(f)).collect();
@@ -179,6 +235,7 @@ impl Connection {
             .filter(|f| vfs.locate(&f.path, "GAME").is_none() || (downloaded(f) && !same(f)))
             .collect();
         let wanted: Vec<&FileInfo> = lua.iter().chain(&content).collect();
+        told(Fetching::Listed(&wanted.iter().map(|f| f.path.clone()).collect::<Vec<_>>()));
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
@@ -191,6 +248,9 @@ impl Connection {
             while let Some(piece) = c.take(|m| matches!(m, FromServer::File { .. } | FromServer::FilesSent), Some) {
                 let FromServer::File { path, offset, size, data } = piece else { return Some(()) };
                 let Some(info) = wanted.iter().find(|f| f.path == path) else { continue };
+                if offset == 0 {
+                    told(Fetching::Coming(&path));
+                }
                 let file = files.entry(path).or_default();
                 if offset != file.len() as u64 || size != info.size || size > MAX_FILE || offset + data.len() as u64 > size {
                     wrong = Some(format!("{}: sent wrong", info.path));
@@ -221,6 +281,16 @@ impl Connection {
                 }
             }
         }
+        // the download folder, read while looking for what to fetch, has more in it now
+        if let Some(dir) = download {
+            for mount in vfs.mounts() {
+                if let gmod_fs::Backing::Dir(folder) = &mount.backing
+                    && folder.root() == dir
+                {
+                    folder.forget();
+                }
+            }
+        }
         Ok(lua_files)
     }
 
@@ -246,22 +316,43 @@ impl Connection {
                 self.buffer.push_back(snapshot);
                 self.answered = self.answered.max(command);
                 while self.commands.front().is_some_and(|(n, _, _)| *n <= self.answered) {
-                    self.commands.pop_front();
+                    self.forget_command();
                 }
             }
         }
     }
 
     /// The player's own entity in the newest snapshot: where the server last said it was.
+    #[cfg(test)]
     pub fn newest(&self, player: EntityHandle) -> Option<&gmod_lua::EntityState> {
         let index = player.index?;
         self.buffer.back()?.entities.iter().find(|e| e.index == index && e.serial == player.serial)
     }
 
+    /// What the client predicts goes on from the newest snapshot, not the one shown: the
+    /// player, the weapons it carries and what it has before its eyes, as the server last
+    /// said they were; and the server's time then.
+    pub fn predicted(&self, player: EntityHandle) -> (Vec<gmod_lua::EntityState>, f64) {
+        let Some(newest) = self.buffer.back() else { return (Vec::new(), 0.0) };
+        let own = |e: &gmod_lua::EntityState| {
+            (Some(e.index) == player.index && e.serial == player.serial)
+                || (e.ent.owner == player && (e.ent.weapon.is_some() || e.ent.class.to_ascii_lowercase().contains("viewmodel")))
+        };
+        (newest.entities.iter().filter(|e| own(e)).cloned().collect(), newest.time)
+    }
+
     /// The commands the newest snapshot does not answer yet, oldest first, with how long each
-    /// was the player's: what to move the player on by from there.
-    pub fn unanswered(&self) -> Vec<(UserCmd, f32)> {
-        self.commands.iter().map(|&(_, cmd, seconds)| (cmd, seconds)).collect()
+    /// was the player's: what to move the player on by from there. And how long those before
+    /// them were, all told.
+    pub fn unanswered(&self) -> (Vec<(UserCmd, f32)>, f64) {
+        (self.commands.iter().map(|&(_, cmd, seconds)| (cmd, seconds)).collect(), self.played)
+    }
+
+    /// The oldest command is done with: answered, or too old to keep.
+    fn forget_command(&mut self) {
+        if let Some((_, _, seconds)) = self.commands.pop_front() {
+            self.played += f64::from(seconds);
+        }
     }
 
     /// Reads what arrived and sends what is due: what happened since the last call.
@@ -277,11 +368,12 @@ impl Connection {
         self.commands.push_back((self.last_command, cmd, seconds));
         // a server that answers nothing: only the latest are kept
         while self.commands.len() > MAX_UNANSWERED {
-            self.commands.pop_front();
+            self.forget_command();
         }
         let first = self.commands.len().saturating_sub(COMMANDS_SENT);
         let sent = self.commands.iter().skip(first).map(|&(_, cmd, _)| cmd).collect();
-        let message = ToServer::Commands { last: self.last_command, commands: sent, ack: self.snapshots.newest };
+        let view = self.shown.unwrap_or(0.0);
+        let message = ToServer::Commands { last: self.last_command, commands: sent, ack: self.snapshots.newest, view };
         self.send(&message, false);
         self.net.flush(Instant::now());
     }

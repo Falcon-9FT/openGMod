@@ -48,7 +48,7 @@ impl Kind {
 }
 
 /// A handle to an entity: its index and serial number, or none for `NULL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EntityHandle {
     pub index: Option<u32>,
     pub serial: u32,
@@ -58,6 +58,13 @@ pub struct EntityHandle {
 impl EntityHandle {
     pub const NULL: EntityHandle = EntityHandle { index: None, serial: 0, kind: Kind::Entity };
     pub const WORLD: EntityHandle = EntityHandle { index: Some(0), serial: 0, kind: Kind::Entity };
+}
+
+/// `NULL`, as an entity that is not there.
+impl Default for EntityHandle {
+    fn default() -> EntityHandle {
+        EntityHandle::NULL
+    }
 }
 
 /// One entity, as the engine keeps it. Position and angles are relative to the parent, if
@@ -133,6 +140,8 @@ pub struct Ent {
     /// Where the bones of a ragdoll's parts are in the world - bone, origin, angles - as a
     /// snapshot carries them: a client has no bodies to read them from ([`crate::ragdoll`]).
     pub ragdoll_pose: Vec<(u16, Vector, Angle)>,
+    /// The set of its model's hitboxes in use (`SetHitboxSet`).
+    pub hitbox_set: usize,
     /// How it is drawn changing (`kRenderFx`): pulsing, fading, a hologram.
     pub render_fx: i64,
     /// Materials in place of the model's own, by slot (`SetSubMaterial`).
@@ -162,6 +171,10 @@ pub struct Ent {
     /// What an NPC keeps ([`crate::npc`]).
     #[serde(skip)]
     pub npc: Option<Box<crate::npc::Npc>>,
+    /// A client's: the server has it but does not send it now, as it is out of sight
+    /// ([`crate::pvs`]).
+    #[serde(skip)]
+    pub dormant: bool,
 }
 
 /// How a bone is moved from where its model has it.
@@ -237,6 +250,7 @@ impl Ent {
             links: Vec::new(),
             spawn_effect: false,
             ragdoll_pose: Vec::new(),
+            hitbox_set: 0,
             render_fx: 0,
             sub_materials: Vec::new(),
             flex_scale: 1.0,
@@ -249,6 +263,7 @@ impl Ent {
             mover: None,
             charger: None,
             npc: None,
+            dormant: false,
         }
     }
 
@@ -782,6 +797,7 @@ fn install_many(def: &DefMany) -> mlua::Result<()> {
         Ok(color.into_iter().map(|part| Value::Integer(part.into())).collect())
     })?;
     crate::anim::install_many(def)?;
+    crate::hitbox::install_many(def)?;
     crate::constraint::install_many(def)
 }
 
@@ -1480,7 +1496,11 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     })?;
     def("AddEFlags", |a| {
         let flags = a.number(2)? as i64;
-        write(a, |ent| ent.engine_flags |= flags)
+        // asked again how it is sent, the flag goes as the engine takes it
+        if flags & crate::pvs::EFL_FORCE_CHECK_TRANSMIT != 0 {
+            crate::pvs::recheck(a.lua, this(a, 1)?);
+        }
+        write(a, |ent| ent.engine_flags |= flags & !crate::pvs::EFL_FORCE_CHECK_TRANSMIT)
     })?;
     def("RemoveEFlags", |a| {
         let flags = a.number(2)? as i64;
@@ -1581,6 +1601,10 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     crate::constraint::install_methods(def)?;
     crate::sound::install_methods(def)?;
     crate::anim::install_methods(def)?;
+    crate::hitbox::install_methods(def)?;
+    crate::bullets::install_methods(def)?;
+    crate::lagcomp::install_methods(def)?;
+    crate::pvs::install_methods(def)?;
     crate::ents::install_variables(def)
 }
 

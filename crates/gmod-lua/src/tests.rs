@@ -11,12 +11,14 @@ use mlua::Value;
 
 use super::*;
 
+mod bullets;
 mod chat;
 mod items;
 mod mapio;
 mod movers;
 mod multiplayer;
 mod npc;
+mod pvs;
 mod ragdoll;
 mod shapes;
 mod triggers;
@@ -1103,6 +1105,7 @@ fn player_map() -> Map {
         brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
         collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
         textures: bsp.texinfo.iter().map(texture).collect(),
+        visibility: gmod_bsp::Visibility::new(&bsp).map(Arc::new),
     }
 }
 
@@ -2921,4 +2924,116 @@ fn weapons_translate_the_activities_of_their_holders() {
     // nothing in hand: as it was
     g.runtime.run_string("Entity(1):StripWeapons()", "strip").unwrap();
     assert!(g.eval::<bool>("return Entity(1):TranslateWeaponActivity(ACT_MP_RUN) == ACT_MP_RUN"));
+}
+
+#[test]
+fn the_server_browser_asks_the_program() {
+    use crate::{ServerEntry, ServerPlayer, ServerQuery};
+    let menu = game(Realm::Menu, &[]);
+    menu.runtime.set_favorite_servers(vec!["10.0.0.5:27015".into()]);
+    menu.runtime
+        .run_string(
+            "GOT = {}
+             serverlist.Query({
+                 Type = 'lan',
+                 Callback = function(ping, name, desc, map, players, max, bots, pass, last, address, gm, ws, anon, version)
+                     table.insert(GOT, table.concat({ ping, name, desc, map, players, max, bots, tostring(pass), address, gm, version }, '|'))
+                     return #GOT < 2
+                 end,
+                 CallbackFailed = function(address) table.insert(GOT, 'failed ' .. address) end,
+                 Finished = function() table.insert(GOT, 'finished') end,
+             })
+             serverlist.PingServer('10.0.0.5:27015', function(ping, name) PINGED = name or 'no answer' end)
+             serverlist.PlayerList('10.0.0.5:27015', function(t) PLAYERS = #t .. ' ' .. (t[1] and t[1].name or '') end)",
+            "browse",
+        )
+        .unwrap();
+    let queries = menu.runtime.take_server_queries();
+    assert_eq!(
+        queries,
+        [
+            ServerQuery::List { id: 1, list: "lan".into() },
+            ServerQuery::Ping { id: 2, address: "10.0.0.5:27015".into() },
+            ServerQuery::Players { id: 3, address: "10.0.0.5:27015".into() },
+        ]
+    );
+    let entry = ServerEntry {
+        address: "192.168.1.4:27015".into(),
+        ping: 12,
+        name: "Alice's game".into(),
+        description: "Sandbox".into(),
+        map: "gm_construct".into(),
+        players: 2,
+        max_players: 8,
+        gamemode: "sandbox".into(),
+        version: "0.4".into(),
+        ..ServerEntry::default()
+    };
+    assert!(menu.runtime.server_listed(1, &entry));
+    assert!(!menu.runtime.server_listed(1, &entry), "the menu said it had enough");
+    menu.runtime.server_unanswered(1, "192.168.1.9:27015");
+    menu.runtime.servers_listed(1);
+    menu.runtime.servers_listed(1);
+    menu.runtime.server_pinged(2, None);
+    menu.runtime.server_players(3, &[ServerPlayer { name: "Bob".into(), score: 3, time: 60.0 }]);
+    assert_eq!(
+        menu.eval::<String>("return table.concat(GOT, '\\n') .. '\\n' .. PINGED .. '\\n' .. PLAYERS"),
+        "12|Alice's game|Sandbox|gm_construct|2|8|0|false|192.168.1.4:27015|sandbox|0.4\n\
+         12|Alice's game|Sandbox|gm_construct|2|8|0|false|192.168.1.4:27015|sandbox|0.4\n\
+         failed 192.168.1.9:27015\nfinished\nno answer\n1 Bob"
+    );
+    // favourites: the menu changes them, the program keeps them
+    assert!(menu.eval::<bool>(
+        "local was = serverlist.IsServerFavorite('10.0.0.5:27015')
+         serverlist.AddServerToFavorites('1.2.3.4:27015') serverlist.RemoveServerFromFavorites('10.0.0.5:27015')
+         return was and serverlist.IsServerFavorite('1.2.3.4:27015') and not CanAddServerToFavorites()"
+    ));
+    assert_eq!(menu.runtime.take_favorite_servers(), Some(vec!["1.2.3.4:27015".to_string()]));
+    assert_eq!(menu.runtime.take_favorite_servers(), None);
+    menu.runtime.set_current_server(Some("5.6.7.8:27015".into()));
+    assert!(menu.eval::<bool>(
+        "local could, was = CanAddServerToFavorites(), serverlist.IsCurrentServerFavorite()
+         serverlist.AddCurrentServerToFavorites(true)
+         return could and not was and serverlist.IsCurrentServerFavorite()"
+    ));
+    assert!(menu.messages().is_empty(), "{:?}", menu.messages());
+}
+
+#[test]
+fn the_menu_shows_the_loading_screen() {
+    let menu = game(Realm::Menu, &[]);
+    menu.runtime
+        .run_string(
+            "LOG = {}
+             local P = vgui.Create('Panel') P:SetVisible(false)
+             function P:OnActivate() table.insert(LOG, 'up ' .. GetDefaultLoadingHTML() .. ' ' .. GetLoadStatus()) end
+             function P:OnDeactivate() table.insert(LOG, 'down') end
+             function GetLoadPanel() return P end
+             function GameDetails(server, url, map, max, shown, steamid, gm) table.insert(LOG, table.concat({ server, url, map, max, gm }, '|')) end
+             PANEL = P",
+            "loading",
+        )
+        .unwrap();
+    assert!(menu.eval::<bool>("return GetLoadStatus() == nil and NumDownloadables() == nil and not IsHostingGame()"));
+    menu.runtime.begin_loading(false);
+    menu.runtime.game_details("Alice's game", "", "gm_construct", 8, "sandbox");
+    menu.runtime.set_load_status("Downloading maps/gm_construct.bsp");
+    menu.runtime.set_downloadables(vec!["maps/gm_construct.bsp".into(), "materials/a.vtf".into()]);
+    assert!(menu.runtime.loading());
+    assert!(menu.eval::<bool>(
+        "return PANEL:IsVisible() and GetLoadStatus() == 'Downloading maps/gm_construct.bsp' and NumDownloadables() == 2
+             and GetDownloadables()[2] == 'materials/a.vtf' and GetConVar_Internal('cl_enable_loadingurl'):GetBool()"
+    ));
+    menu.runtime.end_loading();
+    menu.runtime.end_loading();
+    assert!(!menu.runtime.loading());
+    assert_eq!(
+        menu.eval::<String>("return table.concat(LOG, '\\n') .. '\\n' .. tostring(PANEL:IsVisible()) .. ' ' .. tostring(GetLoadStatus())"),
+        "up asset://garrysmod/html/loading.html Loading\nAlice's game||gm_construct|8|sandbox\ndown\nfalse nil"
+    );
+    // its own game: the menu is told it hosts
+    menu.runtime.begin_loading(true);
+    assert!(menu.eval::<bool>("return IsHostingGame()"));
+    menu.runtime.end_loading();
+    assert!(menu.messages().is_empty(), "{:?}", menu.messages());
 }

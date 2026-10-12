@@ -6,9 +6,9 @@
 //! A weapon in a player's hands works as in Source: every tick the active one gets its
 //! `Think`, and the keys held fire it - `PrimaryAttack` when `IN_ATTACK` is down and its next
 //! primary fire has come (pressed anew, for a SWEP that is not `Primary.Automatic`),
-//! `SecondaryAttack` for `IN_ATTACK2`, `Reload` for `IN_RELOAD`. What the engine's own weapons
-//! do when fired (the pistol shooting, the gravity gun) comes with physics and `FireBullets`;
-//! until then only SWEPs do something.
+//! `SecondaryAttack` for `IN_ATTACK2`, `Reload` for `IN_RELOAD`. The engine's own weapons fire
+//! as Half-Life 2's do ([`crate::hl2weapons`]). A client does the same for its own player's
+//! weapon in the ticks it predicts ([`crate::player::predict`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -151,6 +151,16 @@ pub struct WeaponData {
     pub auto_switch_from: bool,
     /// Fires while the key is held rather than once a press (a SWEP's `Primary.Automatic`).
     pub automatic: [bool; 2],
+    /// An engine weapon's sounds by what they are for (`single_shot`, `empty`, `reload`,
+    /// `melee_hit` ...): sound scripts.
+    pub sounds: Vec<(String, String)>,
+}
+
+impl WeaponData {
+    /// The sound script of what an engine weapon does (`single_shot`), if it has one.
+    pub fn sound(&self, what: &str) -> Option<&str> {
+        self.sounds.iter().find(|(k, _)| k.eq_ignore_ascii_case(what)).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
+    }
 }
 
 impl Default for WeaponData {
@@ -169,6 +179,7 @@ impl Default for WeaponData {
             auto_switch_to: true,
             auto_switch_from: true,
             automatic: [true, true],
+            sounds: Vec::new(),
         }
     }
 }
@@ -248,6 +259,63 @@ pub(crate) struct Weapons {
     scripts: RefCell<HashMap<String, Option<WeaponData>>>,
     /// The ammo types once the game has started; until then they are built when asked for.
     ammo: RefCell<Option<Vec<AmmoType>>>,
+    /// The skill settings of the game's `cfg/skill.cfg` (`sk_plr_dmg_pistol` ...), read when
+    /// first asked for.
+    skill: RefCell<Option<HashMap<String, f32>>>,
+}
+
+/// The skill settings of the engine's ammo and weapons: (the name in `sk_plr_dmg_*`, what a
+/// player's does, what an NPC's does) - about what Half-Life 2 does on normal skill, for a
+/// game without its `skill.cfg`.
+const SKILL_DAMAGE: &[(&str, &str, f32, f32)] = &[
+    ("Pistol", "pistol", 8.0, 3.0),
+    ("SMG1", "smg1", 4.0, 3.0),
+    ("AR2", "ar2", 8.0, 3.0),
+    ("357", "357", 40.0, 30.0),
+    ("Buckshot", "buckshot", 8.0, 3.0),
+    ("XBowBolt", "crossbow", 100.0, 10.0),
+    ("AlyxGun", "alyxgun", 5.0, 3.0),
+    ("SniperRound", "sniper_round", 100.0, 100.0),
+    ("SniperPenetratedRound", "sniper_round", 100.0, 100.0),
+    ("CombineCannon", "combine_cannon", 3.0, 3.0),
+    ("AirboatGun", "airboat", 3.0, 3.0),
+    ("StriderMinigun", "strider", 5.0, 5.0),
+    ("HelicopterGun", "helicopter", 3.0, 3.0),
+    // the melee weapons', by their class
+    ("weapon_crowbar", "crowbar", 10.0, 10.0),
+    ("weapon_stunstick", "stunstick", 40.0, 40.0),
+];
+
+/// A skill setting: a ConVar of that name, else the game's `cfg/skill.cfg`.
+pub(crate) fn skill(lua: &Lua, name: &str) -> Option<f32> {
+    if let Some(value) = crate::convar::value(lua, name) {
+        return Some(crate::convar::atof(&value) as f32);
+    }
+    let host = host(lua);
+    let mut cache = host.weapons.skill.borrow_mut();
+    let settings = cache.get_or_insert_with(|| {
+        let text = host.vfs.read("cfg/skill.cfg", "GAME").map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        let mut out = HashMap::new();
+        for line in text.lines() {
+            let line = line.split("//").next().unwrap_or("");
+            let mut words = line.split_whitespace().map(|w| w.trim_matches('"'));
+            if let (Some(key), Some(value)) = (words.next(), words.next())
+                && let Ok(value) = value.parse::<f32>()
+            {
+                out.insert(key.to_ascii_lowercase(), value);
+            }
+        }
+        out
+    });
+    settings.get(&name.to_ascii_lowercase()).copied()
+}
+
+/// What a round of an engine's ammo type (or a hit of an engine's melee weapon, by class)
+/// does to what it hits: a player's or an NPC's. 0 for what the game has no setting of.
+pub(crate) fn skill_damage(lua: &Lua, name: &str, by_player: bool) -> f32 {
+    let Some(&(_, key, player, npc)) = SKILL_DAMAGE.iter().find(|(n, ..)| n.eq_ignore_ascii_case(name)) else { return 0.0 };
+    let who = if by_player { "plr" } else { "npc" };
+    skill(lua, &format!("sk_{who}_dmg_{key}")).unwrap_or(if by_player { player } else { npc })
 }
 
 /// The hold types of the engine's weapons in GMod's player animations.
@@ -298,6 +366,10 @@ fn script(lua: &Lua, class: &str) -> Option<WeaponData> {
             auto_switch_to: number("autoswitchto", 1) != 0,
             auto_switch_from: number("autoswitchfrom", 1) != 0,
             automatic: [true, true],
+            sounds: block
+                .block("SoundData")
+                .map(|sounds| sounds.iter().filter_map(|p| Some((p.key.clone(), p.value.as_str()?.to_string()))).collect())
+                .unwrap_or_default(),
         })
     };
     let data = read();
@@ -406,6 +478,11 @@ fn ammo_type(lua: &Lua, id: i64) -> Option<AmmoType> {
     with_ammo(lua, |list| usize::try_from(id - 1).ok().and_then(|i| list.get(i).cloned()))
 }
 
+/// An ammo type by its ID (from 1).
+pub(crate) fn ammo_type_of(lua: &Lua, id: i64) -> Option<AmmoType> {
+    ammo_type(lua, id)
+}
+
 /// The most of an ammo type a player carries.
 pub(crate) fn ammo_max(lua: &Lua, id: i64) -> i64 {
     ammo_type(lua, id).map_or(-1, |a| a.max_carry)
@@ -479,6 +556,12 @@ pub(crate) fn post_frame(lua: &Lua, weapon: EntityHandle, buttons: u32, pressed:
         finish_reload(lua, weapon);
     }
     call(lua, weapon, "Think", MultiValue::new());
+    // the engine's own weapons fire as Half-Life 2's do
+    if host(lua).entities.get(weapon).is_some_and(|ent| !ent.scripted) {
+        crate::hl2weapons::frame(lua, weapon, buttons, pressed);
+        crate::anim::weapon_idle(lua, weapon, buttons & (IN_ATTACK | IN_ATTACK2 | IN_RELOAD) != 0);
+        return;
+    }
     let Some(data) = data(lua, weapon) else { return };
     let Some(state) = host(lua).entities.get(weapon).and_then(|ent| ent.weapon.clone()) else { return };
     let wants = |key: u32, automatic: bool| if automatic { buttons & key != 0 } else { pressed & key != 0 };
@@ -517,6 +600,35 @@ pub(crate) fn set_idle_time(lua: &Lua, weapon: EntityHandle, time: f64) {
 /// A weapon's activity, and from when it may go back to idle.
 pub(crate) fn activity_and_idle(lua: &Lua, weapon: EntityHandle) -> Option<(i64, f64)> {
     host(lua).entities.get(weapon).and_then(|ent| ent.weapon.as_ref().map(|w| (w.activity, w.idle_time)))
+}
+
+/// Starts a reload when the clip is not full and the owner has rounds for it
+/// (`DefaultReload`): the view model plays the activity, the owner the reload of their own
+/// model, and the clip fills when the view model's sequence has played. Whether it started.
+pub(crate) fn default_reload(lua: &Lua, weapon: EntityHandle, act: i64) -> bool {
+    let Some(state) = host(lua).entities.get(weapon).and_then(|ent| ent.weapon.clone()) else { return false };
+    let data = data(lua, weapon).unwrap_or_default();
+    let owner = host(lua).entities.get(weapon).map_or(EntityHandle::NULL, |ent| ent.owner);
+    let room = |i: usize| {
+        data.clip_size[i] >= 0
+            && state.clip[i] < data.clip_size[i]
+            && crate::player::ammo_count(lua, owner, ammo_id(lua, &data.ammo[i])) > 0
+    };
+    if state.reload.is_some() || !(room(0) || room(1)) {
+        return false;
+    }
+    let played = crate::anim::send_weapon_anim(lua, weapon, act);
+    crate::anim::animation_event(lua, owner, crate::anim::EVENT_RELOAD, 0);
+    let duration = if played { crate::anim::view_model_duration(lua, weapon) } else { 0.0 };
+    let done = host(lua).clock.cur_time.get() + duration;
+    host(lua).entities.with_mut(weapon, |ent| {
+        if let Some(w) = ent.weapon.as_mut() {
+            w.activity = act;
+            w.reload = Some(done);
+            w.next_fire = [done, done];
+        }
+    });
+    true
 }
 
 /// The end of a reload: the clip takes what it holds from the owner's ammo.
@@ -680,28 +792,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     // plays the activity, the owner the reload of their own model, and the clip fills when the
     // view model's sequence has played (the next tick without one)
     def("DefaultReload", |a| {
-        let (handle, state) = state(a)?;
-        let act = a.number(2)? as i64;
-        let data = data(a.lua, handle).unwrap_or_default();
-        let owner = host(a.lua).entities.get(handle).map_or(EntityHandle::NULL, |ent| ent.owner);
-        let room = |i: usize| {
-            data.clip_size[i] >= 0
-                && state.clip[i] < data.clip_size[i]
-                && crate::player::ammo_count(a.lua, owner, ammo_id(a.lua, &data.ammo[i])) > 0
-        };
-        if state.reload.is_some() || !(room(0) || room(1)) {
-            return Ok(Value::Boolean(false));
-        }
-        let played = crate::anim::send_weapon_anim(a.lua, handle, act);
-        crate::anim::animation_event(a.lua, owner, crate::anim::EVENT_RELOAD, 0);
-        let duration = if played { crate::anim::view_model_duration(a.lua, handle) } else { 0.0 };
-        let done = host(a.lua).clock.cur_time.get() + duration;
-        change(a, |w| {
-            w.activity = act;
-            w.reload = Some(done);
-            w.next_fire = [done, done];
-        })?;
-        Ok(Value::Boolean(true))
+        let handle = entity::this(a, 1)?;
+        Ok(Value::Boolean(default_reload(a.lua, handle, a.number(2)? as i64)))
     })?;
     Ok(())
 }

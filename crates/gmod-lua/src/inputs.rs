@@ -112,7 +112,8 @@ fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str, activ
                 || crate::breakable::input(lua, target, input, param, activator)
                 || crate::items::input(lua, target, input, activator)
                 || crate::anim::input(lua, target, input, param)
-                || crate::constraint::input(lua, target, input);
+                || crate::constraint::input(lua, target, input)
+                || crate::pvs::input(lua, target, input);
         }
     }
     true

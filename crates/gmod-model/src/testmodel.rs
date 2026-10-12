@@ -296,6 +296,8 @@ pub struct TestRig {
     pub include_models: Vec<String>,
     /// Name, bone and where on it.
     pub attachments: Vec<(String, usize, [f32; 3])>,
+    /// The hitboxes of the one set, `default`: bone, hit group, and the box in the bone's space.
+    pub hitboxes: Vec<(usize, i32, [f32; 3], [f32; 3])>,
     /// The `.ani` file of the blocks the animations name.
     pub animation_file: String,
 }
@@ -547,6 +549,19 @@ impl TestRig {
         }
         b.set(240, self.attachments.len() as i32);
         b.set(244, attachment_at as i32);
+
+        if !self.hitboxes.is_empty() {
+            let set_at = b.at();
+            strings.push((set_at, set_at, "default".into()));
+            b.i32(0).i32(self.hitboxes.len() as i32).i32(12);
+            for (i, (bone, group, mins, maxs)) in self.hitboxes.iter().enumerate() {
+                let at = b.at();
+                strings.push((at, at + 32, format!("box{i}")));
+                b.i32(*bone as i32).i32(*group).f32s(mins).f32s(maxs).i32(0).zeros(32);
+            }
+            b.set(172, 1);
+            b.set(176, set_at as i32);
+        }
 
         let pose_at = b.at();
         for pose in &self.pose_parameters {

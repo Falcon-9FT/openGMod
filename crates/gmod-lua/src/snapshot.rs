@@ -10,10 +10,14 @@
 //! them what only the server's engine keeps of an entity (the outputs of the map's entities,
 //! the state of triggers, doors and NPCs); a ragdoll goes with where its parts are.
 //!
+//! A player is sent only what it may see ([`crate::pvs`]); what its client has and is out of
+//! sight now the snapshot names as dormant: the client keeps it as it last was, not drawn and
+//! not thinking (`IsDormant`), and `NotifyShouldTransmit` tells of it going and coming back.
+//!
 //! Every type here crosses the network with serde. Between two snapshots a client sees the
 //! entities moving smoothly ([`Snapshot::between`]).
 
-use mlua::{AnyUserData, Lua, Table, Value};
+use mlua::{AnyUserData, Lua, MultiValue, Table, Value};
 
 use crate::entity::{self, Ent, EntityHandle};
 use crate::host;
@@ -50,6 +54,10 @@ pub struct Snapshot {
     /// The server's `CurTime`.
     pub time: f64,
     pub entities: Vec<EntityState>,
+    /// Entities - index and serial number - the server has but does not send now: the client
+    /// keeps them dormant if it has them.
+    #[serde(default)]
+    pub dormant: Vec<(u32, u32)>,
 }
 
 impl Snapshot {
@@ -117,9 +125,10 @@ fn lerp_angle(a: Angle, b: Angle, t: f32) -> Angle {
 }
 
 /// Classes only the server has: the engine sends clients nothing of them.
-const SERVER_ONLY: &[&str] = &["info_", "logic_", "filter_", "ai_", "path_", "trigger_", "game_", "math_", "lua_run", "point_template"];
+const SERVER_ONLY: &[&str] =
+    &["info_", "logic_", "filter_", "ai_", "path_", "trigger_", "game_", "math_", "lua_run", "point_template", "func_areaportal"];
 
-fn server_only(class: &str) -> bool {
+pub(crate) fn server_only(class: &str) -> bool {
     let class = class.to_ascii_lowercase();
     SERVER_ONLY.iter().any(|prefix| class.starts_with(prefix))
 }
@@ -204,16 +213,18 @@ impl crate::Runtime {
             };
             entities.push(EntityState { index, serial: handle.serial, ent, vars });
         }
-        Snapshot { time: self.cur_time(), entities }
+        Snapshot { time: self.cur_time(), entities, dormant: Vec::new() }
     }
 
     /// A client takes what the server sent: entities gone from the server go (`OnRemove`,
-    /// `EntityRemoved`), the others are as the server has them, and those new to the client
-    /// come into being (`OnEntityCreated`, `Initialize`). `CurTime` is the server's.
+    /// `EntityRemoved`), those out of sight are kept dormant, the others are as the server has
+    /// them, and those new to the client come into being (`OnEntityCreated`, `Initialize`).
+    /// `CurTime` is the server's.
     pub fn apply_snapshot(&self, snapshot: &Snapshot) {
         let lua = &self.lua;
         host(lua).clock.cur_time.set(snapshot.time);
-        let wanted: std::collections::HashMap<u32, u32> = snapshot.entities.iter().map(|e| (e.index, e.serial)).collect();
+        let wanted: std::collections::HashMap<u32, u32> =
+            snapshot.entities.iter().map(|e| (e.index, e.serial)).chain(snapshot.dormant.iter().copied()).collect();
         let gone: Vec<EntityHandle> = host(lua)
             .entities
             .handles()
@@ -224,13 +235,31 @@ impl crate::Runtime {
             crate::ents::remove(lua, handle);
         }
         crate::ents::collect(lua);
+        // out of sight: kept as they were
+        let sleeping: std::collections::HashSet<(u32, u32)> = snapshot.dormant.iter().copied().collect();
+        let fell_asleep: Vec<EntityHandle> = host(lua)
+            .entities
+            .handles()
+            .into_iter()
+            .filter(|h| h.index.is_some_and(|i| sleeping.contains(&(i, h.serial))))
+            .filter(|&h| {
+                let entities = &host(lua).entities;
+                let awake = entities.get(h).is_some_and(|e| !e.dormant);
+                entities.with_mut(h, |e| e.dormant = true);
+                awake
+            })
+            .collect();
 
         let mut new = Vec::new();
+        let mut woke = Vec::new();
         let mut handles = Vec::with_capacity(snapshot.entities.len());
         for state in &snapshot.entities {
             let handle = EntityHandle { index: Some(state.index), serial: state.serial, kind: state.ent.kind };
             let entities = &host(lua).entities;
             if entities.is_valid(handle) {
+                if entities.get(handle).is_some_and(|e| e.dormant) {
+                    woke.push(handle);
+                }
                 entities.with_mut(handle, |ent| *ent = state.ent.clone());
             } else {
                 entities.put(state.index, state.serial, state.ent.clone());
@@ -250,6 +279,11 @@ impl crate::Runtime {
         }
         for handle in new {
             crate::ents::arrived(lua, handle);
+        }
+        for (handle, sent) in fell_asleep.into_iter().map(|h| (h, false)).chain(woke.into_iter().map(|h| (h, true))) {
+            if let Ok(value) = entity::push(lua, handle) {
+                crate::call_hook(lua, "NotifyShouldTransmit", MultiValue::from_iter([value, Value::Boolean(sent)]));
+            }
         }
     }
 }

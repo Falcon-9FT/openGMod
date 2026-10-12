@@ -129,16 +129,19 @@ impl Game {
         pages: Option<gmod_lua::WebPages>,
         max_players: u32,
         listen: Option<SocketAddr>,
-        name: &str,
+        (name, key): (&str, gmod_net::PublicKey),
     ) -> Result<Game, String> {
         let mut server = Server::start(vfs.clone(), map, gamemode, max_players, false)?;
         if let Some(addr) = listen {
-            match server.listen(addr) {
-                Ok(at) => println!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port()),
+            match server.listen(addr, crate::keys::server_identity()) {
+                Ok(at) => {
+                    println!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port());
+                    server.set_masters(crate::browser::masters(&[]));
+                }
                 Err(e) => println!("Others cannot join: {addr}: {e}"),
             }
         }
-        let player = server.join_host(name).ok_or("no player could join the game")?;
+        let player = server.join_host(name, Some(key)).ok_or("no player could join the game")?;
         let client = client(vfs, map, gamemode, max_players, pages)?;
         client.set_local_player(player);
         client.apply_snapshot(&server.runtime().snapshot());
@@ -172,6 +175,15 @@ impl Game {
         };
         game.send_client_commands();
         Ok(game)
+    }
+
+    /// Whether the player may run Lua of their own: in their own game, or on a server with
+    /// `sv_allowcslua`.
+    pub fn own_lua_allowed(&self) -> bool {
+        match &self.link {
+            Link::Local(_) => true,
+            Link::Remote(connection) => connection.welcome.allow_cs_lua,
+        }
     }
 
     /// Whether others play too: the game goes on under the menu.
@@ -336,12 +348,15 @@ impl Game {
             }
             Link::Remote(connection) => {
                 let events = connection.poll();
+                let (own, from) = connection.predicted(self.player);
                 if let Some(mut snapshot) = connection.shown(seconds) {
-                    // the player itself where the server last said, not a while ago
-                    if let Some(own) = connection.newest(self.player)
-                        && let Some(at) = snapshot.entities.iter_mut().find(|e| e.index == own.index && e.serial == own.serial)
-                    {
-                        *at = own.clone();
+                    // the player itself, its weapons and view models where the server last
+                    // said, not a while ago: the prediction goes on from there
+                    for state in own {
+                        match snapshot.entities.binary_search_by_key(&state.index, |e| e.index) {
+                            Ok(i) => snapshot.entities[i] = state,
+                            Err(i) => snapshot.entities.insert(i, state),
+                        }
                     }
                     self.client.apply_snapshot(&snapshot);
                 }
@@ -354,8 +369,9 @@ impl Game {
                         Event::Joined(_) => {}
                     }
                 }
-                // and moved on by what it asked since, as the server will move it
-                let fraction = self.client.predict(self.player, &connection.unanswered());
+                // and moved on by what it asked since, its weapon fired, as the server will
+                let (commands, played) = connection.unanswered();
+                let fraction = self.client.predict(self.player, &commands, from, played);
                 let view = self.client.view(self.player)?;
                 between(view.previous_eye, view.eye, fraction)
             }
@@ -549,7 +565,8 @@ mod tests {
         let mut map = Map::from_bsp("gm_test", &bsp, Arc::new(Collision::new(&bsp)));
         let start = [("classname", "info_player_start"), ("origin", "0 0 0"), ("angles", "0 90 0")];
         map.entities.push(start.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
-        let mut game = Game::start(Arc::new(vfs), &map, "sandbox", None, 1, None, "Player").unwrap();
+        let me = gmod_net::Identity::generate().public();
+        let mut game = Game::start(Arc::new(vfs), &map, "sandbox", None, 1, None, ("Player", me)).unwrap();
 
         // the camera turns to where the spawn point looks, and sees from the player's eyes
         let still = (Keys::default(), Buttons::default());
@@ -586,7 +603,7 @@ mod tests {
         end
         function net.Incoming(len, from)
             local name = util.NetworkIDToString(net.ReadHeader())
-            if CLIENT then GOT = name .. ': ' .. net.ReadString() else HEARD = from:Nick() .. ' ' .. name end
+            if CLIENT then GOT = name .. ': ' .. net.ReadString() else HEARD = from:Nick() .. ' ' .. from:SteamID64() .. ' ' .. name end
         end
     ";
 
@@ -645,6 +662,14 @@ mod tests {
         );
         let client_files = Folder::new("net-client", &[("lua/includes/init.lua", NET_INIT.as_bytes())]);
         let download = Folder::new("net-download", &[]);
+        let addon = Folder::new(
+            "net-addon",
+            &[
+                ("lua/autorun/client/mine.lua", b"MINE = true"),
+                ("lua/autorun/client/hello.lua", b"HELLO = 'from the addon'"),
+                ("materials/mine.vmt", b"\"UnlitGeneric\" {}"),
+            ],
+        );
         let server_vfs = Arc::new(server_files.vfs());
         let (to_test, from_server) = mpsc::channel::<String>();
         let (stop, stopped) = mpsc::channel::<()>();
@@ -654,7 +679,7 @@ mod tests {
                 .runtime()
                 .run_string("AddCSLuaFile('autorun/client/hello.lua') resource.AddFile('materials/test/thing.vmt')", "files")
                 .unwrap();
-            let at = server.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+            let at = server.listen("127.0.0.1:0".parse().unwrap(), gmod_net::Identity::generate()).unwrap();
             to_test.send(at.to_string()).unwrap();
             while stopped.try_recv().is_err() {
                 server.frame(0.015);
@@ -674,17 +699,42 @@ mod tests {
         });
         let at: SocketAddr = from_server.recv().unwrap().parse().unwrap();
 
+        // a server known by another key is not joined: it may be another one in its place
+        let alice = gmod_net::Identity::generate();
+        let lists = Folder::new("known-servers", &[]);
+        let known = crate::keys::KnownServers::at(Some(lists.0.join("known.txt")));
+        let wrong = crate::keys::KnownServers::at(Some(lists.0.join("wrong.txt")));
+        wrong.remember(&at.to_string(), gmod_net::Identity::generate().public());
+        let refused = Connection::open(at, "Alice", &alice, &wrong).err().unwrap();
+        assert!(refused.contains("is not the server that was there"), "{refused}");
+
         // connecting: what the client lacks comes, the Lua into memory, the rest saved
-        let mut connection = Connection::open(at, "Alice").unwrap();
+        let mut connection = Connection::open(at, "Alice", &alice, &known).unwrap();
+        assert_eq!(known.key(&at.to_string()), connection.key, "the server's key is kept");
         assert_eq!((connection.welcome.map.as_str(), connection.welcome.max_players), ("gm_test", 4));
         let mut vfs = client_files.vfs();
-        let lua = connection.download(&vfs, Some(&download.0)).unwrap();
+        vfs.push(Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&download.0))));
+        // an addon of the player's own, with Lua of its own and the server's file too
+        vfs.insert(0, Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&addon.0))).of_addon());
+        let lua = connection.download(&vfs, Some(&download.0), &|_| {}).unwrap();
+        assert!(!connection.welcome.allow_cs_lua);
+        vfs.hide_in_addons(Some(super::super::client::addon_lua_hidden(&connection.listed_lua)));
         assert_eq!(lua, [("lua/autorun/client/hello.lua".to_string(), b"HELLO = 'from the server'".to_vec())]);
         assert_eq!(std::fs::read(download.0.join("materials/test/thing.vtf")).unwrap(), b"texture");
+        // and the game finds it at once, though it looked in that folder before it came
+        assert!(vfs.read("materials/test/thing.vtf", "GAME").is_ok_and(|data| data[..] == b"texture"[..]));
         vfs.insert(0, Mount::new(&["GAME"], Backing::Memory(gmod_fs::MemoryMount::new("server", lua))));
         let mut game = Game::join(Arc::new(vfs), &test_map(), connection, None).unwrap();
         game.client().run_string("include('autorun/client/hello.lua')", "hello").unwrap();
         assert_eq!(game.client().lua().load("return HELLO").eval::<String>().unwrap(), "from the server");
+        // the addon's own Lua is not run, nor seen; its content is
+        let addon_lua: bool = game
+            .client()
+            .lua()
+            .load("return MINE == nil and not file.Exists('lua/autorun/client/mine.lua', 'GAME') and file.Exists('materials/mine.vmt', 'GAME')")
+            .eval()
+            .unwrap();
+        assert!(addon_lua && !game.own_lua_allowed());
 
         // walking along y: the client sees the server move the player, and hears from it
         let forward = Keys { forward: true, ..Keys::default() };
@@ -709,7 +759,7 @@ mod tests {
         let on_server = connection.newest(game.player).unwrap().ent.local_pos;
         let predicted = game.client.position(game.player).unwrap();
         assert!((on_server - predicted).length() < 0.5, "{on_server:?} {predicted:?}");
-        assert!(connection.unanswered().len() < 10);
+        assert!(connection.unanswered().0.len() < 10);
         assert_eq!(game.client().lua().load("return GOT").eval::<String>().unwrap(), "welcome: hi Alice");
         assert!(game.multiplayer() && game.closed().is_none());
 
@@ -721,9 +771,88 @@ mod tests {
         }
         game.leave();
         stop.send(()).unwrap();
-        assert_eq!(from_server.recv().unwrap(), "Alice thanks");
+        assert_eq!(from_server.recv().unwrap(), format!("Alice {} thanks", crate::keys::steam_id64(&alice.public())), "known by her key");
         assert_eq!(from_server.recv().unwrap(), "0", "the player left with the client");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn the_menu_finds_servers_and_their_players() {
+        use std::time::{Duration, Instant};
+        let server_files = Folder::new(
+            "browse-server",
+            &[("lua/includes/init.lua", NET_INIT.as_bytes()), ("gamemodes/sandbox/sandbox.txt", b"\"sandbox\" { \"title\" \"Sandbox\" }")],
+        );
+        let mut server = Server::start(Arc::new(server_files.vfs()), &test_map(), "sandbox", 4, true).unwrap();
+        server.name = "Alice's game".into();
+        let at = server.listen("127.0.0.1:0".parse().unwrap(), gmod_net::Identity::generate()).unwrap();
+        server.runtime().join(gmod_lua::PlayerInfo { name: "Bob".into(), bot: true, ..Default::default() }).unwrap();
+
+        // a master server the server tells it is here, which lists it once it answers
+        let mut master = gmod_net::Master::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let master_at = master.local_addr().unwrap();
+        server.set_masters(vec![master_at]);
+        let listed = Instant::now();
+        while master.servers().is_empty() && listed.elapsed() < Duration::from_secs(3) {
+            server.frame(0.01);
+            master.poll(Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(master.servers(), [at]);
+
+        let saved = Folder::new("browse-lists", &[]);
+        std::fs::write(saved.0.join("favorites.txt"), format!("{at}\n127.0.0.1:1\n")).unwrap();
+        std::fs::write(saved.0.join("masters.txt"), format!("{master_at}\n")).unwrap();
+        let mut browser = crate::browser::Browser::new(Some(saved.0.clone()));
+        let menu = Runtime::new(Realm::Menu, Arc::new(Vfs::new())).unwrap();
+        menu.set_favorite_servers(browser.favorites());
+        menu.run_string(
+            &format!(
+                "serverlist.PingServer('{at}', function(ping, name, desc, map, players, max, bots)
+                     PING = table.concat({{ name, desc, map, players, max, bots }}, '|')
+                 end)
+                 serverlist.PingServer('127.0.0.1:1', function(ping, name) DEAD = name or 'no answer' end)
+                 serverlist.PlayerList('{at}', function(t) PLAYERS = t[1] and t[1].name or 'none' end)
+                 FAV = {{}}
+                 serverlist.Query({{ Type = 'favorite',
+                     Callback = function(ping, name) table.insert(FAV, name) return true end,
+                     CallbackFailed = function(address) table.insert(FAV, 'failed ' .. address) return true end,
+                     Finished = function() FAV_DONE = true end }})
+                 NET = {{}}
+                 serverlist.Query({{ Type = 'internet', Callback = function(ping, name) table.insert(NET, name) return true end,
+                     Finished = function() INTERNET_DONE = true end }})"
+            ),
+            "browse",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let done = || {
+            menu.lua()
+                .load("return FAV_DONE == true and INTERNET_DONE == true and PING ~= nil and DEAD ~= nil and PLAYERS ~= nil")
+                .eval::<bool>()
+                .unwrap()
+        };
+        while !done() && started.elapsed() < Duration::from_secs(5) {
+            server.frame(0.01);
+            master.poll(Instant::now());
+            browser.poll(&menu);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let got: String = menu
+            .lua()
+            .load("return table.concat({ PING, DEAD, PLAYERS, table.concat(FAV, ','), table.concat(NET, ',') }, '\\n')")
+            .eval()
+            .unwrap();
+        assert_eq!(got, "Alice's game|Sandbox|gm_test|0|4|1\nno answer\nBob\nAlice's game,failed 127.0.0.1:1\nAlice's game");
+        // the servers played on, newest first
+        browser.played_on("10.0.0.1:27015");
+        browser.played_on(&at.to_string());
+        browser.played_on("10.0.0.1:27015");
+        assert_eq!(std::fs::read_to_string(saved.0.join("history.txt")).unwrap(), format!("10.0.0.1:27015\n{at}\n"));
+        // favourites the menu changed are kept
+        menu.run_string("serverlist.RemoveServerFromFavorites('127.0.0.1:1')", "unfavorite").unwrap();
+        browser.poll(&menu);
+        assert_eq!(browser.favorites(), [at.to_string()]);
     }
 
     #[test]

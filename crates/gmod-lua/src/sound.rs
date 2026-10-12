@@ -6,6 +6,11 @@
 //! of the engine's (`scripts/game_sounds*.txt`, [`gmod_audio::Scripts`]) - or a file under
 //! `sound/`. A script's wave, volume and pitch are picked from what it allows each time it
 //! plays, its sound level and channel are its own.
+//!
+//! A client that predicts its player's weapon ([`crate::player::predict`]) plays what it makes
+//! heard as it predicts it, once; the server's run of the same command then sends that player
+//! none of it (`SuppressHostEvents`, which the engine does for every player whose client
+//! predicts), and the others all of it.
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
@@ -44,6 +49,9 @@ pub struct SoundPlay {
     pub channel: i32,
     /// The `CSoundPatch` or looping sound it is, to change or stop it by.
     pub patch: Option<u64>,
+    /// The player whose client made it itself, predicting: it is not sent to them.
+    #[serde(default)]
+    pub unheard_by: Option<EntityHandle>,
 }
 
 /// What Lua did with sounds, for the program to hear.
@@ -65,10 +73,22 @@ pub enum SoundEvent {
     },
 }
 
+impl SoundEvent {
+    /// The player who is not sent it: their client made it itself.
+    pub fn unheard_by(&self) -> Option<EntityHandle> {
+        match self {
+            SoundEvent::Play(play) => play.unheard_by,
+            _ => None,
+        }
+    }
+}
+
 /// The sounds of a runtime.
 #[derive(Default)]
 pub(crate) struct Sounds {
     pub events: RefCell<Vec<SoundEvent>>,
+    /// The player the sounds made now are not sent to (`SuppressHostEvents`).
+    pub unheard_by: Cell<Option<EntityHandle>>,
     /// The engine's sound scripts, read when first asked for.
     engine: OnceCell<gmod_audio::Scripts>,
     /// The entity and name of each `CSoundPatch` and looping sound, by number.
@@ -244,7 +264,12 @@ fn play(
     channel: i32,
     patch: Option<u64>,
 ) {
+    // a tick predicted again was heard the first time
+    if !crate::timer::first_time_predicted(lua) {
+        return;
+    }
     let Some(r) = resolve(lua, name, volume, pitch, level, channel) else { return };
+    let unheard_by = host(lua).sounds.unheard_by.get();
     host(lua).sounds.events.borrow_mut().push(SoundEvent::Play(SoundPlay {
         name: name.to_string(),
         wave: r.wave,
@@ -255,6 +280,7 @@ fn play(
         level: r.level,
         channel: r.channel,
         patch,
+        unheard_by,
     }));
 }
 
@@ -297,6 +323,14 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     let def = |t: &Table, name: &'static str, f: fn(&Args) -> mlua::Result<Value>| -> mlua::Result<()> {
         t.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
     };
+    if host(lua).realm == crate::Realm::Server {
+        // SuppressHostEvents(player): what is heard from now on is not sent to them (NULL: to all)
+        def(&globals, "SuppressHostEvents", |a| {
+            let player = entity::handle_of(a.get(1)).filter(|&h| h != EntityHandle::NULL);
+            host(a.lua).sounds.unheard_by.set(player);
+            Ok(Value::Nil)
+        })?;
+    }
     // EmitSound(name, position, entity index, channel, volume, level, flags, pitch, dsp, filter)
     def(&globals, "EmitSound", |a| {
         let name = a.string(1)?;

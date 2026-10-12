@@ -328,6 +328,9 @@ fn a_client_tells_its_own_player_and_says_through_the_server() {
     let told = ChatMessage::Text { player: 0, name: String::new(), text: "to all".into(), kind: "none".into() };
     assert_eq!(server.runtime.take_chat(), [(alice, told)]);
     assert_eq!(server.runtime.take_to_clients(), [(alice, ToClient::Print("to the console".into()))]);
+    // and `MsgAll` to every console (the base gamemode's word of a player an NPC killed)
+    server.runtime.run_string("MsgAll('Alice was killed by ', 7, '\\n')", "msg").unwrap();
+    assert_eq!(server.runtime.take_to_clients(), [(alice, ToClient::Print("Alice was killed by 7\n".into()))]);
     assert!(server.messages().is_empty(), "{:?}", server.messages());
     assert!(client.messages().is_empty(), "{:?}", client.messages());
 }

@@ -30,6 +30,7 @@ fn trigger_map(entities: Vec<Vec<(String, String)>>) -> Map {
         brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
         collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
         textures: Vec::new(),
+        visibility: None,
     }
 }
 

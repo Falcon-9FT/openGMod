@@ -95,7 +95,7 @@ pub fn mount_install(install: &Install, options: &MountOptions) -> (Vfs, Vec<Str
                     std::fs::read_dir(dir).into_iter().flatten().filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect();
                 folders.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
                 for folder in folders {
-                    vfs.push(Mount::new(&ids, Backing::Dir(DirMount::new(folder))));
+                    vfs.push(Mount::new(&ids, Backing::Dir(DirMount::new(folder))).of_addon());
                 }
             }
             Target::Vpk(path) => match VpkArchive::open(path) {
@@ -150,7 +150,7 @@ pub fn mount_install(install: &Install, options: &MountOptions) -> (Vfs, Vec<Str
                     // the addon's title is a search path of its own, as in GMod
                     let title = gma.info().title.clone();
                     let ids: Vec<&str> = if title.is_empty() { vec!["GAME", "WORKSHOP"] } else { vec!["GAME", "WORKSHOP", &title] };
-                    vfs.insert(slot, Mount::new(&ids, Backing::Gma(gma)));
+                    vfs.insert(slot, Mount::new(&ids, Backing::Gma(gma)).of_addon());
                     slot += 1;
                 }
                 Err(e) => warnings.push(e.to_string()),

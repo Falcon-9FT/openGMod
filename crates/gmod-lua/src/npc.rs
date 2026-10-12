@@ -1,6 +1,6 @@
 //! NPCs: the engine's own (`npc_citizen`, `npc_zombie`, `npc_combine_s` ...) as sandbox's
 //! spawn menu makes them (`gmod_spawnnpc`: `ents.Create`, key-values, `Spawn`), and the `NPC`
-//! metatable. There is no AI that moves them yet: they stand and look.
+//! metatable. What they do by themselves - moving, fighting - is [`crate::ai`]'s.
 //!
 //! Spawned, an NPC takes what its class has in HL2 unless it was given otherwise: its model
 //! (a citizen's head and clothes by `citizentype` and its spawn flags), its health (the skill
@@ -11,14 +11,14 @@
 //! given before `Spawn` (`SetNPCClass`) is kept. It plays its idle (`ACT_IDLE`) and takes the
 //! weapon of `additionalequipment`, held in its hand as a player's is (bone-merged, drawn). A
 //! map's template NPCs (`SF_NPC_TEMPLATE`) go as the map loads. Without an enemy, one that
-//! hates a player it can see within its look distance takes the nearest (it looks five times
-//! a second), and it turns to face its enemy every tick. As in GMod, `ai_disabled` stops that,
-//! and players with `FL_NOTARGET`, or all of them with `ai_ignoreplayers`, are not taken as
-//! enemies - when seen or when they shoot - and one that was is let go.
+//! hates a player or an NPC it can see within its look distance takes the nearest (it looks
+//! five times a second), and remembers where it sees it. As in GMod, `ai_disabled` stops all
+//! it does, and players with `FL_NOTARGET`, or all of them with `ai_ignoreplayers`, are not
+//! taken as enemies - when seen or when they shoot - and one that was is let go.
 //!
 //! Damage ([`crate::damage`]) hurts it: `OnDamaged` (and `OnDamagedByPlayer`) fire,
 //! `OnHalfHealth` once it is down to half, and it takes a hated attacker as its enemy
-//! (`ScaleNPCDamage` waits for bullets that fly). At no health it dies: `OnNPCKilled`, `OnDeath`, its
+//! (bullets ask `ScaleNPCDamage` first). At no health it dies: `OnNPCKilled`, `OnDeath`, its
 //! weapon falls (unless `SF_NPC_NO_WEAPON_DROP`), a health vial with `SF_NPC_DROP_HEALTHKIT`,
 //! and the NPC goes, leaving a corpse: a ragdoll of its model posed as it was drawn and pushed
 //! by the killing blow ([`crate::ragdoll`]). As in GMod the corpse is the client's by default -
@@ -33,8 +33,7 @@
 //! relationships (`AddRelationship`, `AddEntityRelationship`, `Disposition`, by default those
 //! of HL2's sides: rebels like the player, the Combine, zombies and antlions hate them and
 //! each other), schedules, state, capabilities, squads (`ai.GetSquadMembers`), activities,
-//! weapon proficiency - and answer harmlessly what needs an AI: navigation finds no path,
-//! sounds and scenes are quiet.
+//! weapon proficiency; goals and ways go to [`crate::ai`]. Sounds and scenes are quiet.
 
 use std::cell::RefCell;
 
@@ -137,7 +136,7 @@ const CLIENT_RAGDOLL: &str = "class C_ClientRagdoll";
 
 /// Where an NPC of a class is: on the ground, in the air, or fixed where it was put.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Place {
+pub(crate) enum Place {
     Ground,
     Air,
     Fixed,
@@ -145,13 +144,13 @@ enum Place {
 
 /// What the engine gives an NPC of a class: model, health (its skill ConVar and HL2's default
 /// at normal skill), hull (`HULL_`, none for the model's own box), side, place, capabilities.
-struct Class {
+pub(crate) struct Class {
     name: &'static str,
     model: &'static str,
     health: (&'static str, i64),
     hull: Option<i64>,
     side: i64,
-    place: Place,
+    pub(crate) place: Place,
     caps: i64,
 }
 
@@ -231,7 +230,7 @@ const CLASSES: &[Class] = &[
 ];
 
 /// The class's entry, or that of a person of no side.
-fn class_of(name: &str) -> &'static Class {
+pub(crate) fn class_of(name: &str) -> &'static Class {
     const OTHER: Class = npc("", "", ("", 100), None, class::NONE, Place::Ground, CAPS_GROUND);
     CLASSES.iter().find(|c| c.name.eq_ignore_ascii_case(name)).unwrap_or(&OTHER)
 }
@@ -281,31 +280,33 @@ struct Memory {
 #[derive(Debug, Clone)]
 pub struct Npc {
     /// Its side (`Classify`).
-    class: i64,
+    pub(crate) class: i64,
     /// The side was given (`SetNPCClass`): spawning keeps it.
-    class_set: bool,
-    hull: i64,
-    weapon: EntityHandle,
-    proficiency: i64,
-    enemy: EntityHandle,
+    pub(crate) class_set: bool,
+    pub(crate) hull: i64,
+    pub(crate) weapon: EntityHandle,
+    pub(crate) proficiency: i64,
+    pub(crate) enemy: EntityHandle,
     memory: Vec<Memory>,
-    target: EntityHandle,
+    pub(crate) target: EntityHandle,
     relationships: Vec<Relationship>,
-    schedule: i64,
-    state: i64,
-    conditions: Vec<i64>,
-    capabilities: i64,
-    look_distance: f32,
-    next_look: f64,
-    last_position: Vector,
-    movement_activity: i64,
-    movement_sequence: i64,
-    arrival_activity: i64,
-    arrival_sequence: i64,
-    squad: String,
+    pub(crate) schedule: i64,
+    pub(crate) state: i64,
+    pub(crate) conditions: Vec<i64>,
+    pub(crate) capabilities: i64,
+    pub(crate) look_distance: f32,
+    pub(crate) next_look: f64,
+    pub(crate) last_position: Vector,
+    pub(crate) movement_activity: i64,
+    pub(crate) movement_sequence: i64,
+    pub(crate) arrival_activity: i64,
+    pub(crate) arrival_sequence: i64,
+    pub(crate) squad: String,
     /// `OnHalfHealth` has fired.
-    half_health: bool,
-    dead: bool,
+    pub(crate) half_health: bool,
+    pub(crate) dead: bool,
+    /// What it is doing: its schedule's goal and way, its attacks.
+    pub(crate) mind: crate::ai::Mind,
 }
 
 impl Npc {
@@ -335,6 +336,7 @@ impl Npc {
             squad: String::new(),
             half_health: false,
             dead: false,
+            mind: crate::ai::Mind::default(),
         }
     }
 }
@@ -414,7 +416,7 @@ fn default_disposition(me: i64, them: i64) -> i64 {
 }
 
 /// Runs `f` on an NPC and what the engine keeps for it, made when first needed.
-fn with_npc<R>(lua: &Lua, handle: EntityHandle, f: impl FnOnce(&mut Ent, &mut Npc) -> R) -> Option<R> {
+pub(crate) fn with_npc<R>(lua: &Lua, handle: EntityHandle, f: impl FnOnce(&mut Ent, &mut Npc) -> R) -> Option<R> {
     host(lua)
         .entities
         .with_mut(handle, |ent| {
@@ -457,7 +459,7 @@ fn class_of_entity(lua: &Lua, target: EntityHandle) -> i64 {
 }
 
 /// Whether a target is there and alive: a living player, an NPC that has not died.
-fn living(lua: &Lua, target: EntityHandle) -> bool {
+pub(crate) fn living(lua: &Lua, target: EntityHandle) -> bool {
     let host = host(lua);
     let Some(ent) = host.entities.get(target) else { return false };
     if ent.removed {
@@ -471,7 +473,7 @@ fn living(lua: &Lua, target: EntityHandle) -> bool {
 
 /// Whether an NPC may take a target as its enemy: not one with `FL_NOTARGET`, nor any player
 /// while `ai_ignoreplayers` is on - seen or shot by, alike.
-fn targetable(lua: &Lua, target: EntityHandle) -> bool {
+pub(crate) fn targetable(lua: &Lua, target: EntityHandle) -> bool {
     let Some((player, flags)) = host(lua).entities.get(target).map(|e| (e.player.is_some(), e.flags)) else { return false };
     flags & FL_NOTARGET == 0 && !(player && number(lua, "ai_ignoreplayers").is_some_and(|n| n != 0.0))
 }
@@ -631,7 +633,7 @@ fn drop_to_floor(lua: &Lua, handle: EntityHandle) {
 
 /// Plays a sequence of an activity (chosen by weight), from its start; the activity is kept
 /// either way. Whether the model had one.
-fn play_activity(lua: &Lua, handle: EntityHandle, act: i64) -> bool {
+pub(crate) fn play_activity(lua: &Lua, handle: EntityHandle, act: i64) -> bool {
     let model = host(lua).entities.get(handle).map(|e| e.model.clone()).unwrap_or_default();
     host(lua).entities.with_mut(handle, |e| e.anim.activity = act);
     let Some(rig) = crate::anim::rig(lua, &model) else { return false };
@@ -686,6 +688,11 @@ fn equip(lua: &Lua, handle: EntityHandle, item: EntityHandle) {
     crate::weapon::call(lua, item, "OwnerChanged", MultiValue::new());
 }
 
+/// The weapon in an NPC's hand, if it holds one.
+pub(crate) fn weapon_of(lua: &Lua, handle: EntityHandle) -> Option<EntityHandle> {
+    with_npc(lua, handle, |_, npc| npc.weapon).filter(|&w| host(lua).entities.is_valid(w))
+}
+
 /// The weapon leaves the NPC's hand for the floor where it stands.
 fn drop_weapon(lua: &Lua, handle: EntityHandle) -> EntityHandle {
     let Some(item) = with_npc(lua, handle, |_, npc| std::mem::replace(&mut npc.weapon, EntityHandle::NULL)) else {
@@ -706,7 +713,7 @@ fn drop_weapon(lua: &Lua, handle: EntityHandle) -> EntityHandle {
 }
 
 /// Makes `enemy` the NPC's enemy, remembered where it is now; `OnFoundEnemy` fires for a new one.
-fn set_enemy(lua: &Lua, handle: EntityHandle, enemy: EntityHandle) {
+pub(crate) fn set_enemy(lua: &Lua, handle: EntityHandle, enemy: EntityHandle) {
     let now = host(lua).clock.cur_time.get();
     let position = host(lua).entities.transform(enemy).map(|(p, _)| p);
     let found = with_npc(lua, handle, |_, npc| {
@@ -734,8 +741,8 @@ fn remember(npc: &mut Npc, enemy: EntityHandle, position: Vector, now: f64) {
 
 /// Damage to an engine NPC, after the `EntityTakeDamage` hook let it through
 /// ([`crate::damage::take`]). `ScaleNPCDamage` is not for it: GMod asks that hook where a
-/// bullet's trace hits a hit group, before the damage is taken, and never for damage given
-/// directly (`TakeDamageInfo`) - here bullets do not fly yet.
+/// bullet's trace hits a hit group, before the damage is taken ([`crate::bullets`]), and never
+/// for damage given directly (`TakeDamageInfo`).
 pub(crate) fn hurt(lua: &Lua, handle: EntityHandle, info: DamageInfo) {
     if handle.kind != Kind::Npc {
         return;
@@ -977,7 +984,6 @@ pub(crate) fn tick(lua: &Lua) {
 
 fn think(lua: &Lua, handle: EntityHandle, now: f64) {
     let Some((enemy, look)) = with_npc(lua, handle, |_, npc| (npc.enemy, npc.next_look <= now)) else { return };
-    let mut enemy = enemy;
     // one dead or gone, or that it may no longer target, it lets go of, still alert
     if enemy.index.is_some() && !(living(lua, enemy) && targetable(lua, enemy)) {
         with_npc(lua, handle, |_, npc| {
@@ -986,56 +992,38 @@ fn think(lua: &Lua, handle: EntityHandle, now: f64) {
                 npc.state = NPC_STATE_ALERT;
             }
         });
-        enemy = EntityHandle::NULL;
     }
+    let enemy = with_npc(lua, handle, |_, npc| npc.enemy).unwrap_or(EntityHandle::NULL);
     if enemy.index.is_none() && look {
         with_npc(lua, handle, |_, npc| npc.next_look = now + LOOK_INTERVAL);
-        if let Some(found) = nearest_hated_player(lua, handle) {
+        if let Some(found) = crate::ai::nearest_enemy(lua, handle) {
             set_enemy(lua, handle, found);
             with_npc(lua, handle, |_, npc| npc.state = NPC_STATE_COMBAT);
-            enemy = found;
+        }
+    } else if look && enemy.index.is_some() {
+        // what it sees of its enemy it remembers
+        with_npc(lua, handle, |_, npc| npc.next_look = now + LOOK_INTERVAL);
+        if crate::ai::sees(lua, handle, enemy) {
+            let position = host(lua).entities.transform(enemy).map(|(p, _)| p);
+            with_npc(lua, handle, |_, npc| {
+                if let Some(position) = position {
+                    remember(npc, enemy, position, now);
+                }
+            });
         }
     }
-    if let Some((target, _)) = host(lua).entities.transform(enemy) {
-        turn_towards(lua, handle, target, timer::TICK_INTERVAL as f32);
-    }
+    crate::ai::think(lua, handle, timer::TICK_INTERVAL);
 }
 
 /// Where an NPC's eyes are: near the top of its box.
-fn eyes(lua: &Lua, handle: EntityHandle) -> Option<Vector> {
+pub(crate) fn eyes(lua: &Lua, handle: EntityHandle) -> Option<Vector> {
     let (pos, _) = host(lua).entities.transform(handle)?;
     let (mins, maxs) = host(lua).entities.get(handle).map(|e| (e.mins, e.maxs))?;
     Some(pos + Vector::new(0.0, 0.0, mins.z + (maxs.z - mins.z) * 0.9))
 }
 
-/// The nearest living player the NPC hates and can see within its look distance.
-fn nearest_hated_player(lua: &Lua, handle: EntityHandle) -> Option<EntityHandle> {
-    let from = eyes(lua, handle)?;
-    let range = with_npc(lua, handle, |_, npc| npc.look_distance)?;
-    let mut best: Option<(EntityHandle, f32)> = None;
-    for player in crate::player::all(lua) {
-        if !targetable(lua, player) || !crate::player::alive(lua, player) || disposition(lua, handle, player).0 != D_HT {
-            continue;
-        }
-        let Some((to, _)) = crate::player::eye(lua, player) else { continue };
-        let distance = (to - from).length();
-        if distance > range || best.is_some_and(|(_, d)| d <= distance) {
-            continue;
-        }
-        let sweep = crate::trace::Sweep {
-            mask: gmod_bsp::mask::OPAQUE,
-            ..crate::trace::Sweep::line(from, to, crate::trace::Filter::Entities(vec![handle]))
-        };
-        let hit = crate::trace::trace(lua, &sweep);
-        if hit.fraction >= 1.0 || hit.entity == player {
-            best = Some((player, distance));
-        }
-    }
-    best.map(|(player, _)| player)
-}
-
 /// Turns an NPC about its yaw towards a point, as far as it turns in `seconds`.
-fn turn_towards(lua: &Lua, handle: EntityHandle, target: Vector, seconds: f32) {
+pub(crate) fn turn_towards(lua: &Lua, handle: EntityHandle, target: Vector, seconds: f32) {
     let Some((pos, angles)) = host(lua).entities.transform(handle) else { return };
     let (dx, dy) = (target.x - pos.x, target.y - pos.y);
     if dx.abs() < 0.01 && dy.abs() < 0.01 {
@@ -1117,11 +1105,6 @@ fn no(a: &Args) -> mlua::Result<Value> {
 fn zero(a: &Args) -> mlua::Result<Value> {
     this(a)?;
     Ok(Value::Integer(0))
-}
-
-fn null(a: &Args) -> mlua::Result<Value> {
-    this(a)?;
-    entity::push(a.lua, EntityHandle::NULL)
 }
 
 fn own_pos(a: &Args) -> mlua::Result<Value> {
@@ -1392,14 +1375,24 @@ fn install_relationships(def: &Def) -> mlua::Result<()> {
 fn install_schedules(def: &Def) -> mlua::Result<()> {
     def("SetSchedule", |a| {
         let n = a.number(2)? as i64;
-        write(a, |_, npc| npc.schedule = n)
+        write(a, |_, npc| {
+            npc.schedule = n;
+            crate::ai::schedule_set(npc);
+        })
     })?;
     def("GetCurrentSchedule", |a| integer(read(a, |_, npc| npc.schedule)?))?;
     def("IsCurrentSchedule", |a| {
         let n = a.number(2)? as i64;
         Ok(Value::Boolean(read(a, |_, npc| npc.schedule == n)?))
     })?;
-    def("ClearSchedule", |a| write(a, |_, npc| npc.schedule = SCHED_NONE))?;
+    def("ClearSchedule", |a| {
+        let handle = this(a)?;
+        crate::ai::stop(a.lua, handle);
+        write(a, |_, npc| {
+            npc.schedule = SCHED_NONE;
+            crate::ai::schedule_set(npc);
+        })
+    })?;
     def("SetNPCState", |a| {
         let n = a.number(2)? as i64;
         write(a, |_, npc| npc.state = n)
@@ -1491,39 +1484,148 @@ fn install_activities(def: &Def) -> mlua::Result<()> {
     def("UpdateTurnActivity", nothing)
 }
 
-/// Moving: there is no navigation yet, so no goal is ever reached and nothing moves.
+/// A goal Lua gives ([`crate::ai::set_goal`]): walked to, or run to when its movement activity
+/// is the run.
+fn lua_goal(a: &Args, goal: impl FnOnce(bool) -> crate::ai::Goal) -> mlua::Result<Value> {
+    let handle = this(a)?;
+    let run = read(a, |_, npc| npc.movement_activity == crate::ai::ACT_RUN)?;
+    Ok(Value::Boolean(crate::ai::set_goal(a.lua, handle, goal(run))))
+}
+
+/// Moving: goals, the way to them and how it goes ([`crate::ai`]).
 fn install_movement(def: &Def) -> mlua::Result<()> {
-    for name in ["NavSetGoal", "NavSetGoalPos", "NavSetGoalTarget", "NavSetRandomGoal", "NavSetWanderGoal", "IsMoving", "IsUnreachable"] {
-        def(name, no)?;
-    }
-    for name in ["HasObstacles", "IsGoalActive"] {
-        def(name, no)?;
-    }
-    for name in [
-        "StopMoving",
-        "ClearGoal",
-        "RememberUnreachable",
-        "SetArrivalDirection",
-        "SetArrivalDistance",
-        "SetArrivalSpeed",
-        "SetMaxRouteRebuildTime",
-        "SetMoveVelocity",
-        "SetNavType",
-        "MoveOrder",
-        "TargetOrder",
-    ] {
+    const TOLERANCE: f32 = 12.0;
+    def("NavSetGoal", |a| {
+        let pos = a.userdata::<Vector>(2, "Vector")?;
+        lua_goal(a, |run| crate::ai::Goal::point(pos, TOLERANCE, run))
+    })?;
+    def("NavSetGoalPos", |a| {
+        let pos = a.userdata::<Vector>(2, "Vector")?;
+        lua_goal(a, |run| crate::ai::Goal::point(pos, TOLERANCE, run))
+    })?;
+    def("NavSetGoalTarget", |a| {
+        let target = entity::this(a, 2)?;
+        let offset = a.get(3).and_then(|_| a.userdata::<Vector>(3, "Vector").ok()).unwrap_or_default();
+        lua_goal(a, |run| crate::ai::Goal::after(target, offset, TOLERANCE * 4.0, run))
+    })?;
+    def("NavSetRandomGoal", |a| {
+        let handle = this(a)?;
+        let min = a.opt_number(2)?.unwrap_or(128.0) as f32;
+        let (pos, _) = host(a.lua).entities.transform(handle).unwrap_or_default();
+        let lua = a.lua;
+        let roll = |below: usize| crate::anim::random(lua, below as i64) as usize;
+        let hull = crate::nav::Hull {
+            mins: host(lua).entities.get(handle).map(|e| e.mins).unwrap_or_default(),
+            maxs: host(lua).entities.get(handle).map(|e| e.maxs).unwrap_or_default(),
+            air: host(lua).entities.get(handle).is_some_and(|e| e.move_type == MOVETYPE_FLY),
+        };
+        let Some(spot) = crate::nav::random_spot(lua, pos, min, min.max(128.0) * 2.0, &hull, roll) else {
+            return Ok(Value::Boolean(false));
+        };
+        lua_goal(a, |run| crate::ai::Goal::point(spot, TOLERANCE, run))
+    })?;
+    def("NavSetWanderGoal", |a| {
+        let handle = this(a)?;
+        let min = a.opt_number(2)?.unwrap_or(128.0) as f32;
+        let max = a.opt_number(3)?.map_or(min.max(128.0) * 2.0, |m| m as f32);
+        let (pos, _) = host(a.lua).entities.transform(handle).unwrap_or_default();
+        let lua = a.lua;
+        let roll = |below: usize| crate::anim::random(lua, below as i64) as usize;
+        let hull = crate::nav::Hull {
+            mins: host(lua).entities.get(handle).map(|e| e.mins).unwrap_or_default(),
+            maxs: host(lua).entities.get(handle).map(|e| e.maxs).unwrap_or_default(),
+            air: host(lua).entities.get(handle).is_some_and(|e| e.move_type == MOVETYPE_FLY),
+        };
+        let Some(spot) = crate::nav::random_spot(lua, pos, min, max.max(min), &hull, roll) else { return Ok(Value::Boolean(false)) };
+        lua_goal(a, |run| crate::ai::Goal::point(spot, TOLERANCE, run))
+    })?;
+    def("IsMoving", |a| Ok(Value::Boolean(read(a, |_, npc| npc.mind.goal.is_some() && !npc.mind.route.is_empty())?)))?;
+    def("IsGoalActive", |a| Ok(Value::Boolean(read(a, |_, npc| npc.mind.goal.is_some())?)))?;
+    def("StopMoving", |a| {
+        let handle = this(a)?;
+        crate::ai::stop(a.lua, handle);
+        Ok(Value::Nil)
+    })?;
+    def("ClearGoal", |a| {
+        let handle = this(a)?;
+        crate::ai::stop(a.lua, handle);
+        Ok(Value::Nil)
+    })?;
+    def("HasObstacles", no)?;
+    def("IsUnreachable", |a| {
+        let handle = this(a)?;
+        let target = entity_arg(a, 2);
+        Ok(Value::Boolean(crate::ai::is_unreachable(a.lua, handle, target)))
+    })?;
+    def("RememberUnreachable", |a| {
+        let handle = this(a)?;
+        let target = entity::this(a, 2)?;
+        let seconds = a.opt_number(3)?.unwrap_or(3.0);
+        crate::ai::remember_unreachable(a.lua, handle, target, seconds);
+        Ok(Value::Nil)
+    })?;
+    def("SetArrivalDistance", |a| {
+        let n = a.number(2)? as f32;
+        write(a, |_, npc| npc.mind.arrival_distance = Some(n))
+    })?;
+    for name in ["SetArrivalDirection", "SetArrivalSpeed", "SetMaxRouteRebuildTime", "SetMoveVelocity"] {
         def(name, nothing)?;
     }
-    for name in ["GetPathDistanceToGoal", "GetPathTimeToGoal", "GetIdealMoveSpeed", "GetIdealMoveAcceleration", "GetNavType"] {
-        def(name, zero)?;
-    }
-    def("GetBlockingEntity", null)?;
-    def("GetCurrentWaypointPos", own_pos)?;
-    def("GetNextWaypointPos", own_pos)?;
-    def("GetMoveVelocity", |a| {
-        this(a)?;
-        entity::vector(a.lua, Vector::default())
+    def("SetNavType", |a| {
+        let n = a.number(2)? as i64;
+        write(a, |_, npc| npc.mind.nav_type = Some(n))
     })?;
+    def("GetNavType", |a| {
+        let handle = this(a)?;
+        let set = read(a, |_, npc| npc.mind.nav_type)?;
+        let by_movement = match host(a.lua).entities.get(handle).map_or(MOVETYPE_NONE, |e| e.move_type) {
+            MOVETYPE_STEP => 0,
+            MOVETYPE_FLY => 2,
+            _ => -1,
+        };
+        integer(set.unwrap_or(by_movement))
+    })?;
+    // a citizen of the player's squad sent somewhere, and told what to go for
+    def("MoveOrder", |a| {
+        let pos = a.userdata::<Vector>(2, "Vector")?;
+        write(a, |_, npc| {
+            npc.last_position = pos;
+            npc.schedule = crate::ai::sched::FORCED_GO_RUN;
+            crate::ai::schedule_set(npc);
+        })
+    })?;
+    def("TargetOrder", |a| {
+        let target = entity_arg(a, 2);
+        write(a, |_, npc| npc.target = target)
+    })?;
+    def("GetPathDistanceToGoal", |a| {
+        let handle = this(a)?;
+        Ok(Value::Number(f64::from(crate::ai::path_length(a.lua, handle))))
+    })?;
+    def("GetPathTimeToGoal", |a| {
+        let handle = this(a)?;
+        let speed = crate::ai::speed(a.lua, handle);
+        let length = crate::ai::path_length(a.lua, handle);
+        Ok(Value::Number(if speed > 0.0 { f64::from(length / speed) } else { 0.0 }))
+    })?;
+    def("GetIdealMoveSpeed", |a| {
+        let handle = this(a)?;
+        Ok(Value::Number(f64::from(crate::ai::speed(a.lua, handle))))
+    })?;
+    def("GetIdealMoveAcceleration", zero)?;
+    def("GetBlockingEntity", |a| {
+        let blocker = read(a, |_, npc| npc.mind.blocker)?;
+        push_valid(a.lua, blocker)
+    })?;
+    def("GetCurrentWaypointPos", |a| match read(a, |_, npc| npc.mind.route.first().copied())? {
+        Some(pos) => entity::vector(a.lua, pos),
+        None => own_pos(a),
+    })?;
+    def("GetNextWaypointPos", |a| match read(a, |_, npc| npc.mind.route.get(1).or(npc.mind.route.first()).copied())? {
+        Some(pos) => entity::vector(a.lua, pos),
+        None => own_pos(a),
+    })?;
+    def("GetMoveVelocity", |a| entity::vector(a.lua, read(a, |_, npc| npc.mind.velocity)?))?;
     def("SetLastPosition", |a| {
         let pos = a.userdata::<Vector>(2, "Vector")?;
         write(a, |_, npc| npc.last_position = pos)

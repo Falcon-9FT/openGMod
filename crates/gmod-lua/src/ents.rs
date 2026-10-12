@@ -43,6 +43,9 @@ pub struct Map {
     pub collision: Option<std::sync::Arc<gmod_bsp::Collision>>,
     /// The material of each surface (`texinfo`), which traces name as `HitTexture`.
     pub textures: Vec<String>,
+    /// What is seen and heard from where ([`gmod_bsp::Visibility`]); without it everything is
+    /// seen from everywhere.
+    pub visibility: Option<std::sync::Arc<gmod_bsp::Visibility>>,
 }
 
 impl Map {
@@ -55,6 +58,7 @@ impl Map {
             brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
             collision: Some(collision),
             textures: bsp.texinfo.iter().map(|info| texture(info.texdata)).collect(),
+            visibility: gmod_bsp::Visibility::new(bsp).map(std::sync::Arc::new),
         }
     }
 }
@@ -531,7 +535,9 @@ pub(crate) fn think(lua: &Lua) {
             .handles()
             .into_iter()
             .filter(|&h| h.kind != Kind::Weapon)
-            .filter(|&h| entities.get(h).is_some_and(|ent| ent.scripted && ent.spawned && !ent.removed && ent.next_think <= now))
+            .filter(|&h| {
+                entities.get(h).is_some_and(|ent| ent.scripted && ent.spawned && !ent.removed && !ent.dormant && ent.next_think <= now)
+            })
             .collect()
     };
     for handle in due {
@@ -589,8 +595,12 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
         .filter_map(|handle| {
             let (model, skin) = {
                 let ent = entities.get(handle)?;
-                let hidden =
-                    ent.removed || !ent.spawned || ent.no_draw || ent.effects & EF_NODRAW != 0 || ent.render_mode == RENDERMODE_NONE;
+                let hidden = ent.removed
+                    || ent.dormant
+                    || !ent.spawned
+                    || ent.no_draw
+                    || ent.effects & EF_NODRAW != 0
+                    || ent.render_mode == RENDERMODE_NONE;
                 let studio = ent.model.len() > 4 && ent.model[ent.model.len() - 4..].eq_ignore_ascii_case(".mdl");
                 // the brushes that may move are drawn where their entities are; the others are the map's
                 let moving_brush = crate::movers::moving_brush(&ent).is_some();
@@ -604,7 +614,6 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
             };
             // a merged model is drawn where its parent is, a player's turned as its legs are
             let (origin, angles, scale) = crate::anim::drawn_at(lua, handle)?;
-            let angles = crate::player::state(lua, handle, |_, p| p.render_angles).unwrap_or(angles);
             Some(Drawn { entity: handle, model, skin, origin, angles, scale, bones: crate::anim::skinning(lua, handle) })
         })
         .collect()
@@ -716,6 +725,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
         return;
     }
     crate::physics::load_world(lua, map.collision.as_deref());
+    *host(lua).transmit.visibility.borrow_mut() = map.visibility.clone();
     crate::movers::clear(lua);
     let world_bounds = model_bounds(lua, "*0").unwrap_or_default();
     host(lua).entities.with_mut(world, |ent| {
@@ -724,8 +734,15 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     });
 
     let mut made = Vec::new();
+    let mut nodes = Vec::new();
     for (i, pairs) in map.entities.iter().enumerate() {
         let Some((_, class)) = pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case("classname")) else { continue };
+        // the AI's nodes are no entities: the engine keeps where they are, for its graph
+        if let Some(air) = crate::nav::node_class(class) {
+            let origin = pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case("origin")).map_or([0.0; 3], |(_, v)| three(v));
+            nodes.push(crate::nav::Node { pos: Vector::new(origin[0], origin[1], origin[2]), air });
+            continue;
+        }
         let id = FIRST_MAP_CREATION_ID + i as i32;
         let handle = if class.eq_ignore_ascii_case("worldspawn") {
             host(lua).entities.with_mut(world, |ent| ent.map_creation_id = Some(id));
@@ -750,6 +767,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
             made.push(handle);
         }
     }
+    crate::nav::load(lua, nodes);
     // parents first, as the engine spawns a hierarchy
     for &handle in &made {
         let parent = host(lua).entities.get(handle).and_then(|ent| ent.keyvalue("parentname").map(str::to_string));

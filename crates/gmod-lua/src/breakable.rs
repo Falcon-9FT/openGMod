@@ -194,13 +194,24 @@ pub(crate) fn damaged(lua: &Lua, handle: EntityHandle, info: &DamageInfo) {
     hurt(lua, handle, amount, info.attacker.unwrap_or(EntityHandle::NULL));
 }
 
-/// The force of damage pushes a body, at the point hit when it is on it.
+/// The force of damage pushes a body, at the point hit when it is on it. A ragdoll's bullets
+/// push the part they hit themselves ([`crate::bullets`]).
 fn push(lua: &Lua, handle: EntityHandle, info: &DamageInfo) {
-    if info.force.length() <= 0.0 {
+    if crate::ragdoll::is_ragdoll(lua, handle) && info.kind & DMG_BULLETS != 0 {
         return;
     }
     let Some(id) = crate::physics::body(lua, handle) else { return };
     let on = host(lua).entities.world_bounds(handle).is_some_and(|(_, _, lo, hi)| inside(info.position, lo, hi));
+    push_body(lua, id, info, on);
+}
+
+/// The force of damage pushes a body: at the point of the damage when `at_point`, else at its
+/// middle; never faster than a body of the game goes.
+pub(crate) fn push_body(lua: &Lua, id: gmod_physics::BodyId, info: &DamageInfo, at_point: bool) {
+    if info.force.length() <= 0.0 {
+        return;
+    }
+    let on = at_point;
     let host = host(lua);
     let mut physics = host.physics.physics.borrow_mut();
     let most = physics.mass(id) * MAX_SPEED;

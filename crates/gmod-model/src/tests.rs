@@ -523,9 +523,25 @@ fn arm() -> TestRig {
         ],
         pose_parameters: vec![PoseParameter { name: "aim_yaw".into(), flags: 0, start: -45.0, end: 45.0, wrap: 0.0 }],
         attachments: vec![("tip".into(), 2, [5.0, 0.0, 0.0])],
+        hitboxes: vec![(1, 4, [0.0, -2.0, -2.0], [10.0, 2.0, 2.0]), (2, 5, [0.0, -1.5, -1.5], [10.0, 1.5, 1.5])],
         animation_file: "models/test/arm.ani".into(),
         ..TestRig::default()
     }
+}
+
+#[test]
+fn hitboxes_are_read_by_set() {
+    let (mdl, _) = arm().files();
+    let mdl = Mdl::parse(&mdl).unwrap();
+    assert_eq!(mdl.hitbox_sets.len(), 1);
+    let set = &mdl.hitbox_sets[0];
+    assert_eq!((set.name.as_str(), set.hitboxes.len()), ("default", 2));
+    let lower = &set.hitboxes[1];
+    assert_eq!((lower.bone, lower.group, lower.name.as_str()), (2, 5, "box1"));
+    assert_eq!((lower.mins, lower.maxs), ([0.0, -1.5, -1.5], [10.0, 1.5, 1.5]));
+    // a model without any
+    let (still, _) = TestRig { hitboxes: Vec::new(), ..arm() }.files();
+    assert!(Mdl::parse(&still).unwrap().hitbox_sets.is_empty());
 }
 
 fn arm_rig() -> Rig {

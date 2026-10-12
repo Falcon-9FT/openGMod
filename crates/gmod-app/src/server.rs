@@ -8,22 +8,26 @@
 //! server's Lua asks of their clients. What is for the host's client the caller takes
 //! ([`ForHost`]): that client is in the same program and sees the server's entities directly.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::rc::Rc;
+
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gmod_fs::Vfs;
 use gmod_lua::net::NetMessage;
 use gmod_lua::sound::SoundEvent;
 use gmod_lua::{ChatMessage, EntityHandle, Map, Output, PlayerInfo, Realm, Runtime, ToClient};
-use gmod_net::{ClientId, ServerEvent};
+use gmod_net::{ClientId, Identity, PublicKey, ServerEvent};
 
-use crate::proto::{self, FileInfo, FromServer, Hello, SnapshotSender, ToServer, Welcome};
+use crate::keys;
+use crate::proto::{self, FileInfo, FromServer, Hello, ServerInfo, SnapshotSender, ToServer, Welcome};
 
 /// How much of a file goes in one message.
 const FILE_PIECE: usize = 1 << 20;
+/// How often a server tells its master servers it is here: they forget it after five minutes.
+const ANNOUNCE_EVERY: Duration = Duration::from_secs(60);
 
 /// A Lua state of the game on the game's files, printing to the terminal and keeping its data
 /// in openGMOD's folder.
@@ -56,9 +60,14 @@ struct Remote {
     id: ClientId,
     addr: SocketAddr,
     name: String,
+    /// Who the player is: their key, proven as they connected.
+    key: PublicKey,
     /// Its player, once it has loaded and joined.
     player: Option<EntityHandle>,
     snapshots: SnapshotSender,
+    /// The entities it was sent, by index, with their serial numbers, while the server has
+    /// them: those out of sight it keeps dormant.
+    known: HashMap<u32, u32>,
     /// The number of the last command taken.
     command: u32,
 }
@@ -82,9 +91,20 @@ pub struct Server {
     net: Option<gmod_net::Server>,
     remotes: Vec<Remote>,
     host: Option<EntityHandle>,
+    /// The key of the player at this computer, who plays with it here already.
+    host_key: Option<PublicKey>,
     files: Option<Files>,
     /// The tick of the last snapshot sent.
     last_tick: i64,
+    /// When it last told the network what it is ([`ServerInfo`]), and what its gamemode is
+    /// called.
+    told: Option<Instant>,
+    title: Option<String>,
+    /// What tells this server from others that answer at the same address ([`ServerInfo`]).
+    instance: u64,
+    /// The master servers it tells it is here, and when it last did.
+    masters: Vec<SocketAddr>,
+    announced: Option<Instant>,
     started: Instant,
 }
 
@@ -105,8 +125,17 @@ impl Server {
             net: None,
             remotes: Vec::new(),
             host: None,
+            host_key: None,
             files: None,
             last_tick: -1,
+            told: None,
+            title: None,
+            instance: {
+                use std::hash::{BuildHasher, RandomState};
+                RandomState::new().hash_one(std::time::SystemTime::now())
+            },
+            masters: Vec::new(),
+            announced: None,
             started: Instant::now(),
         })
     }
@@ -115,12 +144,20 @@ impl Server {
         &self.runtime
     }
 
-    /// Takes clients from the network at `addr` from now on: where it listens.
-    pub fn listen(&mut self, addr: SocketAddr) -> std::io::Result<SocketAddr> {
-        let net = gmod_net::Server::bind(addr)?;
+    /// Takes clients from the network at `addr` from now on, known to them by `identity`:
+    /// where it listens.
+    pub fn listen(&mut self, addr: SocketAddr, identity: Identity) -> std::io::Result<SocketAddr> {
+        let net = gmod_net::Server::bind(addr, identity)?;
         let at = net.local_addr()?;
         self.net = Some(net);
         Ok(at)
+    }
+
+    /// The master servers it tells it is here, for the browsers' internet list: every minute,
+    /// unless `sv_lan` is 1.
+    pub fn set_masters(&mut self, masters: Vec<SocketAddr>) {
+        self.masters = masters;
+        self.announced = None;
     }
 
     /// Whether clients may join over the network.
@@ -128,24 +165,67 @@ impl Server {
         self.net.is_some()
     }
 
-    /// The player at this computer joins.
-    pub fn join_host(&mut self, name: &str) -> Option<EntityHandle> {
-        let player = self.runtime.join(PlayerInfo { name: name.to_string(), ..PlayerInfo::default() })?;
+    /// The player at this computer joins, known by `key` when they have one.
+    pub fn join_host(&mut self, name: &str, key: Option<PublicKey>) -> Option<EntityHandle> {
+        let steam_id64 = key.as_ref().map(keys::steam_id64);
+        let player = self.runtime.join(PlayerInfo { name: name.to_string(), steam_id64, ..PlayerInfo::default() })?;
         self.host = Some(player);
+        self.host_key = key;
         Some(player)
     }
 
-    /// The players connected over the network, by name, with their round trip.
-    pub fn remote_players(&self) -> Vec<(String, Option<std::time::Duration>)> {
+    /// The players connected over the network: their names, their `SteamID`s, and their
+    /// round trips.
+    pub fn remote_players(&self) -> Vec<(String, String, Option<std::time::Duration>)> {
         let net = self.net.as_ref();
-        self.remotes.iter().map(|r| (r.name.clone(), net.and_then(|n| n.client_info(r.id)).map(|(_, rtt)| rtt))).collect()
+        self.remotes
+            .iter()
+            .map(|r| (r.name.clone(), keys::steam_id(keys::steam_id64(&r.key)), net.and_then(|n| n.client_info(r.id)).map(|(_, rtt)| rtt)))
+            .collect()
     }
 
     /// One frame of `seconds`: what the clients sent, the game, and what goes to them.
     pub fn frame(&mut self, seconds: f64) -> ForHost {
         self.receive();
         self.runtime.think(seconds);
+        self.tell_what_it_is();
         self.send()
+    }
+
+    /// What it is, for those who ask (the menu's server browser): once a second.
+    fn tell_what_it_is(&mut self) {
+        if self.net.is_none() || self.told.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.told = Some(Instant::now());
+        let title = self.title.get_or_insert_with(|| self.runtime.gamemode_title()).clone();
+        let rows = self.runtime.scoreboard();
+        let info = ServerInfo {
+            name: self.name.clone(),
+            map: self.map.clone(),
+            gamemode: self.gamemode.clone(),
+            title,
+            players: rows.iter().filter(|r| !r.bot).count() as u32,
+            max_players: self.runtime.max_players(),
+            bots: rows.iter().filter(|r| r.bot).count() as u32,
+            version: proto::VERSION,
+            instance: self.instance,
+            list: rows.into_iter().map(|r| (r.name, r.frags, r.time as f32)).collect(),
+        };
+        if let Some(net) = &mut self.net {
+            net.set_info(&info.encode());
+        }
+        let lan = self.runtime.convar("sv_lan").is_some_and(|v| v.trim().parse::<f64>().is_ok_and(|n| n != 0.0));
+        if !lan && !self.masters.is_empty() && self.announced.is_none_or(|at| at.elapsed() >= ANNOUNCE_EVERY) {
+            self.announced = Some(Instant::now());
+            if let Some(net) = &mut self.net {
+                for master in &self.masters {
+                    if let Err(e) = net.announce(*master) {
+                        eprintln!("master server {master}: {e}");
+                    }
+                }
+            }
+        }
     }
 
     /// Tells every client the server goes, and lets them go.
@@ -167,7 +247,7 @@ impl Server {
         let Some(net) = &mut self.net else { return };
         for event in net.poll(now) {
             match event {
-                ServerEvent::Request { addr, hello } => self.request(addr, &hello),
+                ServerEvent::Request { addr, hello, key } => self.request(addr, &hello, key),
                 ServerEvent::Message { client, data } => match proto::decode::<ToServer>(&data) {
                     Some(message) => self.message(client, message),
                     None => self.drop_client(client, "sent what is no message"),
@@ -178,7 +258,7 @@ impl Server {
     }
 
     /// Someone asks to connect: let in if there is room and they speak our messages.
-    fn request(&mut self, addr: SocketAddr, hello: &[u8]) {
+    fn request(&mut self, addr: SocketAddr, hello: &[u8], key: PublicKey) {
         let now = self.now();
         let Some(hello) = proto::decode::<Hello>(hello) else {
             self.deny(addr, "not an openGMOD client");
@@ -188,6 +268,21 @@ impl Server {
             self.deny(addr, &format!("the server runs openGMOD's messages {}, the client {}", proto::VERSION, hello.version));
             return;
         }
+        if self.host_key == Some(key) {
+            self.deny(
+                addr,
+                "the player of this server's own computer has your key: another openGMOD folder (OPENGMOD_HOME) is another player",
+            );
+            return;
+        }
+        // the same player again (their game went, and came back before the server noticed):
+        // the new connection is theirs
+        if let Some(old) = self.remotes.iter().find(|r| r.key == key).map(|r| r.id) {
+            if let Some(net) = &mut self.net {
+                net.disconnect(old, "you connected again from elsewhere");
+            }
+            self.gone(old, "connected again");
+        }
         let max = self.runtime.max_players() as usize;
         let taken = self.runtime.players().len() + self.remotes.iter().filter(|r| r.player.is_none()).count();
         if taken >= max {
@@ -195,12 +290,31 @@ impl Server {
             return;
         }
         let name: String = self.name.chars().take(64).collect();
-        let welcome = Welcome { server: name, map: self.map.clone(), gamemode: self.gamemode.clone(), max_players: max as u32 };
+        let allow_cs_lua = self.runtime.convar("sv_allowcslua").is_some_and(|v| v.trim().parse::<f64>().is_ok_and(|n| n != 0.0));
+        // the welcome is one packet: a loading screen's address longer than any real one is left out
+        let loading_url = self.runtime.convar("sv_loadingurl").filter(|u| u.len() <= 512).unwrap_or_default();
+        let welcome = Welcome {
+            server: name,
+            map: self.map.clone(),
+            gamemode: self.gamemode.clone(),
+            max_players: max as u32,
+            allow_cs_lua,
+            loading_url,
+        };
         let Some(net) = &mut self.net else { return };
         let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
         let name = clean_name(&hello.name);
         println!("{name} is connecting from {addr}");
-        self.remotes.push(Remote { id, addr, name, player: None, snapshots: SnapshotSender::default(), command: 0 });
+        self.remotes.push(Remote {
+            id,
+            addr,
+            name,
+            key,
+            player: None,
+            snapshots: SnapshotSender::default(),
+            known: HashMap::new(),
+            command: 0,
+        });
         let (lua, content) = {
             let files = self.files();
             (files.lua.clone(), files.content.clone())
@@ -254,8 +368,15 @@ impl Server {
         match message {
             ToServer::Want(paths) => self.send_files(client, &paths),
             ToServer::Ready if player.is_none() => {
-                let (name, addr) = (remote.name.clone(), remote.addr);
-                let joined = self.runtime.join(PlayerInfo { name: name.clone(), address: addr.to_string(), ..PlayerInfo::default() });
+                let (name, addr, steam_id64) = (remote.name.clone(), remote.addr, keys::steam_id64(&remote.key));
+                let joined = self.runtime.join(PlayerInfo {
+                    name: name.clone(),
+                    address: addr.to_string(),
+                    steam_id64: Some(steam_id64),
+                    // its client predicts its movement and weapon
+                    predicts: true,
+                    ..PlayerInfo::default()
+                });
                 match joined {
                     Some(player) => {
                         if let Some(remote) = self.remote(client) {
@@ -268,13 +389,16 @@ impl Server {
                 }
             }
             ToServer::Ready => {}
-            ToServer::Commands { last, commands, ack } => {
+            ToServer::Commands { last, commands, ack, view } => {
                 remote.snapshots.ack(ack);
                 if let Some(player) = player
                     && let Some(cmd) = proto::merge_commands(remote.command, last, &commands)
                 {
                     remote.command = last;
                     self.runtime.set_input(player, cmd);
+                    if view > 0.0 {
+                        self.runtime.set_view_time(player, view);
+                    }
                 }
             }
             ToServer::Command(line) => {
@@ -371,21 +495,52 @@ impl Server {
                 None => {}
             }
         }
+        // each hears what is heard where its player is
         let sounds = self.runtime.take_sounds();
         if !sounds.is_empty() {
-            for (id, _) in &joined {
-                out.push((*id, FromServer::Sounds(sounds.clone()), true));
+            let hearers: Vec<Option<Vec<EntityHandle>>> = sounds.iter().map(|s| self.runtime.hearing(s)).collect();
+            let heard = |player: EntityHandle| -> Vec<gmod_lua::sound::SoundEvent> {
+                sounds
+                    .iter()
+                    .zip(&hearers)
+                    .filter(|(s, h)| h.as_ref().is_none_or(|h| h.contains(&player)) && s.unheard_by() != Some(player))
+                    .map(|(s, _)| s.clone())
+                    .collect()
+            };
+            for (id, player) in &joined {
+                let mine = heard(*player);
+                if !mine.is_empty() {
+                    out.push((*id, FromServer::Sounds(mine), true));
+                }
             }
+            host.sounds = match self.host {
+                Some(player) => heard(player),
+                None => Vec::new(),
+            };
         }
-        host.sounds = sounds;
         // the entities, once a tick has passed
         let tick = (self.runtime.cur_time() / gmod_lua::timer::TICK_INTERVAL).floor() as i64;
         if tick != self.last_tick && !joined.is_empty() {
             self.last_tick = tick;
-            let encoded = Rc::new(proto::encode_entities(&self.runtime.snapshot()));
+            let snapshot = self.runtime.snapshot();
+            let serials: HashMap<u32, u32> = snapshot.entities.iter().map(|e| (e.index, e.serial)).collect();
+            let encoded = proto::encode_entities(&snapshot);
+            let transmission = self.runtime.transmission();
             let time = self.runtime.cur_time();
-            for remote in self.remotes.iter_mut().filter(|r| r.player.is_some()) {
-                let delta = remote.snapshots.delta(&encoded, time, remote.command);
+            for remote in self.remotes.iter_mut() {
+                let Some(player) = remote.player else { continue };
+                // each is sent what its player may see; what it has of the rest it keeps dormant
+                let sent = self.runtime.sent_to(&transmission, player);
+                remote.known.retain(|index, serial| serials.get(index) == Some(serial));
+                let dormant: Vec<(u32, u32)> =
+                    sent.held.iter().filter(|(index, serial)| remote.known.get(index) == Some(serial)).copied().collect();
+                for index in &sent.indices {
+                    if let Some(&serial) = serials.get(index) {
+                        remote.known.insert(*index, serial);
+                    }
+                }
+                let mine = Arc::new(proto::for_player(&encoded, &sent.indices, &dormant));
+                let delta = remote.snapshots.delta(&mine, time, remote.command);
                 out.push((remote.id, FromServer::Snapshot(delta), false));
             }
         }

@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::dir::DirMount;
 use crate::gma::GmaArchive;
@@ -31,11 +32,19 @@ pub enum Backing {
     Memory(MemoryMount),
 }
 
+/// Which paths a mount hides: those it is to have no file at.
+pub type Hide = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// One entry of the search order.
 pub struct Mount {
     /// Search path IDs, upper case.
     pub ids: Vec<String>,
     pub backing: Backing,
+    /// An addon's - a folder of `garrysmod/addons`, a `.gma` - rather than the game's own.
+    pub addon: bool,
+    /// Files it does not show, as if it had none there (normalized paths): the Lua of a
+    /// player's addons on a server that did not send it.
+    hidden: Option<Hide>,
 }
 
 impl fmt::Debug for Mount {
@@ -46,7 +55,22 @@ impl fmt::Debug for Mount {
 
 impl Mount {
     pub fn new(ids: &[&str], backing: Backing) -> Mount {
-        Mount { ids: ids.iter().map(|id| id.to_ascii_uppercase()).collect(), backing }
+        Mount { ids: ids.iter().map(|id| id.to_ascii_uppercase()).collect(), backing, addon: false, hidden: None }
+    }
+
+    /// The mount, as an addon's.
+    pub fn of_addon(mut self) -> Mount {
+        self.addon = true;
+        self
+    }
+
+    /// Hides files: those `hide` says, from now on (`None`: none).
+    pub fn hide(&mut self, hide: Option<Hide>) {
+        self.hidden = hide;
+    }
+
+    fn hides(&self, path: &str) -> bool {
+        self.hidden.as_ref().is_some_and(|hide| hide(path))
     }
 
     /// Whether lookups under `path_id` see this mount. An empty ID sees every mount.
@@ -77,17 +101,21 @@ impl Mount {
 
     /// `Some(is a folder)` if something is at the normalized `path`.
     pub fn contains(&self, path: &str) -> Option<bool> {
-        match &self.backing {
+        let found = match &self.backing {
             Backing::Dir(d) => d.contains(path),
             Backing::Vpk(v) => v.contains(path),
             Backing::Gma(g) => g.contains(path),
             Backing::Zip(z) => z.contains(path),
             Backing::Memory(m) => m.contains(path),
-        }
+        };
+        found.filter(|&dir| dir || !self.hides(path))
     }
 
     /// Reads the file at the normalized `path`.
     pub fn read(&self, path: &str) -> io::Result<Vec<u8>> {
+        if self.hides(path) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("{path} is not there")));
+        }
         match &self.backing {
             Backing::Dir(d) => d.read(path),
             Backing::Vpk(v) => v.read(path),
@@ -99,24 +127,30 @@ impl Mount {
 
     /// The names directly inside the normalized folder `dir`, each with whether it is a folder.
     pub fn list(&self, dir: &str) -> Vec<(String, bool)> {
-        match &self.backing {
+        let mut listed = match &self.backing {
             Backing::Dir(d) => d.list(dir),
             Backing::Vpk(v) => v.list(dir),
             Backing::Gma(g) => g.list(dir),
             Backing::Zip(z) => z.list(dir),
             Backing::Memory(m) => m.list(dir),
+        };
+        if self.hidden.is_some() {
+            listed.retain(|(name, is_dir)| *is_dir || !self.hides(&if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") }));
         }
+        listed
     }
 
     /// Every file in the mount, as normalized paths, sorted.
     pub fn files(&self) -> Vec<String> {
-        match &self.backing {
+        let mut files = match &self.backing {
             Backing::Dir(d) => d.walk(),
             Backing::Vpk(v) => v.entries().iter().map(|e| e.path.clone()).collect(),
             Backing::Gma(g) => g.entries().iter().map(|e| e.path.clone()).collect(),
             Backing::Zip(z) => z.entries().iter().map(|e| e.path.clone()).collect(),
             Backing::Memory(m) => m.paths(),
-        }
+        };
+        files.retain(|f| !self.hides(f));
+        files
     }
 }
 
@@ -160,6 +194,13 @@ impl Vfs {
     /// The mounts in search order.
     pub fn mounts(&self) -> &[Mount] {
         &self.mounts
+    }
+
+    /// Hides files of the addons' mounts: what `hide` says (`None`: shows them all again).
+    pub fn hide_in_addons(&mut self, hide: Option<Hide>) {
+        for mount in self.mounts.iter_mut().filter(|m| m.addon) {
+            mount.hide(hide.clone());
+        }
     }
 
     fn search<'a>(&'a self, path_id: &str) -> impl Iterator<Item = &'a Mount> {
@@ -266,8 +307,25 @@ mod tests {
         let mut vfs = Vfs::new();
         vfs.push(Mount::new(&["game", "mod"], Backing::Vpk(VpkArchive::open(&pack).unwrap())));
         vfs.push(Mount::new(&["GAME"], Backing::Dir(DirMount::new(&loose))));
-        vfs.insert(0, Mount::new(&["GAME", "WORKSHOP"], Backing::Gma(GmaArchive::open(&addon).unwrap())));
+        vfs.insert(0, Mount::new(&["GAME", "WORKSHOP"], Backing::Gma(GmaArchive::open(&addon).unwrap())).of_addon());
         vfs
+    }
+
+    #[test]
+    fn addons_hide_what_they_are_told_to() {
+        let tmp = TempDir::new();
+        let mut vfs = stack(&tmp);
+        // the addon's Lua out of sight: the game's own shows through, the addon's own is gone
+        vfs.hide_in_addons(Some(Arc::new(|path: &str| path.starts_with("lua/"))));
+        assert_eq!(vfs.read("lua/shared.lua", "GAME").unwrap(), b"from the pack");
+        assert!(vfs.read("lua/autorun/addon.lua", "GAME").is_err());
+        assert!(vfs.locate("lua/autorun/addon.lua", "GAME").is_none());
+        assert_eq!(vfs.find("lua/autorun/*.lua", "GAME").files, ["loose.lua", "packed.lua"]);
+        assert!(!vfs.files("WORKSHOP").iter().any(|(f, _)| f.starts_with("lua/")));
+        assert!(vfs.is_dir("lua/autorun", "WORKSHOP"), "its folders stay");
+        // and back
+        vfs.hide_in_addons(None);
+        assert_eq!(vfs.read("lua/autorun/addon.lua", "GAME").unwrap(), b"addon");
     }
 
     #[test]

@@ -163,7 +163,8 @@ pub(crate) fn to_client(lua: &Lua, player: EntityHandle, what: ToClient) {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlayerInfo {
     pub name: String,
-    /// The player's Steam ID, when Steam vouches for them; bots have none.
+    /// The player's `SteamID64`. openGMOD's own, made from the key the player proved is
+    /// theirs as they connected - no Steam vouches for anyone; bots have none.
     pub steam_id64: Option<u64>,
     pub bot: bool,
     /// `IPAddress`: `loopback` for the player of a single-player game.
@@ -171,6 +172,10 @@ pub struct PlayerInfo {
     /// The client's user info (`cl_playermodel` ...): what [`DEFAULT_USER_INFO`] does not
     /// cover, or covers otherwise.
     pub user_info: Vec<(String, String)>,
+    /// The player's client predicts what its commands do - its movement, its weapon - and
+    /// hears its weapon as it predicts it ([`predict`]): a client over the network.
+    #[serde(default)]
+    pub predicts: bool,
 }
 
 /// What the engine keeps for a player, beside what every entity has.
@@ -370,7 +375,7 @@ impl PlayerState {
         }
     }
 
-    /// `SteamID64`: the Steam ID, the bot's number, or 0 for a player Steam does not know.
+    /// `SteamID64`: the player's ID, the bot's number, or 0 for a player with none.
     fn steam_id64(&self) -> u64 {
         if self.info.bot { self.bot_id } else { self.info.steam_id64.unwrap_or(0) }
     }
@@ -552,6 +557,46 @@ fn settings(lua: &Lua, p: &PlayerState, speed: f32) -> Settings {
         noclip_speed: cvar("sv_noclipspeed", 5.0),
         noclip_accelerate: cvar("sv_noclipaccelerate", 5.0),
     }
+}
+
+/// How hard the view springs back to where the player looks, and how much it is held back.
+const PUNCH_SPRING: f32 = 65.0;
+const PUNCH_DAMPING: f32 = 9.0;
+
+/// The view kicks (`ViewPunch`): a recoil, a blow.
+pub(crate) fn view_punch(lua: &Lua, handle: EntityHandle, punch: Angle) {
+    with_player(lua, handle, |_, p| {
+        let v = p.view_punch_velocity;
+        p.view_punch_velocity = Angle::new(v.p + punch.p * 20.0, v.y + punch.y * 20.0, v.r + punch.r * 20.0);
+    });
+}
+
+/// A tick of the view's kick: it moves on, and springs back to nothing.
+fn decay_punch(lua: &Lua, handle: EntityHandle) {
+    let dt = crate::timer::TICK_INTERVAL as f32;
+    with_player(lua, handle, |_, p| {
+        let (punch, velocity) = (p.view_punch, p.view_punch_velocity);
+        if punch == Angle::default() && velocity == Angle::default() {
+            return;
+        }
+        let damping = (1.0 - PUNCH_DAMPING * dt).max(0.0);
+        let axis = |a: f32, v: f32, limit: f32| {
+            let a = (a + v * dt).clamp(-limit, limit);
+            let v = v * damping - a * PUNCH_SPRING * dt;
+            // still enough is still
+            if a.abs() < 0.001 && v.abs() < 0.001 { (0.0, 0.0) } else { (a, v) }
+        };
+        let (pp, vp) = axis(punch.p, velocity.p, 89.0);
+        let (py, vy) = axis(punch.y, velocity.y, 179.0);
+        let (pr, vr) = axis(punch.r, velocity.r, 89.0);
+        p.view_punch = Angle::new(pp, py, pr);
+        p.view_punch_velocity = Angle::new(vp, vy, vr);
+    });
+}
+
+/// The hit group the last bullet that hit a player hit (`LastHitGroup`).
+pub(crate) fn set_last_hit_group(lua: &Lua, handle: EntityHandle, group: i64) {
+    with_player(lua, handle, |_, p| p.last_hit_group = group);
 }
 
 /// The eyes of a player and where they aim.
@@ -820,6 +865,7 @@ pub(crate) fn tick_all(lua: &Lua) {
 /// One tick of a player: the command, movement, the weapon.
 fn tick(lua: &Lua, handle: EntityHandle) {
     let tick = host(lua).clock.ticks.get() as i64;
+    decay_punch(lua, handle);
     if let Some((eye, _)) = eye(lua, handle) {
         with_player(lua, handle, |_, p| p.previous_eye = Some(eye));
     }
@@ -916,7 +962,14 @@ fn tick(lua: &Lua, handle: EntityHandle) {
         pressed &= !(IN_ATTACK | IN_ATTACK2);
     }
     if host(lua).entities.is_valid(active) {
+        // a client that predicted the weapon heard it then: what it makes heard now is the
+        // others' (`SuppressHostEvents`)
+        let predicts = state(lua, handle, |_, p| p.info.predicts).unwrap_or(false);
+        let before = predicts.then(|| host(lua).sounds.unheard_by.replace(Some(handle)));
         weapon::post_frame(lua, active, buttons, pressed);
+        if let Some(before) = before {
+            host(lua).sounds.unheard_by.set(before);
+        }
         crate::physgun::command(lua, handle, active, &UserCmd { buttons, ..cmd.cmd }, pressed);
     }
     if host(lua).entities.is_valid(handle) && self::alive(lua, handle) {
@@ -995,13 +1048,19 @@ fn engine_move(lua: &Lua, handle: EntityHandle, mv: &mut MoveData) {
     }
 }
 
-/// A client moves its own player on from where the server last said it was, as the server
-/// will once the commands it has not answered yet arrive: each for as long as it was the
-/// player's, in the server's ticks - the engine's movement only, without the gamemode's
-/// hooks, which mostly leave it be. What the server then says puts it right. How far the time
-/// of the commands goes into a tick not run yet, 0 to 1: the eyes are drawn that far from
-/// where they were before the last tick ([`PlayerState::previous_eye`]) to where they are.
-pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32)]) -> f32 {
+/// A client moves its own player on from where the server last said it was (at `from`, the
+/// time of the newest snapshot), as the server will once the commands it has not answered yet
+/// arrive: each for as long as it was the player's, in the server's ticks - the engine's
+/// movement, without the gamemode's hooks, which mostly leave it be, and the weapon in hand
+/// (its `Think`, and what the keys held fire), each tick at the `CurTime` the server will run
+/// it at. `played` is how long the commands before these were the player's, all told: a tick
+/// that ends no further into the commands than one before did is predicted again - every
+/// frame, until the server's answer comes - and not for the first time
+/// (`IsFirstTimePredicted`): what it makes heard is heard once. What the server then says
+/// puts it right. The view model plays on to the time of the newest command. How far that
+/// time goes into a tick not run yet, 0 to 1: the eyes are drawn that far from where they were
+/// before the last tick ([`PlayerState::previous_eye`]) to where they are.
+pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32)], from: f64, played: f64) -> f32 {
     let tick = crate::timer::TICK_INTERVAL as f32;
     let still = eye(lua, handle).map(|(eye, _)| eye);
     with_player(lua, handle, |_, p| p.previous_eye = still);
@@ -1012,7 +1071,16 @@ pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32
     let Some(&(mut cmd, first)) = commands.next() else { return 0.0 };
     until += first;
     let total: f32 = until + commands.clone().map(|(_, s)| s).sum::<f32>();
-    while time + tick <= total + 1e-4 {
+    let clock = &host(lua).clock;
+    let outside = clock.cur_time.get();
+    clock.unpredicted.set(Some(outside));
+    // the server's ticks after the one of the snapshot
+    let base = (from / crate::timer::TICK_INTERVAL + 1e-6).floor();
+    let mut ticks = 0.0;
+    let fraction = loop {
+        if time + tick > total + 1e-4 {
+            break ((total - time) / tick).clamp(0.0, 1.0);
+        }
         while time >= until - 1e-4
             && let Some(&(next, seconds)) = commands.next()
         {
@@ -1020,27 +1088,57 @@ pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32
             until += seconds;
         }
         time += tick;
-        let Some((alive, frozen, turning)) =
-            state(lua, handle, |ent, p| (p.alive, ent.flags & fl::FROZEN != 0, cmd.buttons & key::USE != 0 && p.physgun.index.is_some()))
-        else {
-            return 0.0;
-        };
-        if !alive {
-            return 0.0;
+        ticks += 1.0;
+        clock.cur_time.set((base + ticks) * crate::timer::TICK_INTERVAL);
+        let reached = played + f64::from(time);
+        clock.first_prediction.set(reached > clock.predicted_until.get() + 1e-4);
+        if !predict_tick(lua, handle, &cmd) {
+            break 0.0;
         }
-        let before = eye(lua, handle).map(|(eye, _)| eye);
-        with_player(lua, handle, |_, p| {
-            p.previous_eye = before;
-            if !frozen && !turning {
-                p.eye_angles = cmd.view_angles;
-            }
-        });
-        let data = CmdData { cmd, ..CmdData::default() };
-        let Some(mut mv) = movedata(lua, handle, &data, frozen) else { return 0.0 };
-        engine_move(lua, handle, &mut mv);
-        finish_move(lua, handle, &mv);
+        clock.predicted_until.set(clock.predicted_until.get().max(reached));
+    };
+    // what is before the eyes plays on to the time of the newest command
+    clock.cur_time.set(base * crate::timer::TICK_INTERVAL + f64::from(total));
+    for vm in crate::anim::view_models_of(lua, handle) {
+        crate::anim::frame_advance(lua, vm, None);
     }
-    ((total - time) / tick).clamp(0.0, 1.0)
+    clock.cur_time.set(outside);
+    clock.unpredicted.set(None);
+    fraction
+}
+
+/// A tick of a client's own player, predicted: the command's movement, and the weapon in
+/// hand. Whether the player is there to go on with.
+fn predict_tick(lua: &Lua, handle: EntityHandle, cmd: &UserCmd) -> bool {
+    let Some((alive, frozen, turning)) =
+        state(lua, handle, |ent, p| (p.alive, ent.flags & fl::FROZEN != 0, cmd.buttons & key::USE != 0 && p.physgun.index.is_some()))
+    else {
+        return false;
+    };
+    if !alive {
+        return false;
+    }
+    let before = eye(lua, handle).map(|(eye, _)| eye);
+    let Some((buttons, pressed, active)) = with_player(lua, handle, |_, p| {
+        p.previous_eye = before;
+        if !frozen && !turning {
+            p.eye_angles = cmd.view_angles;
+        }
+        p.old_buttons = p.buttons;
+        p.buttons = cmd.buttons;
+        (p.buttons, p.buttons & !p.old_buttons, p.active_weapon)
+    }) else {
+        return false;
+    };
+    decay_punch(lua, handle);
+    let data = CmdData { cmd: *cmd, ..CmdData::default() };
+    let Some(mut mv) = movedata(lua, handle, &data, frozen) else { return false };
+    engine_move(lua, handle, &mut mv);
+    finish_move(lua, handle, &mv);
+    if host(lua).entities.is_valid(active) && host(lua).entities.get(active).is_some_and(|w| !w.dormant) {
+        weapon::post_frame(lua, active, buttons, pressed);
+    }
+    host(lua).entities.is_valid(handle)
 }
 
 /// How heavy a player is to what they push, in kilograms.
@@ -2049,6 +2147,13 @@ pub(crate) fn install(lua: &Lua, realm: crate::Realm) -> mlua::Result<()> {
             }
             Ok(Value::Nil)
         })?;
+        // to every player's console, as `PrintMessage(HUD_PRINTCONSOLE)` (the base gamemode
+        // tells so of a player an NPC killed)
+        def_lib(lua, &globals, "MsgAll", |a| {
+            let text = crate::console::join(a.lua, &a.values, "")?;
+            print_to(a, all(a.lua), &text);
+            Ok(Value::Nil)
+        })?;
         def_lib(lua, &globals, "BroadcastLua", |a| {
             let code = a.string(1)?;
             for player in all(a.lua) {
@@ -2662,10 +2767,8 @@ fn install_view(def: &entity::Def) -> mlua::Result<()> {
     // as Source does it: the punch goes into the view's spring as velocity
     def("ViewPunch", |a| {
         let punch = a.userdata::<Angle>(2, "Angle")?;
-        write(a, |_, p| {
-            let v = p.view_punch_velocity;
-            p.view_punch_velocity = Angle::new(v.p + punch.p * 20.0, v.y + punch.y * 20.0, v.r + punch.r * 20.0);
-        })
+        view_punch(a.lua, this(a)?, punch);
+        Ok(Value::Nil)
     })?;
     def("ViewPunchReset", |a| {
         write(a, |_, p| {
@@ -2743,13 +2846,14 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
         to_client(a.lua, handle, ToClient::Lua(code));
         Ok(Value::Nil)
     })?;
-    for name in ["SendHint", "SuppressHint", "ScreenFade", "LagCompensation", "PlayStepSound", "SprayDecal"] {
+    for name in ["SendHint", "SuppressHint", "ScreenFade", "PlayStepSound", "SprayDecal"] {
         def(name, nothing)?;
     }
     def("AllowImmediateDecalPainting", nothing)?;
     // the gesture slots and the animation events of the player's model
     crate::anim::install_player(def)?;
     crate::pickup::install_player(def)?;
+    crate::lagcomp::install_player(def)?;
     // the base gamemode makes the physics gun's own in Lua (`AddFrozenPhysicsObject`,
     // `PhysgunUnfreeze`, `UnfreezePhysicsObjects`); these stand in without it. Nothing is
     // carried with the gravity gun yet, and there are no vehicles.

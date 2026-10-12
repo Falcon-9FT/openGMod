@@ -255,6 +255,17 @@ pub(crate) fn select_weighted(lua: &Lua, rig: &Rig, act: i64) -> i64 {
     weighted(lua, rig, act, |total| random(lua, total))
 }
 
+/// Whether a rig has a sequence of an activity.
+pub(crate) fn has_activity(lua: &Lua, rig: &Rig, act: i64) -> bool {
+    weighted(lua, rig, act, |_| 0) >= 0
+}
+
+/// How fast what an entity plays carries its model over the ground, at its rate.
+pub(crate) fn ground_speed(lua: &Lua, handle: EntityHandle) -> f32 {
+    let Some((rig, anim)) = animated(lua, handle) else { return 0.0 };
+    sequence_of(&rig, anim.sequence).map_or(0.0, |s| rig.ground_speed(s, &anim.parameters(&rig)) * anim.playback_rate)
+}
+
 /// What of an entity's animation goes with its model.
 fn animated(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Rig>, AnimState)> {
     let (model, anim) = host(lua).entities.get(handle).map(|ent| (ent.model.clone(), ent.anim.clone()))?;
@@ -449,10 +460,12 @@ fn frame_owner(lua: &Lua, handle: EntityHandle) -> EntityHandle {
 }
 
 /// Where an entity's model is drawn and its bones are counted from: its origin, its angles
-/// and its scale; a merged one's are its parent's.
+/// and its scale; a merged one's are its parent's. A player's model is turned as its legs are
+/// (`GetRenderAngles`), and so are its bones, its hitboxes and what is merged onto it.
 pub(crate) fn drawn_at(lua: &Lua, handle: EntityHandle) -> Option<(Vector, Angle, f32)> {
     let owner = frame_owner(lua, handle);
     let (pos, angles) = host(lua).entities.transform(owner)?;
+    let angles = player::state(lua, owner, |_, p| p.render_angles).unwrap_or(angles);
     let scale = host(lua).entities.get(owner).map_or(1.0, |e| e.model_scale);
     Some((pos, angles, scale))
 }
@@ -462,6 +475,14 @@ fn placement(lua: &Lua, handle: EntityHandle) -> Option<BoneMatrix> {
     let (pos, angles, scale) = drawn_at(lua, handle)?;
     let m = Matrix::from_angle(angles).m;
     Some(std::array::from_fn(|r| [m[r][0] * scale, m[r][1] * scale, m[r][2] * scale, [pos.x, pos.y, pos.z][r]]))
+}
+
+/// Where the bones of an entity's model are now in the world.
+pub(crate) fn world_bones(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Rig>, Vec<BoneMatrix>)> {
+    let (rig, bones) = model_bones(lua, handle)?;
+    let place = placement(lua, handle)?;
+    let world = bones.iter().map(|b| rig_pose::multiply(&place, b)).collect();
+    Some((rig, world))
 }
 
 /// Where the bones of an entity's model are now, bone to model: its sequence at its cycle,
@@ -622,6 +643,12 @@ fn view_model_fov(lua: &Lua, viewer: EntityHandle) -> f32 {
         _ => None,
     });
     own.or_else(|| crate::convar::value(lua, "viewmodel_fov").and_then(|v| v.parse().ok())).unwrap_or(54.0)
+}
+
+/// A player's view models that are there.
+pub(crate) fn view_models_of(lua: &Lua, owner: EntityHandle) -> Vec<EntityHandle> {
+    let all = player::state(lua, owner, |_, p| p.view_models).unwrap_or([EntityHandle::NULL; 3]);
+    all.into_iter().filter(|&vm| host(lua).entities.is_valid(vm)).collect()
 }
 
 /// A player's view model `index`.
@@ -877,6 +904,14 @@ fn add_layer(lua: &Lua, handle: EntityHandle, sequence: i64, f: impl FnOnce(&mut
         }
     });
     added
+}
+
+/// Where an attachment of an entity's model (counted from 0) is in the world.
+pub(crate) fn attachment_world(lua: &Lua, handle: EntityHandle, attachment: usize) -> Option<(Vector, Angle)> {
+    let (rig, bones) = model_bones(lua, handle)?;
+    let local = rig.attachment(attachment, &bones)?;
+    let world = to_vmatrix(&rig_pose::multiply(&placement(lua, handle)?, &local));
+    Some((world.translation(), world.angles()))
 }
 
 /// What `GetAttachment` gives: where an attachment is (counted from 1) and its bone; nil for

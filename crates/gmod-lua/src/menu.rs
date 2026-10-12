@@ -2,9 +2,9 @@
 //! that can be mounted, whether a game is running, and the commands that start and leave one
 //! (they go to the program: [`Runtime::take_engine_commands`](crate::Runtime::take_engine_commands)).
 //!
-//! The Steam side - `steamworks`, `serverlist` - is what the menu needs of it without Steam:
-//! the details of workshop items come from Steam's public web API; there are no servers to
-//! list, no favourites, nothing to publish.
+//! The Steam side - `steamworks` - is what the menu needs of it without Steam: the details of
+//! workshop items come from Steam's public web API; there is nothing to publish. The server
+//! browser (`serverlist`) is [`crate::serverlist`]'s.
 
 use std::cell::{Cell, RefCell};
 
@@ -60,6 +60,8 @@ pub(crate) struct Menu {
     pub in_game: Cell<bool>,
     /// Addons were not mounted at all (`-noaddons`), workshop ones were not (`-noworkshop`).
     pub no_addons: Cell<bool>,
+    /// The server browser's questions and favourites.
+    pub servers: crate::serverlist::Servers,
 }
 
 fn def(lua: &Lua, table: &Table, name: &'static str, f: fn(&Args) -> mlua::Result<Value>) -> mlua::Result<()> {
@@ -180,6 +182,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     if realm != Realm::Menu {
         return Ok(());
     }
+    crate::loading::install(lua)?;
     // mounting a game takes a restart in openGMOD: `cfg/mount.cfg` says what is mounted
     def(lua, &engine, "SetMounted", nothing)?;
 
@@ -207,7 +210,6 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         host(a.lua).client.to_server.borrow_mut().push(line.to_string());
         Ok(Value::Nil)
     })?;
-    def(lua, &globals, "CanAddServerToFavorites", |_| Ok(Value::Boolean(false)))?;
     def(lua, &globals, "OpenFolder", nothing)?;
     def(lua, &globals, "SetClipboardText", nothing)?;
     def(lua, &globals, "LoadAddonPresets", |a| {
@@ -302,21 +304,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     }
 
     let serverlist = library(lua, "serverlist")?;
-    def(lua, &serverlist, "Query", |a| {
-        // no servers without Steam's master server: the list is done at once
-        if let Some(Value::Table(data)) = a.values.front()
-            && let Some(finished) = data.get::<Option<mlua::Function>>("Finished")?
-        {
-            call_back(a.lua, finished, MultiValue::new());
-        }
-        Ok(Value::Nil)
-    })?;
-    for name in ["IsCurrentServerFavorite", "IsServerFavorite"] {
-        def(lua, &serverlist, name, |_| Ok(Value::Boolean(false)))?;
-    }
-    for name in ["PingServer", "PlayerList", "AddServerToFavorites", "RemoveServerFromFavorites", "AddCurrentServerToFavorites"] {
-        def(lua, &serverlist, name, nothing)?;
-    }
+    crate::serverlist::install(lua, &serverlist)?;
 
     let chunk = lua.load(MENU_LUA).set_name("=[openGMOD menu]");
     chunk.exec()

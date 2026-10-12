@@ -4,6 +4,7 @@ use super::*;
 use crate::testmap::{BLUE, GREEN, RED, TestBrush, TestMap};
 
 mod overlay;
+mod vis;
 
 fn map() -> Bsp {
     Bsp::parse("test.bsp".into(), Arc::from(testmap::bytes())).unwrap()

@@ -11,6 +11,7 @@
 //! | 80 | eye position, illumination position, hull and view box (`f32`×3 each) |
 //! | 152 | `i32` flags |
 //! | 156 | bones: count, offset (216-byte records) |
+//! | 172 | hitbox sets: count, offset (12-byte records: name, count and offset of 68-byte boxes) |
 //! | 180 | animations: count, offset (100-byte records, [`crate::anim`]) |
 //! | 188 | sequences: count, offset (212-byte records) |
 //! | 204 | textures: count, offset (64-byte records) |
@@ -34,6 +35,8 @@ use crate::anim::{self, Animation, PoseParameter, Sequence};
 use crate::reader::{Reader, invalid};
 
 const BONE_SIZE: usize = 216;
+const HITBOX_SET_SIZE: usize = 12;
+const HITBOX_SIZE: usize = 68;
 const ATTACHMENT_SIZE: usize = 92;
 const FLEX_SIZE: usize = 4;
 const TEXTURE_SIZE: usize = 64;
@@ -50,6 +53,26 @@ pub struct Attachment {
     pub bone: usize,
     /// Where it is in the bone's space: a 3×4 matrix, rotation and translation.
     pub local: [[f32; 4]; 3],
+}
+
+/// A box on a bone where shots hit the model: of a hit group (`HITGROUP_HEAD`...).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hitbox {
+    pub bone: usize,
+    /// `HITGROUP_*`: 0 generic, 1 head, 2 chest, 3 stomach, 4 and 5 the left and right arm, 6
+    /// and 7 the left and right leg, 10 gear.
+    pub group: i32,
+    /// The box in the bone's space.
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+    pub name: String,
+}
+
+/// The boxes a model is hit by, one set of which is in use (the first, unless Lua chooses).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HitboxSet {
+    pub name: String,
+    pub hitboxes: Vec<Hitbox>,
 }
 
 /// A bone of the skeleton, in its rest position.
@@ -125,6 +148,7 @@ pub struct Mdl {
     pub skins: Vec<Vec<usize>>,
     pub body_parts: Vec<BodyPart>,
     pub attachments: Vec<Attachment>,
+    pub hitbox_sets: Vec<HitboxSet>,
     /// The names of what moves the face (flexes).
     pub flexes: Vec<String>,
     pub surface_prop: String,
@@ -271,6 +295,38 @@ impl Mdl {
             })
             .collect::<io::Result<Vec<Attachment>>>()?;
 
+        let set_count = r.count(172, "hitbox set")?;
+        let set_at = r.offset(0, 176)?;
+        r.table(set_at, set_count, HITBOX_SET_SIZE, "hitbox sets")?;
+        let hitbox_sets = (0..set_count)
+            .map(|i| {
+                let at = set_at + i * HITBOX_SET_SIZE;
+                let count = r.count(at + 4, "hitbox")?;
+                let boxes = r.offset(at, at + 8)?;
+                r.table(boxes, count, HITBOX_SIZE, "hitboxes")?;
+                let hitboxes = (0..count)
+                    .map(|k| {
+                        let at = boxes + k * HITBOX_SIZE;
+                        Ok(Hitbox {
+                            bone: r.count(at, "hitbox bone")?,
+                            group: r.i32(at + 4)?,
+                            mins: r.vec3(at + 8)?,
+                            maxs: r.vec3(at + 20)?,
+                            name: match r.i32(at + 32)? {
+                                0 => String::new(),
+                                _ => r.string(r.offset(at, at + 32)?)?,
+                            },
+                        })
+                    })
+                    .collect::<io::Result<Vec<Hitbox>>>()?;
+                let name = match r.i32(at)? {
+                    0 => String::new(),
+                    _ => r.string(r.offset(at, at)?)?,
+                };
+                Ok(HitboxSet { name, hitboxes })
+            })
+            .collect::<io::Result<Vec<HitboxSet>>>()?;
+
         let flex_count = r.count(260, "flex")?;
         let flex_at = r.offset(0, 264)?;
         r.table(flex_at, flex_count, FLEX_SIZE, "flexes")?;
@@ -334,6 +390,7 @@ impl Mdl {
             skins,
             body_parts,
             attachments,
+            hitbox_sets,
             flexes,
             surface_prop,
             key_values,

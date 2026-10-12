@@ -28,7 +28,7 @@ pub mod vtx;
 pub mod vvd;
 
 pub use anim::{Animation, Local, PoseParameter, Sequence};
-pub use mdl::{Attachment, BodyPart, Bone, Mdl, SubModel};
+pub use mdl::{Attachment, BodyPart, Bone, Hitbox, HitboxSet, Mdl, SubModel};
 pub use mesh::{Batch, StaticMesh};
 pub use phy::{Convex, Phy, RagdollConstraint, Solid};
 pub use pose::{Layer, Matrix, Rig};

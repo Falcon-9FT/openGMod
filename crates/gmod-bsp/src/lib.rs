@@ -5,7 +5,8 @@
 //! it points to. Any lump may be LZMA-compressed (`bspzip -repack`); see [`lumps`]. The
 //! pakfile lump is a zip of the files the map brings along ([`Bsp::pakfile`]); the game lump
 //! holds the static props ([`props`]). What is solid - the brushes and the BSP trees over them -
-//! and the sweeps of boxes and rays through it are in [`collision`].
+//! and the sweeps of boxes and rays through it are in [`collision`]; what is seen and heard
+//! from where, in [`Visibility`].
 //!
 //! A map is read into memory as a whole: maps from workshop addons live inside `.gma` files
 //! and are no files of their own.
@@ -27,15 +28,18 @@ mod math;
 pub mod mesh;
 pub mod overlay;
 pub mod props;
+mod vis;
 
 pub use collision::{Collision, SolidShapes, Trace, mask};
 pub use entities::{Entity, parse_entities};
 pub use light::{AmbientSample, LightCube, LightKind, WorldLight};
 pub use lighting::{luxels, rgbe_to_linear};
 pub use lumps::{
-    Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Overlay, Plane, TexData, TexInfo, contents, surf,
+    Area, AreaPortal, Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Overlay, Plane, TexData, TexInfo,
+    contents, surf,
 };
 pub use props::{GameLump, StaticProp, StaticProps};
+pub use vis::{MAX_ENTITY_CLUSTERS, Visibility, has as row_has};
 
 use lumps::{index, invalid, lump_bytes, records};
 
@@ -75,6 +79,9 @@ pub struct Bsp {
     pub cubemaps: Vec<Cubemap>,
     /// The `info_overlay`s, drawn over the faces they name ([`mesh`]).
     pub overlays: Vec<Overlay>,
+    /// The areas of the world and the portals between them ([`Visibility`]).
+    pub areas: Vec<Area>,
+    pub area_portals: Vec<AreaPortal>,
     pub game_lumps: Vec<GameLump>,
     pub static_props: StaticProps,
     bytes: Arc<[u8]>,
@@ -153,6 +160,10 @@ impl Bsp {
         let cubemaps = records(&lump(index::CUBEMAPS, "cubemaps")?, Cubemap::SIZE, "cubemaps", Cubemap::parse)?;
         // overlays only paint: a lump that does not add up costs them, not the map
         let overlays = records(&lump(index::OVERLAYS, "overlays")?, Overlay::SIZE, "overlays", Overlay::parse).unwrap_or_default();
+        // as overlays: areas only cull what is sent, a map whose do not add up keeps them all open
+        let areas = records(&lump(index::AREAS, "areas")?, Area::SIZE, "areas", Area::parse).unwrap_or_default();
+        let area_portals =
+            records(&lump(index::AREA_PORTALS, "area portals")?, AreaPortal::SIZE, "area portals", AreaPortal::parse).unwrap_or_default();
         let lighting = lump(index::LIGHTING, "lighting")?.into_owned();
         let lighting_hdr = lump(index::LIGHTING_HDR, "HDR lighting")?.into_owned();
 
@@ -204,6 +215,8 @@ impl Bsp {
             disp_verts,
             cubemaps,
             overlays,
+            areas,
+            area_portals,
             game_lumps,
             static_props,
             bytes,
@@ -323,6 +336,11 @@ impl Bsp {
     pub fn face_material(&self, face: &Face) -> Option<&str> {
         let info = self.texinfo.get(usize::try_from(face.texinfo).ok()?)?;
         self.materials.get(usize::try_from(info.texdata).ok()?).map(String::as_str)
+    }
+
+    /// The map's bytes, as read.
+    pub(crate) fn raw(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// The `worldspawn` entity.

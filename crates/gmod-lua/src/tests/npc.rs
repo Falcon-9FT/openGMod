@@ -311,13 +311,14 @@ fn npcs_keep_relationships_and_schedules() {
              and N:GetSquad() == 'alpha' and N:GetLastPosition() == Vector(1, 2, 3) and N:GetTarget() == Z
              and N:GetEnemy() == C and N:HasEnemyMemory(C) and N:GetEnemyLastKnownPos(C) == Vector(5, 6, 7)
              and N:GetKnownEnemies()[1] == C and N:HasCondition(10) and not N:HasCondition(11)
-             and N:NavSetGoal(Vector(0, 0, 0)) == false and N:NavSetRandomGoal(100, Vector(1, 0, 0)) == false
-             and not N:IsMoving()"
+             and N:NavSetGoal(Vector(0, 0, 0)) and N:IsMoving() and N:IsGoalActive()
+             and N:GetCurrentWaypointPos() == Vector(0, 0, 0) and N:GetPathDistanceToGoal() == 200"
     ));
     // an activity plays its sequence
     assert!(g.eval::<bool>(
         "N:SetActivity(ACT_WALK) N:StopMoving() N:AlertSound() N:ClearEnemyMemory()
          return N:GetActivity() == ACT_WALK and N:GetSequence() == 1 and not N:GetEnemy():IsValid() and not N:HasEnemyMemory(C)
+             and not N:IsMoving() and not N:IsGoalActive()
              and N:GetSquad() == 'alpha' and FindMetaTable('NPC').Give ~= nil"
     ));
     assert!(g.messages().is_empty(), "{:?}", g.messages());
@@ -330,11 +331,12 @@ fn npcs_face_the_players_they_hate() {
     g.eval::<()>(
         "Z = ents.Create('npc_zombie') Z:SetPos(Vector(0, 300, 0)) Z:SetAngles(Angle(0, 0, 0)) Z:Spawn()
          N = ents.Create('npc_citizen') N:SetPos(Vector(-60, 300, 0)) N:SetAngles(Angle(0, 0, 0)) N:Spawn()
-         BEHIND = ents.Create('npc_zombie') BEHIND:SetPos(Vector(300, 0, 0)) BEHIND:Spawn()",
+         BEHIND = ents.Create('npc_zombie') BEHIND:SetPos(Vector(300, 0, 0)) BEHIND:Spawn()
+         N:AddRelationship('npc_zombie D_NU 0') Z:AddRelationship('npc_citizen D_NU 0')",
     );
     g.runtime.think(1.0);
-    // the zombie found the player and turned to face them; the citizen likes them; the
-    // zombie behind the wall did not see them
+    // the zombie found the player and turned to face them (going for them); the citizen likes
+    // them, and was told to leave zombies be; the zombie behind the wall did not see them
     assert!(g.eval::<bool>(
         "return Z:GetEnemy() == Entity(1) and Z:GetNPCState() == NPC_STATE_COMBAT and math.abs(Z:GetAngles().y % 360 - 270) < 1
              and not N:GetEnemy():IsValid() and N:GetAngles().y == 0
@@ -432,4 +434,211 @@ fn the_client_keeps_what_a_dead_npc_dropped() {
     ));
     assert!(server.messages().is_empty(), "{:?}", server.messages());
     assert!(client.messages().is_empty(), "{:?}", client.messages());
+}
+
+/// A map for walking: a floor with its top at 0, a wall along y from x -16 to 16 with a way
+/// round past y 200, a step 16 high from x 300 to 600 and y -400 to -200, a block 64 high from
+/// x 300 to 600 and y 400 to 600; ground nodes either side of the way round and on the right,
+/// an air node, and a spawn point far off.
+fn walking_map() -> Map {
+    use gmod_bsp::testmap::{TestBrush, TestMap};
+    let brushes = vec![
+        TestBrush::cuboid([-1024.0, -1024.0, -64.0], [1024.0, 1024.0, 0.0]),
+        TestBrush::cuboid([-16.0, -1024.0, 0.0], [16.0, 200.0, 256.0]),
+        TestBrush::cuboid([300.0, -400.0, 0.0], [600.0, -200.0, 16.0]),
+        TestBrush::cuboid([300.0, 400.0, 0.0], [600.0, 600.0, 64.0]),
+    ];
+    let test = TestMap { models: vec![brushes], ..TestMap::default() };
+    let bsp = gmod_bsp::Bsp::parse("walk.bsp".into(), Arc::from(test.bytes())).unwrap();
+    let texture =
+        |info: &gmod_bsp::TexInfo| usize::try_from(info.texdata).ok().and_then(|i| bsp.materials.get(i)).cloned().unwrap_or_default();
+    let pairs = |list: &[(&str, &str)]| list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    Map {
+        name: "gm_walking".into(),
+        entities: vec![
+            pairs(&[("classname", "worldspawn")]),
+            pairs(&[("classname", "info_player_start"), ("origin", "-800 -800 0"), ("angles", "0 90 0")]),
+            pairs(&[("classname", "info_node"), ("origin", "-150 350 8")]),
+            pairs(&[("classname", "info_node"), ("origin", "150 350 8")]),
+            pairs(&[("classname", "info_node_hint"), ("origin", "500 0 8"), ("hinttype", "0")]),
+            pairs(&[("classname", "info_node_air"), ("origin", "0 0 400")]),
+        ],
+        brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
+        collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
+        textures: bsp.texinfo.iter().map(texture).collect(),
+        visibility: gmod_bsp::Visibility::new(&bsp).map(Arc::new),
+    }
+}
+
+/// Thinks half a second at a time until `done` (Lua) is true, for at most `seconds`.
+fn think_until(g: &Game, done: &str, seconds: f64) -> bool {
+    let mut left = seconds;
+    while left > 0.0 {
+        if g.eval::<bool>(done) {
+            return true;
+        }
+        g.runtime.think(0.5);
+        left -= 0.5;
+    }
+    g.eval::<bool>(done)
+}
+
+#[test]
+fn npcs_find_their_way_by_the_nodes() {
+    // where it went: never through the wall, and how far round
+    let g = npc_game_on(
+        "HOOKS.Tick = function()
+             if N and N:IsValid() then
+                 local p = N:GetPos()
+                 if p.y < 200 and math.abs(p.x) < 29 then THROUGH = true end
+                 FARTHEST = math.max(FARTHEST or -1e9, p.y)
+             end
+         end",
+        &walking_map(),
+    );
+    // the nodes are no entities
+    assert!(g.eval::<bool>(
+        "return #ents.FindByClass('info_node') == 0 and #ents.FindByClass('info_node_hint') == 0
+             and #ents.FindByClass('info_node_air') == 0"
+    ));
+    // told to go to the other side of the wall, it goes round by the nodes
+    assert!(g.eval::<bool>(
+        "N = ents.Create('npc_citizen') N:SetPos(Vector(-150, -100, 0)) N:Spawn()
+         N:SetLastPosition(Vector(150, -100, 0)) N:SetSchedule(SCHED_FORCED_GO_RUN)
+         return N:GetCurrentSchedule() == SCHED_FORCED_GO_RUN"
+    ));
+    g.runtime.think(1.0);
+    // the model has no run: it walks, at the speed of its own
+    assert!(g.eval::<bool>(
+        "return N:IsMoving() and N:IsGoalActive() and N:GetCurrentSchedule() == SCHED_FORCED_GO_RUN
+             and N:GetActivity() == ACT_WALK and N:GetMovementActivity() == ACT_RUN and N:GetSequence() == 1
+             and N:GetCurrentWaypointPos():IsEqualTol(Vector(-150, 350, 0), 1)
+             and N:GetNextWaypointPos():IsEqualTol(Vector(150, 350, 0), 1)
+             and N:GetPos().x < -100 and N:GetPos().y > -40 and N:GetPos().y < -20
+             and N:GetMoveVelocity():IsEqualTol(Vector(0, 75, 0), 1) and N:GetIdealMoveSpeed() == 75
+             and math.abs(N:GetPathDistanceToGoal() - ((350 - N:GetPos().y) + 300 + 450)) < 1 and math.abs(N:GetAngles().y - 90) < 1"
+    ));
+    assert!(think_until(&g, "return not N:IsMoving()", 20.0));
+    assert!(g.eval::<bool>(
+        "return N:GetPos():IsEqualTol(Vector(150, -100, 0), 13) and not N:IsGoalActive()
+             and N:GetCurrentSchedule() == SCHED_IDLE_STAND and N:GetActivity() == ACT_IDLE
+             and not THROUGH and FARTHEST > 300 and N:GetMoveVelocity() == Vector(0, 0, 0)"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn npcs_walk_up_steps_and_not_up_walls() {
+    let g = npc_game_on("", &walking_map());
+    // up a step, by a goal of Lua's
+    assert!(g.eval::<bool>(
+        "S = ents.Create('npc_citizen') S:SetPos(Vector(250, -300, 0)) S:Spawn()
+         return S:NavSetGoal(Vector(450, -300, 16))"
+    ));
+    assert!(think_until(&g, "return not S:IsMoving()", 6.0));
+    assert!(g.eval::<bool>("return S:GetPos():IsEqualTol(Vector(450, -300, 16), 13) and math.abs(S:GetPos().z - 16) < 0.1"));
+    // not onto a block a man's height, nor into a wall; what it could not get to it remembers
+    assert!(g.eval::<bool>(
+        "return not S:NavSetGoal(Vector(450, 500, 64)) and not S:NavSetGoal(Vector(0, -500, 50)) and not S:IsGoalActive()
+             and not S:IsUnreachable(game.GetWorld())"
+    ));
+    // wandering: to the hint node, the only one in reach, then it stands
+    assert!(g.eval::<bool>(
+        "S:SetSchedule(SCHED_IDLE_WANDER)
+         return S:GetCurrentSchedule() == SCHED_IDLE_WANDER"
+    ));
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("return S:IsMoving() and S:GetCurrentWaypointPos():IsEqualTol(Vector(500, 0, 0), 1)"));
+    assert!(think_until(&g, "return S:GetCurrentSchedule() == SCHED_IDLE_STAND", 8.0));
+    assert!(g.eval::<bool>("return S:GetPos():IsEqualTol(Vector(500, 0, 0), 13) and not S:IsMoving()"));
+    // one that does not move goes nowhere; StopMoving stops one that does
+    assert!(g.eval::<bool>(
+        "T = ents.Create('npc_turret_floor') T:SetPos(Vector(-500, -500, 0)) T:Spawn()
+         local fixed = not T:NavSetGoal(Vector(-400, -500, 0)) and T:GetNavType() == NAV_NONE
+         S:NavSetGoalPos(Vector(500, 300, 0)) local going = S:IsMoving()
+         S:StopMoving()
+         return fixed and going and not S:IsMoving() and S:GetNavType() == NAV_GROUND"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn zombies_go_for_players_and_strike() {
+    let g = npc_game(
+        "HOOKS.EntityTakeDamage = function(target, info)
+             if target:IsPlayer() then
+                 HURT = (HURT or 0) + info:GetDamage() BY = info:GetAttacker() KIND = info:GetDamageType()
+             end
+         end",
+    );
+    g.runtime.join(alice()).unwrap();
+    g.eval::<()>("Z = ents.Create('npc_zombie') Z:SetPos(Vector(0, 400, 0)) Z:Spawn()");
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>(
+        "return Z:GetEnemy() == Entity(1) and Z:GetCurrentSchedule() == SCHED_CHASE_ENEMY and Z:IsMoving()
+             and Z:GetPos().y < 350 and Z:GetActivity() == ACT_WALK and HURT == nil"
+    ));
+    assert!(think_until(&g, "return HURT ~= nil", 8.0));
+    assert!(g.eval::<bool>(
+        "return HURT == 10 and BY == Z and KIND == DMG_SLASH and Entity(1):Health() == 90
+             and Z:GetCurrentSchedule() == SCHED_MELEE_ATTACK1 and not Z:IsMoving()
+             and Z:GetPos():Distance(Entity(1):GetPos()) < 72"
+    ));
+    // a skill ConVar sets how hard, and it strikes again a while later
+    g.runtime.run_string("CreateConVar('sk_zombie_dmg_one_slash', '25')", "skill").unwrap();
+    assert!(think_until(&g, "return HURT > 10", 3.0));
+    assert!(g.eval::<bool>("return HURT == 35 and Entity(1):Health() == 65"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn soldiers_shoot_in_bursts_and_reload() {
+    let g = npc_game(
+        "HOOKS.EntityTakeDamage = function(target, info)
+             if target:IsPlayer() then HURT = (HURT or 0) + info:GetDamage() BY = info:GetAttacker() KIND = info:GetDamageType() end
+         end
+         HOOKS.EntityFireBullets = function(shooter, bullets)
+             if shooter == C then SHOTS = (SHOTS or 0) + 1 FROM = bullets.Src end
+         end",
+    );
+    g.runtime.join(alice()).unwrap();
+    g.eval::<()>(
+        "C = ents.Create('npc_combine_s') C:SetPos(Vector(0, 600, 0)) C:SetAngles(Angle(0, -90, 0)) C:Spawn()
+         W = C:Give('weapon_pistol') C:SetCurrentWeaponProficiency(WEAPON_PROFICIENCY_PERFECT) W:SetClip1(1)",
+    );
+    // it sees the player, shoots its round and reloads, standing where it is
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>(
+        "return C:GetEnemy() == Entity(1) and SHOTS == 1 and W:Clip1() == 0 and C:GetCurrentSchedule() == SCHED_RELOAD
+             and FROM == C:GetShootPos() and C:GetPos() == Vector(0, 600, 0)"
+    ));
+    g.runtime.think(1.5);
+    assert!(g.eval::<bool>("return W:Clip1() > 0 and W:Clip1() <= 18"));
+    // and shoots on in bursts, the player hurt by its bullets
+    g.runtime.think(4.0);
+    assert!(g.eval::<bool>(
+        "return SHOTS >= 6 and SHOTS <= 17 and HURT ~= nil and HURT % 3 == 0 and BY == C and KIND == DMG_BULLET
+             and C:GetCurrentSchedule() == SCHED_RANGE_ATTACK1 and C:GetPos() == Vector(0, 600, 0)"
+    ));
+    // not through a friend: it goes to shoot from elsewhere
+    g.eval::<()>("F = ents.Create('npc_combine_s') F:SetPos(Vector(0, 300, 0)) F:Spawn() SHOTS = 0");
+    g.runtime.think(0.3);
+    assert!(g.eval::<bool>("return SHOTS == 0 and C:GetCurrentSchedule() == SCHED_CHASE_ENEMY and C:IsMoving()"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn npcs_fight_each_other() {
+    let g = npc_game("");
+    g.eval::<()>(
+        "R = ents.Create('npc_citizen') R:SetPos(Vector(-500, -500, 0)) R:Spawn() R:Give('weapon_pistol')
+         R:SetCurrentWeaponProficiency(WEAPON_PROFICIENCY_PERFECT)
+         Z = ents.Create('npc_zombie') Z:SetPos(Vector(-500, -100, 0)) Z:Spawn()",
+    );
+    g.runtime.think(3.0);
+    assert!(g.eval::<bool>(
+        "return R:GetEnemy() == Z and Z:GetEnemy() == R and Z:Health() < 50 and Z:Health() % 3 == 2
+             and R:GetCurrentSchedule() == SCHED_RANGE_ATTACK1 and Z:GetPos().y < -200"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
 }

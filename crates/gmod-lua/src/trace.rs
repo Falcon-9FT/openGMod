@@ -13,7 +13,10 @@
 //! What was hit is made of a surface ([`crate::surfaceprops`]): the map's material's
 //! `$surfaceprop`, an entity's body's; `SurfaceProps` is its number, `MatType` its `MAT_*`.
 //!
-//! Not yet: hit boxes and hit groups, the `ShouldCollide` hook.
+//! A trace for hitboxes (`CONTENTS_HITBOX`, in `MASK_SHOT`) goes through those of players and
+//! NPCs ([`crate::hitbox`]): `HitBox` and `HitGroup` say which it hit.
+//!
+//! Not yet: the `ShouldCollide` hook.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -173,6 +176,9 @@ pub(crate) struct Hit {
     pub displacement: bool,
     /// The part of a ragdoll hit; 0 for anything else.
     pub physics_bone: usize,
+    /// The hitbox hit and its group (`HITGROUP_*`), for a trace for hitboxes.
+    pub hitbox: usize,
+    pub hit_group: i32,
 }
 
 impl Hit {
@@ -223,14 +229,15 @@ fn allowed(lua: &Lua, sweep: &Sweep, handle: EntityHandle) -> bool {
 
 /// Where a segment enters a box: the fraction, the normal of the face, or that it starts
 /// inside (and the fraction where it leaves, 1 when it never does).
-struct BoxHit {
-    fraction: f32,
-    normal: Vector,
-    start_solid: bool,
-    left: f32,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoxHit {
+    pub fraction: f32,
+    pub normal: Vector,
+    pub start_solid: bool,
+    pub left: f32,
 }
 
-fn through_box(start: Vector, end: Vector, lo: Vector, hi: Vector) -> Option<BoxHit> {
+pub(crate) fn through_box(start: Vector, end: Vector, lo: Vector, hi: Vector) -> Option<BoxHit> {
     let (mut enter, mut leave) = (f32::MIN, f32::MAX);
     let mut normal = Vector::default();
     let axes = [(start.x, end.x, lo.x, hi.x), (start.y, end.y, lo.y, hi.y), (start.z, end.z, lo.z, hi.z)];
@@ -278,6 +285,8 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
         surface_flags: 0,
         displacement: false,
         physics_bone: 0,
+        hitbox: 0,
+        hit_group: 0,
     };
     let collision = host(lua).world.collision.borrow().clone();
     if let Some(collision) = collision.filter(|_| !sweep.ignore_world) {
@@ -317,6 +326,8 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
                 surface_flags: t.surface_flags,
                 displacement: t.displacement,
                 physics_bone: 0,
+                hitbox: 0,
+                hit_group: 0,
             };
         }
     }
@@ -347,7 +358,15 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
         let Some((pos, angles)) = host(lua).entities.transform(handle) else { continue };
         let Some((mins, maxs)) = host(lua).entities.get(handle).map(|ent| (ent.mins, ent.maxs)) else { continue };
         let mut part = 0;
-        let found = if crate::ragdoll::is_ragdoll(lua, handle) {
+        let mut hitbox = None;
+        let found = if !hull && sweep.mask & contents::HITBOX != 0 && crate::hitbox::traced(lua, handle) {
+            // its hitboxes where its bones are, not its box: between the legs is nothing
+            crate::hitbox::trace(lua, handle, sweep.start, sweep.end).map(|h| {
+                hitbox = Some((h.hitbox, h.group));
+                part = crate::ragdoll::part_of_bone(lua, handle, h.bone as i64).max(0) as usize;
+                BoxHit { fraction: h.fraction, normal: h.normal, start_solid: h.start_solid, left: if h.start_solid { 1.0 } else { 0.0 } }
+            })
+        } else if crate::ragdoll::is_ragdoll(lua, handle) {
             let Some((lo, hi)) = crate::ragdoll::world_bounds(lua, handle) else { continue };
             if hull {
                 through_box(sweep.start, sweep.end, lo - sweep.maxs, hi - sweep.mins)
@@ -417,6 +436,8 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
             surface_flags: 0,
             displacement: false,
             physics_bone: part,
+            hitbox: hitbox.map_or(0, |(h, _)| h),
+            hit_group: hitbox.map_or(0, |(_, g)| g),
         };
         if found.start_solid {
             break;
@@ -441,6 +462,19 @@ pub(crate) fn in_world(lua: &Lua, point: Vector) -> bool {
     inside && collision.point_contents(array(point)) & contents::SOLID == 0
 }
 
+/// What was hit is made of: its surface's number and the surface (`default` for nothing).
+pub(crate) fn surface_of(lua: &Lua, hit: &Hit) -> (usize, gmod_material::SurfaceProp) {
+    let world = hit.entity == EntityHandle::WORLD;
+    let found = if !hit.hit() {
+        None
+    } else if world && !hit.texture.starts_with("**") {
+        Some(crate::surfaceprops::of_material(lua, &hit.texture))
+    } else {
+        crate::physics::material_of(lua, hit.entity).map(|name| crate::surfaceprops::named(lua, &name))
+    };
+    found.unwrap_or_else(|| crate::surfaceprops::named(lua, "default"))
+}
+
 /// The `TraceResult` table of a hit.
 pub(crate) fn result(lua: &Lua, sweep: &Sweep, hit: &Hit, out: Option<Table>) -> mlua::Result<Table> {
     let t = match out {
@@ -452,8 +486,8 @@ pub(crate) fn result(lua: &Lua, sweep: &Sweep, hit: &Hit, out: Option<Table>) ->
     t.raw_set("Fraction", hit.fraction)?;
     t.raw_set("FractionLeftSolid", hit.fraction_left_solid)?;
     t.raw_set("Hit", hit.hit())?;
-    t.raw_set("HitBox", 0)?;
-    t.raw_set("HitGroup", 0)?;
+    t.raw_set("HitBox", hit.hitbox)?;
+    t.raw_set("HitGroup", hit.hit_group)?;
     t.raw_set("HitNoDraw", hit.surface_flags & surf::NODRAW != 0)?;
     t.raw_set("HitNonWorld", hit.hit() && !world)?;
     t.raw_set("HitNormal", entity::vector(lua, hit.normal)?)?;

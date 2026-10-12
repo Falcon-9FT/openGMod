@@ -272,9 +272,10 @@ fn a_client_moves_its_player_as_the_server_will() {
     let place = |runtime: &Runtime| runtime.position(alice).unwrap();
     // walking along y, then running into the wall at x 100 at an angle
     for (cmd, seconds) in [(walking(90.0, 0), 0.3), (walking(30.0, crate::player::key::SPEED), 0.6)] {
-        client.runtime.apply_snapshot(&server.runtime.snapshot());
+        let snapshot = server.runtime.snapshot();
+        client.runtime.apply_snapshot(&snapshot);
         let ticks = run(cmd, seconds);
-        let fraction = client.runtime.predict(alice, &[(cmd, ticks as f32 * tick as f32)]);
+        let fraction = client.runtime.predict(alice, &[(cmd, ticks as f32 * tick as f32)], snapshot.time, 0.0);
         let (on_server, predicted) = (place(&server.runtime), place(&client.runtime));
         assert!((on_server - predicted).length() < 0.05, "{on_server:?} {predicted:?}");
         assert!(fraction < 0.01, "{fraction}");
@@ -282,7 +283,89 @@ fn a_client_moves_its_player_as_the_server_will() {
     assert!(place(&client.runtime).x > 80.0 && place(&client.runtime).x < 100.0, "against the wall: {:?}", place(&client.runtime));
     // the eyes look where the commands said; half a tick more is drawn half way into it
     assert!((client.runtime.view(alice).unwrap().angles.y - 30.0).abs() < 0.01);
-    client.runtime.apply_snapshot(&server.runtime.snapshot());
-    let fraction = client.runtime.predict(alice, &[(walking(90.0, 0), 1.5 * tick as f32)]);
+    let snapshot = server.runtime.snapshot();
+    client.runtime.apply_snapshot(&snapshot);
+    let fraction = client.runtime.predict(alice, &[(walking(90.0, 0), 1.5 * tick as f32)], snapshot.time, 0.0);
     assert!((fraction - 0.5).abs() < 0.01, "{fraction}");
+}
+
+/// A SWEP whose shot is heard, takes a round and waits half a second; it counts how often it
+/// fires, and how often for the first time.
+const TESTER_LUA: &str = "
+    sound.Add({ name = 'Test.Shot', sound = 'test/shot.wav' })
+    weapons.list.weapon_tester = {
+        Primary = { ClipSize = 5, DefaultClip = 5, Ammo = 'Pistol' },
+        Secondary = { ClipSize = -1, DefaultClip = -1, Ammo = 'none' },
+        PrimaryAttack = function(self)
+            if self:Clip1() <= 0 then return end
+            RUNS = (RUNS or 0) + 1
+            if IsFirstTimePredicted() then FIRST = (FIRST or 0) + 1 end
+            SHOT_AT = CurTime()
+            self:EmitSound('Test.Shot')
+            self:SetClip1(self:Clip1() - 1)
+            self:SetNextPrimaryFire(CurTime() + 0.5)
+        end,
+    }
+";
+
+#[test]
+fn a_client_fires_its_weapon_as_the_server_will() {
+    let server = server_for(2);
+    server.runtime.run_string(TESTER_LUA, "tester").unwrap();
+    let alice = server.runtime.join(PlayerInfo { predicts: true, ..named("Alice") }).unwrap();
+    let bob = server.runtime.join(named("Bob")).unwrap();
+    server.runtime.run_string("Entity(1):Give('weapon_tester') Entity(1):SelectWeapon('weapon_tester')", "give").unwrap();
+    server.runtime.think(0.1);
+    server.runtime.take_sounds();
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let client = game_with(Realm::Client, &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/box.mdl", &mdl)]);
+    client.runtime.init();
+    client.runtime.run_string(TESTER_LUA, "tester").unwrap();
+    client.runtime.spawn_map(&player_map());
+    let tick = crate::timer::TICK_INTERVAL;
+    let attack = UserCmd { buttons: crate::player::key::ATTACK, ..UserCmd::default() };
+    let clip = |runtime: &Runtime| runtime.view(alice).and_then(|v| v.weapon).map(|w| (w.class, w.clip));
+    use crate::sound::{SoundEvent, SoundPlay};
+    let shots = |sounds: Vec<SoundEvent>| -> Vec<SoundPlay> {
+        sounds.into_iter().filter_map(|e| if let SoundEvent::Play(p) = e { Some(p) } else { None }).collect()
+    };
+
+    // the client fires at once, from where the server last was: every frame again until the
+    // server answers, the first time once - heard once, the round gone, the next shot waiting
+    let snapshot = server.runtime.snapshot();
+    let outside = snapshot.time;
+    for _ in 0..3 {
+        client.runtime.apply_snapshot(&snapshot);
+        client.runtime.predict(alice, &[(attack, 3.0 * tick as f32)], snapshot.time, 0.0);
+        assert_eq!(clip(&client.runtime), Some(("weapon_tester".into(), 4)));
+    }
+    assert_eq!(client.eval::<(i64, i64)>("return RUNS, FIRST"), (3, 1));
+    assert_eq!(shots(client.runtime.take_sounds()).len(), 1, "heard once");
+    assert_eq!(client.runtime.cur_time(), outside, "the time outside the prediction is as it was");
+
+    // the server fires at the time the client did; the others hear it, Alice heard it already
+    server.runtime.set_input(alice, attack);
+    server.runtime.think(3.0 * tick);
+    assert_eq!(server.eval::<f64>("return SHOT_AT"), client.eval::<f64>("return SHOT_AT"));
+    assert_eq!(clip(&server.runtime), Some(("weapon_tester".into(), 4)));
+    let heard = shots(server.runtime.take_sounds());
+    assert!(heard.len() == 1 && heard[0].unheard_by == Some(alice), "{heard:?}");
+
+    // its answer here, the shot is done with: held down, the weapon waits for its next
+    let answered = server.runtime.snapshot();
+    client.runtime.apply_snapshot(&answered);
+    client.runtime.predict(alice, &[(attack, 3.0 * tick as f32)], answered.time, 3.0 * tick);
+    assert_eq!(client.eval::<(i64, i64)>("return RUNS, FIRST"), (3, 1));
+    assert_eq!(clip(&client.runtime), Some(("weapon_tester".into(), 4)));
+    assert!(shots(client.runtime.take_sounds()).is_empty());
+
+    // one whose client does not predict (the host of a listen server) hears its shot from the
+    // server
+    server.runtime.run_string("Entity(2):Give('weapon_tester') Entity(2):SelectWeapon('weapon_tester')", "give").unwrap();
+    server.runtime.set_input(alice, UserCmd::default());
+    server.runtime.set_input(bob, attack);
+    server.runtime.think(3.0 * tick);
+    let heard = shots(server.runtime.take_sounds());
+    assert!(heard.len() == 1 && heard[0].unheard_by.is_none(), "{heard:?}");
+    assert!(server.messages().is_empty() && client.messages().is_empty(), "{:?} {:?}", server.messages(), client.messages());
 }

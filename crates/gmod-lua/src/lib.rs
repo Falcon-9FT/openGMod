@@ -61,9 +61,11 @@ use std::time::Instant;
 use gmod_fs::Vfs;
 use mlua::Lua;
 
+pub mod ai;
 pub mod anim;
 mod args;
 pub mod breakable;
+pub mod bullets;
 pub mod chat;
 pub mod client;
 pub mod console;
@@ -76,11 +78,15 @@ pub mod entity;
 pub mod ents;
 pub mod files;
 pub mod filesystem;
+pub mod hitbox;
+pub mod hl2weapons;
 pub mod html;
 pub mod http;
 pub mod hud;
 pub mod inputs;
 pub mod items;
+pub mod lagcomp;
+pub mod loading;
 pub mod logic;
 pub mod material;
 pub mod matrix;
@@ -88,6 +94,7 @@ pub mod menu;
 pub mod meta;
 pub mod movedata;
 pub mod movers;
+pub mod nav;
 pub mod net;
 pub mod npc;
 pub mod outputs;
@@ -95,10 +102,12 @@ pub mod physgun;
 pub mod physics;
 pub mod pickup;
 pub mod player;
+pub mod pvs;
 pub mod ragdoll;
 pub mod recipients;
 pub mod resource;
 pub mod sandbox;
+pub mod serverlist;
 pub mod snapshot;
 pub mod sound;
 pub mod sql;
@@ -125,6 +134,8 @@ pub use menu::{Addon, MountableGame};
 pub use mlua;
 pub use movedata::UserCmd;
 pub use player::{PlayerInfo, PlayerView, ToClient, WeaponView};
+pub use pvs::{Sent, Transmission};
+pub use serverlist::{ScoreRow, ServerEntry, ServerPlayer, ServerQuery};
 pub use snapshot::{EntityState, NetValue, Snapshot};
 
 /// Which of GMod's Lua states a [`Runtime`] is.
@@ -305,6 +316,16 @@ pub(crate) struct Host {
     pub(crate) npcs: npc::Npcs,
     /// What clients download.
     pub(crate) resources: resource::Resources,
+    /// The dice of bullets' spread.
+    pub(crate) bullets: bullets::State,
+    /// Where players were at each tick of the last second, for their shots.
+    pub(crate) lagcomp: lagcomp::History,
+    /// The map's nodes, and the ways NPCs find by them.
+    pub(crate) nav: nav::Graph,
+    /// What each player is sent: the map's visibility, and what Lua says of it.
+    pub(crate) transmit: pvs::Transmit,
+    /// The menu's loading screen: what the program says of the loading going on.
+    pub(crate) loading: loading::Loading,
 }
 
 impl Host {
@@ -393,6 +414,11 @@ impl Runtime {
             props: breakable::Props::default(),
             npcs: npc::Npcs::default(),
             resources: resource::Resources::default(),
+            bullets: bullets::State::default(),
+            lagcomp: lagcomp::History::default(),
+            nav: nav::Graph::default(),
+            transmit: pvs::Transmit::default(),
+            loading: loading::Loading::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -423,6 +449,7 @@ impl Runtime {
         if realm == Realm::Server {
             recipients::install(&lua)?;
             resource::install(&lua)?;
+            pvs::install(&lua)?;
         }
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
@@ -548,6 +575,7 @@ impl Runtime {
             ents::think(&self.lua);
             if server {
                 anim::advance(&self.lua);
+                lagcomp::record(&self.lua);
             }
             self.call_hook("Tick", mlua::MultiValue::new());
         }
@@ -641,6 +669,27 @@ impl Runtime {
         player::view(&self.lua, player)
     }
 
+    /// A console variable's value, if there is one of that name.
+    pub fn convar(&self, name: &str) -> Option<String> {
+        convar::value(&self.lua, name)
+    }
+
+    /// The players who hear a sound, by the map's PAS; `None` for everyone.
+    pub fn hearing(&self, event: &sound::SoundEvent) -> Option<Vec<EntityHandle>> {
+        pvs::sound_hearers(&self.lua, event)
+    }
+
+    /// How each entity is sent now (on the server, once a tick), for [`sent_to`](Self::sent_to).
+    pub fn transmission(&self) -> Transmission {
+        pvs::transmission(&self.lua)
+    }
+
+    /// What a player is sent of the entities: what it may see from where it looks, with what
+    /// `SetupPlayerVisibility` adds ([`pvs`]); the rest it keeps dormant.
+    pub fn sent_to(&self, transmission: &Transmission, player: EntityHandle) -> Sent {
+        transmission.for_player(&self.lua, player)
+    }
+
     /// The models of entities to draw as a player sees them: every entity with a model that
     /// is not hidden, but not the player and what they carry.
     pub fn drawn(&self, viewer: EntityHandle) -> Vec<Drawn> {
@@ -679,13 +728,21 @@ impl Runtime {
         player::set_input(&self.lua, player, cmd);
     }
 
-    /// A client moves its own player on from where the server last said it was, by the
-    /// commands the server has not answered yet - each with how long it was the player's -
-    /// as the server will move it ([`player`]'s prediction: the engine's movement). How far
-    /// into the next tick the commands' time goes, 0 to 1: where to draw the eyes between
-    /// where they were and are ([`PlayerView::previous_eye`]).
-    pub fn predict(&self, player: EntityHandle, commands: &[(UserCmd, f32)]) -> f32 {
-        player::predict(&self.lua, player, commands)
+    /// A client moves its own player on from where the server last said it was - in the
+    /// snapshot of the server's time `from` - by the commands the server has not answered yet
+    /// (each with how long it was the player's; `played`: how long those before were, all
+    /// told), as the server will move it, and fires its weapon as the server will
+    /// ([`player`]'s prediction: the engine's movement and the weapon in hand). How far into
+    /// the next tick the commands' time goes, 0 to 1: where to draw the eyes between where
+    /// they were and are ([`PlayerView::previous_eye`]).
+    pub fn predict(&self, player: EntityHandle, commands: &[(UserCmd, f32)], from: f64, played: f64) -> f32 {
+        player::predict(&self.lua, player, commands, from, played)
+    }
+
+    /// The time of the game a player's client showed when it gave its latest command: their
+    /// shots hit what they saw then ([`lagcomp`]).
+    pub fn set_view_time(&self, player: EntityHandle, time: f64) {
+        lagcomp::set_view_time(&self.lua, player, time);
     }
 
     /// The players in the game.

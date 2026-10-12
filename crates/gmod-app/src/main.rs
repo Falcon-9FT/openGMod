@@ -35,8 +35,10 @@ use gmod_world::World;
 use gmod_world::gpu::Camera;
 
 mod audio;
+mod browser;
 mod client;
 mod game;
+mod keys;
 mod menu;
 mod proto;
 mod server;
@@ -52,6 +54,7 @@ USAGE:
     opengmod [OPTIONS] [MAP]
     opengmod --connect <ADDRESS> [OPTIONS]
     opengmod --dedicated [OPTIONS] MAP
+    opengmod --master [--port <PORT>]
 
     MAP                  a map to start in: one of the game (gm_construct), or a .bsp file;
                          without one, the main menu
@@ -72,6 +75,12 @@ OPTIONS:
                          status lists the players, lua_run runs Lua, quit
                          stops it
     --hostname <NAME>    the server's name its players see
+    --announce <ADDRESS> a master server this server tells it is here, for the browsers'
+                         internet list (also those in ~/.opengmod/servers/masters.txt;
+                         none with sv_lan 1)
+    --master             a master server: the list of the servers that tell it they are
+                         here, for the browsers of those who name it in their masters.txt
+                         (UDP port 27011 unless --port says otherwise)
     -h, --help           this text
 
 CONTROLS:
@@ -87,7 +96,8 @@ CONTROLS:
 
     Lines typed into this terminal are the game's console: give weapon_crowbar,
     gm_spawn models/props_c17/oildrum001.mdl, the commands of the addons; connect <address>
-    joins a server, disconnect leaves it, lua_run_cl runs Lua in your client.";
+    joins a server, disconnect leaves it, lua_run_cl runs Lua in your client and lua_run_menu
+    in the main menu.";
 
 /// Degrees the view turns per pixel the mouse moves.
 const MOUSE_DEGREES: f32 = 0.12;
@@ -108,11 +118,14 @@ struct Args {
     html: bool,
     gamemode: Option<String>,
     max_players: Option<u32>,
-    port: u16,
+    port: Option<u16>,
     name: Option<String>,
     connect: Option<String>,
     dedicated: bool,
     hostname: Option<String>,
+    /// Master servers a server here tells it is here.
+    announce: Vec<String>,
+    master: bool,
 }
 
 fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
@@ -124,11 +137,13 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
         html: true,
         gamemode: None,
         max_players: None,
-        port: proto::DEFAULT_PORT,
+        port: None,
         name: None,
         connect: None,
         dedicated: false,
         hostname: None,
+        announce: Vec::new(),
+        master: false,
     };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
@@ -142,11 +157,13 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
                 let n = raw.next().and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=gmod_lua::player::MAX_PLAYERS).contains(n));
                 args.max_players = Some(n.ok_or(format!("--maxplayers needs a number from 1 to {}", gmod_lua::player::MAX_PLAYERS))?);
             }
-            "--port" => args.port = raw.next().and_then(|p| p.parse().ok()).ok_or("--port needs a port")?,
+            "--port" => args.port = Some(raw.next().and_then(|p| p.parse().ok()).ok_or("--port needs a port")?),
             "--name" => args.name = Some(raw.next().ok_or("--name needs a name")?),
             "--connect" => args.connect = Some(raw.next().ok_or("--connect needs an address")?),
             "--dedicated" => args.dedicated = true,
             "--hostname" => args.hostname = Some(raw.next().ok_or("--hostname needs a name")?),
+            "--announce" => args.announce.push(raw.next().ok_or("--announce needs a master server's address")?),
+            "--master" => args.master = true,
             "-h" | "--help" => return Ok(None),
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if args.map.is_none() => args.map = Some(arg),
@@ -157,6 +174,7 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
 }
 
 /// How games are started: from where, with what.
+#[derive(Clone)]
 struct Setup {
     gmod: Option<PathBuf>,
     addons: bool,
@@ -167,8 +185,11 @@ struct Setup {
     /// Players a game started here takes: more than one, it listens for them on `port`.
     max_players: u32,
     port: u16,
-    /// The player's name.
+    /// Master servers a server here tells it is here, besides those of `servers/masters.txt`.
+    announce: Vec<String>,
+    /// The player's name, and their key: who they are on every server.
     name: String,
+    identity: gmod_net::Identity,
 }
 
 impl Setup {
@@ -195,6 +216,102 @@ struct Loaded {
     name: String,
     /// The brush models of the entities that may move, drawn where those are.
     brushes: HashMap<usize, World>,
+}
+
+/// What may be loaded in the background: a map of the player's own, or a server to join.
+enum Loadable {
+    Map(String),
+    Server(String),
+}
+
+/// What a loading in the background made ready.
+enum Prepared {
+    Map(Box<Loaded>),
+    Server(Box<Joining>),
+}
+
+/// A server's game made ready: the connection open, the files fetched, its map loaded.
+struct Joining {
+    loaded: Loaded,
+    connection: client::Connection,
+    addr: SocketAddr,
+}
+
+/// What the server being joined says of itself, for the loading screen (`GameDetails`), and the
+/// files it has the client fetch.
+struct Details {
+    server: String,
+    loading_url: String,
+    map: String,
+    max_players: u32,
+    gamemode: String,
+    downloads: Vec<String>,
+}
+
+/// A loading going on in the background ([`App::begin_loading`]).
+struct Loading {
+    done: std::sync::mpsc::Receiver<Result<Prepared, String>>,
+    /// What it does now.
+    status: Arc<std::sync::Mutex<String>>,
+    /// What the server said, until the loading screen took it.
+    details: Arc<std::sync::Mutex<Option<Details>>>,
+    /// The map or the server: what the player is told failed.
+    name: String,
+}
+
+/// Gets a server's game ready: connects, fetches the files it says to have, loads its map;
+/// `say` hears what it does.
+fn prepare_join(setup: &Setup, address: &str, say: &dyn Fn(&str)) -> Result<Joining, String> {
+    prepare_join_telling(setup, address, say, &Arc::new(std::sync::Mutex::new(None)))
+}
+
+/// [`prepare_join`], telling `details` what the server is and has the client fetch.
+fn prepare_join_telling(
+    setup: &Setup,
+    address: &str,
+    say: &dyn Fn(&str),
+    details: &Arc<std::sync::Mutex<Option<Details>>>,
+) -> Result<Joining, String> {
+    let addr = server_address(address)?;
+    say(&format!("Connecting to {addr}"));
+    let mut connection = client::Connection::open(addr, &setup.name, &setup.identity, &keys::KnownServers::open())?;
+    let welcome = connection.welcome.clone();
+    println!("{}: {} ({}, {} players)", welcome.server, welcome.map, welcome.gamemode, welcome.max_players);
+    let install = Install::locate(setup.gmod.as_deref()).map_err(|e| e.to_string())?;
+    let mut vfs = setup.mount(&install);
+    // what servers had downloaded is kept, behind the game's own files
+    let download = UserDir::default_root().map(|root| root.join("download"));
+    if let Some(dir) = &download {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(dir))));
+    }
+    let told = |fetching: client::Fetching| match fetching {
+        client::Fetching::Listed(files) => {
+            if let Ok(mut details) = details.lock() {
+                *details = Some(Details {
+                    server: welcome.server.clone(),
+                    loading_url: welcome.loading_url.clone(),
+                    map: welcome.map.clone(),
+                    max_players: welcome.max_players,
+                    gamemode: welcome.gamemode.clone(),
+                    downloads: files.to_vec(),
+                });
+            }
+        }
+        client::Fetching::Coming(file) => say(&format!("Downloading {file}")),
+    };
+    let lua = connection.download(&vfs, download.as_deref(), &told)?;
+    // the player's addons run on the server's word: their Lua the server lacks does not
+    if !welcome.allow_cs_lua {
+        vfs.hide_in_addons(Some(client::addon_lua_hidden(&connection.listed_lua)));
+    }
+    // the server's client Lua before the client's own
+    if !lua.is_empty() {
+        vfs.insert(0, gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Memory(gmod_fs::MemoryMount::new("server", lua))));
+    }
+    say(&format!("Loading {}", welcome.map));
+    let loaded = load_from(vfs, &welcome.map, true)?;
+    Ok(Joining { loaded, connection, addr })
 }
 
 /// Reads the map and everything it needs from the game.
@@ -278,6 +395,31 @@ fn load_from(mut vfs: Vfs, map: &str, lua: bool) -> Result<Loaded, String> {
 
 /// A dedicated server: the game on a map for those who join over the network, without a
 /// window; lines typed are its console. Runs until `quit`.
+/// A master server: lists the servers that tell it they are here, for the browsers that ask.
+/// Lines typed are its console: `status` lists the servers, `quit` stops it.
+fn master(port: u16) -> Result<(), String> {
+    let mut master = gmod_net::Master::bind(SocketAddr::from(([0, 0, 0, 0], port))).map_err(|e| format!("port {port}: {e}"))?;
+    println!("openGMOD master server on UDP port {port}; type status or quit");
+    loop {
+        master.poll(Instant::now());
+        for line in game::typed_lines() {
+            match line.trim() {
+                "quit" | "exit" => return Ok(()),
+                "status" => {
+                    let servers = master.servers();
+                    println!("{} servers", servers.len());
+                    for server in servers {
+                        println!("  {server}");
+                    }
+                }
+                "" => {}
+                other => println!("{other}: status or quit"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
     let install = Install::locate(setup.gmod.as_deref()).map_err(|e| e.to_string())?;
     println!("Garry's Mod: {}", install.root.display());
@@ -292,7 +434,10 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
     let started = Instant::now();
     let mut server = server::Server::start(Arc::new(vfs), &lua_map, &setup.gamemode, setup.max_players, true)?;
     server.name = hostname.to_string();
-    let at = server.listen(SocketAddr::from(([0, 0, 0, 0], setup.port))).map_err(|e| format!("port {}: {e}", setup.port))?;
+    let identity = keys::server_identity();
+    let key = identity.public();
+    let at = server.listen(SocketAddr::from(([0, 0, 0, 0], setup.port)), identity).map_err(|e| format!("port {}: {e}", setup.port))?;
+    server.set_masters(browser::masters(&setup.announce));
     println!(
         "{hostname}: {name} ({}) for {} players, started in {:.1} s, on UDP port {}; type status, quit or the server's commands",
         setup.gamemode,
@@ -300,6 +445,7 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
         started.elapsed().as_secs_f64(),
         at.port()
     );
+    println!("Its key, which players know it by: {key}");
     let tick = Duration::from_secs_f64(gmod_lua::timer::TICK_INTERVAL);
     let mut next = Instant::now();
     loop {
@@ -313,8 +459,8 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
                 "status" => {
                     let players = server.remote_players();
                     println!("{} of {} players", players.len(), setup.max_players);
-                    for (name, rtt) in players {
-                        println!("  {name}: {} ms", rtt.map_or(0, |r| r.as_millis()));
+                    for (name, steam_id, rtt) in players {
+                        println!("  {name} ({steam_id}): {} ms", rtt.map_or(0, |r| r.as_millis()));
                     }
                 }
                 text => match text.strip_prefix("lua_run ") {
@@ -708,6 +854,8 @@ struct App {
     pending_map: Option<String>,
     /// A server to join, likewise.
     pending_connect: Option<String>,
+    /// A map or a server's game being made ready in the background.
+    loading: Option<Loading>,
     /// The menu said to quit.
     quit: bool,
     /// When the menu started, whether Chromium drew it, and whether it was said that it did not.
@@ -835,24 +983,28 @@ impl App {
         }
     }
 
-    /// Starts a game on a map, leaving the one there was: the menu asked, or the command line.
+    /// Starts a game on a map, leaving the one there was, loading it here and now: the command
+    /// line asked, before there is a window to show the loading in.
     fn enter_map(&mut self, map: &str) {
         self.leave_map();
         println!("Loading {map}");
-        let loaded = match load(&self.setup, map) {
-            Ok(loaded) => loaded,
-            Err(e) => {
-                eprintln!("{e}");
-                return;
-            }
-        };
+        match load(&self.setup, map) {
+            Ok(loaded) => self.start_game(loaded),
+            Err(e) => eprintln!("{e}"),
+        }
+    }
+
+    /// The game starts on a map loaded: the player's own, with others joining over the network
+    /// when it takes more than one.
+    fn start_game(&mut self, loaded: Loaded) {
         let pages = self.web.clone().map(menu::web_pages);
         let setup = &self.setup;
         // more than one player: the others join over the network
         let listen = (setup.max_players > 1).then(|| SocketAddr::from(([0, 0, 0, 0], setup.port)));
         let game = loaded.lua.as_ref().and_then(|(vfs, map)| {
             let started = Instant::now();
-            match Game::start(vfs.clone(), map, &setup.gamemode, pages, setup.max_players, listen, &setup.name) {
+            let player = (setup.name.as_str(), setup.identity.public());
+            match Game::start(vfs.clone(), map, &setup.gamemode, pages, setup.max_players, listen, player) {
                 Ok(game) => {
                     println!("The game started in {:.1} s", started.elapsed().as_secs_f64());
                     Some(game)
@@ -866,41 +1018,104 @@ impl App {
         self.show_map(loaded, game);
     }
 
-    /// Joins a server over the network: what it says to have is fetched, its map loaded, and
-    /// the player plays there.
+    /// Joins a server over the network, here and now (the command line asked): what it says
+    /// to have is fetched, its map loaded, and the player plays there.
     fn connect(&mut self, address: &str) {
         self.leave_map();
-        if let Err(e) = self.try_connect(address) {
+        let joined = prepare_join(&self.setup, address, &|status| println!("{status}")).and_then(|j| self.join_game(j));
+        if let Err(e) = joined {
             eprintln!("Could not join {address}: {e}");
         }
     }
 
-    fn try_connect(&mut self, address: &str) -> Result<(), String> {
-        let addr = server_address(address)?;
-        println!("Connecting to {addr}");
-        let mut connection = client::Connection::open(addr, &self.setup.name)?;
-        let welcome = connection.welcome.clone();
-        println!("{}: {} ({}, {} players)", welcome.server, welcome.map, welcome.gamemode, welcome.max_players);
-        let install = Install::locate(self.setup.gmod.as_deref()).map_err(|e| e.to_string())?;
-        let mut vfs = self.setup.mount(&install);
-        // what servers had downloaded is kept, behind the game's own files
-        let download = UserDir::default_root().map(|root| root.join("download"));
-        if let Some(dir) = &download {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(dir))));
-        }
-        let lua = connection.download(&vfs, download.as_deref())?;
-        // the server's client Lua before the client's own
-        if !lua.is_empty() {
-            vfs.insert(0, gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Memory(gmod_fs::MemoryMount::new("server", lua))));
-        }
-        println!("Loading {}", welcome.map);
-        let loaded = load_from(vfs, &welcome.map, true)?;
+    /// The player joins the server a [`Joining`] got ready for.
+    fn join_game(&mut self, joining: Joining) -> Result<(), String> {
+        let Joining { loaded, connection, addr } = joining;
         let pages = self.web.clone().map(menu::web_pages);
         let (vfs, map) = loaded.lua.as_ref().ok_or("no Lua")?;
         let game = Game::join(vfs.clone(), map, connection, pages)?;
         self.show_map(loaded, Some(game));
+        if let Some(menu) = &self.menu {
+            menu.on_server(Some(&addr.to_string()));
+        }
         Ok(())
+    }
+
+    /// Starts loading a map (`Some`) or joining a server in the background: the window goes on,
+    /// the menu showing its loading screen, until it is ready ([`Self::poll_loading`]).
+    fn begin_loading(&mut self, what: Loadable) {
+        self.leave_map();
+        let (to_main, done) = std::sync::mpsc::channel();
+        let status = Arc::new(std::sync::Mutex::new(String::new()));
+        let details = Arc::new(std::sync::Mutex::new(None));
+        let setup = self.setup.clone();
+        let (said, told) = (status.clone(), details.clone());
+        let hosting = matches!(what, Loadable::Map(_));
+        let name = match &what {
+            Loadable::Map(map) => map.clone(),
+            Loadable::Server(address) => address.clone(),
+        };
+        std::thread::spawn(move || {
+            let say = |text: &str| {
+                println!("{text}");
+                if let Ok(mut status) = said.lock() {
+                    *status = text.to_string();
+                }
+            };
+            let prepared = match what {
+                Loadable::Map(map) => {
+                    say(&format!("Loading {map}"));
+                    load(&setup, &map).map(|loaded| Prepared::Map(Box::new(loaded)))
+                }
+                Loadable::Server(address) => prepare_join_telling(&setup, &address, &say, &told).map(|j| Prepared::Server(Box::new(j))),
+            };
+            let _ = to_main.send(prepared);
+        });
+        if let Some(menu) = &self.menu {
+            // the loading screen of one's own game names its map from `host_map`
+            if hosting {
+                menu.runtime().run_command(&format!("host_map \"{}.bsp\"", name.trim_end_matches(".bsp")));
+                menu.runtime().run_command(&format!("gamemode \"{}\"", self.setup.gamemode));
+            }
+            menu.runtime().begin_loading(hosting);
+        }
+        self.loading = Some(Loading { done, status, details, name });
+    }
+
+    /// The background loading: the loading screen told what it does, and, once it is ready,
+    /// the game goes on with it - or the menu comes back, saying why not.
+    fn poll_loading(&mut self) {
+        let Some(loading) = &self.loading else { return };
+        if let Some(menu) = &self.menu {
+            if let Ok(status) = loading.status.lock() {
+                menu.runtime().set_load_status(&status);
+            }
+            if let Some(details) = loading.details.lock().ok().and_then(|mut d| d.take()) {
+                menu.runtime().game_details(&details.server, &details.loading_url, &details.map, details.max_players, &details.gamemode);
+                menu.runtime().set_downloadables(details.downloads);
+            }
+        }
+        let result = match loading.done.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the loading stopped".to_string()),
+        };
+        let name = loading.name.clone();
+        self.loading = None;
+        let started = match result {
+            Ok(Prepared::Map(loaded)) => {
+                self.start_game(*loaded);
+                Ok(())
+            }
+            Ok(Prepared::Server(joining)) => self.join_game(*joining),
+            Err(e) => Err(e),
+        };
+        if let Some(menu) = &self.menu {
+            menu.runtime().end_loading();
+        }
+        if let Err(e) = started {
+            eprintln!("{name}: {e}");
+        }
     }
 
     /// A map loaded comes on the screen, with its game if there is one.
@@ -963,6 +1178,7 @@ impl App {
         self.capture(false);
         if let Some(menu) = &self.menu {
             menu.runtime().set_in_game(false);
+            menu.on_server(None);
         }
     }
 
@@ -998,6 +1214,7 @@ impl App {
         {
             menu.frame(gpu.config.width, gpu.config.height, f64::from(seconds));
         }
+        menu.browse();
         if self.game.is_none() {
             for line in game::typed_lines() {
                 menu.console(&line);
@@ -1090,10 +1307,19 @@ impl App {
                 }
                 ["quit" | "exit"] => self.quit = true,
                 ["screenshot" | "jpeg"] => self.screenshot = true,
-                // Lua for the player's own client, typed here only
+                ["lua_run_menu", ..] => {
+                    if let Some(menu) = &self.menu {
+                        menu.console(&line);
+                    }
+                }
+                // Lua for the player's own client, typed here only - where the server allows it
                 ["lua_run_cl", ..] => {
                     if let (Some(game), Some(code)) = (&self.game, line.trim_start().get("lua_run_cl ".len()..)) {
-                        let _ = game.client().run_string(code, "lua_run_cl");
+                        if game.own_lua_allowed() {
+                            let _ = game.client().run_string(code, "lua_run_cl");
+                        } else {
+                            println!("lua_run_cl: the server does not let players run Lua of their own (sv_allowcslua 0)");
+                        }
                     }
                 }
                 _ => lines.push(line),
@@ -1388,11 +1614,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(map) = self.pending_map.take() {
-                    self.enter_map(&map);
+                    self.begin_loading(Loadable::Map(map));
                 }
                 if let Some(address) = self.pending_connect.take() {
-                    self.connect(&address);
+                    self.begin_loading(Loadable::Server(address));
                 }
+                self.poll_loading();
                 let now = Instant::now();
                 let seconds = (now - self.last_frame).as_secs_f32().min(0.25);
                 self.last_frame = now;
@@ -1572,6 +1799,12 @@ fn main() -> ExitCode {
         Err(e) => return fail(&format!("{e}\n\n{USAGE}")),
     };
     println!("openGMOD {}", env!("CARGO_PKG_VERSION"));
+    if args.master {
+        return match master(args.port.unwrap_or(gmod_net::MASTER_PORT)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
     let disabled = menu::disabled_file().map(|file| gmod_fs::workshop::read_disabled(&file)).unwrap_or_default();
     let setup = Setup {
         gmod: args.gmod.clone(),
@@ -1580,8 +1813,11 @@ fn main() -> ExitCode {
         gamemode: args.gamemode.clone().unwrap_or_else(|| "sandbox".into()),
         disabled,
         max_players: args.max_players.unwrap_or(if args.dedicated { 16 } else { 1 }),
-        port: args.port,
+        port: args.port.unwrap_or(proto::DEFAULT_PORT),
+        announce: args.announce.clone(),
         name: args.name.clone().unwrap_or_else(default_name),
+        // a dedicated server has no player of its own
+        identity: if args.dedicated { gmod_net::Identity::generate() } else { keys::player_identity() },
     };
     if args.dedicated {
         let Some(map) = &args.map else { return fail(&format!("--dedicated needs a map\n\n{USAGE}")) };
@@ -1670,6 +1906,7 @@ fn main() -> ExitCode {
         web: web.take(),
         pending_map: None,
         pending_connect: None,
+        loading: None,
         quit: false,
         menu_started: now,
         menu_drawn: false,

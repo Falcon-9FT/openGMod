@@ -325,9 +325,8 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     if realm == Realm::Server {
         def(lua, &net, "Send", |a| send(a, crate::recipients::players_of(a.lua, a.get(1))))?;
         def(lua, &net, "SendOmit", |a| send(a, crate::recipients::all_but(a.lua, a.get(1))))?;
-        for name in ["SendPAS", "SendPVS"] {
-            def(lua, &net, name, |a| send(a, crate::recipients::near(a.lua, a.get(1))))?;
-        }
+        def(lua, &net, "SendPAS", |a| send(a, crate::recipients::hearing(a.lua, a.get(1))))?;
+        def(lua, &net, "SendPVS", |a| send(a, crate::recipients::seeing(a.lua, a.get(1))))?;
         def(lua, &net, "Broadcast", |a| send(a, crate::player::all(a.lua)))?;
     } else {
         def(lua, &net, "SendToServer", |a| send(a, Vec::new()))?;

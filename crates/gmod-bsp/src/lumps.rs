@@ -10,6 +10,7 @@ pub mod index {
     pub const PLANES: usize = 1;
     pub const TEXDATA: usize = 2;
     pub const VERTEXES: usize = 3;
+    pub const VISIBILITY: usize = 4;
     pub const NODES: usize = 5;
     pub const TEXINFO: usize = 6;
     pub const FACES: usize = 7;
@@ -21,6 +22,8 @@ pub mod index {
     pub const LEAF_BRUSHES: usize = 17;
     pub const BRUSHES: usize = 18;
     pub const BRUSH_SIDES: usize = 19;
+    pub const AREAS: usize = 20;
+    pub const AREA_PORTALS: usize = 21;
     pub const DISPINFO: usize = 26;
     pub const DISP_VERTS: usize = 33;
     pub const GAME_LUMP: usize = 35;
@@ -500,6 +503,41 @@ impl DispVert {
 
     pub(crate) fn parse(f: &mut Fields) -> DispVert {
         DispVert { direction: f.vec3(), distance: f.f32(), alpha: f.f32() }
+    }
+}
+
+/// An area of the world: open space the compiler flooded, bounded by area portals; its portals
+/// are a range of the area portal lump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Area {
+    pub portals: i32,
+    pub first_portal: i32,
+}
+
+impl Area {
+    pub(crate) const SIZE: usize = 8;
+
+    pub(crate) fn parse(f: &mut Fields) -> Area {
+        Area { portals: f.i32(), first_portal: f.i32() }
+    }
+}
+
+/// A portal of an area to another, which a `func_areaportal` of the same key (its
+/// `portalnumber`) opens and closes: a door shut between two rooms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AreaPortal {
+    pub key: u16,
+    pub other_area: u16,
+    pub first_clip_vertex: u16,
+    pub clip_vertices: u16,
+    pub plane: i32,
+}
+
+impl AreaPortal {
+    pub(crate) const SIZE: usize = 12;
+
+    pub(crate) fn parse(f: &mut Fields) -> AreaPortal {
+        AreaPortal { key: f.u16(), other_area: f.u16(), first_clip_vertex: f.u16(), clip_vertices: f.u16(), plane: f.i32() }
     }
 }
 
