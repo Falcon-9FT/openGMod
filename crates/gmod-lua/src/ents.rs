@@ -604,7 +604,6 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
             };
             // a merged model is drawn where its parent is, a player's turned as its legs are
             let (origin, angles, scale) = crate::anim::drawn_at(lua, handle)?;
-            let angles = crate::player::state(lua, handle, |_, p| p.render_angles).unwrap_or(angles);
             Some(Drawn { entity: handle, model, skin, origin, angles, scale, bones: crate::anim::skinning(lua, handle) })
         })
         .collect()

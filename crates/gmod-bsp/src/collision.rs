@@ -45,6 +45,8 @@ pub mod mask {
     pub const VISIBLE: u32 = OPAQUE | c::IGNORE_NODRAW_OPAQUE;
     /// What stops bullets.
     pub const SHOT: u32 = c::SOLID | c::MOVEABLE | c::MONSTER | c::WINDOW | c::DEBRIS | c::HITBOX;
+    /// What stops a swing: bullets' without the hitboxes, with grates.
+    pub const SHOT_HULL: u32 = c::SOLID | c::MOVEABLE | c::MONSTER | c::WINDOW | c::DEBRIS | c::GRATE;
 }
 
 /// The surface of a side: its `texinfo` and the [`surf`](crate::surf) flags of that.

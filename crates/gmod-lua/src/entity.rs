@@ -133,6 +133,8 @@ pub struct Ent {
     /// Where the bones of a ragdoll's parts are in the world - bone, origin, angles - as a
     /// snapshot carries them: a client has no bodies to read them from ([`crate::ragdoll`]).
     pub ragdoll_pose: Vec<(u16, Vector, Angle)>,
+    /// The set of its model's hitboxes in use (`SetHitboxSet`).
+    pub hitbox_set: usize,
     /// How it is drawn changing (`kRenderFx`): pulsing, fading, a hologram.
     pub render_fx: i64,
     /// Materials in place of the model's own, by slot (`SetSubMaterial`).
@@ -237,6 +239,7 @@ impl Ent {
             links: Vec::new(),
             spawn_effect: false,
             ragdoll_pose: Vec::new(),
+            hitbox_set: 0,
             render_fx: 0,
             sub_materials: Vec::new(),
             flex_scale: 1.0,
@@ -782,6 +785,7 @@ fn install_many(def: &DefMany) -> mlua::Result<()> {
         Ok(color.into_iter().map(|part| Value::Integer(part.into())).collect())
     })?;
     crate::anim::install_many(def)?;
+    crate::hitbox::install_many(def)?;
     crate::constraint::install_many(def)
 }
 
@@ -1581,6 +1585,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     crate::constraint::install_methods(def)?;
     crate::sound::install_methods(def)?;
     crate::anim::install_methods(def)?;
+    crate::hitbox::install_methods(def)?;
+    crate::bullets::install_methods(def)?;
     crate::ents::install_variables(def)
 }
 

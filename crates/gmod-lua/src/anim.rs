@@ -449,10 +449,12 @@ fn frame_owner(lua: &Lua, handle: EntityHandle) -> EntityHandle {
 }
 
 /// Where an entity's model is drawn and its bones are counted from: its origin, its angles
-/// and its scale; a merged one's are its parent's.
+/// and its scale; a merged one's are its parent's. A player's model is turned as its legs are
+/// (`GetRenderAngles`), and so are its bones, its hitboxes and what is merged onto it.
 pub(crate) fn drawn_at(lua: &Lua, handle: EntityHandle) -> Option<(Vector, Angle, f32)> {
     let owner = frame_owner(lua, handle);
     let (pos, angles) = host(lua).entities.transform(owner)?;
+    let angles = player::state(lua, owner, |_, p| p.render_angles).unwrap_or(angles);
     let scale = host(lua).entities.get(owner).map_or(1.0, |e| e.model_scale);
     Some((pos, angles, scale))
 }
@@ -462,6 +464,14 @@ fn placement(lua: &Lua, handle: EntityHandle) -> Option<BoneMatrix> {
     let (pos, angles, scale) = drawn_at(lua, handle)?;
     let m = Matrix::from_angle(angles).m;
     Some(std::array::from_fn(|r| [m[r][0] * scale, m[r][1] * scale, m[r][2] * scale, [pos.x, pos.y, pos.z][r]]))
+}
+
+/// Where the bones of an entity's model are now in the world.
+pub(crate) fn world_bones(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Rig>, Vec<BoneMatrix>)> {
+    let (rig, bones) = model_bones(lua, handle)?;
+    let place = placement(lua, handle)?;
+    let world = bones.iter().map(|b| rig_pose::multiply(&place, b)).collect();
+    Some((rig, world))
 }
 
 /// Where the bones of an entity's model are now, bone to model: its sequence at its cycle,
@@ -877,6 +887,14 @@ fn add_layer(lua: &Lua, handle: EntityHandle, sequence: i64, f: impl FnOnce(&mut
         }
     });
     added
+}
+
+/// Where an attachment of an entity's model (counted from 0) is in the world.
+pub(crate) fn attachment_world(lua: &Lua, handle: EntityHandle, attachment: usize) -> Option<(Vector, Angle)> {
+    let (rig, bones) = model_bones(lua, handle)?;
+    let local = rig.attachment(attachment, &bones)?;
+    let world = to_vmatrix(&rig_pose::multiply(&placement(lua, handle)?, &local));
+    Some((world.translation(), world.angles()))
 }
 
 /// What `GetAttachment` gives: where an attachment is (counted from 1) and its bone; nil for

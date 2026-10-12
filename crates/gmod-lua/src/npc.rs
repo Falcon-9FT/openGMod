@@ -686,6 +686,11 @@ fn equip(lua: &Lua, handle: EntityHandle, item: EntityHandle) {
     crate::weapon::call(lua, item, "OwnerChanged", MultiValue::new());
 }
 
+/// The weapon in an NPC's hand, if it holds one.
+pub(crate) fn weapon_of(lua: &Lua, handle: EntityHandle) -> Option<EntityHandle> {
+    with_npc(lua, handle, |_, npc| npc.weapon).filter(|&w| host(lua).entities.is_valid(w))
+}
+
 /// The weapon leaves the NPC's hand for the floor where it stands.
 fn drop_weapon(lua: &Lua, handle: EntityHandle) -> EntityHandle {
     let Some(item) = with_npc(lua, handle, |_, npc| std::mem::replace(&mut npc.weapon, EntityHandle::NULL)) else {

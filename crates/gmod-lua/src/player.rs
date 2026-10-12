@@ -554,6 +554,46 @@ fn settings(lua: &Lua, p: &PlayerState, speed: f32) -> Settings {
     }
 }
 
+/// How hard the view springs back to where the player looks, and how much it is held back.
+const PUNCH_SPRING: f32 = 65.0;
+const PUNCH_DAMPING: f32 = 9.0;
+
+/// The view kicks (`ViewPunch`): a recoil, a blow.
+pub(crate) fn view_punch(lua: &Lua, handle: EntityHandle, punch: Angle) {
+    with_player(lua, handle, |_, p| {
+        let v = p.view_punch_velocity;
+        p.view_punch_velocity = Angle::new(v.p + punch.p * 20.0, v.y + punch.y * 20.0, v.r + punch.r * 20.0);
+    });
+}
+
+/// A tick of the view's kick: it moves on, and springs back to nothing.
+fn decay_punch(lua: &Lua, handle: EntityHandle) {
+    let dt = crate::timer::TICK_INTERVAL as f32;
+    with_player(lua, handle, |_, p| {
+        let (punch, velocity) = (p.view_punch, p.view_punch_velocity);
+        if punch == Angle::default() && velocity == Angle::default() {
+            return;
+        }
+        let damping = (1.0 - PUNCH_DAMPING * dt).max(0.0);
+        let axis = |a: f32, v: f32, limit: f32| {
+            let a = (a + v * dt).clamp(-limit, limit);
+            let v = v * damping - a * PUNCH_SPRING * dt;
+            // still enough is still
+            if a.abs() < 0.001 && v.abs() < 0.001 { (0.0, 0.0) } else { (a, v) }
+        };
+        let (pp, vp) = axis(punch.p, velocity.p, 89.0);
+        let (py, vy) = axis(punch.y, velocity.y, 179.0);
+        let (pr, vr) = axis(punch.r, velocity.r, 89.0);
+        p.view_punch = Angle::new(pp, py, pr);
+        p.view_punch_velocity = Angle::new(vp, vy, vr);
+    });
+}
+
+/// The hit group the last bullet that hit a player hit (`LastHitGroup`).
+pub(crate) fn set_last_hit_group(lua: &Lua, handle: EntityHandle, group: i64) {
+    with_player(lua, handle, |_, p| p.last_hit_group = group);
+}
+
 /// The eyes of a player and where they aim.
 pub(crate) fn eye(lua: &Lua, handle: EntityHandle) -> Option<(Vector, Vector)> {
     let (pos, _) = host(lua).entities.transform(handle)?;
@@ -820,6 +860,7 @@ pub(crate) fn tick_all(lua: &Lua) {
 /// One tick of a player: the command, movement, the weapon.
 fn tick(lua: &Lua, handle: EntityHandle) {
     let tick = host(lua).clock.ticks.get() as i64;
+    decay_punch(lua, handle);
     if let Some((eye, _)) = eye(lua, handle) {
         with_player(lua, handle, |_, p| p.previous_eye = Some(eye));
     }
@@ -2662,10 +2703,8 @@ fn install_view(def: &entity::Def) -> mlua::Result<()> {
     // as Source does it: the punch goes into the view's spring as velocity
     def("ViewPunch", |a| {
         let punch = a.userdata::<Angle>(2, "Angle")?;
-        write(a, |_, p| {
-            let v = p.view_punch_velocity;
-            p.view_punch_velocity = Angle::new(v.p + punch.p * 20.0, v.y + punch.y * 20.0, v.r + punch.r * 20.0);
-        })
+        view_punch(a.lua, this(a)?, punch);
+        Ok(Value::Nil)
     })?;
     def("ViewPunchReset", |a| {
         write(a, |_, p| {

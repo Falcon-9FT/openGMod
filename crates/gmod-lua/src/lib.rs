@@ -64,6 +64,7 @@ use mlua::Lua;
 pub mod anim;
 mod args;
 pub mod breakable;
+pub mod bullets;
 pub mod chat;
 pub mod client;
 pub mod console;
@@ -76,6 +77,8 @@ pub mod entity;
 pub mod ents;
 pub mod files;
 pub mod filesystem;
+pub mod hitbox;
+pub mod hl2weapons;
 pub mod html;
 pub mod http;
 pub mod hud;
@@ -305,6 +308,8 @@ pub(crate) struct Host {
     pub(crate) npcs: npc::Npcs,
     /// What clients download.
     pub(crate) resources: resource::Resources,
+    /// The dice of bullets' spread.
+    pub(crate) bullets: bullets::State,
 }
 
 impl Host {
@@ -393,6 +398,7 @@ impl Runtime {
             props: breakable::Props::default(),
             npcs: npc::Npcs::default(),
             resources: resource::Resources::default(),
+            bullets: bullets::State::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
