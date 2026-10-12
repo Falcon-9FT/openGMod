@@ -12,6 +12,7 @@ use mlua::Value;
 use super::*;
 
 mod chat;
+mod items;
 mod mapio;
 mod movers;
 mod ragdoll;

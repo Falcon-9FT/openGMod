@@ -1547,7 +1547,7 @@ fn use_key(lua: &Lua, handle: EntityHandle, buttons: u32, pressed: u32) {
         }
         return;
     }
-    if scripted && matches!(use_type(target), CONTINUOUS_USE | ONOFF_USE) {
+    if (scripted || crate::items::is_charger(lua, target)) && matches!(use_type(target), CONTINUOUS_USE | ONOFF_USE) {
         with_player(lua, handle, |_, p| p.using = target);
     }
     if !crate::inputs::use_entity(lua, target, handle, handle, USE_ON, 1.0) {

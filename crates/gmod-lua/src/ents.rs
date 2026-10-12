@@ -81,6 +81,8 @@ pub(crate) struct Studio {
     pub attachments: Vec<String>,
     /// The names of the flexes.
     pub flexes: Vec<String>,
+    /// Its `$keyvalues` text (`prop_data` ...).
+    pub key_values: String,
 }
 
 /// A studio model, read once.
@@ -106,6 +108,7 @@ pub(crate) fn studio(lua: &Lua, model: &str) -> Option<Studio> {
             bones: mdl.bones.iter().map(|b| (b.name.clone(), b.parent)).collect(),
             attachments: mdl.attachments.iter().map(|a| a.name.clone()).collect(),
             flexes: mdl.flexes.clone(),
+            key_values: mdl.key_values.clone(),
         }
     });
     host.models.studio.borrow_mut().insert(path, studio.clone());
@@ -429,6 +432,8 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         crate::logic::spawned(lua, handle);
         crate::triggers::spawned(lua, handle);
         crate::movers::spawned(lua, handle);
+        crate::items::spawned(lua, handle);
+        crate::breakable::spawned(lua, handle);
     }
     if scripted && let Some(ud) = userdata(lua, handle) {
         call_method(lua, &ud, "Initialize", MultiValue::new());

@@ -25,7 +25,8 @@
 //!   physics, solid scripted entities. A scripted entity touching a trigger hears it the same
 //!   way.
 //! * A player who walks over a weapon on the ground picks it up when `PlayerCanPickupWeapon`
-//!   lets them - or, having one of the class already, takes the ammo in it.
+//!   lets them - or, having one of the class already, takes the ammo in it; over an item of
+//!   HL2, takes it ([`crate::items`]).
 
 use std::cell::RefCell;
 
@@ -279,6 +280,7 @@ pub(crate) fn tick(lua: &Lua) {
         touch(lua, trigger, other, scripted);
     }
     pick_up(lua, &touchers);
+    crate::items::touch(lua, &touchers.iter().filter(|t| t.player).map(|t| (t.handle, t.lo, t.hi)).collect::<Vec<_>>());
 }
 
 fn array(v: Vector) -> [f32; 3] {

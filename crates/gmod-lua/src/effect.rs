@@ -70,6 +70,14 @@ fn data(a: &Args) -> mlua::Result<EffectData> {
     a.userdata::<EffectData>(1, NAME)
 }
 
+/// An effect the engine makes itself (an explosion's), the way Lua makes one: through
+/// `util.Effect`, so that what the game puts in its place sees it too.
+pub(crate) fn dispatch(lua: &Lua, name: &str, data: EffectData) {
+    let effect = lua.globals().get::<Table>("util").and_then(|util| util.get::<mlua::Function>("Effect"));
+    let (Ok(effect), Ok(name), Ok(data)) = (effect, lua.create_string(name), lua.create_userdata(data)) else { return };
+    let _ = crate::files::call_reporting(lua, effect, MultiValue::from_iter([Value::String(name), Value::UserData(data)]));
+}
+
 pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     lua.globals().raw_set("EffectData", lua.create_function(|_, _: MultiValue| Ok(EffectData::default()))?)?;
     let t = meta::meta_table(lua, NAME, type_id::EFFECTDATA)?;

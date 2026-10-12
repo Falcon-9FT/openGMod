@@ -61,6 +61,7 @@ use mlua::Lua;
 
 pub mod anim;
 mod args;
+mod breakable;
 pub mod chat;
 pub mod client;
 pub mod console;
@@ -77,6 +78,7 @@ pub mod html;
 pub mod http;
 pub mod hud;
 pub mod inputs;
+mod items;
 pub mod logic;
 pub mod material;
 pub mod matrix;
@@ -292,6 +294,8 @@ pub(crate) struct Host {
     pub(crate) touching: triggers::Touching,
     /// What is solid of the brushes that may move.
     pub(crate) movers: movers::Moving,
+    /// The classes of breakable props.
+    pub(crate) props: breakable::Props,
 }
 
 impl Host {
@@ -377,6 +381,7 @@ impl Runtime {
             chat: chat::Chat::default(),
             touching: triggers::Touching::default(),
             movers: movers::Moving::default(),
+            props: breakable::Props::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;

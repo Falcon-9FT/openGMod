@@ -8,7 +8,8 @@
 //! (`OnTrigger target:input:param:delay:times`, [`crate::outputs`]), `SetParent` (by name)
 //! and `ClearParent`, `Color`, `Alpha` and `Skin`, `FireUser1` to `FireUser4` fire its
 //! `OnUser1` to `OnUser4`, the entities of the map take theirs ([`crate::logic`],
-//! [`crate::triggers`], [`crate::movers`]), and so do the constraints ([`crate::constraint`]). Inputs it does not know are dropped.
+//! [`crate::triggers`], [`crate::movers`], [`crate::breakable`], [`crate::items`]), and so
+//! do the constraints ([`crate::constraint`]). Inputs it does not know are dropped.
 //!
 //! An output's input waits here with the name of its target, found when it is given
 //! (`outputs::targets`).
@@ -108,6 +109,8 @@ fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str, activ
             return crate::logic::input(lua, target, input, param, activator, caller)
                 || crate::triggers::input(lua, target, input, param, activator, caller)
                 || crate::movers::input(lua, target, input, param, activator, caller)
+                || crate::breakable::input(lua, target, input, param, activator)
+                || crate::items::input(lua, target, input, activator)
                 || crate::anim::input(lua, target, input, param)
                 || crate::constraint::input(lua, target, input);
         }

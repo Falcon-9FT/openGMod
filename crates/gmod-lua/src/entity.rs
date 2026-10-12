@@ -147,6 +147,8 @@ pub struct Ent {
     pub trigger_state: Option<Box<crate::triggers::Trigger>>,
     /// What a door, a button or a platform keeps ([`crate::movers`]).
     pub mover: Option<Box<crate::movers::Mover>>,
+    /// What a charger on a wall keeps ([`crate::items`]).
+    pub charger: Option<Box<crate::items::Charger>>,
 }
 
 /// How a bone is moved from where its model has it.
@@ -231,6 +233,7 @@ impl Ent {
             logic: None,
             trigger_state: None,
             mover: None,
+            charger: None,
         }
     }
 

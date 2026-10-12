@@ -248,6 +248,11 @@ fn play(
     }));
 }
 
+/// A sound at a place, of no entity: what is left of something that broke or blew up.
+pub(crate) fn emit_at(lua: &Lua, name: &str, position: Vector) {
+    play(lua, name, None, Some(position), 1.0, 100.0, 75.0, 0, None);
+}
+
 /// A sound an entity makes, as loud as `scale` makes what its script says (an impact's).
 pub(crate) fn emit_scaled(lua: &Lua, name: &str, entity: EntityHandle, scale: f32) {
     let before = host(lua).sounds.events.borrow().len();
