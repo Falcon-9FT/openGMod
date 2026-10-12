@@ -42,7 +42,7 @@ pub use gma::GmaArchive;
 pub use install::Install;
 pub use memory::MemoryMount;
 pub use user::UserDir;
-pub use vfs::{Backing, Mount, Vfs};
+pub use vfs::{Backing, Hide, Mount, Vfs};
 pub use vpk::VpkArchive;
 pub use zip::ZipArchive;
 

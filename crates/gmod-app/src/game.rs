@@ -174,6 +174,15 @@ impl Game {
         Ok(game)
     }
 
+    /// Whether the player may run Lua of their own: in their own game, or on a server with
+    /// `sv_allowcslua`.
+    pub fn own_lua_allowed(&self) -> bool {
+        match &self.link {
+            Link::Local(_) => true,
+            Link::Remote(connection) => connection.welcome.allow_cs_lua,
+        }
+    }
+
     /// Whether others play too: the game goes on under the menu.
     pub fn multiplayer(&self) -> bool {
         match &self.link {
@@ -645,6 +654,14 @@ mod tests {
         );
         let client_files = Folder::new("net-client", &[("lua/includes/init.lua", NET_INIT.as_bytes())]);
         let download = Folder::new("net-download", &[]);
+        let addon = Folder::new(
+            "net-addon",
+            &[
+                ("lua/autorun/client/mine.lua", b"MINE = true"),
+                ("lua/autorun/client/hello.lua", b"HELLO = 'from the addon'"),
+                ("materials/mine.vmt", b"\"UnlitGeneric\" {}"),
+            ],
+        );
         let server_vfs = Arc::new(server_files.vfs());
         let (to_test, from_server) = mpsc::channel::<String>();
         let (stop, stopped) = mpsc::channel::<()>();
@@ -679,7 +696,11 @@ mod tests {
         assert_eq!((connection.welcome.map.as_str(), connection.welcome.max_players), ("gm_test", 4));
         let mut vfs = client_files.vfs();
         vfs.push(Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&download.0))));
+        // an addon of the player's own, with Lua of its own and the server's file too
+        vfs.insert(0, Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&addon.0))).of_addon());
         let lua = connection.download(&vfs, Some(&download.0)).unwrap();
+        assert!(!connection.welcome.allow_cs_lua);
+        vfs.hide_in_addons(Some(super::super::client::addon_lua_hidden(&connection.listed_lua)));
         assert_eq!(lua, [("lua/autorun/client/hello.lua".to_string(), b"HELLO = 'from the server'".to_vec())]);
         assert_eq!(std::fs::read(download.0.join("materials/test/thing.vtf")).unwrap(), b"texture");
         // and the game finds it at once, though it looked in that folder before it came
@@ -688,6 +709,14 @@ mod tests {
         let mut game = Game::join(Arc::new(vfs), &test_map(), connection, None).unwrap();
         game.client().run_string("include('autorun/client/hello.lua')", "hello").unwrap();
         assert_eq!(game.client().lua().load("return HELLO").eval::<String>().unwrap(), "from the server");
+        // the addon's own Lua is not run, nor seen; its content is
+        let addon_lua: bool = game
+            .client()
+            .lua()
+            .load("return MINE == nil and not file.Exists('lua/autorun/client/mine.lua', 'GAME') and file.Exists('materials/mine.vmt', 'GAME')")
+            .eval()
+            .unwrap();
+        assert!(addon_lua && !game.own_lua_allowed());
 
         // walking along y: the client sees the server move the player, and hears from it
         let forward = Keys { forward: true, ..Keys::default() };

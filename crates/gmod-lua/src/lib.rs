@@ -663,6 +663,11 @@ impl Runtime {
         player::view(&self.lua, player)
     }
 
+    /// A console variable's value, if there is one of that name.
+    pub fn convar(&self, name: &str) -> Option<String> {
+        convar::value(&self.lua, name)
+    }
+
     /// The players who hear a sound, by the map's PAS; `None` for everyone.
     pub fn hearing(&self, event: &sound::SoundEvent) -> Option<Vec<EntityHandle>> {
         pvs::sound_hearers(&self.lua, event)

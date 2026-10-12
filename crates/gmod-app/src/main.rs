@@ -890,6 +890,10 @@ impl App {
             vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(dir))));
         }
         let lua = connection.download(&vfs, download.as_deref())?;
+        // the player's addons run on the server's word: their Lua the server lacks does not
+        if !welcome.allow_cs_lua {
+            vfs.hide_in_addons(Some(client::addon_lua_hidden(&connection.listed_lua)));
+        }
         // the server's client Lua before the client's own
         if !lua.is_empty() {
             vfs.insert(0, gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Memory(gmod_fs::MemoryMount::new("server", lua))));
@@ -1090,10 +1094,14 @@ impl App {
                 }
                 ["quit" | "exit"] => self.quit = true,
                 ["screenshot" | "jpeg"] => self.screenshot = true,
-                // Lua for the player's own client, typed here only
+                // Lua for the player's own client, typed here only - where the server allows it
                 ["lua_run_cl", ..] => {
                     if let (Some(game), Some(code)) = (&self.game, line.trim_start().get("lua_run_cl ".len()..)) {
-                        let _ = game.client().run_string(code, "lua_run_cl");
+                        if game.own_lua_allowed() {
+                            let _ = game.client().run_string(code, "lua_run_cl");
+                        } else {
+                            println!("lua_run_cl: the server does not let players run Lua of their own (sv_allowcslua 0)");
+                        }
                     }
                 }
                 _ => lines.push(line),

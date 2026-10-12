@@ -199,7 +199,9 @@ impl Server {
             return;
         }
         let name: String = self.name.chars().take(64).collect();
-        let welcome = Welcome { server: name, map: self.map.clone(), gamemode: self.gamemode.clone(), max_players: max as u32 };
+        let allow_cs_lua = self.runtime.convar("sv_allowcslua").is_some_and(|v| v.trim().parse::<f64>().is_ok_and(|n| n != 0.0));
+        let welcome =
+            Welcome { server: name, map: self.map.clone(), gamemode: self.gamemode.clone(), max_players: max as u32, allow_cs_lua };
         let Some(net) = &mut self.net else { return };
         let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
         let name = clean_name(&hello.name);

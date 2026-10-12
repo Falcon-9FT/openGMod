@@ -3,9 +3,10 @@
 //! the entities, drawn a little behind the newest and between two of them, so that what
 //! moves moves smoothly whatever the network does - and what the player does, sent back.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gmod_fs::Vfs;
@@ -59,11 +60,24 @@ pub struct Connection {
     inbox: VecDeque<FromServer>,
     /// Why the connection closed, once it has.
     pub closed: Option<String>,
+    /// The client Lua the server has, by game path ([`download`](Self::download)): what of
+    /// the player's addons it may run.
+    pub listed_lua: Vec<String>,
 }
 
 /// Waits a moment between looks at the network while blocking on it.
 fn nap() {
     std::thread::sleep(Duration::from_millis(5));
+}
+
+/// What of the player's addons a server's client does not run, as in GMod: their Lua that the
+/// server does not have (`listed`). Their content is used all the same.
+pub fn addon_lua_hidden(listed: &[String]) -> gmod_fs::Hide {
+    let listed: HashSet<String> = listed.iter().filter_map(|p| gmod_fs::path::normalize(p)).collect();
+    Arc::new(move |path: &str| {
+        let path = path.to_ascii_lowercase();
+        path.ends_with(".lua") && (path.starts_with("lua/") || path.starts_with("gamemodes/")) && !listed.contains(&path)
+    })
 }
 
 impl Connection {
@@ -74,7 +88,8 @@ impl Connection {
         let net = gmod_net::Client::connect(server, &hello, started).map_err(|e| format!("{server}: {e}"))?;
         let mut connection = Connection {
             net,
-            welcome: Welcome { server: String::new(), map: String::new(), gamemode: String::new(), max_players: 1 },
+            welcome: Welcome { server: String::new(), map: String::new(), gamemode: String::new(), max_players: 1, allow_cs_lua: false },
+            listed_lua: Vec::new(),
             snapshots: SnapshotReceiver::default(),
             commands: VecDeque::new(),
             last_command: 0,
@@ -170,6 +185,7 @@ impl Connection {
                 },
             )
         })?;
+        self.listed_lua = listed_lua.iter().map(|f| f.path.clone()).collect();
         let same = |f: &FileInfo| vfs.read(&f.path, "GAME").is_ok_and(|data| FileInfo::of(&f.path, &data) == *f);
         let downloaded = |f: &FileInfo| download.is_some_and(|dir| vfs.locate(&f.path, "GAME").is_some_and(|m| m.origin() == dir));
         let lua: Vec<FileInfo> = listed_lua.into_iter().filter(|f| !same(f)).collect();

@@ -61,6 +61,8 @@ pub struct Welcome {
     pub map: String,
     pub gamemode: String,
     pub max_players: u32,
+    /// `sv_allowcslua`: its players may run Lua of their own - their addons' too.
+    pub allow_cs_lua: bool,
 }
 
 /// What a client sends its server.
