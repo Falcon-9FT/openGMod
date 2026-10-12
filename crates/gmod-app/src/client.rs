@@ -281,7 +281,8 @@ impl Connection {
         }
         let first = self.commands.len().saturating_sub(COMMANDS_SENT);
         let sent = self.commands.iter().skip(first).map(|&(_, cmd, _)| cmd).collect();
-        let message = ToServer::Commands { last: self.last_command, commands: sent, ack: self.snapshots.newest };
+        let view = self.shown.unwrap_or(0.0);
+        let message = ToServer::Commands { last: self.last_command, commands: sent, ack: self.snapshots.newest, view };
         self.send(&message, false);
         self.net.flush(Instant::now());
     }

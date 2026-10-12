@@ -48,7 +48,7 @@ impl Kind {
 }
 
 /// A handle to an entity: its index and serial number, or none for `NULL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EntityHandle {
     pub index: Option<u32>,
     pub serial: u32,
@@ -1587,6 +1587,7 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     crate::anim::install_methods(def)?;
     crate::hitbox::install_methods(def)?;
     crate::bullets::install_methods(def)?;
+    crate::lagcomp::install_methods(def)?;
     crate::ents::install_variables(def)
 }
 

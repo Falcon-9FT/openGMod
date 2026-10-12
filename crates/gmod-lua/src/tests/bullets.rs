@@ -252,3 +252,35 @@ fn the_engines_pistol_and_crowbar() {
     ));
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
+
+#[test]
+fn shots_hit_where_the_shooter_saw_the_target() {
+    let (g, alice, _bob) = alice_and_bob();
+    // Bob stood in Alice's line of fire when her client showed the game, and has moved since
+    g.runtime.think(0.05);
+    let seen = g.runtime.cur_time() - 0.02;
+    g.runtime.run_string("Entity(2):SetPos(Vector(40, 200, 0))", "away").unwrap();
+    g.runtime.think(0.2);
+    let shoot = "local a = Entity(1) a:LagCompensation(true)
+                 a:FireBullets({ Src = a:EyePos(), Dir = Vector(0, 1, 0), Damage = 10 }) a:LagCompensation(false)";
+    g.runtime.run_string(shoot, "now").unwrap();
+    assert_eq!(g.eval::<i64>("return Entity(2):Health()"), 100, "where he is, she misses");
+    g.runtime.set_view_time(alice, seen);
+    g.runtime.run_string(shoot, "then").unwrap();
+    assert!(
+        g.eval::<bool>("return Entity(2):Health() == 90 and Entity(2):GetPos().x == 40"),
+        "where she saw him, she hits; he is back: {}",
+        g.eval::<String>("return Entity(2):Health() .. ' ' .. tostring(Entity(2):GetPos())")
+    );
+    // not compensated: where he is
+    g.runtime.run_string("local a = Entity(1) a:FireBullets({ Src = a:EyePos(), Dir = Vector(0, 1, 0), Damage = 10 })", "plain").unwrap();
+    assert_eq!(g.eval::<i64>("return Entity(2):Health()"), 90);
+    // the engine's pistol compensates by itself
+    g.runtime.set_input(
+        alice,
+        UserCmd { view_angles: vector::Angle::new(0.0, 90.0, 0.0), buttons: crate::player::key::ATTACK, ..UserCmd::default() },
+    );
+    g.runtime.think(0.015);
+    assert!(g.eval::<bool>("return Entity(2):Health() == 82 and Entity(2):GetPos().x == 40 and Entity(2):IsLagCompensated()"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}

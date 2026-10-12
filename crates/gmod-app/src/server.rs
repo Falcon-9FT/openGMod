@@ -268,13 +268,16 @@ impl Server {
                 }
             }
             ToServer::Ready => {}
-            ToServer::Commands { last, commands, ack } => {
+            ToServer::Commands { last, commands, ack, view } => {
                 remote.snapshots.ack(ack);
                 if let Some(player) = player
                     && let Some(cmd) = proto::merge_commands(remote.command, last, &commands)
                 {
                     remote.command = last;
                     self.runtime.set_input(player, cmd);
+                    if view > 0.0 {
+                        self.runtime.set_view_time(player, view);
+                    }
                 }
             }
             ToServer::Command(line) => {

@@ -2782,13 +2782,14 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
         to_client(a.lua, handle, ToClient::Lua(code));
         Ok(Value::Nil)
     })?;
-    for name in ["SendHint", "SuppressHint", "ScreenFade", "LagCompensation", "PlayStepSound", "SprayDecal"] {
+    for name in ["SendHint", "SuppressHint", "ScreenFade", "PlayStepSound", "SprayDecal"] {
         def(name, nothing)?;
     }
     def("AllowImmediateDecalPainting", nothing)?;
     // the gesture slots and the animation events of the player's model
     crate::anim::install_player(def)?;
     crate::pickup::install_player(def)?;
+    crate::lagcomp::install_player(def)?;
     // the base gamemode makes the physics gun's own in Lua (`AddFrozenPhysicsObject`,
     // `PhysgunUnfreeze`, `UnfreezePhysicsObjects`); these stand in without it. Nothing is
     // carried with the gravity gun yet, and there are no vehicles.

@@ -72,7 +72,9 @@ pub enum ToServer {
     Ready,
     /// Its latest commands, oldest first, the last numbered `last`; and the newest snapshot it
     /// has (0 for none).
-    Commands { last: u32, commands: Vec<UserCmd>, ack: u32 },
+    /// And the time of the game it showed then, which its shots go back to (lag
+    /// compensation).
+    Commands { last: u32, commands: Vec<UserCmd>, ack: u32, view: f64 },
     /// A console line for the server, run as the player.
     Command(String),
     /// A value of its user info (`cl_playermodel`).

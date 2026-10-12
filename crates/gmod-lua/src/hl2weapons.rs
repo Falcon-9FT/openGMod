@@ -130,13 +130,13 @@ pub(crate) fn frame(lua: &Lua, weapon: EntityHandle, buttons: u32, pressed: u32)
         }
         let wants = if gun.automatic { buttons & IN_ATTACK != 0 } else { pressed & IN_ATTACK != 0 };
         if wants && state(lua, weapon).is_some_and(|s| s.next_fire[0] <= now(lua) && s.reload.is_none()) {
-            fire(lua, owner, weapon, gun);
+            crate::lagcomp::compensated_shot(lua, owner, || fire(lua, owner, weapon, gun));
         }
     } else if let Some(melee) = MELEE.iter().find(|m| m.class == class)
         && buttons & IN_ATTACK != 0
         && state(lua, weapon).is_some_and(|s| s.next_fire[0] <= now(lua))
     {
-        swing(lua, owner, weapon, melee);
+        crate::lagcomp::compensated_shot(lua, owner, || swing(lua, owner, weapon, melee));
     }
 }
 

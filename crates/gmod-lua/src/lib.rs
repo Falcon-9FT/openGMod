@@ -84,6 +84,7 @@ pub mod http;
 pub mod hud;
 pub mod inputs;
 pub mod items;
+pub mod lagcomp;
 pub mod logic;
 pub mod material;
 pub mod matrix;
@@ -310,6 +311,8 @@ pub(crate) struct Host {
     pub(crate) resources: resource::Resources,
     /// The dice of bullets' spread.
     pub(crate) bullets: bullets::State,
+    /// Where players were at each tick of the last second, for their shots.
+    pub(crate) lagcomp: lagcomp::History,
 }
 
 impl Host {
@@ -399,6 +402,7 @@ impl Runtime {
             npcs: npc::Npcs::default(),
             resources: resource::Resources::default(),
             bullets: bullets::State::default(),
+            lagcomp: lagcomp::History::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -554,6 +558,7 @@ impl Runtime {
             ents::think(&self.lua);
             if server {
                 anim::advance(&self.lua);
+                lagcomp::record(&self.lua);
             }
             self.call_hook("Tick", mlua::MultiValue::new());
         }
@@ -692,6 +697,12 @@ impl Runtime {
     /// where they were and are ([`PlayerView::previous_eye`]).
     pub fn predict(&self, player: EntityHandle, commands: &[(UserCmd, f32)]) -> f32 {
         player::predict(&self.lua, player, commands)
+    }
+
+    /// The time of the game a player's client showed when it gave its latest command: their
+    /// shots hit what they saw then ([`lagcomp`]).
+    pub fn set_view_time(&self, player: EntityHandle, time: f64) {
+        lagcomp::set_view_time(&self.lua, player, time);
     }
 
     /// The players in the game.
