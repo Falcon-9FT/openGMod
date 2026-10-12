@@ -87,6 +87,7 @@ pub mod net;
 pub mod outputs;
 pub mod physgun;
 pub mod physics;
+pub mod pickup;
 pub mod player;
 pub mod ragdoll;
 pub mod sandbox;
@@ -265,6 +266,8 @@ pub(crate) struct Host {
     pub players: player::Players,
     pub physics: physics::World,
     pub physgun: physgun::Guns,
+    /// What players carry with the use key.
+    pub(crate) hands: pickup::Hands,
     pub inputs: inputs::Queue,
     /// The 2D frame `surface` draws, and its fonts; the client and the menu have one.
     pub screen: surface::Screen,
@@ -360,6 +363,7 @@ impl Runtime {
             players: player::Players::default(),
             physics: physics::World::default(),
             physgun: physgun::Guns::default(),
+            hands: pickup::Hands::default(),
             inputs: inputs::Queue::default(),
             screen: surface::Screen::default(),
             client: client::Client::default(),
@@ -511,6 +515,7 @@ impl Runtime {
             if server {
                 player::tick_all(&self.lua);
                 physgun::think(&self.lua);
+                pickup::think(&self.lua);
                 physics::simulate(&self.lua);
                 triggers::tick(&self.lua);
                 inputs::service(&self.lua);

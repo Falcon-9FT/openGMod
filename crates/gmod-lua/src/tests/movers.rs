@@ -305,3 +305,52 @@ fn doors_push_players_or_go_back() {
     assert!(at.z.abs() < 1.0, "still on the floor: {at:?}");
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
+
+#[test]
+fn the_use_key_carries_light_props() {
+    let g = mover_game(mover_map(Vec::new()));
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime
+        .run_string(
+            "LIGHT = ents.Create('prop_physics') LIGHT:SetModel('models/light.mdl') LIGHT:SetPos(Vector(100, 0, 0)) LIGHT:Spawn()
+             HEAVY = ents.Create('prop_physics') HEAVY:SetModel('models/heavy.mdl') HEAVY:SetPos(Vector(100, -200, 0)) HEAVY:Spawn()
+             HOOKS.OnPlayerPhysicsPickup = function(p, e) print('picked', e:GetModel()) end
+             HOOKS.OnPlayerPhysicsDrop = function(p, e, thrown) print('dropped', e:GetModel(), thrown) end",
+            "props",
+        )
+        .unwrap();
+    g.runtime.think(0.5);
+    let press = |look: Angle, buttons: u32| {
+        g.runtime.set_input(alice, UserCmd { view_angles: look, buttons, ..UserCmd::default() });
+        g.runtime.think(0.05);
+        g.runtime.set_input(alice, UserCmd { view_angles: look, ..UserCmd::default() });
+        g.runtime.think(0.5);
+    };
+    // looking down at the light crate, the use key picks it up: before the eyes as they turn
+    let at_light = Angle::new(25.0, 0.0, 0.0);
+    g.runtime.run_string("Entity(1):SetPos(Vector(40, 0, 0)) Entity(1):SetEyeAngles(Angle(25, 0, 0))", "look").unwrap();
+    press(at_light, 32);
+    assert!(g.printed().contains("picked\tmodels/light.mdl"));
+    assert!(g.eval::<bool>("return LIGHT:IsPlayerHolding()"));
+    let side = Angle::new(0.0, 90.0, 0.0);
+    g.runtime.set_input(alice, UserCmd { view_angles: side, ..UserCmd::default() });
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>(
+        "local eye, held = Entity(1):EyePos(), LIGHT:LocalToWorld(LIGHT:OBBCenter())
+         return held.y - eye.y > 35 and math.abs(held.x - eye.x) < 10 and math.abs(held.z - eye.z) < 10"
+    ));
+    // the attack key throws it the way the player looks
+    press(side, 1);
+    assert!(g.printed().contains("dropped\tmodels/light.mdl\ttrue"));
+    assert!(g.eval::<bool>("return not LIGHT:IsPlayerHolding() and LIGHT:GetPos().y > 150"));
+    // the heavy crate is too heavy, unless Lua says to take it
+    let at_heavy = Angle::new(25.0, 0.0, 0.0);
+    g.runtime.run_string("Entity(1):SetPos(Vector(40, -200, 0)) Entity(1):SetEyeAngles(Angle(25, 0, 0))", "look").unwrap();
+    press(at_heavy, 32);
+    assert!(g.eval::<bool>("return not HEAVY:IsPlayerHolding()"));
+    g.runtime.run_string("Entity(1):PickupObject(HEAVY)", "force").unwrap();
+    assert!(g.eval::<bool>("return HEAVY:IsPlayerHolding() and Entity(1):GetEntityInUse() == HEAVY"));
+    g.runtime.run_string("Entity(1):DropObject()", "drop").unwrap();
+    assert!(g.eval::<bool>("return not HEAVY:IsPlayerHolding()"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}

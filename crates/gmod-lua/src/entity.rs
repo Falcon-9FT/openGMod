@@ -1559,6 +1559,7 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     })?;
 
     crate::inputs::install_methods(def)?;
+    crate::pickup::install_methods(def)?;
     crate::constraint::install_methods(def)?;
     crate::sound::install_methods(def)?;
     crate::anim::install_methods(def)?;

@@ -451,7 +451,8 @@ impl Collide for Space<'_> {
             mins: vector(mins),
             maxs: vector(maxs),
             mask,
-            filter: Filter::Entities(vec![self.player]),
+            // what the player carries they walk through
+            filter: Filter::Entities(vec![self.player, crate::pickup::carrying(self.lua, self.player).unwrap_or(EntityHandle::NULL)]),
             whitelist: false,
             ignore_world: false,
             group: trace::group::PLAYER_MOVEMENT,
@@ -858,10 +859,18 @@ fn tick(lua: &Lua, handle: EntityHandle) {
 
     // the weapon in hand
     let active = state(lua, handle, |_, p| p.active_weapon).unwrap_or(EntityHandle::NULL);
-    let (buttons, pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
+    let (mut buttons, mut pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
+    // carrying something, the attack key throws it and the weapon is still
+    if crate::pickup::carrying(lua, handle).is_some() {
+        if pressed & IN_ATTACK != 0 {
+            crate::pickup::drop(lua, handle, true);
+        }
+        buttons &= !(IN_ATTACK | IN_ATTACK2);
+        pressed &= !(IN_ATTACK | IN_ATTACK2);
+    }
     if host(lua).entities.is_valid(active) {
         weapon::post_frame(lua, active, buttons, pressed);
-        crate::physgun::command(lua, handle, active, &cmd.cmd, pressed);
+        crate::physgun::command(lua, handle, active, &UserCmd { buttons, ..cmd.cmd }, pressed);
     }
     if host(lua).entities.is_valid(handle) && self::alive(lua, handle) {
         use_key(lua, handle, buttons, pressed);
@@ -1458,6 +1467,8 @@ pub(crate) fn bump_weapon(lua: &Lua, handle: EntityHandle, item: EntityHandle) {
 /// How far the use key reaches, from the eyes.
 const USE_REACH: f32 = 80.0;
 const IN_USE: u32 = 32;
+const IN_ATTACK: u32 = 1;
+const IN_ATTACK2: u32 = 2048;
 /// `SetUseType`'s kinds, and the kinds of use `ENT:Use` is given.
 const CONTINUOUS_USE: i64 = 0;
 const ONOFF_USE: i64 = 1;
@@ -1512,6 +1523,11 @@ fn use_key(lua: &Lua, handle: EntityHandle, buttons: u32, pressed: u32) {
         }
         return;
     }
+    // carrying something, the use key lets it go
+    if crate::pickup::carrying(lua, handle).is_some() {
+        crate::pickup::drop(lua, handle, false);
+        return;
+    }
     let target = find_use_entity(lua, handle);
     if !host(lua).entities.is_valid(target) {
         crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
@@ -1522,12 +1538,27 @@ fn use_key(lua: &Lua, handle: EntityHandle, buttons: u32, pressed: u32) {
         return;
     }
     let scripted = host(lua).entities.get(target).is_some_and(|ent| ent.scripted);
+    // a prop is picked up; so is a scripted entity of physics that does nothing when used
+    let prop =
+        host(lua).entities.get(target).is_some_and(|ent| !ent.scripted && ent.class.to_ascii_lowercase().starts_with("prop_physics"));
+    if (prop || scripted && !has_own_use(lua, target)) && crate::pickup::can_carry(lua, target) {
+        if !crate::pickup::pick_up(lua, handle, target, false) {
+            crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
+        }
+        return;
+    }
     if scripted && matches!(use_type(target), CONTINUOUS_USE | ONOFF_USE) {
         with_player(lua, handle, |_, p| p.using = target);
     }
     if !crate::inputs::use_entity(lua, target, handle, handle, USE_ON, 1.0) {
         crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
     }
+}
+
+/// Whether a scripted entity has an `ENT:Use` of its own.
+fn has_own_use(lua: &Lua, handle: EntityHandle) -> bool {
+    let Ok(Value::UserData(ud)) = entity::push(lua, handle) else { return false };
+    entity::table_of(&ud).ok().flatten().is_some_and(|t| matches!(t.get::<Value>("Use"), Ok(Value::Function(_))))
 }
 
 /// Turns where a player looks (`SetEyeAngles`); their body turns with the yaw.
@@ -1722,7 +1753,7 @@ fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
 // --- Lua ---
 
 /// The player in argument 1.
-fn this(a: &Args) -> mlua::Result<EntityHandle> {
+pub(crate) fn this(a: &Args) -> mlua::Result<EntityHandle> {
     let handle = entity::this(a, 1)?;
     if is_player(a.lua, handle) { Ok(handle) } else { Err(a.bad(1, "Player")) }
 }
@@ -2604,18 +2635,21 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
     def("AllowImmediateDecalPainting", nothing)?;
     // the gesture slots and the animation events of the player's model
     crate::anim::install_player(def)?;
+    crate::pickup::install_player(def)?;
     // the base gamemode makes the physics gun's own in Lua (`AddFrozenPhysicsObject`,
     // `PhysgunUnfreeze`, `UnfreezePhysicsObjects`); these stand in without it. Nothing is
-    // carried by hand or with the gravity gun yet, and there are no vehicles.
-    for name in
-        ["AddFrozenPhysicsObject", "DropObject", "PickupObject", "SimulateGravGunDrop", "SimulateGravGunPickup", "DetonateTripmines"]
-    {
+    // carried with the gravity gun yet, and there are no vehicles.
+    for name in ["AddFrozenPhysicsObject", "SimulateGravGunDrop", "SimulateGravGunPickup", "DetonateTripmines"] {
         def(name, nothing)?;
     }
     def("PhysgunUnfreeze", zero)?;
     def("UnfreezePhysicsObjects", nothing)?;
     def("GetPreferredCarryAngles", nothing)?;
-    def("GetEntityInUse", null)?;
+    // what the player carries with the use key
+    def("GetEntityInUse", |a| {
+        let handle = this(a)?;
+        entity::push(a.lua, crate::pickup::carrying(a.lua, handle).unwrap_or(EntityHandle::NULL))
+    })?;
     def("GetUseEntity", null)?;
     def("GetVehicle", null)?;
     def("InVehicle", no)?;

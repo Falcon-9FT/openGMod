@@ -165,6 +165,7 @@ fn pick_up(lua: &Lua, player: EntityHandle, weapon: EntityHandle) {
     if !truthy(&hook(lua, "PhysgunPickup", &[player, target])) {
         return;
     }
+    crate::pickup::release(lua, target);
     // the hook may have taken its body away
     let part = hit.physics_bone;
     let Some(body) = crate::physics::part_body(lua, target, part) else { return };
@@ -192,6 +193,14 @@ fn pick_up(lua: &Lua, player: EntityHandle, weapon: EntityHandle) {
     };
     set_held(lua, player, Some(held));
     hook(lua, "OnPhysgunPickup", &[player, target]);
+}
+
+/// Whoever holds an entity with the gun lets go of it: a hand picks it up.
+pub(crate) fn release(lua: &Lua, entity: EntityHandle) {
+    let holders: Vec<EntityHandle> = host(lua).physgun.held.borrow().iter().filter(|(_, h)| h.entity == entity).map(|(p, _)| *p).collect();
+    for player in holders {
+        drop(lua, player);
+    }
 }
 
 /// Lets go of what a player holds: it moves on as it moved. `PhysgunDrop`.
