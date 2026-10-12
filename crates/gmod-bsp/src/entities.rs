@@ -35,7 +35,8 @@ impl Entity {
     /// Whether a brush entity may move, vanish or go while the game runs, so that it is to be
     /// drawn and solid where its entity is rather than baked into the map: the engine's
     /// movers, and any other `func_` brush with a name or a parent, which inputs may move,
-    /// hide or remove. The volumes nothing sees or collides with do not count.
+    /// hide or remove, and the breakables, which go when broken. The volumes nothing sees or
+    /// collides with do not count.
     pub fn moves(&self) -> bool {
         if self.brush_model().is_none() {
             return false;
@@ -49,8 +50,8 @@ impl Entity {
     }
 }
 
-/// The brush entities that move by themselves.
-const MOVERS: [&str; 14] = [
+/// The brush entities that move by themselves, or break and go.
+const MOVERS: [&str; 16] = [
     "func_door",
     "func_door_rotating",
     "func_movelinear",
@@ -65,6 +66,8 @@ const MOVERS: [&str; 14] = [
     "func_water_analog",
     "func_physbox",
     "func_physbox_multiplayer",
+    "func_breakable",
+    "func_breakable_surf",
 ];
 
 /// Brushes that are volumes for the game's logic or its effects, not things.

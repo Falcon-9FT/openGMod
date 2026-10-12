@@ -18,6 +18,17 @@ pub fn mdl(checksum: i32, hull: ([f32; 3], [f32; 3])) -> Vec<u8> {
     b
 }
 
+/// A model header as [`mdl`] writes one, with `$keyvalues` text (`prop_data { ... }`) after it.
+pub fn mdl_with_key_values(checksum: i32, hull: ([f32; 3], [f32; 3]), text: &str) -> Vec<u8> {
+    let mut b = mdl(checksum, hull);
+    let at = b.len() as i32;
+    b.extend_from_slice(text.as_bytes());
+    b.push(0);
+    b[312..316].copy_from_slice(&at.to_le_bytes());
+    b[316..320].copy_from_slice(&(text.len() as i32 + 1).to_le_bytes());
+    b
+}
+
 /// The vertices of a model without any (`.vvd`), to go with a header of the same checksum.
 pub fn empty_vvd(checksum: i32) -> Vec<u8> {
     let mut b = vec![0u8; 64];

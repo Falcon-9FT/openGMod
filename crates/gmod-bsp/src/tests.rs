@@ -215,3 +215,10 @@ fn brush_entities_that_move() {
     let door = c.model_hulls(1, collision::mask::ALL);
     assert_eq!((door.len(), door[0].len()), (1, 8));
 }
+
+#[test]
+fn breakables_may_go_without_a_name() {
+    let entity = |class: &str| Entity { pairs: vec![("classname".into(), class.into()), ("model".into(), "*2".into())] };
+    assert!(entity("func_breakable").moves() && entity("func_breakable_surf").moves());
+    assert!(!entity("func_wall").moves());
+}
