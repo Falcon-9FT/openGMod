@@ -248,7 +248,7 @@ impl Material {
     }
 }
 
-fn leading_number(text: &str) -> Option<f32> {
+pub(crate) fn leading_number(text: &str) -> Option<f32> {
     let text = text.trim_start();
     let end = text
         .char_indices()

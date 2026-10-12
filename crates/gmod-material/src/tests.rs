@@ -4,6 +4,8 @@ use super::*;
 use crate::decode::{half, to_rgba8};
 use crate::vtf::{flags, tag};
 
+mod proxy;
+
 /// A VTF file to build. Up to 7.2 the thumbnail and the image follow the header; from 7.3
 /// resources point at them - the image first, to show that the offsets are followed.
 struct Texture<'a> {
