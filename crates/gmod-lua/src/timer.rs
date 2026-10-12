@@ -38,9 +38,25 @@ struct Timer {
 pub(crate) struct Clock {
     pub cur_time: Cell<f64>,
     pub frame_time: Cell<f64>,
+    /// While a client predicts a tick of its player ([`crate::player::predict`]): the time
+    /// outside the prediction (`UnPredictedCurTime`), `CurTime` being the tick's.
+    pub unpredicted: Cell<Option<f64>>,
+    /// The tick predicted is predicted for the first time (`IsFirstTimePredicted`): what it
+    /// makes heard happens once, though the tick is predicted again every frame until the
+    /// server's answer comes.
+    pub first_prediction: Cell<bool>,
+    /// How far into the player's commands - in seconds of them since the first - the
+    /// prediction has gone: a tick ending there or before has been predicted.
+    pub predicted_until: Cell<f64>,
     pub ticks: Cell<u64>,
     timers: RefCell<Vec<Timer>>,
     next_simple: Cell<u64>,
+}
+
+/// Whether what runs now runs for the first time: anything but a tick a client predicts again.
+pub(crate) fn first_time_predicted(lua: &Lua) -> bool {
+    let clock = &host(lua).clock;
+    clock.unpredicted.get().is_none() || clock.first_prediction.get()
 }
 
 pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
@@ -49,11 +65,17 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         table.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
     };
     globals.raw_set("CurTime", lua.create_function(|lua, ()| Ok(host(lua).clock.cur_time.get()))?)?;
-    globals.raw_set("UnPredictedCurTime", lua.create_function(|lua, ()| Ok(host(lua).clock.cur_time.get()))?)?;
+    globals.raw_set(
+        "UnPredictedCurTime",
+        lua.create_function(|lua, ()| {
+            let clock = &host(lua).clock;
+            Ok(clock.unpredicted.get().unwrap_or(clock.cur_time.get()))
+        })?,
+    )?;
     globals.raw_set("RealTime", lua.create_function(|lua, ()| Ok(host(lua).started.elapsed().as_secs_f64()))?)?;
     globals.raw_set("FrameTime", lua.create_function(|lua, ()| Ok(host(lua).clock.frame_time.get()))?)?;
-    // the server runs each command once: there is nothing to predict again
-    globals.raw_set("IsFirstTimePredicted", lua.create_function(|_, ()| Ok(true))?)?;
+    // the server runs each command once, as does a client outside its prediction
+    globals.raw_set("IsFirstTimePredicted", lua.create_function(|lua, ()| Ok(first_time_predicted(lua)))?)?;
 
     let timer = lua.create_table()?;
     def(&timer, "Create", |a| {

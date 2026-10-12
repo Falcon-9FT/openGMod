@@ -345,12 +345,15 @@ impl Game {
             }
             Link::Remote(connection) => {
                 let events = connection.poll();
+                let (own, from) = connection.predicted(self.player);
                 if let Some(mut snapshot) = connection.shown(seconds) {
-                    // the player itself where the server last said, not a while ago
-                    if let Some(own) = connection.newest(self.player)
-                        && let Some(at) = snapshot.entities.iter_mut().find(|e| e.index == own.index && e.serial == own.serial)
-                    {
-                        *at = own.clone();
+                    // the player itself, its weapons and view models where the server last
+                    // said, not a while ago: the prediction goes on from there
+                    for state in own {
+                        match snapshot.entities.binary_search_by_key(&state.index, |e| e.index) {
+                            Ok(i) => snapshot.entities[i] = state,
+                            Err(i) => snapshot.entities.insert(i, state),
+                        }
                     }
                     self.client.apply_snapshot(&snapshot);
                 }
@@ -363,8 +366,9 @@ impl Game {
                         Event::Joined(_) => {}
                     }
                 }
-                // and moved on by what it asked since, as the server will move it
-                let fraction = self.client.predict(self.player, &connection.unanswered());
+                // and moved on by what it asked since, its weapon fired, as the server will
+                let (commands, played) = connection.unanswered();
+                let fraction = self.client.predict(self.player, &commands, from, played);
                 let view = self.client.view(self.player)?;
                 between(view.previous_eye, view.eye, fraction)
             }
@@ -752,7 +756,7 @@ mod tests {
         let on_server = connection.newest(game.player).unwrap().ent.local_pos;
         let predicted = game.client.position(game.player).unwrap();
         assert!((on_server - predicted).length() < 0.5, "{on_server:?} {predicted:?}");
-        assert!(connection.unanswered().len() < 10);
+        assert!(connection.unanswered().0.len() < 10);
         assert_eq!(game.client().lua().load("return GOT").eval::<String>().unwrap(), "welcome: hi Alice");
         assert!(game.multiplayer() && game.closed().is_none());
 

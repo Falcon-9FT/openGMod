@@ -53,6 +53,8 @@ pub struct Connection {
     last_command: u32,
     /// The last command the newest snapshot answers.
     answered: u32,
+    /// How long the commands done with were the player's, all told.
+    played: f64,
     /// Snapshots received, oldest first, to draw between.
     buffer: VecDeque<Snapshot>,
     /// The server's time the picture shows.
@@ -116,6 +118,7 @@ impl Connection {
             commands: VecDeque::new(),
             last_command: 0,
             answered: 0,
+            played: 0.0,
             buffer: VecDeque::new(),
             shown: None,
             inbox: VecDeque::new(),
@@ -313,22 +316,43 @@ impl Connection {
                 self.buffer.push_back(snapshot);
                 self.answered = self.answered.max(command);
                 while self.commands.front().is_some_and(|(n, _, _)| *n <= self.answered) {
-                    self.commands.pop_front();
+                    self.forget_command();
                 }
             }
         }
     }
 
     /// The player's own entity in the newest snapshot: where the server last said it was.
+    #[cfg(test)]
     pub fn newest(&self, player: EntityHandle) -> Option<&gmod_lua::EntityState> {
         let index = player.index?;
         self.buffer.back()?.entities.iter().find(|e| e.index == index && e.serial == player.serial)
     }
 
+    /// What the client predicts goes on from the newest snapshot, not the one shown: the
+    /// player, the weapons it carries and what it has before its eyes, as the server last
+    /// said they were; and the server's time then.
+    pub fn predicted(&self, player: EntityHandle) -> (Vec<gmod_lua::EntityState>, f64) {
+        let Some(newest) = self.buffer.back() else { return (Vec::new(), 0.0) };
+        let own = |e: &gmod_lua::EntityState| {
+            (Some(e.index) == player.index && e.serial == player.serial)
+                || (e.ent.owner == player && (e.ent.weapon.is_some() || e.ent.class.to_ascii_lowercase().contains("viewmodel")))
+        };
+        (newest.entities.iter().filter(|e| own(e)).cloned().collect(), newest.time)
+    }
+
     /// The commands the newest snapshot does not answer yet, oldest first, with how long each
-    /// was the player's: what to move the player on by from there.
-    pub fn unanswered(&self) -> Vec<(UserCmd, f32)> {
-        self.commands.iter().map(|&(_, cmd, seconds)| (cmd, seconds)).collect()
+    /// was the player's: what to move the player on by from there. And how long those before
+    /// them were, all told.
+    pub fn unanswered(&self) -> (Vec<(UserCmd, f32)>, f64) {
+        (self.commands.iter().map(|&(_, cmd, seconds)| (cmd, seconds)).collect(), self.played)
+    }
+
+    /// The oldest command is done with: answered, or too old to keep.
+    fn forget_command(&mut self) {
+        if let Some((_, _, seconds)) = self.commands.pop_front() {
+            self.played += f64::from(seconds);
+        }
     }
 
     /// Reads what arrived and sends what is due: what happened since the last call.
@@ -344,7 +368,7 @@ impl Connection {
         self.commands.push_back((self.last_command, cmd, seconds));
         // a server that answers nothing: only the latest are kept
         while self.commands.len() > MAX_UNANSWERED {
-            self.commands.pop_front();
+            self.forget_command();
         }
         let first = self.commands.len().saturating_sub(COMMANDS_SENT);
         let sent = self.commands.iter().skip(first).map(|&(_, cmd, _)| cmd).collect();

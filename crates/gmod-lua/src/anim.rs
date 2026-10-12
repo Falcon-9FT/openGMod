@@ -645,6 +645,12 @@ fn view_model_fov(lua: &Lua, viewer: EntityHandle) -> f32 {
     own.or_else(|| crate::convar::value(lua, "viewmodel_fov").and_then(|v| v.parse().ok())).unwrap_or(54.0)
 }
 
+/// A player's view models that are there.
+pub(crate) fn view_models_of(lua: &Lua, owner: EntityHandle) -> Vec<EntityHandle> {
+    let all = player::state(lua, owner, |_, p| p.view_models).unwrap_or([EntityHandle::NULL; 3]);
+    all.into_iter().filter(|&vm| host(lua).entities.is_valid(vm)).collect()
+}
+
 /// A player's view model `index`.
 fn view_model(lua: &Lua, owner: EntityHandle, index: usize) -> EntityHandle {
     player::state(lua, owner, |_, p| p.view_models.get(index).copied()).flatten().unwrap_or(EntityHandle::NULL)

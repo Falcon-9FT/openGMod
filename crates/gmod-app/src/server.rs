@@ -348,6 +348,8 @@ impl Server {
                     name: name.clone(),
                     address: addr.to_string(),
                     steam_id64: Some(steam_id64),
+                    // its client predicts its movement and weapon
+                    predicts: true,
                     ..PlayerInfo::default()
                 });
                 match joined {
@@ -476,7 +478,7 @@ impl Server {
                 sounds
                     .iter()
                     .zip(&hearers)
-                    .filter(|(_, h)| h.as_ref().is_none_or(|h| h.contains(&player)))
+                    .filter(|(s, h)| h.as_ref().is_none_or(|h| h.contains(&player)) && s.unheard_by() != Some(player))
                     .map(|(s, _)| s.clone())
                     .collect()
             };

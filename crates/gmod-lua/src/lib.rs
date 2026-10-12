@@ -728,13 +728,15 @@ impl Runtime {
         player::set_input(&self.lua, player, cmd);
     }
 
-    /// A client moves its own player on from where the server last said it was, by the
-    /// commands the server has not answered yet - each with how long it was the player's -
-    /// as the server will move it ([`player`]'s prediction: the engine's movement). How far
-    /// into the next tick the commands' time goes, 0 to 1: where to draw the eyes between
-    /// where they were and are ([`PlayerView::previous_eye`]).
-    pub fn predict(&self, player: EntityHandle, commands: &[(UserCmd, f32)]) -> f32 {
-        player::predict(&self.lua, player, commands)
+    /// A client moves its own player on from where the server last said it was - in the
+    /// snapshot of the server's time `from` - by the commands the server has not answered yet
+    /// (each with how long it was the player's; `played`: how long those before were, all
+    /// told), as the server will move it, and fires its weapon as the server will
+    /// ([`player`]'s prediction: the engine's movement and the weapon in hand). How far into
+    /// the next tick the commands' time goes, 0 to 1: where to draw the eyes between where
+    /// they were and are ([`PlayerView::previous_eye`]).
+    pub fn predict(&self, player: EntityHandle, commands: &[(UserCmd, f32)], from: f64, played: f64) -> f32 {
+        player::predict(&self.lua, player, commands, from, played)
     }
 
     /// The time of the game a player's client showed when it gave its latest command: their

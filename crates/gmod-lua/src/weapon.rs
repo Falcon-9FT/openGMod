@@ -7,7 +7,8 @@
 //! `Think`, and the keys held fire it - `PrimaryAttack` when `IN_ATTACK` is down and its next
 //! primary fire has come (pressed anew, for a SWEP that is not `Primary.Automatic`),
 //! `SecondaryAttack` for `IN_ATTACK2`, `Reload` for `IN_RELOAD`. The engine's own weapons fire
-//! as Half-Life 2's do ([`crate::hl2weapons`]).
+//! as Half-Life 2's do ([`crate::hl2weapons`]). A client does the same for its own player's
+//! weapon in the ticks it predicts ([`crate::player::predict`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;

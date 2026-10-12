@@ -241,7 +241,8 @@ pub(crate) fn fire(lua: &Lua, shooter: EntityHandle, bullets: Bullets) {
             }
         }
         let info = info_ud.as_ref().and_then(|ud| ud.borrow::<DamageInfo>().ok().map(|i| *i)).unwrap_or(info);
-        if hit_something && hurts && hit.entity.index.is_some_and(|i| i != 0) {
+        // a client's bullets, fired as it predicts its weapon, hurt no one: the server's do
+        if hit_something && hurts && host(lua).realm == crate::Realm::Server && hit.entity.index.is_some_and(|i| i != 0) {
             strike(lua, hit.entity, hit.hit_group, hit.physics_bone, info);
         }
         if hit_something && effects {

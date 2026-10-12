@@ -98,6 +98,10 @@ pub(crate) fn push(lua: &Lua, info: DamageInfo) -> mlua::Result<Value> {
 
 /// Damage to an entity.
 pub(crate) fn take(lua: &Lua, target: EntityHandle, info: DamageInfo) {
+    // damage is the server's: a client firing its weapon as it predicts hurts no one
+    if host(lua).realm != crate::Realm::Server {
+        return;
+    }
     let Ok(Value::UserData(ent)) = entity::push(lua, target) else { return };
     if !host(lua).entities.is_valid(target) {
         return;

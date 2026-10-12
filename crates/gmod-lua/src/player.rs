@@ -172,6 +172,10 @@ pub struct PlayerInfo {
     /// The client's user info (`cl_playermodel` ...): what [`DEFAULT_USER_INFO`] does not
     /// cover, or covers otherwise.
     pub user_info: Vec<(String, String)>,
+    /// The player's client predicts what its commands do - its movement, its weapon - and
+    /// hears its weapon as it predicts it ([`predict`]): a client over the network.
+    #[serde(default)]
+    pub predicts: bool,
 }
 
 /// What the engine keeps for a player, beside what every entity has.
@@ -958,7 +962,14 @@ fn tick(lua: &Lua, handle: EntityHandle) {
         pressed &= !(IN_ATTACK | IN_ATTACK2);
     }
     if host(lua).entities.is_valid(active) {
+        // a client that predicted the weapon heard it then: what it makes heard now is the
+        // others' (`SuppressHostEvents`)
+        let predicts = state(lua, handle, |_, p| p.info.predicts).unwrap_or(false);
+        let before = predicts.then(|| host(lua).sounds.unheard_by.replace(Some(handle)));
         weapon::post_frame(lua, active, buttons, pressed);
+        if let Some(before) = before {
+            host(lua).sounds.unheard_by.set(before);
+        }
         crate::physgun::command(lua, handle, active, &UserCmd { buttons, ..cmd.cmd }, pressed);
     }
     if host(lua).entities.is_valid(handle) && self::alive(lua, handle) {
@@ -1037,13 +1048,19 @@ fn engine_move(lua: &Lua, handle: EntityHandle, mv: &mut MoveData) {
     }
 }
 
-/// A client moves its own player on from where the server last said it was, as the server
-/// will once the commands it has not answered yet arrive: each for as long as it was the
-/// player's, in the server's ticks - the engine's movement only, without the gamemode's
-/// hooks, which mostly leave it be. What the server then says puts it right. How far the time
-/// of the commands goes into a tick not run yet, 0 to 1: the eyes are drawn that far from
-/// where they were before the last tick ([`PlayerState::previous_eye`]) to where they are.
-pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32)]) -> f32 {
+/// A client moves its own player on from where the server last said it was (at `from`, the
+/// time of the newest snapshot), as the server will once the commands it has not answered yet
+/// arrive: each for as long as it was the player's, in the server's ticks - the engine's
+/// movement, without the gamemode's hooks, which mostly leave it be, and the weapon in hand
+/// (its `Think`, and what the keys held fire), each tick at the `CurTime` the server will run
+/// it at. `played` is how long the commands before these were the player's, all told: a tick
+/// that ends no further into the commands than one before did is predicted again - every
+/// frame, until the server's answer comes - and not for the first time
+/// (`IsFirstTimePredicted`): what it makes heard is heard once. What the server then says
+/// puts it right. The view model plays on to the time of the newest command. How far that
+/// time goes into a tick not run yet, 0 to 1: the eyes are drawn that far from where they were
+/// before the last tick ([`PlayerState::previous_eye`]) to where they are.
+pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32)], from: f64, played: f64) -> f32 {
     let tick = crate::timer::TICK_INTERVAL as f32;
     let still = eye(lua, handle).map(|(eye, _)| eye);
     with_player(lua, handle, |_, p| p.previous_eye = still);
@@ -1054,7 +1071,16 @@ pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32
     let Some(&(mut cmd, first)) = commands.next() else { return 0.0 };
     until += first;
     let total: f32 = until + commands.clone().map(|(_, s)| s).sum::<f32>();
-    while time + tick <= total + 1e-4 {
+    let clock = &host(lua).clock;
+    let outside = clock.cur_time.get();
+    clock.unpredicted.set(Some(outside));
+    // the server's ticks after the one of the snapshot
+    let base = (from / crate::timer::TICK_INTERVAL + 1e-6).floor();
+    let mut ticks = 0.0;
+    let fraction = loop {
+        if time + tick > total + 1e-4 {
+            break ((total - time) / tick).clamp(0.0, 1.0);
+        }
         while time >= until - 1e-4
             && let Some(&(next, seconds)) = commands.next()
         {
@@ -1062,27 +1088,57 @@ pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32
             until += seconds;
         }
         time += tick;
-        let Some((alive, frozen, turning)) =
-            state(lua, handle, |ent, p| (p.alive, ent.flags & fl::FROZEN != 0, cmd.buttons & key::USE != 0 && p.physgun.index.is_some()))
-        else {
-            return 0.0;
-        };
-        if !alive {
-            return 0.0;
+        ticks += 1.0;
+        clock.cur_time.set((base + ticks) * crate::timer::TICK_INTERVAL);
+        let reached = played + f64::from(time);
+        clock.first_prediction.set(reached > clock.predicted_until.get() + 1e-4);
+        if !predict_tick(lua, handle, &cmd) {
+            break 0.0;
         }
-        let before = eye(lua, handle).map(|(eye, _)| eye);
-        with_player(lua, handle, |_, p| {
-            p.previous_eye = before;
-            if !frozen && !turning {
-                p.eye_angles = cmd.view_angles;
-            }
-        });
-        let data = CmdData { cmd, ..CmdData::default() };
-        let Some(mut mv) = movedata(lua, handle, &data, frozen) else { return 0.0 };
-        engine_move(lua, handle, &mut mv);
-        finish_move(lua, handle, &mv);
+        clock.predicted_until.set(clock.predicted_until.get().max(reached));
+    };
+    // what is before the eyes plays on to the time of the newest command
+    clock.cur_time.set(base * crate::timer::TICK_INTERVAL + f64::from(total));
+    for vm in crate::anim::view_models_of(lua, handle) {
+        crate::anim::frame_advance(lua, vm, None);
     }
-    ((total - time) / tick).clamp(0.0, 1.0)
+    clock.cur_time.set(outside);
+    clock.unpredicted.set(None);
+    fraction
+}
+
+/// A tick of a client's own player, predicted: the command's movement, and the weapon in
+/// hand. Whether the player is there to go on with.
+fn predict_tick(lua: &Lua, handle: EntityHandle, cmd: &UserCmd) -> bool {
+    let Some((alive, frozen, turning)) =
+        state(lua, handle, |ent, p| (p.alive, ent.flags & fl::FROZEN != 0, cmd.buttons & key::USE != 0 && p.physgun.index.is_some()))
+    else {
+        return false;
+    };
+    if !alive {
+        return false;
+    }
+    let before = eye(lua, handle).map(|(eye, _)| eye);
+    let Some((buttons, pressed, active)) = with_player(lua, handle, |_, p| {
+        p.previous_eye = before;
+        if !frozen && !turning {
+            p.eye_angles = cmd.view_angles;
+        }
+        p.old_buttons = p.buttons;
+        p.buttons = cmd.buttons;
+        (p.buttons, p.buttons & !p.old_buttons, p.active_weapon)
+    }) else {
+        return false;
+    };
+    decay_punch(lua, handle);
+    let data = CmdData { cmd: *cmd, ..CmdData::default() };
+    let Some(mut mv) = movedata(lua, handle, &data, frozen) else { return false };
+    engine_move(lua, handle, &mut mv);
+    finish_move(lua, handle, &mv);
+    if host(lua).entities.is_valid(active) && host(lua).entities.get(active).is_some_and(|w| !w.dormant) {
+        weapon::post_frame(lua, active, buttons, pressed);
+    }
+    host(lua).entities.is_valid(handle)
 }
 
 /// How heavy a player is to what they push, in kilograms.
