@@ -171,6 +171,10 @@ pub struct Ent {
     /// What an NPC keeps ([`crate::npc`]).
     #[serde(skip)]
     pub npc: Option<Box<crate::npc::Npc>>,
+    /// A client's: the server has it but does not send it now, as it is out of sight
+    /// ([`crate::pvs`]).
+    #[serde(skip)]
+    pub dormant: bool,
 }
 
 /// How a bone is moved from where its model has it.
@@ -259,6 +263,7 @@ impl Ent {
             mover: None,
             charger: None,
             npc: None,
+            dormant: false,
         }
     }
 
@@ -1491,7 +1496,11 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     })?;
     def("AddEFlags", |a| {
         let flags = a.number(2)? as i64;
-        write(a, |ent| ent.engine_flags |= flags)
+        // asked again how it is sent, the flag goes as the engine takes it
+        if flags & crate::pvs::EFL_FORCE_CHECK_TRANSMIT != 0 {
+            crate::pvs::recheck(a.lua, this(a, 1)?);
+        }
+        write(a, |ent| ent.engine_flags |= flags & !crate::pvs::EFL_FORCE_CHECK_TRANSMIT)
     })?;
     def("RemoveEFlags", |a| {
         let flags = a.number(2)? as i64;
@@ -1595,6 +1604,7 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     crate::hitbox::install_methods(def)?;
     crate::bullets::install_methods(def)?;
     crate::lagcomp::install_methods(def)?;
+    crate::pvs::install_methods(def)?;
     crate::ents::install_variables(def)
 }
 

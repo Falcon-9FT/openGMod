@@ -10,6 +10,7 @@ pub mod index {
     pub const PLANES: usize = 1;
     pub const TEXDATA: usize = 2;
     pub const VERTEXES: usize = 3;
+    pub const VISIBILITY: usize = 4;
     pub const NODES: usize = 5;
     pub const TEXINFO: usize = 6;
     pub const FACES: usize = 7;

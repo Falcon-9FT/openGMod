@@ -15,7 +15,7 @@
 //!
 //! Every message is serialized with postcard, and compressed when that makes it smaller.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use gmod_lua::net::Bits;
@@ -154,9 +154,22 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
 /// The entities of a snapshot, each serialized, by index.
 pub type Encoded = BTreeMap<u32, Rc<[u8]>>;
 
+/// Where an [`Encoded`] keeps the entities its client is to keep dormant: past every index.
+pub const DORMANT: u32 = u32::MAX;
+
 /// Serializes the entities of a snapshot, for the clients' deltas.
 pub fn encode_entities(snapshot: &Snapshot) -> Encoded {
     snapshot.entities.iter().map(|e| (e.index, Rc::from(postcard::to_allocvec(e).unwrap_or_default()))).collect()
+}
+
+/// What of the entities one client is sent: those of `indices`, and the list of those it is to
+/// keep dormant - as one more entry, so that an unchanged list costs nothing in a delta.
+pub fn for_player(all: &Encoded, indices: &HashSet<u32>, dormant: &[(u32, u32)]) -> Encoded {
+    let mut mine: Encoded = all.iter().filter(|(i, _)| indices.contains(i)).map(|(i, b)| (*i, b.clone())).collect();
+    if !dormant.is_empty() {
+        mine.insert(DORMANT, Rc::from(postcard::to_allocvec(dormant).unwrap_or_default()));
+    }
+    mine
 }
 
 /// A snapshot as what changed since one the client has.
@@ -259,7 +272,11 @@ impl SnapshotReceiver {
         }
         let mut states = Vec::with_capacity(entities.len());
         let mut decoded = HashMap::with_capacity(entities.len());
-        for (&index, bytes) in &entities {
+        let dormant = match entities.get(&DORMANT) {
+            Some(bytes) => postcard::from_bytes::<Vec<(u32, u32)>>(bytes).ok()?,
+            None => Vec::new(),
+        };
+        for (&index, bytes) in entities.iter().filter(|(i, _)| **i != DORMANT) {
             let state = match self.decoded.remove(&index) {
                 Some((before, state)) if Rc::ptr_eq(&before, bytes) || before == *bytes => state,
                 _ => postcard::from_bytes::<EntityState>(bytes).ok().filter(|s| s.index == index)?,
@@ -273,7 +290,7 @@ impl SnapshotReceiver {
             self.history.pop_front();
         }
         self.newest = delta.seq;
-        Some(Snapshot { time: delta.time, entities: states })
+        Some(Snapshot { time: delta.time, entities: states, dormant })
     }
 }
 
@@ -320,7 +337,7 @@ mod tests {
     }
 
     fn snapshot(time: f64, entities: Vec<EntityState>) -> Snapshot {
-        Snapshot { time, entities }
+        Snapshot { time, entities, dormant: Vec::new() }
     }
 
     fn positions(s: &Snapshot) -> Vec<(u32, f32)> {
@@ -370,6 +387,31 @@ mod tests {
         // a delta against a snapshot the client does not have makes nothing
         let orphan = SnapshotDelta { seq: 99, baseline: 77, time: 2.0, command: 0, removed: Vec::new(), changed: Vec::new() };
         assert!(receiver.receive(orphan).is_none());
+    }
+
+    #[test]
+    fn each_client_gets_what_it_sees_and_keeps_the_rest_dormant() {
+        let mut sender = SnapshotSender::default();
+        let mut receiver = SnapshotReceiver::default();
+        let all = encode_entities(&snapshot(1.0, (1..=10).map(|i| state(i, i as f32)).collect()));
+        // it sees the first five; it has 6 and 7 from before
+        let seen: HashSet<u32> = (1..=5).collect();
+        let mine = for_player(&all, &seen, &[(6, 1), (7, 1)]);
+        let got = receiver.receive(sender.delta(&Rc::new(mine.clone()), 1.0, 0)).unwrap();
+        assert_eq!(got.entities.iter().map(|e| e.index).collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
+        assert_eq!(got.dormant, [(6, 1), (7, 1)]);
+        sender.ack(receiver.newest);
+        // the same again: the list costs nothing
+        let delta = sender.delta(&Rc::new(mine), 1.1, 0);
+        assert!(delta.changed.is_empty() && delta.removed.is_empty());
+        assert_eq!(receiver.receive(delta).unwrap().dormant, [(6, 1), (7, 1)]);
+        sender.ack(receiver.newest);
+        // all in sight: none dormant
+        let seen: HashSet<u32> = (1..=10).collect();
+        let delta = sender.delta(&Rc::new(for_player(&all, &seen, &[])), 1.2, 0);
+        assert!(delta.removed.contains(&DORMANT));
+        let got = receiver.receive(delta).unwrap();
+        assert!(got.dormant.is_empty() && got.entities.len() == 10);
     }
 
     #[test]

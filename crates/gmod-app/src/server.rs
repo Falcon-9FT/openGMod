@@ -8,6 +8,7 @@
 //! server's Lua asks of their clients. What is for the host's client the caller takes
 //! ([`ForHost`]): that client is in the same program and sees the server's entities directly.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -59,6 +60,9 @@ struct Remote {
     /// Its player, once it has loaded and joined.
     player: Option<EntityHandle>,
     snapshots: SnapshotSender,
+    /// The entities it was sent, by index, with their serial numbers, while the server has
+    /// them: those out of sight it keeps dormant.
+    known: HashMap<u32, u32>,
     /// The number of the last command taken.
     command: u32,
 }
@@ -200,7 +204,7 @@ impl Server {
         let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
         let name = clean_name(&hello.name);
         println!("{name} is connecting from {addr}");
-        self.remotes.push(Remote { id, addr, name, player: None, snapshots: SnapshotSender::default(), command: 0 });
+        self.remotes.push(Remote { id, addr, name, player: None, snapshots: SnapshotSender::default(), known: HashMap::new(), command: 0 });
         let (lua, content) = {
             let files = self.files();
             (files.lua.clone(), files.content.clone())
@@ -374,21 +378,52 @@ impl Server {
                 None => {}
             }
         }
+        // each hears what is heard where its player is
         let sounds = self.runtime.take_sounds();
         if !sounds.is_empty() {
-            for (id, _) in &joined {
-                out.push((*id, FromServer::Sounds(sounds.clone()), true));
+            let hearers: Vec<Option<Vec<EntityHandle>>> = sounds.iter().map(|s| self.runtime.hearing(s)).collect();
+            let heard = |player: EntityHandle| -> Vec<gmod_lua::sound::SoundEvent> {
+                sounds
+                    .iter()
+                    .zip(&hearers)
+                    .filter(|(_, h)| h.as_ref().is_none_or(|h| h.contains(&player)))
+                    .map(|(s, _)| s.clone())
+                    .collect()
+            };
+            for (id, player) in &joined {
+                let mine = heard(*player);
+                if !mine.is_empty() {
+                    out.push((*id, FromServer::Sounds(mine), true));
+                }
             }
+            host.sounds = match self.host {
+                Some(player) => heard(player),
+                None => Vec::new(),
+            };
         }
-        host.sounds = sounds;
         // the entities, once a tick has passed
         let tick = (self.runtime.cur_time() / gmod_lua::timer::TICK_INTERVAL).floor() as i64;
         if tick != self.last_tick && !joined.is_empty() {
             self.last_tick = tick;
-            let encoded = Rc::new(proto::encode_entities(&self.runtime.snapshot()));
+            let snapshot = self.runtime.snapshot();
+            let serials: HashMap<u32, u32> = snapshot.entities.iter().map(|e| (e.index, e.serial)).collect();
+            let encoded = proto::encode_entities(&snapshot);
+            let transmission = self.runtime.transmission();
             let time = self.runtime.cur_time();
-            for remote in self.remotes.iter_mut().filter(|r| r.player.is_some()) {
-                let delta = remote.snapshots.delta(&encoded, time, remote.command);
+            for remote in self.remotes.iter_mut() {
+                let Some(player) = remote.player else { continue };
+                // each is sent what its player may see; what it has of the rest it keeps dormant
+                let sent = self.runtime.sent_to(&transmission, player);
+                remote.known.retain(|index, serial| serials.get(index) == Some(serial));
+                let dormant: Vec<(u32, u32)> =
+                    sent.held.iter().filter(|(index, serial)| remote.known.get(index) == Some(serial)).copied().collect();
+                for index in &sent.indices {
+                    if let Some(&serial) = serials.get(index) {
+                        remote.known.insert(*index, serial);
+                    }
+                }
+                let mine = Rc::new(proto::for_player(&encoded, &sent.indices, &dormant));
+                let delta = remote.snapshots.delta(&mine, time, remote.command);
                 out.push((remote.id, FromServer::Snapshot(delta), false));
             }
         }

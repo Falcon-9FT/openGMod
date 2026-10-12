@@ -18,6 +18,7 @@ mod mapio;
 mod movers;
 mod multiplayer;
 mod npc;
+mod pvs;
 mod ragdoll;
 mod shapes;
 mod triggers;
@@ -1104,6 +1105,7 @@ fn player_map() -> Map {
         brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
         collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
         textures: bsp.texinfo.iter().map(texture).collect(),
+        visibility: gmod_bsp::Visibility::new(&bsp).map(Arc::new),
     }
 }
 

@@ -1,8 +1,9 @@
 //! Who something the server sends goes to: `RecipientFilter` (`CRecipientFilter`), and the
 //! players a `net` message names - a player, a table of them, or a filter.
 //!
-//! The server knows no sets of what is seen and heard from where yet: `AddPVS` and `AddPAS`
-//! (and `net.SendPVS`, `net.SendPAS`) take every player.
+//! `AddPVS` and `AddPAS` (and `net.SendPVS`, `net.SendPAS`) take the players whose eyes are in
+//! the clusters seen or heard from a point, by the map's visibility ([`crate::pvs`]); on a map
+//! without it, every player.
 
 use mlua::{AnyUserData, Lua, MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value};
 
@@ -80,9 +81,22 @@ pub(crate) fn all_but(lua: &Lua, value: Option<&Value>) -> Vec<EntityHandle> {
     everyone(lua).into_iter().filter(|p| !omitted.contains(p)).collect()
 }
 
-/// Every player: what reaches as far as the server can tell from a place.
-pub(crate) fn near(lua: &Lua, _position: Option<&Value>) -> Vec<EntityHandle> {
-    everyone(lua)
+/// The point a value is, if it is a vector.
+fn point(value: Option<&Value>) -> Option<crate::vector::Vector> {
+    match value {
+        Some(Value::UserData(ud)) => ud.borrow::<crate::vector::Vector>().ok().map(|v| *v),
+        _ => None,
+    }
+}
+
+/// The players that may see a point (every player for what is no point).
+pub(crate) fn seeing(lua: &Lua, position: Option<&Value>) -> Vec<EntityHandle> {
+    point(position).map_or_else(|| everyone(lua), |p| crate::pvs::players_seeing(lua, p))
+}
+
+/// The players that may hear a point (every player for what is no point).
+pub(crate) fn hearing(lua: &Lua, position: Option<&Value>) -> Vec<EntityHandle> {
+    point(position).map_or_else(|| everyone(lua), |p| crate::pvs::players_hearing(lua, p))
 }
 
 fn def(lua: &Lua, t: &Table, name: &'static str, f: fn(&Args) -> mlua::Result<Value>) -> mlua::Result<()> {
@@ -113,12 +127,14 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let players = players_of(a.lua, a.get(2));
         change(a, |r| r.add(players))
     })?;
-    for name in ["AddPAS", "AddPVS"] {
-        def(lua, &t, name, |a| {
-            let players = near(a.lua, a.get(2));
-            change(a, |r| r.add(players))
-        })?;
-    }
+    def(lua, &t, "AddPAS", |a| {
+        let players = hearing(a.lua, a.get(2));
+        change(a, |r| r.add(players))
+    })?;
+    def(lua, &t, "AddPVS", |a| {
+        let players = seeing(a.lua, a.get(2));
+        change(a, |r| r.add(players))
+    })?;
     def(lua, &t, "AddRecipientsByTeam", |a| {
         let players = players_by_team(a.lua, a.number(2)? as i64);
         change(a, |r| r.add(players))
@@ -130,12 +146,14 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             change(a, |r| r.remove(&players))
         })?;
     }
-    for name in ["RemovePAS", "RemovePVS"] {
-        def(lua, &t, name, |a| {
-            let players = near(a.lua, a.get(2));
-            change(a, |r| r.remove(&players))
-        })?;
-    }
+    def(lua, &t, "RemovePAS", |a| {
+        let players = hearing(a.lua, a.get(2));
+        change(a, |r| r.remove(&players))
+    })?;
+    def(lua, &t, "RemovePVS", |a| {
+        let players = seeing(a.lua, a.get(2));
+        change(a, |r| r.remove(&players))
+    })?;
     def(lua, &t, "RemoveRecipientsByTeam", |a| {
         let players = players_by_team(a.lua, a.number(2)? as i64);
         change(a, |r| r.remove(&players))

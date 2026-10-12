@@ -678,9 +678,12 @@ mod tests {
         let mut connection = Connection::open(at, "Alice").unwrap();
         assert_eq!((connection.welcome.map.as_str(), connection.welcome.max_players), ("gm_test", 4));
         let mut vfs = client_files.vfs();
+        vfs.push(Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&download.0))));
         let lua = connection.download(&vfs, Some(&download.0)).unwrap();
         assert_eq!(lua, [("lua/autorun/client/hello.lua".to_string(), b"HELLO = 'from the server'".to_vec())]);
         assert_eq!(std::fs::read(download.0.join("materials/test/thing.vtf")).unwrap(), b"texture");
+        // and the game finds it at once, though it looked in that folder before it came
+        assert!(vfs.read("materials/test/thing.vtf", "GAME").is_ok_and(|data| data[..] == b"texture"[..]));
         vfs.insert(0, Mount::new(&["GAME"], Backing::Memory(gmod_fs::MemoryMount::new("server", lua))));
         let mut game = Game::join(Arc::new(vfs), &test_map(), connection, None).unwrap();
         game.client().run_string("include('autorun/client/hello.lua')", "hello").unwrap();

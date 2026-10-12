@@ -345,6 +345,13 @@ pub struct TestMap {
     /// Areas of the world's leaves: a leaf whose middle is inside a box (mins, maxs) is in its
     /// area; the others in none (0).
     pub areas: Vec<([f32; 3], [f32; 3], u16)>,
+    /// Visibility clusters of the world's leaves: an open leaf whose middle is inside a box is
+    /// in that cluster (its index), the others in none. With none given, every leaf is in
+    /// cluster 0 and the map has no visibility lump.
+    pub clusters: Vec<([f32; 3], [f32; 3])>,
+    /// Which clusters see each other, both ways; each sees itself. A cluster hears what those it
+    /// sees see.
+    pub sees: Vec<(usize, usize)>,
     pub static_props: Vec<TestStaticProp>,
     /// The entities after `worldspawn`, as the entity lump writes them.
     pub entities: String,
@@ -374,6 +381,7 @@ struct Tree {
     leaf_brush_count: usize,
     old_leaves: bool,
     areas: Vec<([f32; 3], [f32; 3], u16)>,
+    clusters: Vec<([f32; 3], [f32; 3])>,
 }
 
 impl Tree {
@@ -387,10 +395,18 @@ impl Tree {
     }
 
     fn leaf(&mut self, brushes: &[Boxed], contents: &[u32], region: ([f32; 3], [f32; 3])) -> i32 {
-        let mut leaf = brushes.iter().fold(0u32, |c, b| c | contents[b.0]).to_le_bytes().to_vec();
-        leaf.extend(0i16.to_le_bytes()); // cluster
+        let solid = brushes.iter().fold(0u32, |c, b| c | contents[b.0]);
+        let mut leaf = solid.to_le_bytes().to_vec();
         let middle: [f32; 3] = std::array::from_fn(|i| (region.0[i] + region.1[i]) / 2.0);
-        let inside = |(lo, hi, _): &&([f32; 3], [f32; 3], u16)| (0..3).all(|i| lo[i] <= middle[i] && middle[i] <= hi[i]);
+        let within = |lo: &[f32; 3], hi: &[f32; 3]| (0..3).all(|i| lo[i] <= middle[i] && middle[i] <= hi[i]);
+        let cluster = match self.clusters.is_empty() {
+            true => 0,
+            // a leaf lists the brushes it touches: it is solid where one is around its middle
+            false if self.leaf_count == 0 || brushes.iter().any(|b| (0..3).all(|i| b.1[i] < middle[i] && middle[i] < b.2[i])) => -1,
+            false => self.clusters.iter().position(|(lo, hi)| within(lo, hi)).map_or(-1, |c| c as i16),
+        };
+        leaf.extend(cluster.to_le_bytes());
+        let inside = |(lo, hi, _): &&([f32; 3], [f32; 3], u16)| within(lo, hi);
         // leaf 0 is outside everything
         let area = self.areas.iter().find(inside).filter(|_| self.leaf_count > 0).map_or(0, |a| a.2);
         leaf.extend(area.to_le_bytes()); // area, and no flags
@@ -435,9 +451,11 @@ impl Tree {
         }
         // the areas split the tree too, so that no leaf is partly in one
         let overlaps = |(lo, hi, _): &&([f32; 3], [f32; 3], u16)| (0..3).all(|i| lo[i] < region.1[i] && hi[i] > region.0[i]);
+        let clusters = self.clusters.iter().map(|(lo, hi)| (*lo, *hi, 0u16)).collect::<Vec<_>>();
         let area_side = self
             .areas
             .iter()
+            .chain(&clusters)
             .filter(overlaps)
             .flat_map(|(lo, hi, _)| (0..3).flat_map(move |axis| [(axis, lo[axis]), (axis, hi[axis])]))
             .find(|&(axis, value)| region.0[axis] < value && value < region.1[axis]);
@@ -470,10 +488,55 @@ impl Tree {
     }
 }
 
+/// A row of bits run-length encoded as the visibility lump has it: a zero byte, then how many.
+fn pack(row: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < row.len() {
+        if row[i] != 0 {
+            out.push(row[i]);
+            i += 1;
+            continue;
+        }
+        let run = row[i..].iter().take(255).take_while(|&&b| b == 0).count();
+        out.extend([0, run as u8]);
+        i += run;
+    }
+    out
+}
+
 impl TestMap {
+    /// The visibility lump of the clusters; empty without them.
+    fn visibility(&self) -> Vec<u8> {
+        let n = self.clusters.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let sees = |a: usize, b: usize| a == b || self.sees.iter().any(|&(x, y)| (x, y) == (a, b) || (y, x) == (a, b));
+        let row = |set: &dyn Fn(usize) -> bool| -> Vec<u8> {
+            let mut bits = vec![0u8; n.div_ceil(8)];
+            for c in (0..n).filter(|&c| set(c)) {
+                bits[c / 8] |= 1 << (c % 8);
+            }
+            bits
+        };
+        let mut header = i32s(&[n as i32]);
+        let mut rows = Vec::new();
+        let start = 4 + n * 8;
+        for c in 0..n {
+            let pvs = pack(&row(&|o| sees(c, o)));
+            let pas = pack(&row(&|o| (0..n).any(|m| sees(c, m) && sees(m, o))));
+            header.extend(i32s(&[(start + rows.len()) as i32, (start + rows.len() + pvs.len()) as i32]));
+            rows.extend(pvs);
+            rows.extend(pas);
+        }
+        header.extend(rows);
+        header
+    }
+
     /// The map's bytes.
     pub fn bytes(&self) -> Vec<u8> {
-        let mut tree = Tree { old_leaves: self.old_leaves, areas: self.areas.clone(), ..Tree::default() };
+        let mut tree = Tree { old_leaves: self.old_leaves, areas: self.areas.clone(), clusters: self.clusters.clone(), ..Tree::default() };
         // leaf 0, as compilers write it: outside everything
         tree.leaf(&[], &[], ([0.0; 3], [0.0; 3]));
 
@@ -529,8 +592,9 @@ impl TestMap {
             }
             let region = (lo.map(|v| v - 1.0), hi.map(|v| v + 1.0));
             let head = tree.build(&boxed, &contents, region, 0, true);
-            // areas are the world's
+            // areas and clusters are the world's
             tree.areas.clear();
+            tree.clusters.clear();
             // the world's faces first, then each model's in turn
             let world_faces = self.displacements.len() + self.faces.len();
             let (first, faces) = match m {
@@ -670,6 +734,7 @@ impl TestMap {
             (index::TEXDATA_STRING_DATA, string_data, 0),
             (index::TEXDATA_STRING_TABLE, string_table, 0),
             (index::OVERLAYS, overlays, 0),
+            (index::VISIBILITY, self.visibility(), 0),
         ];
         let mut out = vec![0u8; 8 + 64 * 16 + 4];
         out[0..4].copy_from_slice(b"VBSP");

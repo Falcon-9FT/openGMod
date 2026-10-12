@@ -5,7 +5,8 @@
 //! it points to. Any lump may be LZMA-compressed (`bspzip -repack`); see [`lumps`]. The
 //! pakfile lump is a zip of the files the map brings along ([`Bsp::pakfile`]); the game lump
 //! holds the static props ([`props`]). What is solid - the brushes and the BSP trees over them -
-//! and the sweeps of boxes and rays through it are in [`collision`].
+//! and the sweeps of boxes and rays through it are in [`collision`]; what is seen and heard
+//! from where, in [`Visibility`].
 //!
 //! A map is read into memory as a whole: maps from workshop addons live inside `.gma` files
 //! and are no files of their own.
@@ -27,6 +28,7 @@ mod math;
 pub mod mesh;
 pub mod overlay;
 pub mod props;
+mod vis;
 
 pub use collision::{Collision, SolidShapes, Trace, mask};
 pub use entities::{Entity, parse_entities};
@@ -36,6 +38,7 @@ pub use lumps::{
     Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Overlay, Plane, TexData, TexInfo, contents, surf,
 };
 pub use props::{GameLump, StaticProp, StaticProps};
+pub use vis::{MAX_ENTITY_CLUSTERS, Visibility, has as row_has};
 
 use lumps::{index, invalid, lump_bytes, records};
 
@@ -323,6 +326,11 @@ impl Bsp {
     pub fn face_material(&self, face: &Face) -> Option<&str> {
         let info = self.texinfo.get(usize::try_from(face.texinfo).ok()?)?;
         self.materials.get(usize::try_from(info.texdata).ok()?).map(String::as_str)
+    }
+
+    /// The map's bytes, as read.
+    pub(crate) fn raw(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// The `worldspawn` entity.

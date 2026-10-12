@@ -43,6 +43,9 @@ pub struct Map {
     pub collision: Option<std::sync::Arc<gmod_bsp::Collision>>,
     /// The material of each surface (`texinfo`), which traces name as `HitTexture`.
     pub textures: Vec<String>,
+    /// What is seen and heard from where ([`gmod_bsp::Visibility`]); without it everything is
+    /// seen from everywhere.
+    pub visibility: Option<std::sync::Arc<gmod_bsp::Visibility>>,
 }
 
 impl Map {
@@ -55,6 +58,7 @@ impl Map {
             brush_models: bsp.models.iter().map(|m| (m.mins, m.maxs)).collect(),
             collision: Some(collision),
             textures: bsp.texinfo.iter().map(|info| texture(info.texdata)).collect(),
+            visibility: gmod_bsp::Visibility::new(bsp).map(std::sync::Arc::new),
         }
     }
 }
@@ -531,7 +535,9 @@ pub(crate) fn think(lua: &Lua) {
             .handles()
             .into_iter()
             .filter(|&h| h.kind != Kind::Weapon)
-            .filter(|&h| entities.get(h).is_some_and(|ent| ent.scripted && ent.spawned && !ent.removed && ent.next_think <= now))
+            .filter(|&h| {
+                entities.get(h).is_some_and(|ent| ent.scripted && ent.spawned && !ent.removed && !ent.dormant && ent.next_think <= now)
+            })
             .collect()
     };
     for handle in due {
@@ -589,8 +595,12 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
         .filter_map(|handle| {
             let (model, skin) = {
                 let ent = entities.get(handle)?;
-                let hidden =
-                    ent.removed || !ent.spawned || ent.no_draw || ent.effects & EF_NODRAW != 0 || ent.render_mode == RENDERMODE_NONE;
+                let hidden = ent.removed
+                    || ent.dormant
+                    || !ent.spawned
+                    || ent.no_draw
+                    || ent.effects & EF_NODRAW != 0
+                    || ent.render_mode == RENDERMODE_NONE;
                 let studio = ent.model.len() > 4 && ent.model[ent.model.len() - 4..].eq_ignore_ascii_case(".mdl");
                 // the brushes that may move are drawn where their entities are; the others are the map's
                 let moving_brush = crate::movers::moving_brush(&ent).is_some();
@@ -715,6 +725,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
         return;
     }
     crate::physics::load_world(lua, map.collision.as_deref());
+    *host(lua).transmit.visibility.borrow_mut() = map.visibility.clone();
     crate::movers::clear(lua);
     let world_bounds = model_bounds(lua, "*0").unwrap_or_default();
     host(lua).entities.with_mut(world, |ent| {

@@ -101,6 +101,7 @@ pub mod physgun;
 pub mod physics;
 pub mod pickup;
 pub mod player;
+pub mod pvs;
 pub mod ragdoll;
 pub mod recipients;
 pub mod resource;
@@ -131,6 +132,7 @@ pub use menu::{Addon, MountableGame};
 pub use mlua;
 pub use movedata::UserCmd;
 pub use player::{PlayerInfo, PlayerView, ToClient, WeaponView};
+pub use pvs::{Sent, Transmission};
 pub use snapshot::{EntityState, NetValue, Snapshot};
 
 /// Which of GMod's Lua states a [`Runtime`] is.
@@ -317,6 +319,8 @@ pub(crate) struct Host {
     pub(crate) lagcomp: lagcomp::History,
     /// The map's nodes, and the ways NPCs find by them.
     pub(crate) nav: nav::Graph,
+    /// What each player is sent: the map's visibility, and what Lua says of it.
+    pub(crate) transmit: pvs::Transmit,
 }
 
 impl Host {
@@ -408,6 +412,7 @@ impl Runtime {
             bullets: bullets::State::default(),
             lagcomp: lagcomp::History::default(),
             nav: nav::Graph::default(),
+            transmit: pvs::Transmit::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -438,6 +443,7 @@ impl Runtime {
         if realm == Realm::Server {
             recipients::install(&lua)?;
             resource::install(&lua)?;
+            pvs::install(&lua)?;
         }
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
@@ -655,6 +661,22 @@ impl Runtime {
     /// What to show of a player: where they see from, their health, the weapon in hand.
     pub fn view(&self, player: EntityHandle) -> Option<PlayerView> {
         player::view(&self.lua, player)
+    }
+
+    /// The players who hear a sound, by the map's PAS; `None` for everyone.
+    pub fn hearing(&self, event: &sound::SoundEvent) -> Option<Vec<EntityHandle>> {
+        pvs::sound_hearers(&self.lua, event)
+    }
+
+    /// How each entity is sent now (on the server, once a tick), for [`sent_to`](Self::sent_to).
+    pub fn transmission(&self) -> Transmission {
+        pvs::transmission(&self.lua)
+    }
+
+    /// What a player is sent of the entities: what it may see from where it looks, with what
+    /// `SetupPlayerVisibility` adds ([`pvs`]); the rest it keeps dormant.
+    pub fn sent_to(&self, transmission: &Transmission, player: EntityHandle) -> Sent {
+        transmission.for_player(&self.lua, player)
     }
 
     /// The models of entities to draw as a player sees them: every entity with a model that

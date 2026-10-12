@@ -221,6 +221,16 @@ impl Connection {
                 }
             }
         }
+        // the download folder, read while looking for what to fetch, has more in it now
+        if let Some(dir) = download {
+            for mount in vfs.mounts() {
+                if let gmod_fs::Backing::Dir(folder) = &mount.backing
+                    && folder.root() == dir
+                {
+                    folder.forget();
+                }
+            }
+        }
         Ok(lua_files)
     }
 
