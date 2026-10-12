@@ -706,8 +706,14 @@ impl Collision {
     /// through the world and the solid brush entities, stopping at what `mask` names. A box
     /// without size is a ray.
     pub fn trace(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, mask: u32) -> Trace {
+        self.trace_skipping(start, end, mins, maxs, mask, &[])
+    }
+
+    /// The same as [`Collision::trace`], going through the brush models `skip` names: a trace
+    /// that is to pass a door goes on to what is behind it.
+    pub fn trace_skipping(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, mask: u32, skip: &[usize]) -> Trace {
         let mut found = Found::default();
-        for placement in &self.placements {
+        for placement in self.placements.iter().filter(|p| !skip.contains(&p.model)) {
             self.sweep_placed(placement, start, end, mins, maxs, mask, &mut found);
         }
         for s in &self.statics {
@@ -1013,6 +1019,10 @@ impl Default for Found {
 impl Found {
     /// What a sweep through one model found, from the space it stands in: kept when nearer.
     fn take(&mut self, sweep: &Sweep, frame: &Frame, model: Option<usize>, static_prop: Option<usize>) {
+        // what it started inside, if nothing was hit: which model that is counts too
+        if sweep.start_solid && !self.start_solid && sweep.hit.is_none() {
+            (self.model, self.static_prop) = (model, static_prop);
+        }
         self.start_solid |= sweep.start_solid;
         self.all_solid |= sweep.all_solid;
         self.left_solid = self.left_solid.max(sweep.left_solid);

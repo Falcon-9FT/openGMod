@@ -281,35 +281,43 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
     };
     let collision = host(lua).world.collision.borrow().clone();
     if let Some(collision) = collision.filter(|_| !sweep.ignore_world) {
-        let t = collision.trace(array(sweep.start), array(sweep.end), array(sweep.mins), array(sweep.maxs), sweep.mask);
-        if t.hit() {
+        // a brush entity the trace may not hit is passed, and what is behind it looked for
+        let mut skip = Vec::new();
+        let (t, entity) = loop {
+            let t = collision.trace_skipping(array(sweep.start), array(sweep.end), array(sweep.mins), array(sweep.maxs), sweep.mask, &skip);
             let entity = match (t.static_prop, t.model) {
                 (Some(_), _) | (None, Some(0)) | (None, None) => EntityHandle::WORLD,
                 (None, Some(model)) => brush_entity(lua, &collision, model),
             };
-            if entity == EntityHandle::WORLD || allowed(lua, sweep, entity) {
-                let texture = if t.static_prop.is_some() {
-                    "**studio**".to_string()
-                } else if t.displacement {
-                    "**displacement**".to_string()
-                } else {
-                    t.texinfo.and_then(|i| host(lua).world.textures.borrow().get(i).cloned()).unwrap_or_default()
-                };
-                best = Hit {
-                    fraction: t.fraction,
-                    end: vector(t.end),
-                    normal: vector(t.normal),
-                    start_solid: t.start_solid,
-                    all_solid: t.all_solid,
-                    fraction_left_solid: t.fraction_left_solid,
-                    contents: t.contents,
-                    entity,
-                    texture,
-                    surface_flags: t.surface_flags,
-                    displacement: t.displacement,
-                    physics_bone: 0,
-                };
+            match t.model {
+                Some(model) if t.hit() && entity != EntityHandle::WORLD && !allowed(lua, sweep, entity) && skip.len() < 16 => {
+                    skip.push(model)
+                }
+                _ => break (t, entity),
             }
+        };
+        if t.hit() && (entity == EntityHandle::WORLD || allowed(lua, sweep, entity)) {
+            let texture = if t.static_prop.is_some() {
+                "**studio**".to_string()
+            } else if t.displacement {
+                "**displacement**".to_string()
+            } else {
+                t.texinfo.and_then(|i| host(lua).world.textures.borrow().get(i).cloned()).unwrap_or_default()
+            };
+            best = Hit {
+                fraction: t.fraction,
+                end: vector(t.end),
+                normal: vector(t.normal),
+                start_solid: t.start_solid,
+                all_solid: t.all_solid,
+                fraction_left_solid: t.fraction_left_solid,
+                contents: t.contents,
+                entity,
+                texture,
+                surface_flags: t.surface_flags,
+                displacement: t.displacement,
+                physics_bone: 0,
+            };
         }
     }
     if best.start_solid {

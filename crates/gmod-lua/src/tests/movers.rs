@@ -35,12 +35,22 @@ fn mover_map(entities: Vec<Vec<(String, String)>>) -> Map {
 }
 
 fn mover_game(map: Map) -> Game {
-    let mdl = gmod_model::testmodel::mdl(1, ([0.0, 0.0, 0.0], [4.0, 48.0, 96.0]));
+    use gmod_model::testmodel::{self, TestConvex};
+    let mdl = testmodel::mdl(1, ([0.0, 0.0, 0.0], [4.0, 48.0, 96.0]));
+    // crates 32 wide, a light one and a heavy one
+    let crate_mdl = testmodel::mdl(2, ([-16.0, -16.0, 0.0], [16.0, 16.0, 32.0]));
+    let shape = [vec![TestConvex::cuboid([-16.0, -16.0, 0.0], [16.0, 16.0, 32.0])]];
+    let light = testmodel::phy(2, &shape, false, "solid { \"index\" \"0\" \"mass\" \"20\" }");
+    let heavy = testmodel::phy(2, &shape, false, "solid { \"index\" \"0\" \"mass\" \"800\" }");
     let g = game_with(
         Realm::Server,
         &[
             ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
             ("models/door.mdl", &mdl),
+            ("models/light.mdl", &crate_mdl),
+            ("models/light.phy", &light),
+            ("models/heavy.mdl", &crate_mdl),
+            ("models/heavy.phy", &heavy),
             ("scripts/weapons/weapon_pistol.txt", PISTOL.as_bytes()),
         ],
     );
@@ -194,5 +204,104 @@ fn brushes_turned_off_spinning_and_gone() {
     let yaw = g.eval::<f32>("return ents.FindByName('fan')[1]:GetAngles().y");
     assert!((80.0..100.0).contains(&yaw), "{yaw}");
     let _ = Vector::default();
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn players_push_props_and_ride_what_moves() {
+    let g = mover_game(mover_map(vec![
+        pairs(&[
+            ("classname", "func_door"),
+            ("model", "*1"),
+            ("targetname", "lift"),
+            ("movedir", "-90 0 0"),
+            ("speed", "64"),
+            ("wait", "-1"),
+        ]),
+        pairs(&[
+            ("classname", "func_movelinear"),
+            ("model", "*4"),
+            ("targetname", "belt"),
+            ("movedir", "0 90 0"),
+            ("movedistance", "256"),
+            ("speed", "64"),
+        ]),
+    ]));
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime.think(0.1);
+    let walk = |y: f32, seconds: f64| {
+        g.runtime.run_string(&format!("Entity(1):SetPos(Vector(40, {y}, 0)) Entity(1):SetEyeAngles(Angle(0, 0, 0))"), "go").unwrap();
+        g.runtime.set_input(alice, UserCmd { forward_move: gmod_movement::FULL_MOVE, ..UserCmd::default() });
+        g.runtime.think(seconds);
+        g.runtime.set_input(alice, UserCmd::default());
+        g.runtime.think(0.5);
+    };
+    // walking into crates: a light one goes along, a heavy one hardly
+    g.runtime
+        .run_string(
+            "LIGHT = ents.Create('prop_physics') LIGHT:SetModel('models/light.mdl') LIGHT:SetPos(Vector(110, -300, 0)) LIGHT:Spawn()
+             HEAVY = ents.Create('prop_physics') HEAVY:SetModel('models/heavy.mdl') HEAVY:SetPos(Vector(110, 300, 0)) HEAVY:Spawn()",
+            "crates",
+        )
+        .unwrap();
+    g.runtime.think(0.5);
+    walk(-300.0, 1.0);
+    walk(300.0, 1.0);
+    let light = g.eval::<f32>("return LIGHT:GetPos().x - 110");
+    let heavy = g.eval::<f32>("return HEAVY:GetPos().x - 110");
+    assert!(light > 60.0 && heavy < light / 4.0, "pushed: light {light}, heavy {heavy}");
+
+    // standing on the top of the door when it rises: lifted with it
+    g.runtime.run_string("Entity(1):SetPos(Vector(204, 0, 129))", "on").unwrap();
+    g.runtime.think(0.3);
+    assert!(g.eval::<bool>("return Entity(1):GetGroundEntity() == ents.FindByName('lift')[1]"));
+    g.runtime.run_string("ents.FindByName('lift')[1]:Fire('Open')", "up").unwrap();
+    g.runtime.think(2.5);
+    let at = g.runtime.position(alice).unwrap();
+    assert!((at.z - 256.0).abs() < 2.0 && (at.x - 204.0).abs() < 2.0, "lifted: {at:?}");
+    // on the belt: carried along y as it goes
+    g.runtime.run_string("Entity(1):SetPos(Vector(604, 0, 129))", "on").unwrap();
+    g.runtime.think(0.3);
+    g.runtime.run_string("ents.FindByName('belt')[1]:Fire('Open')", "go").unwrap();
+    g.runtime.think(4.5);
+    let at = g.runtime.position(alice).unwrap();
+    assert!((at.y - 256.0).abs() < 3.0 && (at.x - 604.0).abs() < 2.0 && at.z > 120.0, "carried: {at:?}");
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn doors_push_players_or_go_back() {
+    let g = mover_game(mover_map(vec![pairs(&[
+        ("classname", "func_door"),
+        ("model", "*1"),
+        ("targetname", "door"),
+        ("movedir", "-90 0 0"),
+        ("spawnpos", "1"),
+        ("speed", "128"),
+        ("wait", "-1"),
+        ("dmg", "10"),
+        ("OnBlockedClosing", "rec,Blocked,,0,-1"),
+        ("OnFullyOpen", "rec,Open,,0,-1"),
+    ])]));
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime.think(0.1);
+    // a trace that may not hit the door goes on to the wall behind it
+    g.runtime.run_string("ents.FindByName('door')[1]:Fire('Close')", "close").unwrap();
+    g.runtime.think(1.5);
+    assert!(g.eval::<bool>(
+        "local door = ents.FindByName('door')[1]
+         return util.TraceLine({ start = Vector(100, 0, 64), endpos = Vector(700, 0, 64), filter = door }).HitPos.x > 599"
+    ));
+    // under the open door as it comes down: it cannot push the player into the floor
+    let start = g.printed().len();
+    g.runtime.run_string("local d = ents.FindByName('door')[1] d:Fire('Open')", "open").unwrap();
+    g.runtime.think(1.5);
+    g.runtime.run_string("Entity(1):SetPos(Vector(204, 0, 0)) ents.FindByName('door')[1]:Fire('Close')", "under").unwrap();
+    g.runtime.think(1.5);
+    let printed = &g.printed()[start..];
+    assert!(printed.contains("Blocked") && printed.matches("Open").count() == 2, "{printed}");
+    assert!(g.eval::<i64>("return Entity(1):Health()") <= 90);
+    let at = g.runtime.position(alice).unwrap();
+    assert!(at.z.abs() < 1.0, "still on the floor: {at:?}");
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }

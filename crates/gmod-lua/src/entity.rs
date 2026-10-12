@@ -898,6 +898,19 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         let (_, angles) = transform(a)?;
         angle(a.lua, align(angles, a.userdata::<Angle>(2, "Angle")?, a.userdata::<Angle>(3, "Angle")?))
     })?;
+    // what a player stands on: the world, an entity, NULL in the air
+    def("GetGroundEntity", |a| {
+        let handle = this(a, 1)?;
+        let ground = crate::player::state(a.lua, handle, |_, p| p.ground).unwrap_or(EntityHandle::NULL);
+        push(a.lua, if host(a.lua).entities.is_valid(ground) { ground } else { EntityHandle::NULL })
+    })?;
+    def("SetGroundEntity", |a| {
+        let handle = this(a, 1)?;
+        let ground = handle_of(a.get(2)).unwrap_or(EntityHandle::NULL);
+        let at = if ground.index.is_some_and(|i| i != 0) { host(a.lua).entities.transform(ground) } else { None };
+        crate::player::with_player(a.lua, handle, |_, p| (p.ground, p.ground_at) = (ground, at));
+        Ok(Value::Nil)
+    })?;
     def("GetVelocity", |a| vector(a.lua, read(a, |ent| ent.velocity)?))?;
     def("GetAbsVelocity", |a| vector(a.lua, read(a, |ent| ent.velocity)?))?;
     // a player is pushed: the velocity is added to what it has

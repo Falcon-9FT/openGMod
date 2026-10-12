@@ -26,7 +26,7 @@
 //! sets them in their console (`gmod_toolmode weld`), as with a client's own ConVars, and
 //! `ply:ConCommand` runs a line as typed by the player.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use gmod_bsp::mask;
@@ -207,6 +207,10 @@ pub struct PlayerState {
     /// What the use key works while it is held (a scripted entity used continuously or on and
     /// off).
     pub using: EntityHandle,
+    /// What the player stands on (`GetGroundEntity`): the world, an entity, or nothing in the
+    /// air; and where that entity was, to carry the player along when it moves.
+    pub ground: EntityHandle,
+    pub ground_at: Option<(Vector, Angle)>,
     pub suit: bool,
     pub suit_power: f32,
     pub view_punch: Angle,
@@ -300,6 +304,8 @@ impl PlayerState {
             hovered_widget: EntityHandle::NULL,
             pressed_widget: EntityHandle::NULL,
             using: EntityHandle::NULL,
+            ground: EntityHandle::NULL,
+            ground_at: None,
             suit: true,
             suit_power: 100.0,
             view_punch: Angle::default(),
@@ -424,9 +430,17 @@ pub(crate) fn all(lua: &Lua) -> Vec<EntityHandle> {
 }
 
 /// The world as a player's movement sees it: the map, and the solid entities but the player.
+/// What the movement ran into is kept: the entity, and the normal of where it was hit.
 struct Space<'a> {
     lua: &'a Lua,
     player: EntityHandle,
+    touched: RefCell<Vec<(EntityHandle, Vector)>>,
+}
+
+impl<'a> Space<'a> {
+    fn new(lua: &'a Lua, player: EntityHandle) -> Space<'a> {
+        Space { lua, player, touched: RefCell::new(Vec::new()) }
+    }
 }
 
 impl Collide for Space<'_> {
@@ -443,6 +457,9 @@ impl Collide for Space<'_> {
             group: trace::group::PLAYER_MOVEMENT,
         };
         let hit = trace::trace(self.lua, &sweep);
+        if hit.fraction < 1.0 && hit.entity.index.is_some_and(|i| i != 0) {
+            self.touched.borrow_mut().push((hit.entity, hit.normal));
+        }
         gmod_bsp::Trace {
             fraction: hit.fraction,
             end: array(hit.end),
@@ -577,7 +594,7 @@ fn make_view_models(lua: &Lua, handle: EntityHandle) {
 /// Puts a player at a point, a little higher when there is no room there.
 fn place(lua: &Lua, handle: EntityHandle, pos: Vector) {
     let Some(settings) = state(lua, handle, |_, p| settings(lua, p, p.walk_speed)) else { return };
-    let space = Space { lua, player: handle };
+    let space = Space::new(lua, handle);
     let origin = gmod_movement::Player::spawn(&space, &settings, array(pos)).map_or(pos, |p| vector(p.origin));
     entity::set_world_pos(lua, handle, origin);
 }
@@ -898,18 +915,112 @@ fn engine_move(lua: &Lua, handle: EntityHandle, mv: &mut MoveData) {
         return;
     };
     let seconds = crate::timer::TICK_INTERVAL as f32 * lag;
+    if move_type == MOVETYPE_WALK {
+        mv.origin = carried(lua, handle, mv.origin, &moving, &settings);
+    }
     moving.origin = array(mv.origin);
     moving.velocity = array(mv.velocity);
     let command =
         Command { angles: [mv.angles.p, mv.angles.y, mv.angles.r], forward_move: mv.forward, side_move: mv.side, buttons: mv.buttons };
+    let space = Space::new(lua, handle);
     match move_type {
-        MOVETYPE_WALK => moving.tick(&Space { lua, player: handle }, &settings, &command, seconds),
+        MOVETYPE_WALK => moving.tick(&space, &settings, &command, seconds),
         MOVETYPE_NOCLIP | MOVETYPE_OBSERVER => moving.noclip(&settings, &command, seconds),
         _ => return,
     }
     mv.origin = vector(moving.origin);
     mv.velocity = vector(moving.velocity);
     with_player(lua, handle, |_, p| p.moving = moving);
+    if move_type == MOVETYPE_WALK {
+        push_props(lua, mv, &space.touched.borrow());
+        find_ground(lua, handle, &moving, &settings);
+    } else {
+        with_player(lua, handle, |_, p| (p.ground, p.ground_at) = (EntityHandle::NULL, None));
+    }
+}
+
+/// How heavy a player is to what they push, in kilograms.
+const PLAYER_MASS: f32 = 85.0;
+
+/// A player walking into props pushes them: a prop that may move is given at least the speed
+/// the player means to go into it - all of it if it is no heavier than a player, less as it is
+/// heavier. What the player stands on or bumps from above is not pushed.
+fn push_props(lua: &Lua, mv: &MoveData, touched: &[(EntityHandle, Vector)]) {
+    let (forward, right, _) = Angle::new(0.0, mv.angles.y, 0.0).vectors();
+    let wish = forward * mv.forward + right * mv.side;
+    let wish = if wish.length() > mv.max_speed && wish.length() > 0.0 { wish * (mv.max_speed / wish.length()) } else { wish };
+    let mut pushed = Vec::new();
+    for &(prop, normal) in touched {
+        if normal.z.abs() > 0.7 || pushed.contains(&prop) {
+            continue;
+        }
+        let Some(id) = crate::physics::body(lua, prop) else { continue };
+        let into = -wish.dot(normal);
+        if into <= 0.0 {
+            continue;
+        }
+        let host = host(lua);
+        let mut physics = host.physics.physics.borrow_mut();
+        if !physics.motion(id) {
+            continue;
+        }
+        pushed.push(prop);
+        let mass = physics.mass(id).max(1.0);
+        let speed = into * (PLAYER_MASS / mass).min(1.0);
+        let v = physics.velocity(id);
+        let direction = normal * -1.0;
+        let along = v[0] * direction.x + v[1] * direction.y + v[2] * direction.z;
+        if along < speed {
+            let add = direction * (speed - along);
+            physics.set_velocity(id, [v[0] + add.x, v[1] + add.y, v[2] + add.z]);
+            physics.wake(id);
+        }
+    }
+}
+
+/// What a player on the ground stands on, and where it is now.
+fn find_ground(lua: &Lua, handle: EntityHandle, moving: &gmod_movement::Player, settings: &Settings) {
+    let ground = if moving.on_ground {
+        let (mins, maxs) = moving.hull(settings);
+        let down = Sweep {
+            mins: vector(mins),
+            maxs: vector(maxs),
+            mask: gmod_bsp::mask::PLAYERSOLID,
+            group: trace::group::PLAYER_MOVEMENT,
+            ..Sweep::line(vector(moving.origin), vector(moving.origin) - Vector::new(0.0, 0.0, 2.0), Filter::Entities(vec![handle]))
+        };
+        let hit = trace::trace(lua, &down);
+        if hit.fraction < 1.0 { hit.entity } else { EntityHandle::WORLD }
+    } else {
+        EntityHandle::NULL
+    };
+    let at = if ground.index.is_some_and(|i| i != 0) { host(lua).entities.transform(ground) } else { None };
+    with_player(lua, handle, |_, p| (p.ground, p.ground_at) = (ground, at));
+}
+
+/// Where a player standing on something that moved is taken with it: as far as it moved and
+/// turned under their feet since last tick, if nothing is in the way.
+fn carried(lua: &Lua, handle: EntityHandle, origin: Vector, moving: &gmod_movement::Player, settings: &Settings) -> Vector {
+    let Some((ground, Some((was, was_turned)))) = state(lua, handle, |_, p| (p.ground, p.ground_at)) else { return origin };
+    let Some((now, turned)) = host(lua).entities.transform(ground) else { return origin };
+    if now == was && turned == was_turned {
+        return origin;
+    }
+    // where the feet stood on it, as it stands now
+    let on = entity::unrotated(origin - was, was_turned);
+    let to = now + on.rotated(turned);
+    let (mins, maxs) = moving.hull(settings);
+    let sweep = Sweep {
+        mins: vector(mins),
+        maxs: vector(maxs),
+        mask: gmod_bsp::mask::PLAYERSOLID,
+        group: trace::group::PLAYER_MOVEMENT,
+        ..Sweep::line(origin, to, Filter::Entities(vec![handle, ground]))
+    };
+    let hit = trace::trace(lua, &sweep);
+    let carried = if hit.start_solid { origin } else { hit.end };
+    with_player(lua, handle, |_, p| p.ground_at = Some((now, turned)));
+    carried
 }
 
 /// The end of a tick's movement: the player takes what the `CMoveData` says.

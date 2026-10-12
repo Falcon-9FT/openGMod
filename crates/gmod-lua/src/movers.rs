@@ -437,6 +437,7 @@ pub(crate) fn tick(lua: &Lua) {
         let entities = &host(lua).entities;
         entities.handles().into_iter().filter(|&h| entities.get(h).is_some_and(|e| e.mover.is_some() && !e.removed && e.spawned)).collect()
     };
+    let before: Vec<(EntityHandle, Option<(Vector, Angle)>)> = moving.iter().map(|&h| (h, host(lua).entities.transform(h))).collect();
     for handle in moving {
         let Some(mut m) = mover(lua, handle) else { continue };
         if m.class == Class::Rotating {
@@ -468,6 +469,93 @@ pub(crate) fn tick(lua: &Lua) {
     }
     touch_open(lua);
     sync(lua);
+    for (handle, was) in before {
+        let now = host(lua).entities.transform(handle);
+        if let (Some(was), Some(now)) = (was, now)
+            && was != now
+        {
+            push_players(lua, handle, was, now);
+        }
+    }
+}
+
+/// Whether a player's box is inside a mover: its brushes where it stands now, or the box of a
+/// model door.
+fn inside(lua: &Lua, mover: EntityHandle, player: EntityHandle) -> bool {
+    let entities = &host(lua).entities;
+    let (Some((_, _, lo, hi)), Some((pos, angles))) = (entities.world_bounds(player), entities.transform(mover)) else { return false };
+    let model = entities.get(mover).and_then(|ent| ent.model.strip_prefix('*').and_then(|m| m.parse::<usize>().ok()));
+    match model {
+        Some(model) => {
+            let Some(collision) = host(lua).world.collision.borrow().clone() else { return false };
+            let placement = gmod_bsp::collision::Placement::new(model, None, array(pos), [angles.p, angles.y, angles.r]);
+            // a little smaller than the player: touching is not being inside
+            let (center, half) = ((lo + hi) * 0.5, (hi - lo) * 0.5 - Vector::new(0.1, 0.1, 0.1));
+            let c = array(center);
+            collision.trace_placed(&placement, c, c, array(half * -1.0), array(half), gmod_bsp::mask::ALL).start_solid
+        }
+        None => entities
+            .world_bounds(mover)
+            .is_some_and(|(_, _, mlo, mhi)| lo.x < mhi.x && hi.x > mlo.x && lo.y < mhi.y && hi.y > mlo.y && lo.z < mhi.z && hi.z > mlo.z),
+    }
+}
+
+/// A mover that moved into players pushes them along as far as it moved where they are. One
+/// that cannot push a player out of its way is blocked: it hurts them by its `dmg`, fires
+/// `OnBlockedOpening` or `OnBlockedClosing`, and a door goes back the other way.
+fn push_players(lua: &Lua, handle: EntityHandle, was: (Vector, Angle), now: (Vector, Angle)) {
+    for player in crate::player::all(lua) {
+        if !crate::player::alive(lua, player) || !inside(lua, handle, player) {
+            continue;
+        }
+        let Some((_, _, lo, hi)) = host(lua).entities.world_bounds(player) else { continue };
+        let Some((feet, _)) = host(lua).entities.transform(player) else { continue };
+        // where the middle of the player was on the mover, now
+        let middle = (lo + hi) * 0.5;
+        let on = crate::entity::unrotated(middle - was.0, was.1);
+        let delta = now.0 + on.rotated(now.1) - middle;
+        let length = delta.length();
+        let to = if length > 0.0 { feet + delta * ((length + 0.5) / length) } else { feet };
+        let (mins, maxs) = (lo - feet, hi - feet);
+        let sweep = crate::trace::Sweep {
+            mins,
+            maxs,
+            mask: gmod_bsp::mask::PLAYERSOLID,
+            group: crate::trace::group::PLAYER_MOVEMENT,
+            ..crate::trace::Sweep::line(feet, to, crate::trace::Filter::Entities(vec![player, handle]))
+        };
+        let hit = crate::trace::trace(lua, &sweep);
+        if !hit.start_solid {
+            crate::entity::set_world_pos(lua, player, hit.end);
+            // pushed by what they stand on: not carried along by it again next tick
+            crate::player::with_player(lua, player, |_, p| {
+                if p.ground == handle {
+                    p.ground_at = Some(now);
+                }
+            });
+        }
+        if hit.start_solid || hit.fraction < 1.0 || inside(lua, handle, player) {
+            blocked(lua, handle, player);
+        }
+    }
+}
+
+/// A mover stopped by a player it cannot push away.
+fn blocked(lua: &Lua, handle: EntityHandle, player: EntityHandle) {
+    let damage = number(lua, handle, "dmg", 0.0);
+    if damage > 0.0 {
+        crate::damage::take(lua, player, crate::damage::DamageInfo::new(damage, 1, handle, handle));
+    }
+    let Some(m) = mover(lua, handle) else { return };
+    let opening = m.target > m.at;
+    let output = if opening { "OnBlockedOpening" } else { "OnBlockedClosing" };
+    crate::outputs::fire(lua, handle, output, player, handle, None);
+    // a door goes back unless it is to close whatever is in the way (`forceclosed`)
+    let force = number(lua, handle, "forceclosed", 0.0) != 0.0;
+    if matches!(m.class, Class::Door | Class::RotatingDoor | Class::PropDoor) && !(force && !opening) && m.at != m.target {
+        let back = if opening { 0.0 } else { 1.0 };
+        go(lua, handle, m, back, player, handle);
+    }
 }
 
 /// A mover got where it was going.
