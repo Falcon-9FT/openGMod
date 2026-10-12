@@ -24,7 +24,8 @@
 //!   ammo types), [`movedata`] (`CMoveData`, `CUserCmd`), [`damage`] (`CTakeDamageInfo`,
 //!   taking damage), [`effect`] (`EffectData`, `util.Effect`), [`sound`] (`EmitSound`,
 //!   `CreateSound`, the `sound` library, all quiet), [`trace`] (`util.TraceLine` and the like),
-//!   [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`),
+//!   [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`), [`pickup`]
+//!   (props carried with the use key),
 //!   [`anim`] (what entities play on their bones: sequences, cycles, pose parameters, layers,
 //!   view models, the player's model), [`ragdoll`] (bodies on the bones of `prop_ragdoll` and
 //!   corpses), [`chat`] (`say` through `PlayerSay`, the chat box, `chat.AddText`),
