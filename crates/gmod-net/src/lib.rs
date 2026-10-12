@@ -25,6 +25,11 @@
 //!   reliable chunks are sent again when they have waited longer than the round trip. A packet
 //!   that comes twice is dropped the second time.
 //! * `DISCONNECT`: the connection, and why.
+//! * `QUERY` (anyone to a server, no connection needed): a number the asker picked, padded with
+//!   zeros to a whole packet. `INFO`: that number, and what the server says of itself (its name,
+//!   its map...: [`Server::set_info`]). The question is as long as any answer can be, so a
+//!   forged sender address gets no more than was sent in its name: a server is no amplifier.
+//!   A query sent to a broadcast address finds the servers of a local network ([`Query`]).
 //!
 //! A side that hears nothing for 15 seconds drops the connection; one with nothing to say still
 //! sends an empty `DATA` packet ten times a second, which keeps the other side's
@@ -46,6 +51,8 @@ const ACCEPT: u8 = 2;
 const DENY: u8 = 3;
 const DATA: u8 = 4;
 const DISCONNECT: u8 = 5;
+const QUERY: u8 = 6;
+const INFO: u8 = 7;
 
 const RELIABLE: u8 = 1;
 const UNRELIABLE: u8 = 2;
@@ -68,6 +75,8 @@ const FRAGMENT_BYTES: usize = MAX_PACKET - DATA_HEADER - 1 - 2 - 1 - 1 - 2;
 pub const MAX_RELIABLE: usize = 64 << 20;
 /// The most a client's hello and a server's welcome may hold: each goes in one packet.
 pub const MAX_HELLO: usize = 1000;
+/// The most a server's answer to a query holds: what fits a packet after its header.
+pub const MAX_INFO: usize = MAX_PACKET - 4 - 1 - 8;
 /// The largest unreliable message: 255 fragments.
 pub const MAX_UNRELIABLE: usize = FRAGMENT_BYTES * 255;
 /// How many reliable chunks may be out at once, waiting to be acknowledged.
@@ -105,6 +114,11 @@ impl Udp {
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
         Ok(Udp(socket))
+    }
+
+    /// Whether it may send to broadcast addresses.
+    pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
+        self.0.set_broadcast(on)
     }
 }
 
@@ -561,6 +575,8 @@ pub struct Server<W: Wire = Udp> {
     asked: Vec<Asked>,
     events: Vec<ServerEvent>,
     rate: u32,
+    /// What it answers queries with; nothing while it is empty.
+    info: Vec<u8>,
 }
 
 impl Server<Udp> {
@@ -572,7 +588,13 @@ impl Server<Udp> {
 
 impl<W: Wire> Server<W> {
     pub fn with_wire(wire: W) -> Server<W> {
-        Server { wire, peers: Vec::new(), asked: Vec::new(), events: Vec::new(), rate: DEFAULT_RATE }
+        Server { wire, peers: Vec::new(), asked: Vec::new(), events: Vec::new(), rate: DEFAULT_RATE, info: Vec::new() }
+    }
+
+    /// What it answers those who ask what it is ([`Query`]): no more than [`MAX_INFO`], or it
+    /// says nothing.
+    pub fn set_info(&mut self, info: &[u8]) {
+        self.info = if info.len() <= MAX_INFO { info.to_vec() } else { Vec::new() };
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -647,6 +669,12 @@ impl<W: Wire> Server<W> {
                 let Some(id) = r.u64() else { return };
                 if let Some(peer) = self.peers.iter_mut().find(|p| p.id == id && p.addr == from) {
                     peer.receive(&mut r, now);
+                }
+            }
+            Some(QUERY) => {
+                let Some(nonce) = r.u64() else { return };
+                if packet.len() >= MAX_PACKET && !self.info.is_empty() {
+                    let _ = self.wire.send_to(&control(INFO, &[&nonce.to_le_bytes(), &self.info]), from);
                 }
             }
             Some(DISCONNECT) => {
@@ -930,6 +958,73 @@ impl<W: Wire> Client<W> {
             }
         }
         self.state = State::Closed;
+    }
+}
+
+/// Asks servers what they are, without connecting: a socket of its own for any number of
+/// questions, to addresses or to a local network's broadcast address.
+pub struct Query<W: Wire = Udp> {
+    wire: W,
+    /// The numbers of the questions out, with where and when each went.
+    asked: Vec<(u64, SocketAddr, Instant)>,
+}
+
+/// A server's answer to a [`Query`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    /// The question's number, as [`Query::ask`] gave it.
+    pub question: u64,
+    /// Where the question went (a broadcast address for one asked so).
+    pub asked: SocketAddr,
+    /// Who answered.
+    pub from: SocketAddr,
+    /// How long the answer took.
+    pub took: Duration,
+    /// What the server says of itself.
+    pub info: Vec<u8>,
+}
+
+impl Query<Udp> {
+    /// A socket for questions, which may go to broadcast addresses.
+    pub fn open() -> io::Result<Query<Udp>> {
+        let wire = Udp::bind(SocketAddr::from(([0, 0, 0, 0], 0)))?;
+        wire.set_broadcast(true)?;
+        Ok(Query::with_wire(wire))
+    }
+}
+
+impl<W: Wire> Query<W> {
+    pub fn with_wire(wire: W) -> Query<W> {
+        Query { wire, asked: Vec::new() }
+    }
+
+    /// Asks the server at `to` (or every one a broadcast address reaches); the question's
+    /// number, which its answers carry.
+    pub fn ask(&mut self, to: SocketAddr, now: Instant) -> io::Result<u64> {
+        let question = random();
+        let mut packet = control(QUERY, &[&question.to_le_bytes()]);
+        packet.resize(MAX_PACKET, 0);
+        self.wire.send_to(&packet, to)?;
+        self.asked.push((question, to, now));
+        // what has waited long has no answer coming
+        self.asked.retain(|(_, _, at)| now.duration_since(*at) < TIMEOUT);
+        Ok(question)
+    }
+
+    /// The answers that came.
+    pub fn poll(&mut self, now: Instant) -> Vec<Answer> {
+        let mut answers = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok(Some((n, from))) = self.wire.recv_from(&mut buf) {
+            let mut r = Reader { data: &buf[..n.min(buf.len())] };
+            if r.take(4) != Some(&MAGIC[..]) || r.u8() != Some(INFO) {
+                continue;
+            }
+            let Some(question) = r.u64() else { continue };
+            let Some(&(_, asked, at)) = self.asked.iter().find(|(q, ..)| *q == question) else { continue };
+            answers.push(Answer { question, asked, from, took: now.duration_since(at), info: r.rest().to_vec() });
+        }
+        answers
     }
 }
 

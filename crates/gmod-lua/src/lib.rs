@@ -106,6 +106,7 @@ pub mod ragdoll;
 pub mod recipients;
 pub mod resource;
 pub mod sandbox;
+pub mod serverlist;
 pub mod snapshot;
 pub mod sound;
 pub mod sql;
@@ -133,6 +134,7 @@ pub use mlua;
 pub use movedata::UserCmd;
 pub use player::{PlayerInfo, PlayerView, ToClient, WeaponView};
 pub use pvs::{Sent, Transmission};
+pub use serverlist::{ScoreRow, ServerEntry, ServerPlayer, ServerQuery};
 pub use snapshot::{EntityState, NetValue, Snapshot};
 
 /// Which of GMod's Lua states a [`Runtime`] is.

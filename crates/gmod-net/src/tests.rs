@@ -357,3 +357,50 @@ fn over_real_sockets() {
     assert!(id.is_some());
     assert_eq!(got, [b"to the client".to_vec(), b"to the server".to_vec()]);
 }
+
+#[test]
+fn servers_say_what_they_are_to_whoever_asks() {
+    let start = Instant::now();
+    let mut server = Server::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let at = server.local_addr().unwrap();
+    let mut query = Query::with_wire(Udp::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+    // with nothing to say it says nothing
+    query.ask(at, start).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    server.poll(start);
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(query.poll(start).is_empty());
+    // asked, it answers the question with what it is
+    server.set_info(b"gm_construct, 3 of 8");
+    let question = query.ask(at, start).unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..200 {
+        server.poll(start);
+        answers.extend(query.poll(start + Duration::from_millis(30)));
+        if !answers.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(answers.len(), 1);
+    let answer = &answers[0];
+    assert_eq!((answer.question, answer.asked, answer.from), (question, at, at));
+    assert_eq!((answer.info.as_slice(), answer.took), (&b"gm_construct, 3 of 8"[..], Duration::from_millis(30)));
+    // a short question - which would make it an amplifier - gets nothing, nor does too long an answer go out
+    let raw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    raw.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let mut short = b"OGMN".to_vec();
+    short.push(6);
+    short.extend(7u64.to_le_bytes());
+    raw.send_to(&short, at).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    server.poll(start);
+    let mut buf = [0u8; 2048];
+    assert!(raw.recv_from(&mut buf).is_err());
+    server.set_info(&vec![1; MAX_INFO + 1]);
+    query.ask(at, start).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    server.poll(start);
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(query.poll(start).is_empty());
+}

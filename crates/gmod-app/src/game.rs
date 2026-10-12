@@ -759,6 +759,64 @@ mod tests {
     }
 
     #[test]
+    fn the_menu_finds_servers_and_their_players() {
+        use std::time::{Duration, Instant};
+        let server_files = Folder::new(
+            "browse-server",
+            &[("lua/includes/init.lua", NET_INIT.as_bytes()), ("gamemodes/sandbox/sandbox.txt", b"\"sandbox\" { \"title\" \"Sandbox\" }")],
+        );
+        let mut server = Server::start(Arc::new(server_files.vfs()), &test_map(), "sandbox", 4, true).unwrap();
+        server.name = "Alice's game".into();
+        let at = server.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+        server.runtime().join(gmod_lua::PlayerInfo { name: "Bob".into(), bot: true, ..Default::default() }).unwrap();
+
+        let saved = Folder::new("browse-lists", &[]);
+        std::fs::write(saved.0.join("favorites.txt"), format!("{at}\n127.0.0.1:1\n")).unwrap();
+        let mut browser = crate::browser::Browser::new(Some(saved.0.clone()));
+        let menu = Runtime::new(Realm::Menu, Arc::new(Vfs::new())).unwrap();
+        menu.set_favorite_servers(browser.favorites());
+        menu.run_string(
+            &format!(
+                "serverlist.PingServer('{at}', function(ping, name, desc, map, players, max, bots)
+                     PING = table.concat({{ name, desc, map, players, max, bots }}, '|')
+                 end)
+                 serverlist.PingServer('127.0.0.1:1', function(ping, name) DEAD = name or 'no answer' end)
+                 serverlist.PlayerList('{at}', function(t) PLAYERS = t[1] and t[1].name or 'none' end)
+                 FAV = {{}}
+                 serverlist.Query({{ Type = 'favorite',
+                     Callback = function(ping, name) table.insert(FAV, name) return true end,
+                     CallbackFailed = function(address) table.insert(FAV, 'failed ' .. address) return true end,
+                     Finished = function() FAV_DONE = true end }})
+                 serverlist.Query({{ Type = 'internet', Finished = function() INTERNET_DONE = true end }})"
+            ),
+            "browse",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let done = || menu.lua().load("return FAV_DONE == true and PING ~= nil and DEAD ~= nil and PLAYERS ~= nil").eval::<bool>().unwrap();
+        while !done() && started.elapsed() < Duration::from_secs(5) {
+            server.frame(0.01);
+            browser.poll(&menu);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let got: String = menu
+            .lua()
+            .load("return table.concat({ PING, DEAD, PLAYERS, table.concat(FAV, ','), tostring(INTERNET_DONE) }, '\\n')")
+            .eval()
+            .unwrap();
+        assert_eq!(got, "Alice's game|Sandbox|gm_test|0|4|1\nno answer\nBob\nAlice's game,failed 127.0.0.1:1\ntrue");
+        // the servers played on, newest first
+        browser.played_on("10.0.0.1:27015");
+        browser.played_on(&at.to_string());
+        browser.played_on("10.0.0.1:27015");
+        assert_eq!(std::fs::read_to_string(saved.0.join("history.txt")).unwrap(), format!("10.0.0.1:27015\n{at}\n"));
+        // favourites the menu changed are kept
+        menu.run_string("serverlist.RemoveServerFromFavorites('127.0.0.1:1')", "unfavorite").unwrap();
+        browser.poll(&menu);
+        assert_eq!(browser.favorites(), [at.to_string()]);
+    }
+
+    #[test]
     fn models_are_read_once() {
         let mut models = Models::new(Arc::new(Vfs::new()));
         let drawn = Drawn {

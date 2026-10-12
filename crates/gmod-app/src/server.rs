@@ -13,7 +13,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gmod_fs::Vfs;
 use gmod_lua::net::NetMessage;
@@ -21,7 +21,7 @@ use gmod_lua::sound::SoundEvent;
 use gmod_lua::{ChatMessage, EntityHandle, Map, Output, PlayerInfo, Realm, Runtime, ToClient};
 use gmod_net::{ClientId, ServerEvent};
 
-use crate::proto::{self, FileInfo, FromServer, Hello, SnapshotSender, ToServer, Welcome};
+use crate::proto::{self, FileInfo, FromServer, Hello, ServerInfo, SnapshotSender, ToServer, Welcome};
 
 /// How much of a file goes in one message.
 const FILE_PIECE: usize = 1 << 20;
@@ -89,6 +89,12 @@ pub struct Server {
     files: Option<Files>,
     /// The tick of the last snapshot sent.
     last_tick: i64,
+    /// When it last told the network what it is ([`ServerInfo`]), and what its gamemode is
+    /// called.
+    told: Option<Instant>,
+    title: Option<String>,
+    /// What tells this server from others that answer at the same address ([`ServerInfo`]).
+    instance: u64,
     started: Instant,
 }
 
@@ -111,6 +117,12 @@ impl Server {
             host: None,
             files: None,
             last_tick: -1,
+            told: None,
+            title: None,
+            instance: {
+                use std::hash::{BuildHasher, RandomState};
+                RandomState::new().hash_one(std::time::SystemTime::now())
+            },
             started: Instant::now(),
         })
     }
@@ -149,7 +161,33 @@ impl Server {
     pub fn frame(&mut self, seconds: f64) -> ForHost {
         self.receive();
         self.runtime.think(seconds);
+        self.tell_what_it_is();
         self.send()
+    }
+
+    /// What it is, for those who ask (the menu's server browser): once a second.
+    fn tell_what_it_is(&mut self) {
+        if self.net.is_none() || self.told.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.told = Some(Instant::now());
+        let title = self.title.get_or_insert_with(|| self.runtime.gamemode_title()).clone();
+        let rows = self.runtime.scoreboard();
+        let info = ServerInfo {
+            name: self.name.clone(),
+            map: self.map.clone(),
+            gamemode: self.gamemode.clone(),
+            title,
+            players: rows.iter().filter(|r| !r.bot).count() as u32,
+            max_players: self.runtime.max_players(),
+            bots: rows.iter().filter(|r| r.bot).count() as u32,
+            version: proto::VERSION,
+            instance: self.instance,
+            list: rows.into_iter().map(|r| (r.name, r.frags, r.time as f32)).collect(),
+        };
+        if let Some(net) = &mut self.net {
+            net.set_info(&info.encode());
+        }
     }
 
     /// Tells every client the server goes, and lets them go.

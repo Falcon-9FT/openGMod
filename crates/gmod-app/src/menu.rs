@@ -139,6 +139,8 @@ pub fn web_pages(web: Rc<Web>) -> WebPages {
 /// The menu's Lua.
 pub struct Menu {
     runtime: Runtime,
+    /// The server browser's network side.
+    browser: std::cell::RefCell<crate::browser::Browser>,
 }
 
 impl Menu {
@@ -171,7 +173,9 @@ impl Menu {
         runtime.set_games(games);
         runtime.set_no_addons(no_addons);
         runtime.start(gamemode);
-        Ok(Menu { runtime })
+        let browser = crate::browser::Browser::new(gmod_fs::UserDir::default_root().map(|root| root.join("servers")));
+        runtime.set_favorite_servers(browser.favorites());
+        Ok(Menu { runtime, browser: std::cell::RefCell::new(browser) })
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -186,13 +190,32 @@ impl Menu {
         self.runtime.paint(seconds);
     }
 
+    /// The server browser asks the network what the menu asked, and hands back what came.
+    pub fn browse(&self) {
+        self.browser.borrow_mut().poll(&self.runtime);
+    }
+
+    /// The game is on a server (its address), or on none any more: the server heads the
+    /// history, and the menu may make it a favourite.
+    pub fn on_server(&self, address: Option<&str>) {
+        if let Some(address) = address {
+            self.browser.borrow().played_on(address);
+        }
+        self.runtime.set_current_server(address.map(str::to_string));
+    }
+
     /// The engine's commands the menu ran: `map`, `gamemode`, `disconnect`, `quit` ...
     pub fn take_commands(&self) -> Vec<String> {
         self.runtime.take_engine_commands()
     }
 
-    /// A console line typed into the terminal while the menu shows.
+    /// A console line typed into the terminal while the menu shows; `lua_run_menu` runs Lua in
+    /// the menu.
     pub fn console(&self, line: &str) {
+        if let Some(code) = line.trim_start().strip_prefix("lua_run_menu ") {
+            let _ = self.runtime.run_string(code, "lua_run_menu");
+            return;
+        }
         if let Err(e) = self.runtime.run_string(&format!("RunConsoleCommand( unpack( string.Explode( ' ', {line:?} ) ) )"), "console") {
             eprintln!("{e}");
         }

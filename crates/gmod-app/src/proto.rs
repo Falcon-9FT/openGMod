@@ -65,6 +65,47 @@ pub struct Welcome {
     pub allow_cs_lua: bool,
 }
 
+/// What a server says of itself to those who ask ([`gmod_net::Query`]): a line of the menu's
+/// server browser.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerInfo {
+    /// `hostname`.
+    pub name: String,
+    pub map: String,
+    /// The gamemode's folder, and what it calls itself.
+    pub gamemode: String,
+    pub title: String,
+    pub players: u32,
+    pub max_players: u32,
+    pub bots: u32,
+    /// The game's protocol: a client of another cannot join ([`VERSION`]).
+    pub version: u32,
+    /// A number the server picked as it started: one server, though it answers at several
+    /// addresses (this computer's own, the local network's), is listed once.
+    pub instance: u64,
+    /// Its players - name, frags, seconds played - as many as fit an answer.
+    pub list: Vec<(String, i64, f32)>,
+}
+
+impl ServerInfo {
+    /// Serialized to fit an answer ([`gmod_net::MAX_INFO`]): players left off the list until
+    /// it does.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut info = self.clone();
+        loop {
+            let bytes = postcard::to_allocvec(&info).unwrap_or_default();
+            if bytes.len() <= gmod_net::MAX_INFO || info.list.is_empty() {
+                return bytes;
+            }
+            info.list.pop();
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<ServerInfo> {
+        postcard::from_bytes(bytes).ok()
+    }
+}
+
 /// What a client sends its server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToServer {

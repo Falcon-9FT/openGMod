@@ -2925,3 +2925,76 @@ fn weapons_translate_the_activities_of_their_holders() {
     g.runtime.run_string("Entity(1):StripWeapons()", "strip").unwrap();
     assert!(g.eval::<bool>("return Entity(1):TranslateWeaponActivity(ACT_MP_RUN) == ACT_MP_RUN"));
 }
+
+#[test]
+fn the_server_browser_asks_the_program() {
+    use crate::{ServerEntry, ServerPlayer, ServerQuery};
+    let menu = game(Realm::Menu, &[]);
+    menu.runtime.set_favorite_servers(vec!["10.0.0.5:27015".into()]);
+    menu.runtime
+        .run_string(
+            "GOT = {}
+             serverlist.Query({
+                 Type = 'lan',
+                 Callback = function(ping, name, desc, map, players, max, bots, pass, last, address, gm, ws, anon, version)
+                     table.insert(GOT, table.concat({ ping, name, desc, map, players, max, bots, tostring(pass), address, gm, version }, '|'))
+                     return #GOT < 2
+                 end,
+                 CallbackFailed = function(address) table.insert(GOT, 'failed ' .. address) end,
+                 Finished = function() table.insert(GOT, 'finished') end,
+             })
+             serverlist.PingServer('10.0.0.5:27015', function(ping, name) PINGED = name or 'no answer' end)
+             serverlist.PlayerList('10.0.0.5:27015', function(t) PLAYERS = #t .. ' ' .. (t[1] and t[1].name or '') end)",
+            "browse",
+        )
+        .unwrap();
+    let queries = menu.runtime.take_server_queries();
+    assert_eq!(
+        queries,
+        [
+            ServerQuery::List { id: 1, list: "lan".into() },
+            ServerQuery::Ping { id: 2, address: "10.0.0.5:27015".into() },
+            ServerQuery::Players { id: 3, address: "10.0.0.5:27015".into() },
+        ]
+    );
+    let entry = ServerEntry {
+        address: "192.168.1.4:27015".into(),
+        ping: 12,
+        name: "Alice's game".into(),
+        description: "Sandbox".into(),
+        map: "gm_construct".into(),
+        players: 2,
+        max_players: 8,
+        gamemode: "sandbox".into(),
+        version: "0.4".into(),
+        ..ServerEntry::default()
+    };
+    assert!(menu.runtime.server_listed(1, &entry));
+    assert!(!menu.runtime.server_listed(1, &entry), "the menu said it had enough");
+    menu.runtime.server_unanswered(1, "192.168.1.9:27015");
+    menu.runtime.servers_listed(1);
+    menu.runtime.servers_listed(1);
+    menu.runtime.server_pinged(2, None);
+    menu.runtime.server_players(3, &[ServerPlayer { name: "Bob".into(), score: 3, time: 60.0 }]);
+    assert_eq!(
+        menu.eval::<String>("return table.concat(GOT, '\\n') .. '\\n' .. PINGED .. '\\n' .. PLAYERS"),
+        "12|Alice's game|Sandbox|gm_construct|2|8|0|false|192.168.1.4:27015|sandbox|0.4\n\
+         12|Alice's game|Sandbox|gm_construct|2|8|0|false|192.168.1.4:27015|sandbox|0.4\n\
+         failed 192.168.1.9:27015\nfinished\nno answer\n1 Bob"
+    );
+    // favourites: the menu changes them, the program keeps them
+    assert!(menu.eval::<bool>(
+        "local was = serverlist.IsServerFavorite('10.0.0.5:27015')
+         serverlist.AddServerToFavorites('1.2.3.4:27015') serverlist.RemoveServerFromFavorites('10.0.0.5:27015')
+         return was and serverlist.IsServerFavorite('1.2.3.4:27015') and not CanAddServerToFavorites()"
+    ));
+    assert_eq!(menu.runtime.take_favorite_servers(), Some(vec!["1.2.3.4:27015".to_string()]));
+    assert_eq!(menu.runtime.take_favorite_servers(), None);
+    menu.runtime.set_current_server(Some("5.6.7.8:27015".into()));
+    assert!(menu.eval::<bool>(
+        "local could, was = CanAddServerToFavorites(), serverlist.IsCurrentServerFavorite()
+         serverlist.AddCurrentServerToFavorites(true)
+         return could and not was and serverlist.IsCurrentServerFavorite()"
+    ));
+    assert!(menu.messages().is_empty(), "{:?}", menu.messages());
+}

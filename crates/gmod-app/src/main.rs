@@ -35,6 +35,7 @@ use gmod_world::World;
 use gmod_world::gpu::Camera;
 
 mod audio;
+mod browser;
 mod client;
 mod game;
 mod menu;
@@ -87,7 +88,8 @@ CONTROLS:
 
     Lines typed into this terminal are the game's console: give weapon_crowbar,
     gm_spawn models/props_c17/oildrum001.mdl, the commands of the addons; connect <address>
-    joins a server, disconnect leaves it, lua_run_cl runs Lua in your client.";
+    joins a server, disconnect leaves it, lua_run_cl runs Lua in your client and lua_run_menu
+    in the main menu.";
 
 /// Degrees the view turns per pixel the mouse moves.
 const MOUSE_DEGREES: f32 = 0.12;
@@ -904,6 +906,9 @@ impl App {
         let (vfs, map) = loaded.lua.as_ref().ok_or("no Lua")?;
         let game = Game::join(vfs.clone(), map, connection, pages)?;
         self.show_map(loaded, Some(game));
+        if let Some(menu) = &self.menu {
+            menu.on_server(Some(&addr.to_string()));
+        }
         Ok(())
     }
 
@@ -967,6 +972,7 @@ impl App {
         self.capture(false);
         if let Some(menu) = &self.menu {
             menu.runtime().set_in_game(false);
+            menu.on_server(None);
         }
     }
 
@@ -1002,6 +1008,7 @@ impl App {
         {
             menu.frame(gpu.config.width, gpu.config.height, f64::from(seconds));
         }
+        menu.browse();
         if self.game.is_none() {
             for line in game::typed_lines() {
                 menu.console(&line);
@@ -1094,6 +1101,11 @@ impl App {
                 }
                 ["quit" | "exit"] => self.quit = true,
                 ["screenshot" | "jpeg"] => self.screenshot = true,
+                ["lua_run_menu", ..] => {
+                    if let Some(menu) = &self.menu {
+                        menu.console(&line);
+                    }
+                }
                 // Lua for the player's own client, typed here only - where the server allows it
                 ["lua_run_cl", ..] => {
                     if let (Some(game), Some(code)) = (&self.game, line.trim_start().get("lua_run_cl ".len()..)) {
