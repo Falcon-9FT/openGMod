@@ -3,7 +3,8 @@
 //!
 //! * All pieces go into one vertex and one index buffer; a [`Draw`] is a surface's range.
 //! * Textures stay block-compressed when the GPU takes BC formats: DXT1, DXT3 and DXT5 are
-//!   BC1, BC2 and BC3. Everything else becomes 8-bit RGBA.
+//!   BC1, BC2 and BC3. Everything else becomes 8-bit RGBA. The frames of an animated texture
+//!   go along, to be layers of one texture; a surface's parameters say which one shows.
 //! * Light maps become half floats (RGBA, 8 bytes a texel): light can be brighter than 1.
 //! * The camera looks the way Source counts angles and projects with depth reversed: 1 at
 //!   the near plane, 0 at infinity, which keeps float depth precise far away.
@@ -14,7 +15,7 @@ use gmod_material::vtf::flags;
 use gmod_material::{Format, Vtf};
 
 use crate::sky::Fog;
-use crate::{Piece, SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
+use crate::{Look, Piece, SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
 
 /// Bytes of one vertex: position (3 `f32`), normal (3), texture coordinates (2), light map
 /// coordinates (2), blend alpha (1) and vertex light (3).
@@ -140,14 +141,19 @@ pub struct TextureData {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
+    /// The frames of an animated texture; 1 for any other.
+    pub frames: u32,
     /// Mipmap levels, the largest first; each as wide and high as `width >> level` (at least
-    /// 1), compressed levels in whole blocks.
+    /// 1), compressed levels in whole blocks; each level's frames one after another.
     pub levels: Vec<Vec<u8>>,
     pub clamp_s: bool,
     pub clamp_t: bool,
 }
 
-/// A texture's pixels from its largest level no bigger than `max_size` down. DXT stays
+/// The most frames of an animated texture uploaded: the layers a GPU surely has.
+pub const MAX_FRAMES: u32 = 256;
+
+/// A texture's pixels from its largest level no bigger than `max_size` down, every frame. DXT stays
 /// compressed when `compressed` (the GPU takes BC) and the size is whole blocks; anything else
 /// is decoded. `None` when the pixels cannot be decoded.
 pub fn texture_data(vtf: &Vtf, compressed: bool, max_size: u32) -> Option<TextureData> {
@@ -162,16 +168,21 @@ pub fn texture_data(vtf: &Vtf, compressed: bool, max_size: u32) -> Option<Textur
         Format::Rgba8888 => Some(PixelFormat::Rgba8),
         _ => None,
     };
+    let frames = vtf.frames.clamp(1, MAX_FRAMES);
     let levels: Option<Vec<Vec<u8>>> = (first..vtf.mipmaps)
-        .map(|level| match kept {
-            Some(_) => vtf.image(level, 0, 0, 0).map(<[u8]>::to_vec),
-            None => vtf.rgba8(level, 0, 0, 0).map(|image| image.rgba),
+        .map(|level| {
+            let frame = |frame: u32| match kept {
+                Some(_) => vtf.image(level, frame, 0, 0).map(<[u8]>::to_vec),
+                None => vtf.rgba8(level, frame, 0, 0).map(|image| image.rgba),
+            };
+            (0..frames).map(frame).collect::<Option<Vec<Vec<u8>>>>().map(|frames| frames.concat())
         })
         .collect();
     Some(TextureData {
         width,
         height,
         format: kept.unwrap_or(PixelFormat::Rgba8),
+        frames,
         levels: levels?,
         clamp_s: vtf.flags & flags::CLAMP_S != 0,
         clamp_t: vtf.flags & flags::CLAMP_T != 0,
@@ -193,7 +204,7 @@ pub fn missing_texture() -> TextureData {
                 .collect()
         })
         .collect();
-    TextureData { width: 64, height: 64, format: PixelFormat::Rgba8, levels, clamp_s: false, clamp_t: false }
+    TextureData { width: 64, height: 64, format: PixelFormat::Rgba8, frames: 1, levels, clamp_s: false, clamp_t: false }
 }
 
 /// A light map as RGBA half floats.
@@ -212,22 +223,28 @@ pub const FOG_COLOR: f32 = 0.0;
 pub const FOG_DARK: f32 = 1.0;
 pub const FOG_NONE: f32 = 2.0;
 
-/// The 12 floats a shader gets for a surface: tint and alpha; water colour and whether it is
-/// water; alpha test reference (0 for none), how it is lit, whether the second texture blends
-/// in, and how fog covers it.
-pub fn surface_params(surface: &Surface, has_lightmap: bool) -> [f32; 12] {
+/// How many floats a shader gets for a surface.
+pub const SURFACE_PARAMS: usize = 20;
+
+/// The floats a shader gets for a surface as it `look`s at the moment: tint and alpha; water
+/// colour and whether it is water; alpha test reference (0 for none), how it is lit, whether
+/// the second texture blends in, and how fog covers it; the two rows of the base texture's
+/// transform with the layer of the frame that shows (`frame`, wrapped to the texture's
+/// `frames`) and whether it modulates.
+pub fn surface_params(surface: &Surface, look: &Look, frames: u32, has_lightmap: bool) -> [f32; SURFACE_PARAMS] {
     let light = match () {
         _ if !surface.lit => LIGHT_NONE,
         _ if has_lightmap => LIGHT_MAP,
         _ => LIGHT_VERTEX,
     };
-    let [r, g, b] = surface.tint;
+    let [r, g, b] = look.tint;
     let water = surface.water.unwrap_or([0.0; 3]);
+    let [u, v] = look.transform;
     [
         r,
         g,
         b,
-        surface.alpha,
+        look.alpha,
         water[0],
         water[1],
         water[2],
@@ -240,6 +257,14 @@ pub fn surface_params(surface: &Surface, has_lightmap: bool) -> [f32; 12] {
             _ if surface.additive => FOG_DARK,
             _ => FOG_COLOR,
         },
+        u[0],
+        u[1],
+        u[2],
+        (look.frame % frames.max(1)) as f32,
+        v[0],
+        v[1],
+        v[2],
+        if surface.modulate { 1.0 } else { 0.0 },
     ]
 }
 
@@ -446,17 +471,26 @@ mod tests {
     #[test]
     fn surface_params_for_the_shader() {
         let mut s = surface(0, 3);
-        assert_eq!(surface_params(&s, true)[9], LIGHT_MAP);
-        assert_eq!(surface_params(&s, false)[9], LIGHT_VERTEX);
+        let params = |s: &Surface, lightmap: bool| surface_params(s, &s.look(0.0), 1, lightmap);
+        assert_eq!(params(&s, true)[9], LIGHT_MAP);
+        assert_eq!(params(&s, false)[9], LIGHT_VERTEX);
         s.lit = false;
         s.water = Some([0.1, 0.2, 0.3]);
         s.alpha_test = Some(0.4);
-        let p = surface_params(&s, true);
+        let p = params(&s, true);
         assert_eq!((p[4], p[7], p[8], p[9], p[11]), (0.1, 1.0, 0.4, LIGHT_NONE, FOG_COLOR));
         s.additive = true;
-        assert_eq!(surface_params(&s, true)[11], FOG_DARK);
+        assert_eq!(params(&s, true)[11], FOG_DARK);
         s.no_fog = true;
-        assert_eq!(surface_params(&s, true)[11], FOG_NONE);
+        assert_eq!(params(&s, true)[11], FOG_NONE);
+        // no transform: the identity, frame 0, not modulating
+        assert_eq!(params(&s, true)[12..], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // the look of the moment: its tint, alpha, transform and frame, wrapped to the frames
+        let look = Look { frame: 7, transform: [[2.0, 0.0, 0.5], [0.0, 2.0, 0.25]], tint: [0.5; 3], alpha: 0.5 };
+        s.modulate = true;
+        let p = surface_params(&s, &look, 4, true);
+        assert_eq!((p[0], p[3]), (0.5, 0.5));
+        assert_eq!(p[12..], [2.0, 0.0, 0.5, 3.0, 0.0, 2.0, 0.25, 1.0]);
     }
 
     fn transform(m: &[f32; 16], p: Vec3) -> [f32; 4] {

@@ -28,6 +28,10 @@ fn wall(x: f32, y: [f32; 2], z: [f32; 2], light: [f32; 3]) -> Piece {
         alpha: 1.0,
         water: None,
         missing: true,
+        transform: None,
+        frame: 0,
+        proxies: None,
+        modulate: false,
     };
     Piece { vertices, indices: vec![0, 1, 2, 0, 2, 3], lightmap: None, surfaces: vec![surface], skin: Vec::new() }
 }

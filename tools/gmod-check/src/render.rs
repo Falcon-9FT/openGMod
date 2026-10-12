@@ -338,6 +338,8 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
     let edge = |p: &Projected, q: &Projected, x: f32, y: f32| (q.x - p.x) * (y - p.y) - (q.y - p.y) * (x - p.x);
     let base = s.base.and_then(|i| scene.textures[i].as_ref());
     let base2 = s.base2.and_then(|i| scene.textures[i].as_ref());
+    // a still picture: the material as it is when the map starts
+    let look = s.look(0.0);
     for y in min_y..=max_y as usize {
         let py = y as f32 + 0.5;
         for x in min_x..=max_x as usize {
@@ -358,7 +360,7 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
             let du = [(dq[0].0 - uv[0] * dw_dx) * z, (dq[0].1 - uv[0] * dw_dy) * z];
             let dv = [(dq[1].0 - uv[1] * dw_dx) * z, (dq[1].1 - uv[1] * dw_dy) * z];
             let mut albedo = match base {
-                Some(t) => t.sample(uv, lod(t, du, dv), scene.linear),
+                Some(t) => t.sample(gmod_material::proxy::apply(&look.transform, uv), lod(t, du, dv), scene.linear),
                 None if s.water.is_some() => [1.0; 4],
                 None => missing_texture(uv),
             };
@@ -377,8 +379,8 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
                 Some(atlas) => atlas.sample([value(2), value(3)]),
                 None => [value(5), value(6), value(7)],
             };
-            let mut color: Vec3 = std::array::from_fn(|i| albedo[i] * s.tint[i] * light[i]);
-            let mut opacity = albedo[3] * s.alpha;
+            let mut color: Vec3 = std::array::from_fn(|i| albedo[i] * look.tint[i] * light[i]);
+            let mut opacity = albedo[3] * look.alpha;
             if let Some(fog) = s.water {
                 color = fog;
                 opacity = 0.75;
@@ -389,6 +391,12 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
                 frame.depth[at] = w;
             } else if s.additive {
                 *pixel = std::array::from_fn(|i| pixel[i] + color[i] * opacity);
+            } else if s.modulate {
+                // twice its colour times what is behind, in gamma space: grey changes nothing
+                *pixel = std::array::from_fn(|i| {
+                    let gamma = 0.5 + (color[i].powf(1.0 / 2.2) - 0.5) * opacity;
+                    pixel[i] * (2.0 * gamma).powf(2.2)
+                });
             } else {
                 *pixel = std::array::from_fn(|i| pixel[i] * (1.0 - opacity) + color[i] * opacity);
             }

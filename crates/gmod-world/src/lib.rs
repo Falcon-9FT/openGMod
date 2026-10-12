@@ -3,8 +3,11 @@
 //!
 //! [`load`] turns a map into [`Piece`]s - the world, every brush entity that can be seen
 //! (`func_brush`, doors ...) moved to where it stands, and every static prop with its model -
-//! each a list of triangles grouped into [`Surface`]s by material. Brushes are lit by their
-//! light maps, props by the light baked into the map for each of their vertices. Alongside
+//! each a list of triangles grouped into [`Surface`]s by material. The overlays of the map
+//! (`info_overlay`) come with the faces they lie on ([`gmod_bsp::overlay`]). Brushes are lit
+//! by their light maps, props by the light baked into the map for each of their vertices. A
+//! surface whose material has proxies changes as time goes on ([`Surface::look`]): the frame
+//! of an animated texture, a scrolling texture, a pulsing colour. Alongside
 //! come the textures the materials use, still as VTF files (a GPU takes DXT as it is), the
 //! sky box, and the fog. What stands in the room of the 3D sky box is kept apart from the
 //! world, to be drawn behind it ([`sky`]).
@@ -26,7 +29,8 @@ use gmod_bsp::collision::{Collision, Hull};
 use gmod_bsp::props::solid;
 use gmod_bsp::{Bsp, mesh};
 use gmod_fs::{Backing, Mount, Vfs};
-use gmod_material::{Library, Material, Vtf};
+use gmod_material::proxy::{self, IDENTITY, Matrix};
+use gmod_material::{Library, Material, Proxies, Vtf};
 use gmod_model::{Mdl, Model, Vhv};
 
 pub mod gpu;
@@ -107,6 +111,26 @@ pub struct Surface {
     pub water: Option<Vec3>,
     /// The material was not found: the game shows purple and black squares.
     pub missing: bool,
+    /// `$basetexturetransform`: how the base texture's coordinates are scaled, turned and moved.
+    pub transform: Option<Matrix>,
+    /// `$frame`: the frame of an animated base texture that shows.
+    pub frame: u32,
+    /// The material's proxies, which change the frame, the transform, the tint and the alpha
+    /// as time goes on.
+    pub proxies: Option<Arc<Proxies>>,
+    /// `DecalModulate`: darkens and lightens what is behind it, by twice its colour (cracks,
+    /// dirt); grey changes nothing.
+    pub modulate: bool,
+}
+
+/// How a surface looks at a moment, its material's proxies run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Look {
+    /// The frame of the base texture, counting on: wrap it to the frames the texture has.
+    pub frame: u32,
+    pub transform: Matrix,
+    pub tint: Vec3,
+    pub alpha: f32,
 }
 
 impl Surface {
@@ -127,7 +151,33 @@ impl Surface {
             alpha: 1.0,
             water: None,
             missing: true,
+            transform: None,
+            frame: 0,
+            proxies: None,
+            modulate: false,
         }
+    }
+
+    /// How it looks `time` seconds into the map: as the material sets it, then as its proxies
+    /// change it.
+    pub fn look(&self, time: f32) -> Look {
+        let mut look = Look { frame: self.frame, transform: self.transform.unwrap_or(IDENTITY), tint: self.tint, alpha: self.alpha };
+        if let Some(proxies) = &self.proxies {
+            let vars = proxies.at(time);
+            if let Some(frame) = vars.number("$frame") {
+                look.frame = frame.max(0.0) as u32;
+            }
+            if let Some(transform) = vars.matrix("$basetexturetransform") {
+                look.transform = transform;
+            }
+            if let Some(tint) = vars.vector("$color") {
+                look.tint = tint;
+            }
+            if let Some(alpha) = vars.number("$alpha") {
+                look.alpha = alpha.clamp(0.0, 1.0);
+            }
+        }
+        look
     }
 }
 
@@ -509,6 +559,16 @@ impl Gather<'_> {
             s.translucent = true;
             s.lit = false;
         }
+        s.transform = m.get("$basetexturetransform").and_then(proxy::transform);
+        s.frame = m.float("$frame").map_or(0, |f| f.max(0.0) as u32);
+        s.proxies = Proxies::new(m).map(Arc::new);
+        // what proxies fade is drawn over what is behind it
+        s.translucent |= s.proxies.as_ref().is_some_and(|p| p.writes("$alpha"));
+        if m.shader == "decalmodulate" {
+            s.modulate = true;
+            s.translucent = true;
+            s.lit = false;
+        }
         s
     }
 }
@@ -768,6 +828,8 @@ pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod materials;
 
     #[test]
     fn sky_box_faces() {

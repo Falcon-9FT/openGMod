@@ -17,6 +17,12 @@
 //! ([`Renderer::set_view_models`]). Fog fades what is far towards its colour: the world's fog
 //! in the world, the sky camera's in the 3D sky box. Depth runs from 1 at the eye to 0 at
 //! infinity. Over it an [`Overlay`] draws the 2D of the HUD and the panels.
+//!
+//! Materials change as time goes on ([`Renderer::set_time`]): every frame the surfaces whose
+//! materials have proxies get their parameters anew ([`gmod_world::Surface::look`]) - the
+//! layer of an animated texture, whose frames are uploaded as the layers of one texture, the
+//! transform of its coordinates, its tint and alpha. Overlays come with the world's surfaces,
+//! lifted off the faces they lie on; `DecalModulate` ones darken and lighten what is behind.
 
 #![forbid(unsafe_code)]
 
@@ -25,7 +31,7 @@ use std::num::NonZeroU64;
 
 use gmod_world::gpu::{self, Camera, Draw, PixelFormat, TextureData};
 use gmod_world::sky::SkyCamera;
-use gmod_world::{Piece, Texture, World};
+use gmod_world::{Piece, Surface, Texture, World};
 
 mod ui;
 
@@ -57,7 +63,7 @@ const MAX_TEXTURE: u32 = 4096;
 /// Bytes between the parameters of two surfaces in their buffer: the usual offset alignment.
 const PARAMS_STRIDE: u64 = 256;
 /// Bytes of a surface's parameters.
-const PARAMS_SIZE: u64 = 48;
+const PARAMS_SIZE: u64 = gpu::SURFACE_PARAMS as u64 * 4;
 /// Bytes of a camera for the shaders: its matrix, its eye, where the light of models comes
 /// from, the lights of the moment, where the bones of a posed model are, and the fog.
 const CAMERA_SIZE: u64 = 464;
@@ -76,6 +82,8 @@ enum Kind {
     Blend,
     BlendTwoSided,
     Additive,
+    /// Twice its colour times what is behind it.
+    Modulate,
 }
 
 impl Kind {
@@ -84,7 +92,7 @@ impl Kind {
     }
 }
 
-const KINDS: [Kind; 5] = [Kind::Opaque, Kind::OpaqueTwoSided, Kind::Blend, Kind::BlendTwoSided, Kind::Additive];
+const KINDS: [Kind; 6] = [Kind::Opaque, Kind::OpaqueTwoSided, Kind::Blend, Kind::BlendTwoSided, Kind::Additive, Kind::Modulate];
 
 /// The pipelines of each kind of surface: for what stands still, and for models posed by their
 /// bones.
@@ -197,8 +205,27 @@ fn lights_bytes(
     values
 }
 
-/// An uploaded texture and which sampler it takes; none when it could not be uploaded.
-type Uploaded = Option<(wgpu::TextureView, usize)>;
+/// A texture on the GPU: its frames as layers, its first frame alone (for the sky box), which
+/// sampler it takes and how many frames it has.
+#[derive(Clone)]
+struct Views {
+    layers: wgpu::TextureView,
+    first: wgpu::TextureView,
+    sampler: usize,
+    frames: u32,
+}
+
+/// An uploaded texture; none when it could not be uploaded.
+type Uploaded = Option<Views>;
+
+/// A surface whose look changes with time: its draw, the surface, the frames of its base
+/// texture and whether its piece has a light map.
+struct Animated {
+    draw: usize,
+    surface: Surface,
+    frames: u32,
+    lightmap: bool,
+}
 
 /// Pieces on the GPU - the world's or a model's - and what each of their surfaces is drawn
 /// with.
@@ -210,6 +237,20 @@ struct Mesh {
     lightmap_groups: Vec<wgpu::BindGroup>,
     /// For a model that moves: the bones of each vertex, and how many bones it needs.
     skin: Option<(wgpu::Buffer, usize)>,
+    /// The parameters of its surfaces, `PARAMS_STRIDE` apart, and those that change with time.
+    params: wgpu::Buffer,
+    animated: Vec<Animated>,
+}
+
+impl Mesh {
+    /// Writes the parameters of the surfaces that change with time as they are at `time`.
+    fn animate(&self, queue: &wgpu::Queue, time: f32) {
+        for a in &self.animated {
+            let values = gpu::surface_params(&a.surface, &a.surface.look(time), a.frames, a.lightmap);
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            queue.write_buffer(&self.params, a.draw as u64 * PARAMS_STRIDE, &bytes);
+        }
+    }
 }
 
 /// What can be drawn of a world, on the GPU.
@@ -245,6 +286,8 @@ pub struct Renderer {
     sky_vertices: Option<wgpu::Buffer>,
     sky_groups: Vec<wgpu::BindGroup>,
     depth: Option<(wgpu::TextureView, (u32, u32))>,
+    /// Seconds into the map, for materials that change with time.
+    time: f32,
     /// Textures that could not be uploaded and are drawn as missing.
     pub failed_textures: Vec<String>,
 }
@@ -274,10 +317,12 @@ fn wgpu_format(format: PixelFormat) -> wgpu::TextureFormat {
     }
 }
 
-fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data: &TextureData) -> wgpu::TextureView {
+/// Uploads a texture, its frames as layers: a view of them all, and one of the first.
+fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data: &TextureData) -> (wgpu::TextureView, wgpu::TextureView) {
+    let layers = data.frames.max(1);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
-        size: wgpu::Extent3d { width: data.width, height: data.height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width: data.width, height: data.height, depth_or_array_layers: layers },
         mip_level_count: data.levels.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -299,10 +344,17 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data:
             bytes,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(rows) },
             // compressed levels are copied in whole blocks
-            wgpu::Extent3d { width: width.div_ceil(side) * side, height: height.div_ceil(side) * side, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: width.div_ceil(side) * side, height: height.div_ceil(side) * side, depth_or_array_layers: layers },
         );
     }
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
+    let view = |dimension, count| {
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(dimension),
+            array_layer_count: Some(count),
+            ..Default::default()
+        })
+    };
+    (view(wgpu::TextureViewDimension::D2Array, layers), view(wgpu::TextureViewDimension::D2, 1))
 }
 
 fn upload_lightmap(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, bytes: &[u8]) -> wgpu::TextureView {
@@ -343,25 +395,22 @@ fn sampler(device: &wgpu::Device, clamp_s: bool, clamp_t: bool, filtered: bool) 
     })
 }
 
-/// An uploaded texture and which sampler it takes, or the missing texture.
-fn pick<'a>(
-    textures: &'a [Option<(wgpu::TextureView, usize)>],
-    missing: &'a wgpu::TextureView,
-    index: Option<usize>,
-) -> (&'a wgpu::TextureView, usize) {
-    match index.and_then(|i| textures.get(i)).and_then(Option::as_ref) {
-        Some((view, sampler)) => (view, *sampler),
-        None => (missing, 0),
-    }
+/// An uploaded texture, or the missing texture.
+fn pick<'a>(textures: &'a [Uploaded], missing: &'a Views, index: Option<usize>) -> &'a Views {
+    index.and_then(|i| textures.get(i)).and_then(Option::as_ref).unwrap_or(missing)
 }
 
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    view_entry(binding, wgpu::TextureViewDimension::D2)
+}
+
+fn view_entry(binding: u32, view_dimension: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: true },
-            view_dimension: wgpu::TextureViewDimension::D2,
+            view_dimension,
             multisampled: false,
         },
         count: None,
@@ -482,7 +531,7 @@ fn bones_buffer(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, room: usi
 struct Shared {
     layouts: Layouts,
     samplers: Vec<wgpu::Sampler>,
-    missing: wgpu::TextureView,
+    missing: Views,
     white: wgpu::TextureView,
     lightmap_sampler: wgpu::Sampler,
     compressed: bool,
@@ -491,8 +540,7 @@ struct Shared {
 impl Shared {
     fn texture(&self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &Texture) -> Uploaded {
         let data = gpu::texture_data(&texture.vtf, self.compressed, MAX_TEXTURE)?;
-        let view = upload_texture(device, queue, &texture.name, &data);
-        Some((view, usize::from(data.clamp_s) | usize::from(data.clamp_t) << 1))
+        Some(views(device, queue, &texture.name, &data))
     }
 
     /// Uploads pieces of a world or a model, whose textures are `textures`.
@@ -503,15 +551,21 @@ impl Shared {
         let indices = buffer(device, queue, "indices", wgpu::BufferUsages::INDEX, &geometry.indices);
         let mut params = vec![0u8; (geometry.draws.len() as u64 * PARAMS_STRIDE).max(PARAMS_STRIDE) as usize];
         let mut draws = Vec::with_capacity(geometry.draws.len());
+        let mut animated = Vec::new();
         for (i, draw) in geometry.draws.iter().enumerate() {
             let piece = &pieces[draw.piece];
             let surface = &piece.surfaces[draw.surface];
-            let values = gpu::surface_params(surface, piece.lightmap.is_some());
+            let (frames, lightmap) = (texture(surface.base).frames, piece.lightmap.is_some());
+            let values = gpu::surface_params(surface, &surface.look(0.0), frames, lightmap);
             let at = i * PARAMS_STRIDE as usize;
             for (k, v) in values.iter().enumerate() {
                 params[at + k * 4..at + k * 4 + 4].copy_from_slice(&v.to_le_bytes());
             }
+            if surface.proxies.is_some() {
+                animated.push(Animated { draw: i, surface: surface.clone(), frames, lightmap });
+            }
             let kind = match (surface.translucent, surface.additive, surface.no_cull) {
+                _ if surface.modulate => Kind::Modulate,
                 (_, true, _) => Kind::Additive,
                 (true, _, false) => Kind::Blend,
                 (true, _, true) => Kind::BlendTwoSided,
@@ -527,8 +581,8 @@ impl Shared {
             .enumerate()
             .map(|(i, draw)| {
                 let surface = &pieces[draw.piece].surfaces[draw.surface];
-                let (base, sampler_index) = texture(surface.base);
-                let (blend, _) = texture(surface.base2.or(surface.base));
+                let base = texture(surface.base);
+                let blend = texture(surface.base2.or(surface.base));
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("surface"),
                     layout: &self.layouts.surface,
@@ -541,9 +595,9 @@ impl Shared {
                                 size: NonZeroU64::new(PARAMS_SIZE),
                             }),
                         },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(base) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(blend) },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[sampler_index]) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&base.layers) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&blend.layers) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[base.sampler]) },
                     ],
                 })
             })
@@ -573,8 +627,14 @@ impl Shared {
         // a model that moves takes the bones of its vertices along
         let bone_count = gpu::bone_count(pieces);
         let skin = (bone_count > 0).then(|| (buffer(device, queue, "skin", wgpu::BufferUsages::VERTEX, &gpu::skin(pieces)), bone_count));
-        Mesh { vertices, indices, draws, surface_groups, lightmap_groups, skin }
+        Mesh { vertices, indices, draws, surface_groups, lightmap_groups, skin, params: params_buffer, animated }
     }
+}
+
+/// Uploads a texture's pixels: its views, its sampler by how it clamps, its frames.
+fn views(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data: &TextureData) -> Views {
+    let (layers, first) = upload_texture(device, queue, label, data);
+    Views { layers, first, sampler: usize::from(data.clamp_s) | usize::from(data.clamp_t) << 1, frames: data.frames.max(1) }
 }
 
 fn pipeline(
@@ -621,10 +681,20 @@ fn pipeline(
             operation: wgpu::BlendOperation::Add,
         },
     };
+    // what is behind times twice the colour: the shader gives half of it
+    let modulate = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Dst,
+            dst_factor: wgpu::BlendFactor::Src,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: additive.alpha,
+    };
     let blend = match kind {
         Kind::Opaque | Kind::OpaqueTwoSided => None,
         Kind::Blend | Kind::BlendTwoSided => Some(wgpu::BlendState::ALPHA_BLENDING),
         Kind::Additive => Some(additive),
+        Kind::Modulate => Some(modulate),
     };
     let two_sided = matches!(kind, Kind::OpaqueTwoSided | Kind::BlendTwoSided | Kind::Additive);
     let targets = [Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })];
@@ -725,7 +795,13 @@ impl Renderer {
             camera: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("camera"), entries: &[camera_entry] }),
             surface: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("surface"),
-                entries: &[uniform_entry(0, wgpu::ShaderStages::FRAGMENT), texture_entry(1), texture_entry(2), sampler_entry(3)],
+                entries: &[
+                    // the vertex shader moves the texture coordinates
+                    uniform_entry(0, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                    view_entry(1, wgpu::TextureViewDimension::D2Array),
+                    view_entry(2, wgpu::TextureViewDimension::D2Array),
+                    sampler_entry(3),
+                ],
             }),
             texture: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("texture"),
@@ -775,7 +851,7 @@ impl Renderer {
 
         let shared = Shared {
             samplers: (0..4).map(|i| sampler(device, i & 1 != 0, i & 2 != 0, true)).collect(),
-            missing: upload_texture(device, queue, "missing", &gpu::missing_texture()),
+            missing: views(device, queue, "missing", &gpu::missing_texture()),
             white: upload_lightmap(
                 device,
                 queue,
@@ -815,7 +891,7 @@ impl Renderer {
             for corner in [0, 1, 2, 0, 2, 3] {
                 sky_bytes.extend(quad.corners[corner].iter().flat_map(|v| v.to_le_bytes()));
             }
-            let (view, _) = pick(&textures, &shared.missing, Some(quad.texture));
+            let view = &pick(&textures, &shared.missing, Some(quad.texture)).first;
             sky_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("sky"),
                 layout: &shared.layouts.texture,
@@ -851,8 +927,15 @@ impl Renderer {
             sky_vertices,
             sky_groups,
             depth: None,
+            time: 0.0,
             failed_textures,
         }
+    }
+
+    /// The time from now on, in seconds into the map: what materials that change with time
+    /// show (their proxies' `CurrentTime`).
+    pub fn set_time(&mut self, seconds: f32) {
+        self.time = seconds;
     }
 
     /// Uploads a model ([`gmod_world::model`]) to draw where entities have it. Textures the
@@ -986,6 +1069,11 @@ impl Renderer {
             sky_cameras.extend(camera_bytes(projection, [eye[0], eye[1], eye[2], sky.scale], None, &[], None, &fog));
         }
         queue.write_buffer(&self.sky_camera_buffer, 0, &sky_cameras);
+        // the surfaces that change with time, as they are now
+        let meshes = std::iter::once(&self.world).chain(self.skybox.as_ref().map(|(mesh, _)| mesh)).chain(&self.models);
+        for mesh in meshes {
+            mesh.animate(queue, self.time);
+        }
 
         // the sky: the sky box, then the 3D sky box
         let clear = wgpu::LoadOp::Clear(wgpu::Color { r: 0.25, g: 0.35, b: 0.5, a: 1.0 });

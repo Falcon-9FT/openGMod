@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::*;
 
+mod materials;
 mod skybox;
 
 fn validate(name: &str, source: &str) {
@@ -163,6 +164,10 @@ fn draws_models_where_the_entities_are() {
         alpha: 1.0,
         water: None,
         missing: true,
+        transform: None,
+        frame: 0,
+        proxies: None,
+        modulate: false,
     };
     let square = World {
         pieces: vec![gmod_world::Piece {
@@ -281,6 +286,10 @@ fn square(bone: Option<u8>) -> World {
         alpha: 1.0,
         water: None,
         missing: true,
+        transform: None,
+        frame: 0,
+        proxies: None,
+        modulate: false,
     };
     let skin = bone.map_or(Vec::new(), |b| vec![gmod_world::Weights { bones: [b, 0, 0], weights: [1.0, 0.0, 0.0] }; 4]);
     World {

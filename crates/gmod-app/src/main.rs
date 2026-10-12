@@ -235,6 +235,8 @@ struct Gpu {
     view_format: wgpu::TextureFormat,
     /// The map's; none while there is no map.
     renderer: Option<gmod_render::Renderer>,
+    /// When the map came up: materials that change with time count from then.
+    map_started: Instant,
     /// The client's 2D over the world: the HUD, the menus.
     overlay: gmod_render::Overlay,
     /// The main menu's, over everything.
@@ -287,7 +289,19 @@ impl Gpu {
         surface.configure(&device, &config);
         let overlay = gmod_render::Overlay::new(&device, &queue, view_format);
         let menu_overlay = gmod_render::Overlay::new(&device, &queue, view_format);
-        Ok(Gpu { window, instance, surface, device, queue, config, view_format, renderer: None, overlay, menu_overlay })
+        Ok(Gpu {
+            window,
+            instance,
+            surface,
+            device,
+            queue,
+            config,
+            view_format,
+            renderer: None,
+            map_started: Instant::now(),
+            overlay,
+            menu_overlay,
+        })
     }
 
     /// The map to draw from now on, or none.
@@ -303,6 +317,7 @@ impl Gpu {
             println!("Textures that could not be shown: {}", renderer.failed_textures.len());
         }
         self.renderer = Some(renderer);
+        self.map_started = Instant::now();
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -316,7 +331,10 @@ impl Gpu {
     /// The map, or black where there is none.
     fn draw_3d(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, size: (u32, u32), camera: &Camera) {
         match &mut self.renderer {
-            Some(renderer) => renderer.render(&self.device, &self.queue, encoder, view, size, camera),
+            Some(renderer) => {
+                renderer.set_time(self.map_started.elapsed().as_secs_f32());
+                renderer.render(&self.device, &self.queue, encoder, view, size, camera);
+            }
             None => {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("no map"),

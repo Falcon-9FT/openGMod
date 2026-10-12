@@ -13,5 +13,6 @@ wgpu.workspace = true
 [dev-dependencies]
 gmod-bsp = { workspace = true, features = ["testmap"] }
 gmod-fs.workspace = true
+gmod-material.workspace = true
 # checks the shaders without a GPU
 naga = { version = "30.0.0", features = ["wgsl-in"] }

@@ -1,6 +1,7 @@
 // The world, brush entities, props and the models of entities: base texture (blended with a
 // second one on displacements), times light from the light map or the vertex, times the tint;
-// then fog by the distance from the eye.
+// then fog by the distance from the eye. The base texture's coordinates go through its
+// transform, and an animated one shows the layer of its frame.
 
 struct Camera {
     view_projection: mat4x4<f32>,
@@ -37,12 +38,16 @@ struct Surface {
     // z: 1 when the second texture blends in, w: how fog covers it (0 towards its colour,
     // 1 towards nothing for what adds its light, 2 not at all)
     options: vec4<f32>,
+    // the base texture's transform, a row for u and one for v; the w of the first is the
+    // layer of the frame that shows, of the second 1 when it modulates what is behind
+    transform_u: vec4<f32>,
+    transform_v: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var<uniform> surface: Surface;
-@group(1) @binding(1) var base_texture: texture_2d<f32>;
-@group(1) @binding(2) var blend_texture: texture_2d<f32>;
+@group(1) @binding(1) var base_texture: texture_2d_array<f32>;
+@group(1) @binding(2) var blend_texture: texture_2d_array<f32>;
 @group(1) @binding(3) var texture_sampler: sampler;
 @group(2) @binding(0) var lightmap: texture_2d<f32>;
 @group(2) @binding(1) var lightmap_sampler: sampler;
@@ -73,6 +78,8 @@ struct VertexOutput {
     @location(3) light: vec3<f32>,
     @location(4) position: vec3<f32>,
     @location(5) normal: vec3<f32>,
+    // the coordinates of the second texture, which the transform does not move
+    @location(6) blend_uv: vec2<f32>,
 };
 
 /// The lights of the moment on a point facing `n`.
@@ -140,7 +147,9 @@ fn vs_posed(input: VertexInput, skin: Skin) -> VertexOutput {
 fn shade(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.clip = camera.view_projection * vec4<f32>(input.position, 1.0);
-    output.uv = input.uv;
+    let uv = vec3<f32>(input.uv, 1.0);
+    output.uv = vec2<f32>(dot(surface.transform_u.xyz, uv), dot(surface.transform_v.xyz, uv));
+    output.blend_uv = input.uv;
     output.lightmap_uv = input.lightmap_uv;
     output.alpha = input.alpha;
     output.light = input.light;
@@ -167,8 +176,8 @@ fn shade(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // sampled before any branch: texture lookups need every pixel of a quad to take them
-    var albedo = textureSample(base_texture, texture_sampler, input.uv);
-    let blended = textureSample(blend_texture, texture_sampler, input.uv);
+    var albedo = textureSample(base_texture, texture_sampler, input.uv, i32(surface.transform_u.w));
+    let blended = textureSample(blend_texture, texture_sampler, input.blend_uv, 0);
     let mapped = textureSample(lightmap, lightmap_sampler, input.lightmap_uv).rgb;
     if (surface.options.z > 0.5) {
         albedo = mix(albedo, blended, clamp(input.alpha, 0.0, 1.0));
@@ -178,6 +187,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     if (surface.water.w > 0.5) {
         return vec4<f32>(fogged(surface.water.rgb, input.position), 0.75);
+    }
+    if (surface.transform_v.w > 0.5) {
+        // the game modulates in gamma space, where grey (0.5) changes nothing: half of what
+        // multiplies the linear colour behind, the blend doubling it; transparent is grey
+        let gamma = mix(vec3<f32>(0.5), pow(albedo.rgb * surface.tint.rgb, vec3<f32>(1.0 / 2.2)), albedo.a * surface.tint.a);
+        return vec4<f32>(0.5 * pow(2.0 * gamma, vec3<f32>(2.2)), 1.0);
     }
     var light = vec3<f32>(1.0, 1.0, 1.0);
     if (surface.options.y > 1.5) {

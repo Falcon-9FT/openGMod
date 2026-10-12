@@ -1141,6 +1141,7 @@ version = "0.4.4"
 dependencies = [
  "gmod-bsp",
  "gmod-fs",
+ "gmod-material",
  "gmod-ui",
  "gmod-world",
  "naga",
