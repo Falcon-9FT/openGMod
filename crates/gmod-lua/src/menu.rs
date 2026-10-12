@@ -182,6 +182,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     if realm != Realm::Menu {
         return Ok(());
     }
+    crate::loading::install(lua)?;
     // mounting a game takes a restart in openGMOD: `cfg/mount.cfg` says what is mounted
     def(lua, &engine, "SetMounted", nothing)?;
 

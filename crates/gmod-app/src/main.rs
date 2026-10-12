@@ -159,6 +159,7 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
 }
 
 /// How games are started: from where, with what.
+#[derive(Clone)]
 struct Setup {
     gmod: Option<PathBuf>,
     addons: bool,
@@ -197,6 +198,102 @@ struct Loaded {
     name: String,
     /// The brush models of the entities that may move, drawn where those are.
     brushes: HashMap<usize, World>,
+}
+
+/// What may be loaded in the background: a map of the player's own, or a server to join.
+enum Loadable {
+    Map(String),
+    Server(String),
+}
+
+/// What a loading in the background made ready.
+enum Prepared {
+    Map(Box<Loaded>),
+    Server(Box<Joining>),
+}
+
+/// A server's game made ready: the connection open, the files fetched, its map loaded.
+struct Joining {
+    loaded: Loaded,
+    connection: client::Connection,
+    addr: SocketAddr,
+}
+
+/// What the server being joined says of itself, for the loading screen (`GameDetails`), and the
+/// files it has the client fetch.
+struct Details {
+    server: String,
+    loading_url: String,
+    map: String,
+    max_players: u32,
+    gamemode: String,
+    downloads: Vec<String>,
+}
+
+/// A loading going on in the background ([`App::begin_loading`]).
+struct Loading {
+    done: std::sync::mpsc::Receiver<Result<Prepared, String>>,
+    /// What it does now.
+    status: Arc<std::sync::Mutex<String>>,
+    /// What the server said, until the loading screen took it.
+    details: Arc<std::sync::Mutex<Option<Details>>>,
+    /// The map or the server: what the player is told failed.
+    name: String,
+}
+
+/// Gets a server's game ready: connects, fetches the files it says to have, loads its map;
+/// `say` hears what it does.
+fn prepare_join(setup: &Setup, address: &str, say: &dyn Fn(&str)) -> Result<Joining, String> {
+    prepare_join_telling(setup, address, say, &Arc::new(std::sync::Mutex::new(None)))
+}
+
+/// [`prepare_join`], telling `details` what the server is and has the client fetch.
+fn prepare_join_telling(
+    setup: &Setup,
+    address: &str,
+    say: &dyn Fn(&str),
+    details: &Arc<std::sync::Mutex<Option<Details>>>,
+) -> Result<Joining, String> {
+    let addr = server_address(address)?;
+    say(&format!("Connecting to {addr}"));
+    let mut connection = client::Connection::open(addr, &setup.name)?;
+    let welcome = connection.welcome.clone();
+    println!("{}: {} ({}, {} players)", welcome.server, welcome.map, welcome.gamemode, welcome.max_players);
+    let install = Install::locate(setup.gmod.as_deref()).map_err(|e| e.to_string())?;
+    let mut vfs = setup.mount(&install);
+    // what servers had downloaded is kept, behind the game's own files
+    let download = UserDir::default_root().map(|root| root.join("download"));
+    if let Some(dir) = &download {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(dir))));
+    }
+    let told = |fetching: client::Fetching| match fetching {
+        client::Fetching::Listed(files) => {
+            if let Ok(mut details) = details.lock() {
+                *details = Some(Details {
+                    server: welcome.server.clone(),
+                    loading_url: welcome.loading_url.clone(),
+                    map: welcome.map.clone(),
+                    max_players: welcome.max_players,
+                    gamemode: welcome.gamemode.clone(),
+                    downloads: files.to_vec(),
+                });
+            }
+        }
+        client::Fetching::Coming(file) => say(&format!("Downloading {file}")),
+    };
+    let lua = connection.download(&vfs, download.as_deref(), &told)?;
+    // the player's addons run on the server's word: their Lua the server lacks does not
+    if !welcome.allow_cs_lua {
+        vfs.hide_in_addons(Some(client::addon_lua_hidden(&connection.listed_lua)));
+    }
+    // the server's client Lua before the client's own
+    if !lua.is_empty() {
+        vfs.insert(0, gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Memory(gmod_fs::MemoryMount::new("server", lua))));
+    }
+    say(&format!("Loading {}", welcome.map));
+    let loaded = load_from(vfs, &welcome.map, true)?;
+    Ok(Joining { loaded, connection, addr })
 }
 
 /// Reads the map and everything it needs from the game.
@@ -710,6 +807,8 @@ struct App {
     pending_map: Option<String>,
     /// A server to join, likewise.
     pending_connect: Option<String>,
+    /// A map or a server's game being made ready in the background.
+    loading: Option<Loading>,
     /// The menu said to quit.
     quit: bool,
     /// When the menu started, whether Chromium drew it, and whether it was said that it did not.
@@ -837,17 +936,20 @@ impl App {
         }
     }
 
-    /// Starts a game on a map, leaving the one there was: the menu asked, or the command line.
+    /// Starts a game on a map, leaving the one there was, loading it here and now: the command
+    /// line asked, before there is a window to show the loading in.
     fn enter_map(&mut self, map: &str) {
         self.leave_map();
         println!("Loading {map}");
-        let loaded = match load(&self.setup, map) {
-            Ok(loaded) => loaded,
-            Err(e) => {
-                eprintln!("{e}");
-                return;
-            }
-        };
+        match load(&self.setup, map) {
+            Ok(loaded) => self.start_game(loaded),
+            Err(e) => eprintln!("{e}"),
+        }
+    }
+
+    /// The game starts on a map loaded: the player's own, with others joining over the network
+    /// when it takes more than one.
+    fn start_game(&mut self, loaded: Loaded) {
         let pages = self.web.clone().map(menu::web_pages);
         let setup = &self.setup;
         // more than one player: the others join over the network
@@ -868,40 +970,19 @@ impl App {
         self.show_map(loaded, game);
     }
 
-    /// Joins a server over the network: what it says to have is fetched, its map loaded, and
-    /// the player plays there.
+    /// Joins a server over the network, here and now (the command line asked): what it says
+    /// to have is fetched, its map loaded, and the player plays there.
     fn connect(&mut self, address: &str) {
         self.leave_map();
-        if let Err(e) = self.try_connect(address) {
+        let joined = prepare_join(&self.setup, address, &|status| println!("{status}")).and_then(|j| self.join_game(j));
+        if let Err(e) = joined {
             eprintln!("Could not join {address}: {e}");
         }
     }
 
-    fn try_connect(&mut self, address: &str) -> Result<(), String> {
-        let addr = server_address(address)?;
-        println!("Connecting to {addr}");
-        let mut connection = client::Connection::open(addr, &self.setup.name)?;
-        let welcome = connection.welcome.clone();
-        println!("{}: {} ({}, {} players)", welcome.server, welcome.map, welcome.gamemode, welcome.max_players);
-        let install = Install::locate(self.setup.gmod.as_deref()).map_err(|e| e.to_string())?;
-        let mut vfs = self.setup.mount(&install);
-        // what servers had downloaded is kept, behind the game's own files
-        let download = UserDir::default_root().map(|root| root.join("download"));
-        if let Some(dir) = &download {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            vfs.push(gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Dir(gmod_fs::DirMount::new(dir))));
-        }
-        let lua = connection.download(&vfs, download.as_deref())?;
-        // the player's addons run on the server's word: their Lua the server lacks does not
-        if !welcome.allow_cs_lua {
-            vfs.hide_in_addons(Some(client::addon_lua_hidden(&connection.listed_lua)));
-        }
-        // the server's client Lua before the client's own
-        if !lua.is_empty() {
-            vfs.insert(0, gmod_fs::Mount::new(&["GAME"], gmod_fs::Backing::Memory(gmod_fs::MemoryMount::new("server", lua))));
-        }
-        println!("Loading {}", welcome.map);
-        let loaded = load_from(vfs, &welcome.map, true)?;
+    /// The player joins the server a [`Joining`] got ready for.
+    fn join_game(&mut self, joining: Joining) -> Result<(), String> {
+        let Joining { loaded, connection, addr } = joining;
         let pages = self.web.clone().map(menu::web_pages);
         let (vfs, map) = loaded.lua.as_ref().ok_or("no Lua")?;
         let game = Game::join(vfs.clone(), map, connection, pages)?;
@@ -910,6 +991,83 @@ impl App {
             menu.on_server(Some(&addr.to_string()));
         }
         Ok(())
+    }
+
+    /// Starts loading a map (`Some`) or joining a server in the background: the window goes on,
+    /// the menu showing its loading screen, until it is ready ([`Self::poll_loading`]).
+    fn begin_loading(&mut self, what: Loadable) {
+        self.leave_map();
+        let (to_main, done) = std::sync::mpsc::channel();
+        let status = Arc::new(std::sync::Mutex::new(String::new()));
+        let details = Arc::new(std::sync::Mutex::new(None));
+        let setup = self.setup.clone();
+        let (said, told) = (status.clone(), details.clone());
+        let hosting = matches!(what, Loadable::Map(_));
+        let name = match &what {
+            Loadable::Map(map) => map.clone(),
+            Loadable::Server(address) => address.clone(),
+        };
+        std::thread::spawn(move || {
+            let say = |text: &str| {
+                println!("{text}");
+                if let Ok(mut status) = said.lock() {
+                    *status = text.to_string();
+                }
+            };
+            let prepared = match what {
+                Loadable::Map(map) => {
+                    say(&format!("Loading {map}"));
+                    load(&setup, &map).map(|loaded| Prepared::Map(Box::new(loaded)))
+                }
+                Loadable::Server(address) => prepare_join_telling(&setup, &address, &say, &told).map(|j| Prepared::Server(Box::new(j))),
+            };
+            let _ = to_main.send(prepared);
+        });
+        if let Some(menu) = &self.menu {
+            // the loading screen of one's own game names its map from `host_map`
+            if hosting {
+                menu.runtime().run_command(&format!("host_map \"{}.bsp\"", name.trim_end_matches(".bsp")));
+                menu.runtime().run_command(&format!("gamemode \"{}\"", self.setup.gamemode));
+            }
+            menu.runtime().begin_loading(hosting);
+        }
+        self.loading = Some(Loading { done, status, details, name });
+    }
+
+    /// The background loading: the loading screen told what it does, and, once it is ready,
+    /// the game goes on with it - or the menu comes back, saying why not.
+    fn poll_loading(&mut self) {
+        let Some(loading) = &self.loading else { return };
+        if let Some(menu) = &self.menu {
+            if let Ok(status) = loading.status.lock() {
+                menu.runtime().set_load_status(&status);
+            }
+            if let Some(details) = loading.details.lock().ok().and_then(|mut d| d.take()) {
+                menu.runtime().game_details(&details.server, &details.loading_url, &details.map, details.max_players, &details.gamemode);
+                menu.runtime().set_downloadables(details.downloads);
+            }
+        }
+        let result = match loading.done.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the loading stopped".to_string()),
+        };
+        let name = loading.name.clone();
+        self.loading = None;
+        let started = match result {
+            Ok(Prepared::Map(loaded)) => {
+                self.start_game(*loaded);
+                Ok(())
+            }
+            Ok(Prepared::Server(joining)) => self.join_game(*joining),
+            Err(e) => Err(e),
+        };
+        if let Some(menu) = &self.menu {
+            menu.runtime().end_loading();
+        }
+        if let Err(e) = started {
+            eprintln!("{name}: {e}");
+        }
     }
 
     /// A map loaded comes on the screen, with its game if there is one.
@@ -1408,11 +1566,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(map) = self.pending_map.take() {
-                    self.enter_map(&map);
+                    self.begin_loading(Loadable::Map(map));
                 }
                 if let Some(address) = self.pending_connect.take() {
-                    self.connect(&address);
+                    self.begin_loading(Loadable::Server(address));
                 }
+                self.poll_loading();
                 let now = Instant::now();
                 let seconds = (now - self.last_frame).as_secs_f32().min(0.25);
                 self.last_frame = now;
@@ -1690,6 +1849,7 @@ fn main() -> ExitCode {
         web: web.take(),
         pending_map: None,
         pending_connect: None,
+        loading: None,
         quit: false,
         menu_started: now,
         menu_drawn: false,

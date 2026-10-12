@@ -86,6 +86,7 @@ pub mod hud;
 pub mod inputs;
 pub mod items;
 pub mod lagcomp;
+pub mod loading;
 pub mod logic;
 pub mod material;
 pub mod matrix;
@@ -323,6 +324,8 @@ pub(crate) struct Host {
     pub(crate) nav: nav::Graph,
     /// What each player is sent: the map's visibility, and what Lua says of it.
     pub(crate) transmit: pvs::Transmit,
+    /// The menu's loading screen: what the program says of the loading going on.
+    pub(crate) loading: loading::Loading,
 }
 
 impl Host {
@@ -415,6 +418,7 @@ impl Runtime {
             lagcomp: lagcomp::History::default(),
             nav: nav::Graph::default(),
             transmit: pvs::Transmit::default(),
+            loading: loading::Loading::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;

@@ -65,6 +65,13 @@ pub struct Connection {
     pub listed_lua: Vec<String>,
 }
 
+/// What fetching a server's files comes to, as it goes: the files it is to fetch, then each as
+/// it starts coming.
+pub enum Fetching<'a> {
+    Listed(&'a [String]),
+    Coming(&'a str),
+}
+
 /// Waits a moment between looks at the network while blocking on it.
 fn nap() {
     std::thread::sleep(Duration::from_millis(5));
@@ -88,7 +95,14 @@ impl Connection {
         let net = gmod_net::Client::connect(server, &hello, started).map_err(|e| format!("{server}: {e}"))?;
         let mut connection = Connection {
             net,
-            welcome: Welcome { server: String::new(), map: String::new(), gamemode: String::new(), max_players: 1, allow_cs_lua: false },
+            welcome: Welcome {
+                server: String::new(),
+                map: String::new(),
+                gamemode: String::new(),
+                max_players: 1,
+                allow_cs_lua: false,
+                loading_url: String::new(),
+            },
             listed_lua: Vec::new(),
             snapshots: SnapshotReceiver::default(),
             commands: VecDeque::new(),
@@ -175,7 +189,7 @@ impl Connection {
     /// the game does not have, saved into `download` (mounted behind the game's own files, so
     /// that what is there is downloaded again only when the server has it otherwise). Waits
     /// until all came.
-    pub fn download(&mut self, vfs: &Vfs, download: Option<&Path>) -> Result<Vec<(String, Vec<u8>)>, String> {
+    pub fn download(&mut self, vfs: &Vfs, download: Option<&Path>, told: &dyn Fn(Fetching)) -> Result<Vec<(String, Vec<u8>)>, String> {
         let (listed_lua, listed_content) = self.wait_for("saying what files to have", |c| {
             c.take(
                 |m| matches!(m, FromServer::Files { .. }),
@@ -195,6 +209,7 @@ impl Connection {
             .filter(|f| vfs.locate(&f.path, "GAME").is_none() || (downloaded(f) && !same(f)))
             .collect();
         let wanted: Vec<&FileInfo> = lua.iter().chain(&content).collect();
+        told(Fetching::Listed(&wanted.iter().map(|f| f.path.clone()).collect::<Vec<_>>()));
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
@@ -207,6 +222,9 @@ impl Connection {
             while let Some(piece) = c.take(|m| matches!(m, FromServer::File { .. } | FromServer::FilesSent), Some) {
                 let FromServer::File { path, offset, size, data } = piece else { return Some(()) };
                 let Some(info) = wanted.iter().find(|f| f.path == path) else { continue };
+                if offset == 0 {
+                    told(Fetching::Coming(&path));
+                }
                 let file = files.entry(path).or_default();
                 if offset != file.len() as u64 || size != info.size || size > MAX_FILE || offset + data.len() as u64 > size {
                     wrong = Some(format!("{}: sent wrong", info.path));

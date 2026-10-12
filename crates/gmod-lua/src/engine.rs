@@ -160,6 +160,8 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
         Ok(Value::Integer(now as i64))
     })?;
     def(lua, &system, "IsWindowed", |_| Ok(Value::Boolean(true)))?;
+    // the window asks for the player's attention: there is no one to tell but the window
+    def(lua, &system, "FlashWindow", |_| Ok(Value::Nil))?;
     def(lua, &system, "HasFocus", |_| Ok(Value::Boolean(true)))?;
     // 255: no battery
     def(lua, &system, "BatteryPower", |_| Ok(Value::Integer(255)))?;

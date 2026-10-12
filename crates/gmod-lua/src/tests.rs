@@ -2998,3 +2998,42 @@ fn the_server_browser_asks_the_program() {
     ));
     assert!(menu.messages().is_empty(), "{:?}", menu.messages());
 }
+
+#[test]
+fn the_menu_shows_the_loading_screen() {
+    let menu = game(Realm::Menu, &[]);
+    menu.runtime
+        .run_string(
+            "LOG = {}
+             local P = vgui.Create('Panel') P:SetVisible(false)
+             function P:OnActivate() table.insert(LOG, 'up ' .. GetDefaultLoadingHTML() .. ' ' .. GetLoadStatus()) end
+             function P:OnDeactivate() table.insert(LOG, 'down') end
+             function GetLoadPanel() return P end
+             function GameDetails(server, url, map, max, shown, steamid, gm) table.insert(LOG, table.concat({ server, url, map, max, gm }, '|')) end
+             PANEL = P",
+            "loading",
+        )
+        .unwrap();
+    assert!(menu.eval::<bool>("return GetLoadStatus() == nil and NumDownloadables() == nil and not IsHostingGame()"));
+    menu.runtime.begin_loading(false);
+    menu.runtime.game_details("Alice's game", "", "gm_construct", 8, "sandbox");
+    menu.runtime.set_load_status("Downloading maps/gm_construct.bsp");
+    menu.runtime.set_downloadables(vec!["maps/gm_construct.bsp".into(), "materials/a.vtf".into()]);
+    assert!(menu.runtime.loading());
+    assert!(menu.eval::<bool>(
+        "return PANEL:IsVisible() and GetLoadStatus() == 'Downloading maps/gm_construct.bsp' and NumDownloadables() == 2
+             and GetDownloadables()[2] == 'materials/a.vtf' and GetConVar_Internal('cl_enable_loadingurl'):GetBool()"
+    ));
+    menu.runtime.end_loading();
+    menu.runtime.end_loading();
+    assert!(!menu.runtime.loading());
+    assert_eq!(
+        menu.eval::<String>("return table.concat(LOG, '\\n') .. '\\n' .. tostring(PANEL:IsVisible()) .. ' ' .. tostring(GetLoadStatus())"),
+        "up asset://garrysmod/html/loading.html Loading\nAlice's game||gm_construct|8|sandbox\ndown\nfalse nil"
+    );
+    // its own game: the menu is told it hosts
+    menu.runtime.begin_loading(true);
+    assert!(menu.eval::<bool>("return IsHostingGame()"));
+    menu.runtime.end_loading();
+    assert!(menu.messages().is_empty(), "{:?}", menu.messages());
+}

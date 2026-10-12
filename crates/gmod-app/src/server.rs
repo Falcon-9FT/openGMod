@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::rc::Rc;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -238,8 +238,16 @@ impl Server {
         }
         let name: String = self.name.chars().take(64).collect();
         let allow_cs_lua = self.runtime.convar("sv_allowcslua").is_some_and(|v| v.trim().parse::<f64>().is_ok_and(|n| n != 0.0));
-        let welcome =
-            Welcome { server: name, map: self.map.clone(), gamemode: self.gamemode.clone(), max_players: max as u32, allow_cs_lua };
+        // the welcome is one packet: a loading screen's address longer than any real one is left out
+        let loading_url = self.runtime.convar("sv_loadingurl").filter(|u| u.len() <= 512).unwrap_or_default();
+        let welcome = Welcome {
+            server: name,
+            map: self.map.clone(),
+            gamemode: self.gamemode.clone(),
+            max_players: max as u32,
+            allow_cs_lua,
+            loading_url,
+        };
         let Some(net) = &mut self.net else { return };
         let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
         let name = clean_name(&hello.name);
@@ -462,7 +470,7 @@ impl Server {
                         remote.known.insert(*index, serial);
                     }
                 }
-                let mine = Rc::new(proto::for_player(&encoded, &sent.indices, &dormant));
+                let mine = Arc::new(proto::for_player(&encoded, &sent.indices, &dormant));
                 let delta = remote.snapshots.delta(&mine, time, remote.command);
                 out.push((remote.id, FromServer::Snapshot(delta), false));
             }

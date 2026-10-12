@@ -698,7 +698,7 @@ mod tests {
         vfs.push(Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&download.0))));
         // an addon of the player's own, with Lua of its own and the server's file too
         vfs.insert(0, Mount::new(&["GAME"], Backing::Dir(gmod_fs::DirMount::new(&addon.0))).of_addon());
-        let lua = connection.download(&vfs, Some(&download.0)).unwrap();
+        let lua = connection.download(&vfs, Some(&download.0), &|_| {}).unwrap();
         assert!(!connection.welcome.allow_cs_lua);
         vfs.hide_in_addons(Some(super::super::client::addon_lua_hidden(&connection.listed_lua)));
         assert_eq!(lua, [("lua/autorun/client/hello.lua".to_string(), b"HELLO = 'from the server'".to_vec())]);
