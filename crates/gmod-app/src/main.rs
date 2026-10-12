@@ -138,6 +138,8 @@ struct Loaded {
     /// Where players start: the feet, and the angles.
     spawn: Option<([f32; 3], [f32; 3])>,
     name: String,
+    /// The brush models of the entities that may move, drawn where those are.
+    brushes: HashMap<usize, World>,
 }
 
 /// Reads the map and everything it needs from the game.
@@ -182,12 +184,29 @@ fn load(setup: &Setup, map: &str) -> Result<Loaded, String> {
     let (eye, target) = gmod_world::default_view(&bsp);
     let name = Path::new(&path).file_stem().map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned());
     let collision = Arc::new(collision);
+    // the brush models of what may move, drawn where their entities are
+    let brushes = bsp
+        .entities
+        .iter()
+        .filter(|e| e.moves())
+        .filter_map(|e| e.brush_model())
+        .map(|m| (m, gmod_world::brush_model(&vfs, &bsp, m)))
+        .collect();
     let lua = (setup.lua && install.is_ok()).then(|| {
         let map = gmod_lua::Map::from_bsp(&name, &bsp, collision.clone());
         (Arc::new(vfs), map)
     });
     let light = gmod_world::light::MapLight::new(&bsp);
-    Ok(Loaded { world, collision, light, lua, camera: Camera::looking_at(eye, target, FOV), spawn: gmod_world::spawn_point(&bsp), name })
+    Ok(Loaded {
+        world,
+        collision,
+        light,
+        lua,
+        camera: Camera::looking_at(eye, target, FOV),
+        spawn: gmod_world::spawn_point(&bsp),
+        name,
+        brushes,
+    })
 }
 
 /// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
@@ -671,7 +690,7 @@ impl App {
                 }
             }
         });
-        self.models = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone()));
+        self.models = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone()).with_brushes(loaded.brushes));
         self.audio = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| audio::Audio::new(vfs.clone()));
         self.collision = Some(loaded.collision);
         self.light = Some(loaded.light);

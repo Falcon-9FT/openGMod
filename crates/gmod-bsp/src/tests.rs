@@ -170,3 +170,46 @@ fn hdr_ambient_light_that_holds_nothing_gives_way_to_ldr() {
     let bsp = Bsp::parse("bright.bsp".into(), Arc::from(bright.bytes())).unwrap();
     assert_eq!(bsp.ambient_samples().unwrap().iter().flatten().next().unwrap().cube[4], [1.0; 3]);
 }
+
+#[test]
+fn brush_entities_that_move() {
+    let entity = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| format!("\"{k}\" \"{v}\"\n")).collect::<String>();
+    let entities = [
+        entity(&[("classname", "func_door"), ("model", "*1")]),
+        entity(&[("classname", "func_brush"), ("model", "*2"), ("targetname", "wall"), ("StartDisabled", "1")]),
+        entity(&[("classname", "func_illusionary"), ("model", "*3"), ("targetname", "fake")]),
+        entity(&[("classname", "func_wall"), ("model", "*4")]),
+    ]
+    .map(|e| format!("{{\n{e}}}\n"))
+    .concat();
+    let block = |x: f32| vec![TestBrush::cuboid([x, -32.0, 0.0], [x + 8.0, 32.0, 64.0])];
+    let models = vec![
+        vec![TestBrush::cuboid([-512.0, -512.0, -32.0], [1024.0, 512.0, 0.0])],
+        block(100.0),
+        block(200.0),
+        block(300.0),
+        block(400.0),
+    ];
+    let bsp = Bsp::parse("t.bsp".into(), Arc::from(TestMap { models, entities, ..TestMap::default() }.bytes())).unwrap();
+    // the movers, and the named brushes that inputs may move or turn off; not a plain wall
+    let moves: Vec<bool> = bsp.entities.iter().map(|e| e.moves()).collect();
+    assert_eq!(moves, [false, true, true, true, false]);
+    let mut c = Collision::new(&bsp);
+    let ray = |c: &Collision| c.trace_line([0.0, 0.0, 32.0], [1000.0, 0.0, 32.0], collision::mask::ALL).end[0].round();
+    assert_eq!(ray(&c), 100.0, "the door where the map puts it");
+    // the door lifted out of the way: the wall turned off at the start lets the ray by too
+    assert!(c.place_model(1, Some(([0.0, 0.0, 200.0], [0.0; 3]))));
+    assert_eq!(ray(&c), 400.0);
+    assert!(c.place_model(2, Some(([0.0; 3], [0.0; 3]))));
+    assert_eq!(ray(&c), 200.0, "turned on");
+    assert!(c.place_model(2, None));
+    // what is never solid stays so; a brush that does not move cannot be moved
+    assert!(!c.place_model(3, Some(([0.0; 3], [0.0; 3]))));
+    assert!(!c.place_model(4, None));
+    assert!(c.place_model(1, Some(([0.0; 3], [0.0; 3]))));
+    assert_eq!(ray(&c), 100.0, "back down");
+    // the world's solid shapes leave what moves to bodies of its own
+    assert_eq!(c.solid_shapes(collision::mask::ALL).hulls.len(), 2);
+    let door = c.model_hulls(1, collision::mask::ALL);
+    assert_eq!((door.len(), door[0].len()), (1, 8));
+}

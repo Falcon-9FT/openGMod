@@ -256,11 +256,20 @@ pub struct Models {
     vfs: Arc<Vfs>,
     /// By name and skin; none for those that could not be read.
     loaded: HashMap<(String, i64), Option<ModelId>>,
+    /// The map's brush models that move (`*3`), ready to upload when first drawn.
+    brushes: HashMap<usize, World>,
 }
 
 impl Models {
     pub fn new(vfs: Arc<Vfs>) -> Models {
-        Models { vfs, loaded: HashMap::new() }
+        Models { vfs, loaded: HashMap::new(), brushes: HashMap::new() }
+    }
+
+    /// With the brush models of the map that are drawn where their entities are: doors,
+    /// buttons, platforms ([`gmod_world::brush_model`]).
+    pub fn with_brushes(mut self, brushes: HashMap<usize, World>) -> Models {
+        self.brushes = brushes;
+        self
     }
 
     /// Where to draw the models of `drawn`. Those not seen before are read and handed to
@@ -270,7 +279,11 @@ impl Models {
             .iter()
             .filter_map(|d| {
                 let key = (d.model.to_ascii_lowercase().replace('\\', "/"), d.skin);
+                let brushes = &self.brushes;
                 let model = *self.loaded.entry(key).or_insert_with_key(|(name, skin)| {
+                    if let Some(index) = name.strip_prefix('*').and_then(|n| n.parse::<usize>().ok()) {
+                        return brushes.get(&index).filter(|w| !w.pieces.is_empty()).map(&mut upload);
+                    }
                     match gmod_world::model(&self.vfs, name, usize::try_from(*skin).unwrap_or(0)) {
                         Ok(model) => Some(upload(&model)),
                         Err(e) => {

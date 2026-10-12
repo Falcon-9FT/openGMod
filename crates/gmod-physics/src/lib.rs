@@ -334,6 +334,43 @@ impl Physics {
         body.recompute_mass_properties_from_colliders(&self.world.colliders);
     }
 
+    /// Adds a brush that moves as the game moves it (a door, a platform): convex solids by
+    /// their corners in its own space, where `origin` and `angles` put it. It is not pushed by
+    /// anything, and pushes what is in its way when it moves ([`Physics::move_mover`]). None
+    /// when no solid of it has volume.
+    pub fn add_mover(&mut self, hulls: &[Vec<Vec3>], origin: Vec3, angles: Vec3, user: u64) -> Option<BodyId> {
+        let colliders: Vec<_> = hulls
+            .iter()
+            .filter_map(|corners| ColliderBuilder::convex_hull(&corners.iter().map(|&p| metres(p)).collect::<Vec<_>>()))
+            .collect();
+        if colliders.is_empty() {
+            return None;
+        }
+        let rigid = RigidBodyBuilder::kinematic_position_based()
+            .pose(Pose::from_parts(metres(origin), rotation(angles)))
+            .user_data(u128::from(user));
+        let handle = self.world.insert_body(rigid);
+        for collider in colliders {
+            self.world.insert_collider(collider.friction(DEFAULT_FRICTION), Some(handle));
+        }
+        Some(BodyId(handle))
+    }
+
+    /// Where a mover is to be at the end of the next step: it goes there during the step, at
+    /// the speed that takes, and carries or pushes what it meets. What sleeps against it wakes.
+    pub fn move_mover(&mut self, id: BodyId, origin: Vec3, angles: Vec3) {
+        let Some(body) = self.world.bodies.get_mut(id.0) else { return };
+        if !body.is_kinematic() {
+            return;
+        }
+        let to = Pose::from_parts(metres(origin), rotation(angles));
+        if *body.position() == to {
+            return;
+        }
+        body.set_next_kinematic_position(to);
+        body.wake_up(true);
+    }
+
     /// Takes a body away, and its joints. The ground stays.
     pub fn remove(&mut self, id: BodyId) {
         if id.0 != self.ground {

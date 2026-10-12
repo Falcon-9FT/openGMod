@@ -8,7 +8,7 @@
 //! (`OnTrigger target:input:param:delay:times`, [`crate::outputs`]), `SetParent` (by name)
 //! and `ClearParent`, `Color`, `Alpha` and `Skin`, `FireUser1` to `FireUser4` fire its
 //! `OnUser1` to `OnUser4`, the entities of the map take theirs ([`crate::logic`],
-//! [`crate::triggers`]), and so do the constraints ([`crate::constraint`]). Inputs it does not know are dropped.
+//! [`crate::triggers`], [`crate::movers`]), and so do the constraints ([`crate::constraint`]). Inputs it does not know are dropped.
 //!
 //! An output's input waits here with the name of its target, found when it is given
 //! ([`crate::outputs::targets`]).
@@ -107,11 +107,37 @@ fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str, activ
         _ => {
             return crate::logic::input(lua, target, input, param, activator, caller)
                 || crate::triggers::input(lua, target, input, param, activator, caller)
+                || crate::movers::input(lua, target, input, param, activator, caller)
                 || crate::anim::input(lua, target, input, param)
                 || crate::constraint::input(lua, target, input);
         }
     }
     true
+}
+
+/// `Entity:Use`: a scripted entity's `ENT:Use(activator, caller, type, value)`, the engine's
+/// `Use` input for the others. Whether something took it.
+pub(crate) fn use_entity(
+    lua: &Lua,
+    target: EntityHandle,
+    activator: EntityHandle,
+    caller: EntityHandle,
+    use_type: i64,
+    value: f64,
+) -> bool {
+    let scripted = host(lua).entities.get(target).is_some_and(|ent| ent.scripted);
+    if scripted {
+        let Ok(Value::UserData(ud)) = entity::push(lua, target) else { return false };
+        // its own ENT:Use, from its table: through the entity, `Use` is the engine's
+        // Entity:Use that brought us here
+        let own = entity::table_of(&ud).ok().flatten().and_then(|t| t.get::<Value>("Use").ok());
+        let Some(Value::Function(f)) = own else { return false };
+        let push = |h: EntityHandle| entity::push(lua, h).unwrap_or(Value::Nil);
+        let args =
+            MultiValue::from_iter([Value::UserData(ud), push(activator), push(caller), Value::Integer(use_type), Value::Number(value)]);
+        return crate::files::call_reporting(lua, f, args).is_ok();
+    }
+    input(lua, target, "Use", activator, caller, "")
 }
 
 /// Fires an input at an entity, to be given `delay` seconds from now.
@@ -194,6 +220,14 @@ pub(crate) fn install_methods(def: &entity::Def) -> mlua::Result<()> {
         let target = entity::this(a, 1)?;
         let name = a.string(2)?;
         input(a.lua, target, &name, opt_entity(a, 3), opt_entity(a, 4), &param(a, 5));
+        Ok(Value::Nil)
+    })?;
+    // ent:Use(activator, caller, useType, value)
+    def("Use", |a| {
+        let target = entity::this(a, 1)?;
+        let use_type = if matches!(a.get(4), None | Some(Value::Nil)) { 1 } else { a.number(4)? as i64 };
+        let value = if matches!(a.get(5), None | Some(Value::Nil)) { 0.0 } else { a.number(5)? };
+        use_entity(a.lua, target, opt_entity(a, 2), opt_entity(a, 3), use_type, value);
         Ok(Value::Nil)
     })?;
     // ent:Fire(input, param, delay, activator, caller)

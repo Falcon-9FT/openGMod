@@ -79,6 +79,7 @@ pub mod matrix;
 pub mod menu;
 pub mod meta;
 pub mod movedata;
+pub mod movers;
 pub mod net;
 pub mod outputs;
 pub mod physgun;
@@ -282,6 +283,8 @@ pub(crate) struct Host {
     pub chat: chat::Chat,
     /// What touched what last tick.
     pub(crate) touching: triggers::Touching,
+    /// What is solid of the brushes that may move.
+    pub(crate) movers: movers::Moving,
 }
 
 impl Host {
@@ -365,6 +368,7 @@ impl Runtime {
             surfaces: surfaceprops::Surfaces::default(),
             chat: chat::Chat::default(),
             touching: triggers::Touching::default(),
+            movers: movers::Moving::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -508,6 +512,7 @@ impl Runtime {
                 triggers::tick(&self.lua);
                 inputs::service(&self.lua);
                 logic::tick(&self.lua);
+                movers::tick(&self.lua);
             }
             ents::think(&self.lua);
             if server {

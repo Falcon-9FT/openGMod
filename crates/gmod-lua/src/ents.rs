@@ -428,6 +428,7 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         crate::anim::spawned(lua, handle);
         crate::logic::spawned(lua, handle);
         crate::triggers::spawned(lua, handle);
+        crate::movers::spawned(lua, handle);
     }
     if scripted && let Some(ud) = userdata(lua, handle) {
         call_method(lua, &ud, "Initialize", MultiValue::new());
@@ -567,7 +568,9 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
                 let hidden =
                     ent.removed || !ent.spawned || ent.no_draw || ent.effects & EF_NODRAW != 0 || ent.render_mode == RENDERMODE_NONE;
                 let studio = ent.model.len() > 4 && ent.model[ent.model.len() - 4..].eq_ignore_ascii_case(".mdl");
-                if hidden || !studio || (ent.class == "hl2mp_ragdoll" && ent.physics.is_none()) {
+                // the brushes that may move are drawn where their entities are; the others are the map's
+                let moving_brush = crate::movers::moving_brush(&ent).is_some();
+                if hidden || !(studio || moving_brush) || (ent.class == "hl2mp_ragdoll" && ent.physics.is_none()) {
                     return None;
                 }
                 (ent.model.clone(), ent.skin)
@@ -686,6 +689,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
         return;
     }
     crate::physics::load_world(lua, map.collision.as_deref());
+    crate::movers::clear(lua);
     let world_bounds = model_bounds(lua, "*0").unwrap_or_default();
     host(lua).entities.with_mut(world, |ent| {
         ent.model = format!("maps/{}.bsp", map.name);

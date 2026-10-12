@@ -13,6 +13,7 @@ use super::*;
 
 mod chat;
 mod mapio;
+mod movers;
 mod ragdoll;
 mod triggers;
 

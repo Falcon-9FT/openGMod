@@ -428,7 +428,8 @@ pub fn render(vfs: &mut Vfs, bsp: &Bsp, view: &View) -> Result<Picture, String> 
         return Err(format!("a picture of {}x{} pixels cannot be drawn", view.width, view.height));
     }
     let mounted = gmod_world::mount_pakfile(vfs, bsp).map_err(|e| format!("pakfile: {e}"))?;
-    let world = gmod_world::load(vfs, bsp);
+    // a still picture: what may move stands where the map puts it
+    let world = gmod_world::load_all(vfs, bsp);
     if mounted {
         vfs.remove(0);
     }

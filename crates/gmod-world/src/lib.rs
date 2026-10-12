@@ -372,15 +372,21 @@ const UNSEEN: [&str; 12] = [
     "func_clip_vphysics",
 ];
 
-/// The brush models to draw: the world (model 0) and every brush entity that can be seen, with
-/// its origin and angles.
+/// The brush models to draw with the world: the world (model 0) and every brush entity that
+/// can be seen and stays where it is, with its origin and angles. Those that may move
+/// ([`gmod_bsp::Entity::moves`]) are drawn where their entities are ([`brush_model`]).
 pub fn placed_models(bsp: &Bsp) -> Vec<(usize, Vec3, Vec3)> {
+    brush_models_to_draw(bsp, false)
+}
+
+/// The brush models to draw with the world, those that may move too if `moving`.
+fn brush_models_to_draw(bsp: &Bsp, moving: bool) -> Vec<(usize, Vec3, Vec3)> {
     let mut models = vec![(0, [0.0; 3], [0.0; 3])];
     for entity in &bsp.entities {
-        let Some(model) = entity.get("model").and_then(|m| m.strip_prefix('*')).and_then(|m| m.parse::<usize>().ok()) else { continue };
+        let Some(model) = entity.brush_model() else { continue };
         let class = entity.class_name();
         let hidden = entity.get("rendermode") == Some("10") || entity.get("StartDisabled") == Some("1");
-        if model == 0 || model >= bsp.models.len() || hidden || UNSEEN.iter().any(|unseen| class.starts_with(unseen)) {
+        if model >= bsp.models.len() || hidden || !moving && entity.moves() || UNSEEN.iter().any(|unseen| class.starts_with(unseen)) {
             continue;
         }
         models.push((model, entity.vec3("origin").unwrap_or([0.0; 3]), entity.vec3("angles").unwrap_or([0.0; 3])));
@@ -507,12 +513,24 @@ impl Gather<'_> {
     }
 }
 
-/// Gathers a map ready to draw. The map's pakfile should be mounted ([`mount_pakfile`]).
+/// Gathers a map ready to draw. The map's pakfile should be mounted ([`mount_pakfile`]). The
+/// brush entities that may move are left to be drawn where their entities are
+/// ([`brush_model`]).
 pub fn load(vfs: &Vfs, bsp: &Bsp) -> World {
+    gather_map(vfs, bsp, false)
+}
+
+/// The map as it stands when it starts, every brush entity baked in where the map puts it:
+/// for a still picture of it.
+pub fn load_all(vfs: &Vfs, bsp: &Bsp) -> World {
+    gather_map(vfs, bsp, true)
+}
+
+fn gather_map(vfs: &Vfs, bsp: &Bsp, moving: bool) -> World {
     let mut gather = Gather::new(vfs);
     let camera = sky::sky_camera(bsp);
     let sky_area = camera.map(|c| c.area);
-    let [mut pieces, mut sky_pieces] = brushes(bsp, &mut gather, sky_area);
+    let [mut pieces, mut sky_pieces] = brushes(bsp, &mut gather, sky_area, moving);
     let missing_models = static_props(bsp, &mut gather, sky_area, [&mut pieces, &mut sky_pieces]);
     let sky_name = bsp.worldspawn().and_then(|w| w.get("skyname")).unwrap_or("").to_string();
     let sky = std::array::from_fn(|i| {
@@ -537,7 +555,7 @@ pub fn load(vfs: &Vfs, bsp: &Bsp) -> World {
 
 /// The world and the brush entities, each moved to where it stands: those outside the 3D sky
 /// box's area, and those in it.
-fn brushes(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>) -> [Vec<Piece>; 2] {
+fn brushes(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>, moving: bool) -> [Vec<Piece>; 2] {
     let mut materials: HashMap<usize, Option<Arc<Material>>> = HashMap::new();
     let mut pieces = [Vec::new(), Vec::new()];
     // which faces of the world are the sky box's (the HDR faces go along with the others)
@@ -549,7 +567,7 @@ fn brushes(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>) -> [Vec<Piece>
     // the world in two when there is a sky box; a brush entity is where the middle of its
     // bounds is, turned with it (the bounds are in its own space, around its origin)
     let mut placed = Vec::new();
-    for (model, origin, angles) in placed_models(bsp) {
+    for (model, origin, angles) in brush_models_to_draw(bsp, moving) {
         if model == 0 {
             placed.push((false, model, origin, angles));
             if sky_area.is_some() {
@@ -567,34 +585,56 @@ fn brushes(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>) -> [Vec<Piece>
         } else {
             mesh::build(bsp, options)
         };
-        if mesh.indices.is_empty() {
-            continue;
-        }
-        let mut vertices: Vec<Vertex> = mesh
-            .vertices
-            .iter()
-            .map(|v| Vertex {
-                position: v.position,
-                normal: v.normal,
-                uv: v.uv,
-                lightmap_uv: v.lightmap_uv,
-                alpha: v.alpha,
-                light: [1.0; 3],
-            })
-            .collect();
+        let Some(mut piece) = brush_piece(bsp, gather, &mut materials, mesh) else { continue };
         if model != 0 {
-            place(&mut vertices, origin, angles);
+            place(&mut piece.vertices, origin, angles);
         }
-        let mut surfaces = Vec::new();
-        for batch in &mesh.batches {
-            let name = bsp.materials.get(batch.material).map_or("", String::as_str);
-            let material = materials.entry(batch.material).or_insert_with(|| gather.material(name)).clone();
-            surfaces.push(gather.surface(name, material.as_deref(), batch.first_index as usize, batch.index_count as usize));
-        }
-        let piece = Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces, skin: Vec::new() };
         pieces[usize::from(sky)].push(piece);
     }
     pieces
+}
+
+/// A brush model's mesh as a piece in its own space, with its light map and materials.
+fn brush_piece(bsp: &Bsp, gather: &mut Gather, materials: &mut HashMap<usize, Option<Arc<Material>>>, mesh: mesh::Mesh) -> Option<Piece> {
+    if mesh.indices.is_empty() {
+        return None;
+    }
+    let vertices: Vec<Vertex> = mesh
+        .vertices
+        .iter()
+        .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: v.lightmap_uv, alpha: v.alpha, light: [1.0; 3] })
+        .collect();
+    let mut surfaces = Vec::new();
+    for batch in &mesh.batches {
+        let name = bsp.materials.get(batch.material).map_or("", String::as_str);
+        let material = materials.entry(batch.material).or_insert_with(|| gather.material(name)).clone();
+        surfaces.push(gather.surface(name, material.as_deref(), batch.first_index as usize, batch.index_count as usize));
+    }
+    Some(Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces, skin: Vec::new() })
+}
+
+/// A brush model of the map on its own, to draw wherever its entity is (a door, a button, a
+/// platform): one piece in the model's space with its light map, its materials and textures.
+/// Empty when the map has no such model or it has nothing to draw.
+pub fn brush_model(vfs: &Vfs, bsp: &Bsp, model: usize) -> World {
+    let mut gather = Gather::new(vfs);
+    let mut materials = HashMap::new();
+    let pieces = if model == 0 || model >= bsp.models.len() {
+        Vec::new()
+    } else {
+        let mesh = mesh::build(bsp, mesh::Options { model, ..mesh::Options::default() });
+        brush_piece(bsp, &mut gather, &mut materials, mesh).into_iter().collect()
+    };
+    World {
+        pieces,
+        textures: gather.textures,
+        sky: Default::default(),
+        skybox: None,
+        fog: None,
+        missing_materials: gather.missing_materials,
+        missing_textures: gather.missing_textures,
+        missing_models: Vec::new(),
+    }
 }
 
 /// The static props, each with its model and baked light, into the pieces of the world or of
@@ -916,5 +956,34 @@ mod tests {
     fn plain_light_comes_from_above() {
         assert!(plain_light([0.0, 0.0, 1.0])[0] > plain_light([0.0, 0.0, -1.0])[0]);
         assert_eq!(plain_light([0.0, 0.0, -1.0]), [0.35; 3]);
+    }
+
+    #[test]
+    fn brushes_that_move_are_models_of_their_own() {
+        use gmod_bsp::testmap::{TestBrush, TestMap};
+        let entities =
+            "{\n\"classname\" \"func_door\"\n\"model\" \"*1\"\n}\n{\n\"classname\" \"func_wall\"\n\"model\" \"*2\"\n}\n".to_string();
+        let block = |x: f32| vec![TestBrush::cuboid([x, -32.0, 0.0], [x + 8.0, 32.0, 64.0])];
+        let models = vec![vec![TestBrush::cuboid([-512.0, -512.0, -32.0], [1024.0, 512.0, 0.0])], block(100.0), block(200.0)];
+        // the door's face toward -x, in its own space
+        let face = gmod_bsp::testmap::TestFace {
+            corners: vec![[100.0, -32.0, 0.0], [100.0, 32.0, 0.0], [100.0, 32.0, 64.0], [100.0, -32.0, 64.0]],
+            material: "TEST/DOOR",
+            flags: 0,
+        };
+        let test = TestMap { models, entities, model_faces: vec![(1, face)], ..TestMap::default() };
+        let bsp = Bsp::parse("t.bsp".into(), Arc::from(test.bytes())).unwrap();
+        // the door is not baked into the map; the wall is
+        let placed: Vec<usize> = placed_models(&bsp).into_iter().map(|(m, _, _)| m).collect();
+        assert_eq!(placed, [0, 2]);
+        let vfs = Vfs::new();
+        let door = brush_model(&vfs, &bsp, 1);
+        assert_eq!(door.pieces.len(), 1);
+        let piece = &door.pieces[0];
+        assert!(piece.lightmap.is_some() && !piece.surfaces.is_empty());
+        assert!(piece.vertices.iter().all(|v| (100.0..=108.0).contains(&v.position[0])), "in its own space");
+        assert!(brush_model(&vfs, &bsp, 0).pieces.is_empty() && brush_model(&vfs, &bsp, 9).pieces.is_empty());
+        // a still picture has the door where the map puts it
+        assert_eq!(load_all(&vfs, &bsp).pieces.len(), load(&vfs, &bsp).pieces.len() + 1);
     }
 }

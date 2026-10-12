@@ -485,3 +485,37 @@ fn joined_bodies_put_to_sleep_stay_asleep() {
     run(&mut physics, 1.0);
     assert!(physics.pose(post).unwrap().0[2] < 150.0 && physics.pose(arm).unwrap().0[2] < 150.0);
 }
+
+#[test]
+fn movers_carry_and_push_what_they_meet() {
+    let mut physics = floor();
+    // a platform with a crate asleep on it, and a crate beside where it will go
+    let Shape::Hulls(slab) = Shape::cuboid([-64.0, -64.0, -8.0], [64.0, 64.0, 0.0]) else { unreachable!() };
+    let lift = physics.add_mover(&slab, [0.0, 0.0, 8.0], [0.0; 3], 7).unwrap();
+    assert_eq!(physics.user(lift), Some(7));
+    assert!(!physics.motion(lift), "nothing pushes it");
+    let on_top = physics.add(&crate_body([0.0, 0.0, 30.0])).unwrap();
+    run(&mut physics, 2.0);
+    physics.sleep(on_top);
+    // up 100 units in a second: what is on it goes up with it
+    for tick in 1..=66 {
+        let z = 8.0 + 100.0 * tick as f32 / 66.0;
+        physics.move_mover(lift, [0.0, 0.0, z], [0.0; 3]);
+        physics.step(TICK);
+    }
+    let (at, _) = physics.pose(lift).unwrap();
+    assert!(near(at, [0.0, 0.0, 108.0], 0.1), "{at:?}");
+    let (crate_at, _) = physics.pose(on_top).unwrap();
+    assert!(crate_at[2] > 115.0, "carried up: {crate_at:?}");
+    // sideways into a crate standing on the floor: it is pushed out of the way
+    let beside = physics.add(&crate_body([150.0, 0.0, 16.0])).unwrap();
+    run(&mut physics, 1.0);
+    physics.sleep(beside);
+    for tick in 1..=66 {
+        let x = 300.0 * tick as f32 / 66.0;
+        physics.move_mover(lift, [x, 0.0, 20.0], [0.0; 3]);
+        physics.step(TICK);
+    }
+    let (pushed, _) = physics.pose(beside).unwrap();
+    assert!(pushed[0] > 320.0, "pushed along: {pushed:?}");
+}

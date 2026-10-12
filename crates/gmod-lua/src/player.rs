@@ -204,6 +204,9 @@ pub struct PlayerState {
     pub driving_mode: i64,
     pub hovered_widget: EntityHandle,
     pub pressed_widget: EntityHandle,
+    /// What the use key works while it is held (a scripted entity used continuously or on and
+    /// off).
+    pub using: EntityHandle,
     pub suit: bool,
     pub suit_power: f32,
     pub view_punch: Angle,
@@ -296,6 +299,7 @@ impl PlayerState {
             driving_mode: 0,
             hovered_widget: EntityHandle::NULL,
             pressed_widget: EntityHandle::NULL,
+            using: EntityHandle::NULL,
             suit: true,
             suit_power: 100.0,
             view_punch: Angle::default(),
@@ -837,10 +841,13 @@ fn tick(lua: &Lua, handle: EntityHandle) {
 
     // the weapon in hand
     let active = state(lua, handle, |_, p| p.active_weapon).unwrap_or(EntityHandle::NULL);
+    let (buttons, pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
     if host(lua).entities.is_valid(active) {
-        let (buttons, pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
         weapon::post_frame(lua, active, buttons, pressed);
         crate::physgun::command(lua, handle, active, &cmd.cmd, pressed);
+    }
+    if host(lua).entities.is_valid(handle) && self::alive(lua, handle) {
+        use_key(lua, handle, buttons, pressed);
     }
     if host(lua).entities.is_valid(handle) {
         hook(lua, "PlayerPostThink", [Value::UserData(ply)]);
@@ -1335,6 +1342,81 @@ pub(crate) fn bump_weapon(lua: &Lua, handle: EntityHandle, item: EntityHandle) {
     }
     crate::physics::destroy(lua, item);
     equip(lua, handle, item, false);
+}
+
+/// How far the use key reaches, from the eyes.
+const USE_REACH: f32 = 80.0;
+const IN_USE: u32 = 32;
+/// `SetUseType`'s kinds, and the kinds of use `ENT:Use` is given.
+const CONTINUOUS_USE: i64 = 0;
+const ONOFF_USE: i64 = 1;
+const USE_OFF: i64 = 0;
+const USE_ON: i64 = 1;
+
+/// What a player would use: the entity before their eyes within reach - by a ray, or else a
+/// small box for the thin and the small - as `FindUseEntity` may change it.
+fn find_use_entity(lua: &Lua, handle: EntityHandle) -> EntityHandle {
+    let Some((eye, aim)) = eye(lua, handle) else { return EntityHandle::NULL };
+    let end = eye + aim * USE_REACH;
+    let mut found = EntityHandle::NULL;
+    for size in [0.0, 8.0] {
+        let reach = Vector::new(size, size, size);
+        let sweep =
+            Sweep { mins: reach * -1.0, maxs: reach, mask: gmod_bsp::mask::SOLID, ..Sweep::line(eye, end, Filter::Entities(vec![handle])) };
+        let hit = trace::trace(lua, &sweep).entity;
+        if hit.index.is_some_and(|i| i != 0) {
+            found = hit;
+            break;
+        }
+    }
+    let chosen = hook(lua, "FindUseEntity", [ent_value(lua, handle), ent_value(lua, found)]);
+    match chosen.front() {
+        Some(value @ Value::UserData(_)) => entity::handle_of(Some(value)).unwrap_or(found),
+        _ => found,
+    }
+}
+
+/// The use key (`+use`): pressed, the player uses what is before their eyes if `PlayerUse`
+/// lets them - a scripted entity's `ENT:Use`, the engine's `Use` input (doors, buttons) -
+/// and hears the denial when there is nothing. A scripted entity used continuously
+/// (`CONTINUOUS_USE`, the default) is used every tick while the key is held and it is still
+/// there; one used on and off (`ONOFF_USE`) is used off when the key is let go.
+fn use_key(lua: &Lua, handle: EntityHandle, buttons: u32, pressed: u32) {
+    if crate::physgun::holding(lua, handle).is_some() {
+        return;
+    }
+    let using = state(lua, handle, |_, p| p.using).unwrap_or(EntityHandle::NULL);
+    let use_type = |e: EntityHandle| host(lua).entities.get(e).map_or(-1, |ent| ent.use_type);
+    if buttons & IN_USE == 0 {
+        if host(lua).entities.is_valid(using) && use_type(using) == ONOFF_USE {
+            crate::inputs::use_entity(lua, using, handle, handle, USE_OFF, 0.0);
+        }
+        with_player(lua, handle, |_, p| p.using = EntityHandle::NULL);
+        return;
+    }
+    if pressed & IN_USE == 0 {
+        // held: what is used continuously, while it is still before the eyes
+        if host(lua).entities.is_valid(using) && use_type(using) == CONTINUOUS_USE && find_use_entity(lua, handle) == using {
+            crate::inputs::use_entity(lua, using, handle, handle, USE_ON, 1.0);
+        }
+        return;
+    }
+    let target = find_use_entity(lua, handle);
+    if !host(lua).entities.is_valid(target) {
+        crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
+        return;
+    }
+    let allowed = hook(lua, "PlayerUse", [ent_value(lua, handle), ent_value(lua, target)]);
+    if matches!(allowed.front(), Some(Value::Boolean(false))) {
+        return;
+    }
+    let scripted = host(lua).entities.get(target).is_some_and(|ent| ent.scripted);
+    if scripted && matches!(use_type(target), CONTINUOUS_USE | ONOFF_USE) {
+        with_player(lua, handle, |_, p| p.using = target);
+    }
+    if !crate::inputs::use_entity(lua, target, handle, handle, USE_ON, 1.0) {
+        crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
+    }
 }
 
 /// Turns where a player looks (`SetEyeAngles`); their body turns with the yaw.

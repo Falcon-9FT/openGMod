@@ -170,12 +170,15 @@ pub struct Placement {
     pub origin: Vec3,
     /// Pitch, yaw and roll, in degrees.
     pub angles: Vec3,
+    /// Its entity may move or go ([`crate::Entity::moves`]): it is not part of the world's
+    /// solid shapes, and [`Collision::place_model`] moves it.
+    pub moves: bool,
     frame: Frame,
 }
 
 impl Placement {
     pub fn new(model: usize, entity: Option<usize>, origin: Vec3, angles: Vec3) -> Placement {
-        Placement { model, entity, origin, angles, frame: Frame::new(origin, angles) }
+        Placement { model, entity, origin, angles, moves: false, frame: Frame::new(origin, angles) }
     }
 }
 
@@ -523,6 +526,12 @@ const NOT_SOLID: [&str; 14] = [
     "func_vehicleclip",
 ];
 
+/// Whether a brush entity is never solid, whatever is done to it.
+fn never_solid(entity: &Entity) -> bool {
+    let class = entity.class_name();
+    NOT_SOLID.iter().any(|not| class.starts_with(not)) || class == "func_brush" && entity.get("Solidity") == Some("1")
+}
+
 /// Whether a brush entity is solid when the map starts.
 fn solid_at_start(entity: &Entity) -> bool {
     let class = entity.class_name();
@@ -558,6 +567,8 @@ pub struct Collision {
     model_bounds: Vec<Option<(Vec3, Vec3)>>,
     /// The world and the brush entities that are solid where the map puts them.
     pub placements: Vec<Placement>,
+    /// The brush entities that may move and are not solid now: off, or not yet on.
+    parked: Vec<Placement>,
     /// The convex hulls of models, in their own space.
     shapes: Vec<Vec<Hull>>,
     statics: Vec<Static>,
@@ -611,7 +622,8 @@ impl Collision {
             displacements: displacements(bsp, &surface),
             heads,
             model_bounds: Vec::new(),
-            placements: placements(bsp),
+            placements: placements(bsp, true),
+            parked: placements(bsp, false),
             shapes: Vec::new(),
             statics: Vec::new(),
             mins,
@@ -653,7 +665,7 @@ impl Collision {
     /// displacements' triangles.
     pub fn solid_shapes(&self, mask: u32) -> SolidShapes {
         let mut out = SolidShapes::default();
-        for placement in &self.placements {
+        for placement in self.placements.iter().filter(|p| !p.moves) {
             let Some(&head) = self.heads.get(placement.model) else { continue };
             let mut seen = vec![false; self.brushes.len()];
             let mut stack = vec![head];
@@ -715,6 +727,64 @@ impl Collision {
         let mut found = Found::default();
         self.sweep_placed(placement, start, end, mins, maxs, mask, &mut found);
         found.trace(start, end)
+    }
+
+    /// Puts a brush model that may move where its entity is now (`Some(origin, angles)`), or
+    /// takes it out of what is solid (`None`): a door that opens, a wall turned off or removed.
+    /// Whether the model is one that may move.
+    pub fn place_model(&mut self, model: usize, at: Option<(Vec3, Vec3)>) -> bool {
+        let active = self.placements.iter().position(|p| p.moves && p.model == model);
+        let parked = self.parked.iter().position(|p| p.model == model);
+        match (at, active, parked) {
+            (Some((origin, angles)), Some(i), _) => {
+                let p = &mut self.placements[i];
+                if p.origin != origin || p.angles != angles {
+                    (p.origin, p.angles, p.frame) = (origin, angles, Frame::new(origin, angles));
+                }
+            }
+            (Some((origin, angles)), None, Some(i)) => {
+                let mut p = self.parked.swap_remove(i);
+                (p.origin, p.angles, p.frame) = (origin, angles, Frame::new(origin, angles));
+                self.placements.push(p);
+            }
+            (None, Some(i), _) => {
+                let p = self.placements.remove(i);
+                self.parked.push(p);
+            }
+            (None, None, Some(_)) => {}
+            (_, None, None) => return false,
+        }
+        true
+    }
+
+    /// The convex brushes of one brush model that `mask` names, as their corners in the
+    /// model's own space.
+    pub fn model_hulls(&self, model: usize, mask: u32) -> Vec<Vec<Vec3>> {
+        let mut out = Vec::new();
+        let Some(&head) = self.heads.get(model) else { return out };
+        let mut seen = vec![false; self.brushes.len()];
+        let mut stack = vec![head];
+        while let Some(node) = stack.pop() {
+            let Ok(index) = usize::try_from(node) else {
+                let Some(leaf) = self.leaves.get((-1 - node) as usize) else { continue };
+                let range = leaf.first_brush as usize..(leaf.first_brush + leaf.brushes) as usize;
+                for &b in self.leaf_brushes.get(range).unwrap_or(&[]) {
+                    let Some(brush) = self.brushes.get(b as usize) else { continue };
+                    if std::mem::replace(&mut seen[b as usize], true) || brush.contents & mask == 0 {
+                        continue;
+                    }
+                    let corners = corners(&self.sides[brush.first_side as usize..(brush.first_side + brush.sides) as usize]);
+                    if corners.len() >= 4 {
+                        out.push(corners);
+                    }
+                }
+                continue;
+            };
+            if let Some(n) = self.nodes.get(index) {
+                stack.extend(n.children);
+            }
+        }
+        out
     }
 
     /// The leaf of the world's tree a point is in: its index in the map's leaves.
@@ -1041,15 +1111,20 @@ fn displacements(bsp: &Bsp, surface: &impl Fn(i16) -> Surface) -> Vec<Displaceme
     out
 }
 
-/// The world, and the brush entities solid when the map starts, where the map puts them.
-fn placements(bsp: &Bsp) -> Vec<Placement> {
-    let mut out = vec![Placement::new(0, None, [0.0; 3], [0.0; 3])];
+/// The world, and the brush entities solid when the map starts, where the map puts them -
+/// or, not `solid`, the brush entities that may move and are not solid at the start.
+fn placements(bsp: &Bsp, solid: bool) -> Vec<Placement> {
+    let mut out = if solid { vec![Placement::new(0, None, [0.0; 3], [0.0; 3])] } else { Vec::new() };
     for (i, entity) in bsp.entities.iter().enumerate() {
-        let Some(model) = entity.get("model").and_then(|m| m.strip_prefix('*')).and_then(|m| m.parse::<usize>().ok()) else { continue };
-        if model == 0 || model >= bsp.models.len() || !solid_at_start(entity) {
+        let Some(model) = entity.brush_model() else { continue };
+        let moves = entity.moves();
+        if model >= bsp.models.len() || solid_at_start(entity) != solid || !solid && (!moves || never_solid(entity)) {
             continue;
         }
-        out.push(Placement::new(model, Some(i), entity.vec3("origin").unwrap_or([0.0; 3]), entity.vec3("angles").unwrap_or([0.0; 3])));
+        let mut placement =
+            Placement::new(model, Some(i), entity.vec3("origin").unwrap_or([0.0; 3]), entity.vec3("angles").unwrap_or([0.0; 3]));
+        placement.moves = moves;
+        out.push(placement);
     }
     out
 }

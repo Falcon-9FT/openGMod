@@ -145,6 +145,8 @@ pub struct Ent {
     pub logic: Option<Box<crate::logic::State>>,
     /// What a trigger of the map keeps ([`crate::triggers`]).
     pub trigger_state: Option<Box<crate::triggers::Trigger>>,
+    /// What a door, a button or a platform keeps ([`crate::movers`]).
+    pub mover: Option<Box<crate::movers::Mover>>,
 }
 
 /// How a bone is moved from where its model has it.
@@ -228,6 +230,7 @@ impl Ent {
             outputs: Vec::new(),
             logic: None,
             trigger_state: None,
+            mover: None,
         }
     }
 
