@@ -312,9 +312,12 @@ impl Mdl {
                             group: r.i32(at + 4)?,
                             mins: r.vec3(at + 8)?,
                             maxs: r.vec3(at + 20)?,
+                            // not to be trusted: models of Half-Life 2 count it from the start
+                            // of the file or point it past the end, and the engine never reads
+                            // it; a name that is not there is no name
                             name: match r.i32(at + 32)? {
                                 0 => String::new(),
-                                _ => r.string(r.offset(at, at + 32)?)?,
+                                _ => r.offset(at, at + 32).and_then(|name| r.string(name)).unwrap_or_default(),
                             },
                         })
                     })
