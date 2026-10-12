@@ -255,6 +255,17 @@ pub(crate) fn select_weighted(lua: &Lua, rig: &Rig, act: i64) -> i64 {
     weighted(lua, rig, act, |total| random(lua, total))
 }
 
+/// Whether a rig has a sequence of an activity.
+pub(crate) fn has_activity(lua: &Lua, rig: &Rig, act: i64) -> bool {
+    weighted(lua, rig, act, |_| 0) >= 0
+}
+
+/// How fast what an entity plays carries its model over the ground, at its rate.
+pub(crate) fn ground_speed(lua: &Lua, handle: EntityHandle) -> f32 {
+    let Some((rig, anim)) = animated(lua, handle) else { return 0.0 };
+    sequence_of(&rig, anim.sequence).map_or(0.0, |s| rig.ground_speed(s, &anim.parameters(&rig)) * anim.playback_rate)
+}
+
 /// What of an entity's animation goes with its model.
 fn animated(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Rig>, AnimState)> {
     let (model, anim) = host(lua).entities.get(handle).map(|ent| (ent.model.clone(), ent.anim.clone()))?;

@@ -2090,6 +2090,13 @@ pub(crate) fn install(lua: &Lua, realm: crate::Realm) -> mlua::Result<()> {
             }
             Ok(Value::Nil)
         })?;
+        // to every player's console, as `PrintMessage(HUD_PRINTCONSOLE)` (the base gamemode
+        // tells so of a player an NPC killed)
+        def_lib(lua, &globals, "MsgAll", |a| {
+            let text = crate::console::join(a.lua, &a.values, "")?;
+            print_to(a, all(a.lua), &text);
+            Ok(Value::Nil)
+        })?;
         def_lib(lua, &globals, "BroadcastLua", |a| {
             let code = a.string(1)?;
             for player in all(a.lua) {

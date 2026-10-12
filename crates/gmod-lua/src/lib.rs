@@ -61,6 +61,7 @@ use std::time::Instant;
 use gmod_fs::Vfs;
 use mlua::Lua;
 
+pub mod ai;
 pub mod anim;
 mod args;
 pub mod breakable;
@@ -92,6 +93,7 @@ pub mod menu;
 pub mod meta;
 pub mod movedata;
 pub mod movers;
+pub mod nav;
 pub mod net;
 pub mod npc;
 pub mod outputs;
@@ -313,6 +315,8 @@ pub(crate) struct Host {
     pub(crate) bullets: bullets::State,
     /// Where players were at each tick of the last second, for their shots.
     pub(crate) lagcomp: lagcomp::History,
+    /// The map's nodes, and the ways NPCs find by them.
+    pub(crate) nav: nav::Graph,
 }
 
 impl Host {
@@ -403,6 +407,7 @@ impl Runtime {
             resources: resource::Resources::default(),
             bullets: bullets::State::default(),
             lagcomp: lagcomp::History::default(),
+            nav: nav::Graph::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;

@@ -137,12 +137,31 @@
   * Ломающееся ✅ — `gmod-lua::breakable`: `prop_data` модели и классы `scripts/propdata.txt`
     (здоровье, множители урона, взрыв), `func_breakable`, `func_breakable_surf`; `PropBreak`,
     `OnBreak`, звук поломки, взрыв с уроном и толчком по радиусу (цепочки бочек).
-  * NPC ✅ (без ИИ) — `gmod-lua::npc`: `gmod_spawnnpc` из sandbox, модели, здоровье и хуллы
+  * NPC ✅ — `gmod-lua::npc`: `gmod_spawnnpc` из sandbox, модели, здоровье и хуллы
     классов HL2, поза покоя, оружие в руке, стороны и отношения (`AddRelationship`,
-    `Disposition`), поворот к врагу, урон (`ScaleNPCDamage`, `OnDamaged`), смерть
-    (`OnNPCKilled`, `OnDeath`, оружие и аптечка на пол) и рэгдолл-труп; около 120 методов `NPC`.
-  * Дальше: ИИ NPC (движение по node graph, атаки, стрельба, расписания), обломки (`break` в
-    `.phy`), `func_tracktrain`, `env_global`.
+    `Disposition`), урон (`ScaleNPCDamage`, `OnDamaged`), смерть (`OnNPCKilled`, `OnDeath`,
+    оружие и аптечка на пол) и рэгдолл-труп; около 120 методов `NPC`.
+  * ИИ NPC ✅ — `gmod-lua::nav`, `gmod-lua::ai`:
+    * граф узлов: `info_node`, `info_node_hint`, `info_node_air` из карты (сами узлы не
+      энтити, как в HL2), связи для хулла — пройдёт ли он пешком (ступеньки вверх и вниз, не
+      с обрыва и не по крутому склону) или пролетит; путь A* или прямой, если он проходим;
+    * движение: по пути со скоростью анимации ходьбы или бега (`ACT_WALK`, `ACT_RUN`, своя
+      скорость, если модель её не задаёт), скольжение вдоль препятствий, разворот по ходу,
+      путь к движущейся цели пересчитывается, застрявший сдаётся через секунду;
+    * расписания: `SCHED_IDLE_STAND`, `SCHED_FORCED_GO`/`_RUN` (`SetLastPosition`),
+      `SCHED_IDLE_WANDER`, патрули, `SCHED_CHASE_ENEMY`, `SCHED_TARGET_CHASE`/`_FACE`,
+      бегство от врага, `SCHED_RANGE_ATTACK1`, `SCHED_MELEE_ATTACK1`, `SCHED_RELOAD`,
+      `SCHED_NPC_FREEZE`; выбор следующего, когда кончилось текущее; цели из Lua
+      (`NavSetGoal`, `NavSetGoalTarget`, `NavSetWanderGoal`, `StopMoving`, `MoveOrder`…);
+    * бой: враги среди игроков и NPC, кого видно; стрелки бьют очередями через `FireBullets`
+      с разбросом по меткости, уроном NPC по типу патронов и перезарядкой, не стреляют через
+      своих; SWEP в руках NPC (`GetNPCBurstSettings`, `GetNPCRestTimes`,
+      `NPCShoot_Primary`); зомби, хедкрабы, муравьиные львы, мэнхэки, дубинка и монтировка —
+      удар с задержкой, урон из skill-ConVar класса.
+  * Дальше: ИИ — укрытия, звуки и реплики, отряды и тактика, прыжки и лестницы по узлам,
+    турели и вертолёты, сценарии (`scripted_sequence`, `aiscripted_schedule`), SNPC из Lua
+    (`ai_schedule`, `ai_task`), NextBot и навмеш (`navmesh`); обломки (`break` в `.phy`),
+    `func_tracktrain`, `env_global`.
 * Игра в `opengmod` ✅: при запуске карты работает Lua сервера с `sandbox` и аддонами
   воркшопа, игрок одиночной игры ходит через хуки геймода, мышь и клавиши — его команды
   (`IN_ATTACK`, `IN_RELOAD`, выбор оружия, фонарик, noclip, `gmod_undo`), терминал — консоль
@@ -319,5 +338,5 @@
 
 * Linux (Vulkan) и macOS (Metal): код к Windows не привязан, нужны сборка, проверка и пакеты.
 * Подключение других игр Source (CS:S, HL2: Episodes, TF2) через Steam, как в меню GMod.
-* Частицы (PCF), хореография (VCD), NPC и их ИИ, машины.
+* Частицы (PCF), хореография (VCD), машины.
 * Инструменты: просмотр моделей, упаковка аддонов (GMA уже пишется).

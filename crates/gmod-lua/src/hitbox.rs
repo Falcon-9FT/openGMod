@@ -48,7 +48,7 @@ fn set_of(lua: &mlua::Lua, handle: EntityHandle) -> Option<(Arc<Rig>, usize)> {
     let (model, set) = host(lua).entities.get(handle).map(|e| (e.model.clone(), e.hitbox_set))?;
     let rig = crate::anim::rig(lua, &model)?;
     let count = rig.mdl().hitbox_sets.len();
-    (count > 0).then_some((rig, set.min(count - 1)))
+    (count > 0).then(|| (rig, set.min(count - 1)))
 }
 
 /// The hitboxes of the set in use.

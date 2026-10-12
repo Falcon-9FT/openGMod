@@ -60,6 +60,13 @@ impl EntityHandle {
     pub const WORLD: EntityHandle = EntityHandle { index: Some(0), serial: 0, kind: Kind::Entity };
 }
 
+/// `NULL`, as an entity that is not there.
+impl Default for EntityHandle {
+    fn default() -> EntityHandle {
+        EntityHandle::NULL
+    }
+}
+
 /// One entity, as the engine keeps it. Position and angles are relative to the parent, if
 /// there is one.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

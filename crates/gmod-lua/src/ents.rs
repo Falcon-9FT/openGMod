@@ -723,8 +723,15 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     });
 
     let mut made = Vec::new();
+    let mut nodes = Vec::new();
     for (i, pairs) in map.entities.iter().enumerate() {
         let Some((_, class)) = pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case("classname")) else { continue };
+        // the AI's nodes are no entities: the engine keeps where they are, for its graph
+        if let Some(air) = crate::nav::node_class(class) {
+            let origin = pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case("origin")).map_or([0.0; 3], |(_, v)| three(v));
+            nodes.push(crate::nav::Node { pos: Vector::new(origin[0], origin[1], origin[2]), air });
+            continue;
+        }
         let id = FIRST_MAP_CREATION_ID + i as i32;
         let handle = if class.eq_ignore_ascii_case("worldspawn") {
             host(lua).entities.with_mut(world, |ent| ent.map_creation_id = Some(id));
@@ -749,6 +756,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
             made.push(handle);
         }
     }
+    crate::nav::load(lua, nodes);
     // parents first, as the engine spawns a hierarchy
     for &handle in &made {
         let parent = host(lua).entities.get(handle).and_then(|ent| ent.keyvalue("parentname").map(str::to_string));
