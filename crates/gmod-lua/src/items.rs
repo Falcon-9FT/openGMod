@@ -2,14 +2,16 @@
 //! down for players to take.
 //!
 //! * A kit, a battery or a box of rounds (`item_healthkit`, `item_battery`, `item_ammo_smg1`
-//!   ...) takes its model when it spawns, and a body of it: it falls and rolls. A player alive
+//!   ...) takes its model when it spawns, and a body of it: it falls and rolls. Players walk
+//!   through it (`COLLISION_GROUP_WEAPON`), even those it is of no use to. A player alive
 //!   who walks over it takes it when it is of any use - health below their most, armor below
 //!   theirs (100), rounds of its type below what they may carry - and the gamemode's
 //!   `PlayerCanPickupItem` does not say no: the health, armor or rounds (as many as they may
 //!   carry), the item's sound, its `OnPlayerTouch`, and it is gone. A full player leaves it.
 //!   What each gives is HL2's default: a kit 25 health, a vial 10, a battery 15 armor; boxes
 //!   20 pistol rounds (100 the large), 45 SMG rounds (225), 20 AR2 (100), 6 .357 (20),
-//!   6 bolts, 1 rocket, 1 SMG grenade, 20 shells, 1 combine ball.
+//!   6 bolts, 1 rocket, 1 SMG grenade, 20 shells, 1 combine ball. The old names of the boxes
+//!   that HL2's maps still use (`item_box_srounds`, `item_large_box_mrounds` ...) are the same.
 //! * The chargers on walls (`item_healthcharger`, `item_suitcharger`): while a player holds
 //!   the use key on one, it gives them a point of health or armor every tenth of a second
 //!   from what it holds (50 health, 75 armor) - `OnPlayerUse` and its sound when they start,
@@ -54,6 +56,14 @@ const ITEMS: &[(&str, &str, Gives, &str)] = &[
     ("item_ammo_smg1_grenade", "models/items/ar2_grenade.mdl", Gives::Ammo("SMG1_Grenade", 1), AMMO),
     ("item_box_buckshot", "models/items/boxbuckshot.mdl", Gives::Ammo("Buckshot", 20), AMMO),
     ("item_ammo_ar2_altfire", "models/items/combine_rifle_ammo01.mdl", Gives::Ammo("AR2AltFire", 1), AMMO),
+    // the old names
+    ("item_box_srounds", "models/items/boxsrounds.mdl", Gives::Ammo("Pistol", 20), AMMO),
+    ("item_large_box_srounds", "models/items/largeboxsrounds.mdl", Gives::Ammo("Pistol", 100), AMMO),
+    ("item_box_mrounds", "models/items/boxmrounds.mdl", Gives::Ammo("SMG1", 45), AMMO),
+    ("item_large_box_mrounds", "models/items/largeboxmrounds.mdl", Gives::Ammo("SMG1", 225), AMMO),
+    ("item_box_lrounds", "models/items/combine_rifle_cartridge01.mdl", Gives::Ammo("AR2", 20), AMMO),
+    ("item_large_box_lrounds", "models/items/combine_rifle_cartridge01.mdl", Gives::Ammo("AR2", 100), AMMO),
+    ("item_ar2_grenade", "models/items/ar2_grenade.mdl", Gives::Ammo("SMG1_Grenade", 1), AMMO),
 ];
 
 const AMMO: &str = "BaseCombatCharacter.AmmoPickup";
@@ -97,14 +107,21 @@ pub(crate) fn spawned(lua: &Lua, handle: EntityHandle) {
         });
         return;
     }
+    // players go through it, as through a weapon on the ground: one it is of no use to is
+    // not in their way
     host(lua).entities.with_mut(handle, |ent| {
         ent.solid = SOLID_VPHYSICS;
         ent.move_type = MOVETYPE_VPHYSICS;
+        ent.collision_group = crate::trace::group::WEAPON;
     });
     // without a physics model it stays where it was put, a box to walk over
     if !crate::physics::init_model(lua, handle) {
         host(lua).entities.with_mut(handle, |ent| ent.solid = SOLID_BBOX);
     }
+}
+
+fn gone(lua: &Lua, handle: EntityHandle) -> bool {
+    host(lua).entities.get(handle).is_none_or(|ent| ent.removed)
 }
 
 fn overlap(a: (Vector, Vector), b: (Vector, Vector)) -> bool {
@@ -136,7 +153,8 @@ pub(crate) fn touch(lua: &Lua, players: &[(EntityHandle, Vector, Vector)]) {
     let reach = Vector::new(REACH, REACH, REACH);
     for &(player, lo, hi) in players {
         for &(it, item_lo, item_hi, gives, sound) in &items {
-            if overlap((lo, hi), (item_lo - reach, item_hi + reach)) && host(lua).entities.is_valid(it) {
+            // one taken (or removed by a hook) this tick is not taken again
+            if overlap((lo, hi), (item_lo - reach, item_hi + reach)) && !gone(lua, it) {
                 take(lua, player, it, gives, sound);
             }
         }
@@ -159,15 +177,15 @@ fn take(lua: &Lua, player: EntityHandle, it: EntityHandle, gives: Gives, sound: 
     }
     let push = |h: EntityHandle| entity::push(lua, h).unwrap_or(Value::Nil);
     let allowed = crate::call_hook(lua, "PlayerCanPickupItem", MultiValue::from_iter([push(player), push(it)]));
-    if matches!(allowed.front(), Some(Value::Boolean(false))) || !host(lua).entities.is_valid(it) {
+    if matches!(allowed.front(), Some(Value::Boolean(false))) || gone(lua, it) {
         return;
     }
     match gives {
         Gives::Health(amount) => {
-            host(lua).entities.with_mut(player, |ent| ent.health = (ent.health + amount).min(ent.max_health).max(ent.health));
+            host(lua).entities.with_mut(player, |ent| ent.health = ent.health.saturating_add(amount).min(ent.max_health).max(ent.health));
         }
         Gives::Armor(amount) => {
-            crate::player::with_player(lua, player, |_, p| p.armor = (p.armor + amount).min(p.max_armor).max(p.armor));
+            crate::player::with_player(lua, player, |_, p| p.armor = p.armor.saturating_add(amount).min(p.max_armor).max(p.armor));
         }
         Gives::Ammo(name, amount) => {
             crate::player::give_ammo(lua, player, ammo(name), amount);

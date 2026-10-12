@@ -22,7 +22,8 @@
 //!   farther from its middle, pushing it away: players, NPCs, bodies of physics, solid
 //!   scripted entities, other breakables - which may break and blow up in turn.
 //!
-//! Damage with a force pushes the body of an engine's entity, at the point hit.
+//! Damage with a force pushes the body of an engine's entity, at the point hit, no faster
+//! than 2000 units a second.
 //!
 //! Not done: gibs (the `.phy`'s `break` blocks, `func_breakable`'s pieces), props that catch
 //! fire before they blow up, breaking by touch or pressure (flags 2 and 4), breaking on
@@ -71,6 +72,9 @@ const REACH_PER_DAMAGE: f32 = 2.5;
 /// The impulse a point of blast damage gives what it hits: our own choice, such that a blast
 /// of 100 throws a crate of 20 kg away at some 1000 units a second.
 const PUSH: f32 = 200.0;
+/// The most speed a push of damage gives a body: about as fast as the game lets one go, so
+/// that a light one is not shot through walls.
+const MAX_SPEED: f32 = 2000.0;
 
 fn is_prop(class: &str) -> bool {
     class.to_ascii_lowercase().starts_with("prop_physics")
@@ -83,6 +87,12 @@ fn is_brush(class: &str) -> bool {
 /// The class of an engine's entity, "" for a scripted one.
 fn class_of(lua: &Lua, handle: EntityHandle) -> String {
     host(lua).entities.get(handle).filter(|ent| !ent.scripted).map(|ent| ent.class.clone()).unwrap_or_default()
+}
+
+/// Removed, it has broken already (or is about to go): it takes no more damage, and does not
+/// break again - as when barrels in a pile blow each other up.
+fn gone(lua: &Lua, handle: EntityHandle) -> bool {
+    host(lua).entities.get(handle).is_none_or(|ent| ent.removed)
 }
 
 fn key(lua: &Lua, handle: EntityHandle, key: &str) -> f32 {
@@ -100,14 +110,16 @@ fn prop_class(lua: &Lua, name: &str) -> Option<gmod_kv::Block> {
     root.block(name).or_else(|| root.iter().filter_map(|p| p.value.as_block()).find_map(|b| b.block(name))).cloned()
 }
 
-/// A model's `prop_data`, over the class it names.
+/// A model's `prop_data`, over the class it names. The compiler wraps a model's `$keyvalues`
+/// in a block `mdlkeyvalue`; one written at the top is taken too.
 fn prop_data(lua: &Lua, model: &str) -> Option<PropData> {
     let text = crate::ents::studio(lua, model)?.key_values;
     if text.is_empty() {
         return None;
     }
     let (document, _) = gmod_kv::parse_lenient(&text, gmod_kv::Options::default());
-    let own = document.root.block("prop_data")?;
+    let root = &document.root;
+    let own = root.block("mdlkeyvalue").and_then(|b| b.block("prop_data")).or_else(|| root.block("prop_data"))?;
     let base = own.str("base").and_then(|name| prop_class(lua, name));
     let get = |key: &str, default: f32| {
         own.str(key).or_else(|| base.as_ref().and_then(|b| b.str(key))).map_or(default, |v| crate::convar::atof(v) as f32)
@@ -149,6 +161,9 @@ pub(crate) fn spawned(lua: &Lua, handle: EntityHandle) {
 
 /// Damage to an engine's entity: it is pushed, and a breakable loses health.
 pub(crate) fn damaged(lua: &Lua, handle: EntityHandle, info: &DamageInfo) {
+    if gone(lua, handle) {
+        return;
+    }
     push(lua, handle, info);
     let class = class_of(lua, handle);
     let amount = if is_prop(&class) {
@@ -188,7 +203,9 @@ fn push(lua: &Lua, handle: EntityHandle, info: &DamageInfo) {
     let on = host(lua).entities.world_bounds(handle).is_some_and(|(_, _, lo, hi)| inside(info.position, lo, hi));
     let host = host(lua);
     let mut physics = host.physics.physics.borrow_mut();
-    let force = crate::physics::array(info.force);
+    let most = physics.mass(id) * MAX_SPEED;
+    let force = if info.force.length() > most { info.force.normalized() * most } else { info.force };
+    let force = crate::physics::array(force);
     if on {
         physics.apply_impulse_at(id, force, crate::physics::array(info.position));
     } else {
@@ -231,6 +248,9 @@ pub(crate) fn input(lua: &Lua, handle: EntityHandle, input: &str, param: &str, a
     if !is_prop(&class) && !is_brush(&class) {
         return false;
     }
+    if gone(lua, handle) {
+        return true;
+    }
     let n = crate::convar::atof(param) as i64;
     let change = |f: &dyn Fn(i64) -> i64| {
         let Some(health) = host(lua).entities.with_mut(handle, |ent| {
@@ -248,8 +268,8 @@ pub(crate) fn input(lua: &Lua, handle: EntityHandle, input: &str, param: &str, a
     match input.to_ascii_lowercase().as_str() {
         "break" => shatter(lua, handle, activator),
         "sethealth" => change(&|_| n),
-        "addhealth" => change(&|h| h + n),
-        "removehealth" => change(&|h| h - n),
+        "addhealth" => change(&|h| h.saturating_add(n)),
+        "removehealth" => change(&|h| h.saturating_sub(n)),
         _ => return false,
     }
     true
@@ -282,7 +302,7 @@ fn brush_surface(material: i64) -> &'static str {
 
 /// It breaks: told, heard, gone - and blown up, if it does that.
 fn shatter(lua: &Lua, handle: EntityHandle, attacker: EntityHandle) {
-    if !host(lua).entities.is_valid(handle) {
+    if gone(lua, handle) {
         return;
     }
     let class = class_of(lua, handle);
@@ -378,7 +398,8 @@ pub(crate) fn explode(lua: &Lua, center: Vector, damage: f32, radius: f32, attac
     for (victim, lo, hi) in victims(lua, inflictor) {
         let nearest = Vector::new(center.x.clamp(lo.x, hi.x), center.y.clamp(lo.y, hi.y), center.z.clamp(lo.z, hi.z));
         let distance = (nearest - center).length();
-        if distance >= radius || !host(lua).entities.is_valid(victim) {
+        // what an explosion before broke is gone
+        if distance >= radius || gone(lua, victim) {
             continue;
         }
         let target = (lo + hi) * 0.5;

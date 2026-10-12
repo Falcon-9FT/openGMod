@@ -59,11 +59,12 @@ fn items_game(map: Map) -> (Game, EntityHandle) {
         testmodel::phy(1, &part(), false, &format!("solid {{ \"index\" \"0\" \"mass\" \"20\" \"surfaceprop\" \"{material}\" }}"))
     };
     let (wood, metal) = (phy("wood"), phy("metal"));
-    let crate_mdl = testmodel::mdl_with_key_values(1, hull, "prop_data { \"base\" \"Wooden.Small\" }");
+    // `$keyvalues` as the compiler leaves them: in a block `mdlkeyvalue`
+    let crate_mdl = testmodel::mdl_with_key_values(1, hull, "mdlkeyvalue { prop_data { \"base\" \"Wooden.Small\" } }");
     let barrel = testmodel::mdl_with_key_values(
         1,
         hull,
-        "prop_data { \"base\" \"Wooden.Small\" \"health\" \"1\" \"explosive_damage\" \"100\" \"explosive_radius\" \"256\" }",
+        "mdlkeyvalue\n{\nprop_data {\n\"base\" \"Wooden.Small\" \"health\" \"1\" \"explosive_damage\" \"100\" \"explosive_radius\" \"256\" }\n}",
     );
     let charger = testmodel::mdl(1, ([-4.0, -16.0, -16.0], [4.0, 16.0, 16.0]));
     let classes = [
@@ -118,7 +119,6 @@ fn items_game(map: Map) -> (Game, EntityHandle) {
              end
              function IsValid(e) return e ~= nil and e:IsValid() end
              HOOKS.AcceptInput = function(ent, input) if ent:GetName() == 'rec' then print(input) end end
-             util.Effect = function(name, data) print('effect', name, math.floor(data:GetMagnitude() + 0.5)) end
              function spawn(class, x, y, z, model)
                  local e = ents.Create(class) if model then e:SetModel(model) end e:SetPos(Vector(x, y, z)) e:Spawn() return e
              end
@@ -126,6 +126,11 @@ fn items_game(map: Map) -> (Game, EntityHandle) {
             "items",
         )
         .unwrap();
+    // the engine's effects, seen where they go
+    let lua = g.runtime.lua();
+    let log: mlua::Function =
+        lua.load("return function(name, data) print('effect', name, math.floor(data:GetMagnitude() + 0.5)) end").eval().unwrap();
+    lua.set_named_registry_value(crate::effect::ENGINE, log).unwrap();
     g.runtime.spawn_map(&map);
     let alice = g.runtime.join(alice()).unwrap();
     g.runtime.think(0.1);
@@ -195,6 +200,7 @@ fn items_are_taken_when_they_are_of_use() {
         ("item_ammo_smg1_grenade", "SMG1_Grenade", 1),
         ("item_box_buckshot", "Buckshot", 20),
         ("item_ammo_ar2_altfire", "AR2AltFire", 1),
+        ("item_large_box_mrounds", "SMG1", 225),
     ] {
         g.runtime.run_string(&format!("Entity(1):SetAmmo(0, '{ammo}') BOX = spawn('{class}', 0, 0, 20)"), "box").unwrap();
         g.runtime.think(0.1);
@@ -215,6 +221,39 @@ fn items_are_taken_when_they_are_of_use() {
     g.runtime.run_string("HOOKS.PlayerCanPickupItem = nil", "yes").unwrap();
     g.runtime.think(0.1);
     assert!(g.eval::<bool>("return IsValid(SMG) and not IsValid(KIT) and Entity(1):Health() == 75"));
+    // a kit a hook removes as it is asked is not taken
+    g.runtime
+        .run_string(
+            "HOOKS.PlayerCanPickupItem = function(p, item) item:Remove() end
+             Entity(1):SetHealth(50) KIT = spawn('item_healthkit', 0, 0, 20)",
+            "removed",
+        )
+        .unwrap();
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("return not IsValid(KIT) and Entity(1):Health() == 50"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn players_walk_through_items() {
+    let (g, alice) = items_game(breakable_map(Vec::new()));
+    // a full player, a kit in their way (lower than a step)
+    g.runtime.run_string("KIT = spawn('item_healthkit', -60, 0, 20)", "kit").unwrap();
+    g.runtime.think(0.5);
+    let before = g.eval::<f64>("return KIT:GetPos().x");
+    g.runtime.set_input(
+        alice,
+        UserCmd { view_angles: Angle::new(0.0, 180.0, 0.0), forward_move: gmod_movement::FULL_MOVE, ..UserCmd::default() },
+    );
+    let mut highest = 0.0f64;
+    for _ in 0..30 {
+        g.runtime.think(0.05);
+        highest = highest.max(g.eval::<f64>("return Entity(1):GetPos().z"));
+    }
+    assert!(g.eval::<bool>("return Entity(1):GetPos().x < -100"), "they went past it");
+    assert!(highest < 1.0, "not over it: {highest}");
+    assert!(g.eval::<bool>("return IsValid(KIT) and Entity(1):Health() == 100"));
+    assert!((g.eval::<f64>("return KIT:GetPos().x") - before).abs() < 1.0, "nor pushing it");
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
 
@@ -291,9 +330,16 @@ fn props_break_after_enough_damage() {
     assert!(g.eval::<bool>("return not IsValid(CRATE) and IsValid(BOX)"));
     assert_eq!(taken(&g, &mut seen), ["Broke"]);
     // the Break input breaks one at once
-    g.runtime.run_string("CRATE = spawn('prop_physics', -300, 0, 0, 'models/crate.mdl') CRATE:Fire('Break')", "input").unwrap();
+    // the Break input breaks one at once, and once
+    taken(&g, &mut seen);
+    g.runtime
+        .run_string("CRATE = spawn('prop_physics', -300, 0, 0, 'models/crate.mdl') CRATE:Fire('Break') CRATE:Fire('Break')", "input")
+        .unwrap();
+    g.runtime.think(0.1);
     g.runtime.think(0.1);
     assert!(g.eval::<bool>("return not IsValid(CRATE)"));
+    let lines = taken(&g, &mut seen);
+    assert_eq!(lines.iter().filter(|l| l.starts_with("PropBreak")).count(), 1, "{lines:?}");
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
 
@@ -314,7 +360,10 @@ fn explosive_props_blow_up() {
     g.runtime.think(0.5);
     taken(&g, &mut seen);
     sounds(&g);
-    g.runtime.run_string("FAR:Remove() BEHIND:Remove()", "aside").unwrap();
+    // an addon's detour of util.Effect does not see the engine's
+    g.runtime
+        .run_string("FAR:Remove() BEHIND:Remove() util.Effect = function() error('the engine went through Lua') end", "aside")
+        .unwrap();
     g.runtime.run_string("BARREL:TakeDamage(5)", "boom").unwrap();
     let near = 100 - g.eval::<i64>("return Entity(1):Health()");
     assert!((55..=80).contains(&near), "{near}");
@@ -333,6 +382,35 @@ fn explosive_props_blow_up() {
     g.runtime.think(0.1);
     g.runtime.run_string("BEHIND:TakeDamage(5)", "boom").unwrap();
     assert_eq!(g.eval::<i64>("return Entity(1):Health()"), 100);
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn barrels_in_a_pile_blow_up_once_each() {
+    let (g, _) = items_game(breakable_map(Vec::new()));
+    let mut seen = 0;
+    g.runtime
+        .run_string(
+            "for _, y in ipairs({ -40, 0, 40 }) do spawn('prop_physics', -100, y, 0, 'models/barrel.mdl') end
+             HOOKS.PropBreak = function(attacker, prop) print('PropBreak') end",
+            "pile",
+        )
+        .unwrap();
+    g.runtime.think(0.5);
+    g.runtime
+        .run_string(
+            "Entity(1):SetHealth(1000) for _, e in ipairs(ents.FindByModel('models/barrel.mdl')) do e:TakeDamage(5) break end",
+            "boom",
+        )
+        .unwrap();
+    let lines = taken(&g, &mut seen);
+    let count = |line: &str| lines.iter().filter(|l| *l == line).count();
+    assert_eq!((count("PropBreak"), count("effect\tExplosion\t100")), (3, 3), "{lines:?}");
+    // some 66 from each of three
+    let hurt = 1000 - g.eval::<i64>("return Entity(1):Health()");
+    assert!((150..=240).contains(&hurt), "{hurt}");
+    g.runtime.think(0.1);
+    assert_eq!(g.eval::<i64>("return #ents.FindByModel('models/barrel.mdl')"), 0);
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
 

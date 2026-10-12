@@ -70,10 +70,14 @@ fn data(a: &Args) -> mlua::Result<EffectData> {
     a.userdata::<EffectData>(1, NAME)
 }
 
-/// An effect the engine makes itself (an explosion's), the way Lua makes one: through
-/// `util.Effect`, so that what the game puts in its place sees it too.
+/// Where the engine keeps its own `util.Effect`, as it was made.
+pub(crate) const ENGINE: &str = "opengmod.util.Effect";
+
+/// An effect the engine makes itself (an explosion's). It goes straight to the engine's
+/// `util.Effect`: as in the game, what Lua puts in its place (an addon's detour that logs or
+/// blocks effects) does not see it.
 pub(crate) fn dispatch(lua: &Lua, name: &str, data: EffectData) {
-    let effect = lua.globals().get::<Table>("util").and_then(|util| util.get::<mlua::Function>("Effect"));
+    let effect = lua.named_registry_value::<mlua::Function>(ENGINE);
     let (Ok(effect), Ok(name), Ok(data)) = (effect, lua.create_string(name), lua.create_userdata(data)) else { return };
     let _ = crate::files::call_reporting(lua, effect, MultiValue::from_iter([Value::String(name), Value::UserData(data)]));
 }
@@ -133,14 +137,13 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     })?;
 
     let util: Table = lua.globals().get("util")?;
-    util.raw_set(
-        "Effect",
-        lua.create_function(|lua, values: MultiValue| {
-            let a = Args::new(lua, values, "Effect");
-            a.string(1)?;
-            a.userdata::<EffectData>(2, NAME)?;
-            Ok(())
-        })?,
-    )?;
+    let effect = lua.create_function(|lua, values: MultiValue| {
+        let a = Args::new(lua, values, "Effect");
+        a.string(1)?;
+        a.userdata::<EffectData>(2, NAME)?;
+        Ok(())
+    })?;
+    lua.set_named_registry_value(ENGINE, &effect)?;
+    util.raw_set("Effect", effect)?;
     Ok(())
 }
