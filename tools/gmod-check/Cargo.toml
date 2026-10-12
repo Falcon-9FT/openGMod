@@ -18,3 +18,4 @@ gmod-world.workspace = true
 
 [dev-dependencies]
 gmod-bsp = { workspace = true, features = ["testmap"] }
+gmod-model = { workspace = true, features = ["testmodel"] }

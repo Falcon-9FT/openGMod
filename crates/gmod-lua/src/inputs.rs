@@ -4,9 +4,15 @@
 //!
 //! The `AcceptInput` hook may take an input (returning true), then a SENT's
 //! `ENT:AcceptInput`; else the engine does what it knows: `Kill` and `KillHierarchy` remove the
-//! entity, `AddOutput` gives it a key-value (`key value`; outputs are not kept yet),
-//! `SetParent` (by name) and `ClearParent`, `Color`, `Alpha` and `Skin`, and the constraints
-//! take theirs ([`crate::constraint`]). Inputs it does not know are dropped.
+//! entity, `AddOutput` gives it a key-value (`key value`) or a connection of an output
+//! (`OnTrigger target:input:param:delay:times`, [`crate::outputs`]), `SetParent` (by name)
+//! and `ClearParent`, `Color`, `Alpha` and `Skin`, `FireUser1` to `FireUser4` fire its
+//! `OnUser1` to `OnUser4`, the entities of the map take theirs ([`crate::logic`],
+//! [`crate::triggers`], [`crate::movers`], [`crate::breakable`], [`crate::items`]), and so
+//! do the constraints ([`crate::constraint`]). Inputs it does not know are dropped.
+//!
+//! An output's input waits here with the name of its target, found when it is given
+//! (`outputs::targets`).
 
 use std::cell::RefCell;
 
@@ -19,11 +25,21 @@ use crate::host;
 /// An input fired, waiting for its time.
 struct Event {
     at: f64,
-    target: EntityHandle,
+    target: Target,
     input: String,
     param: String,
     activator: EntityHandle,
     caller: EntityHandle,
+}
+
+/// Whom an input is for.
+enum Target {
+    Entity(EntityHandle),
+    /// An output's target, by name: `caller` made the firing entity fire.
+    Named {
+        name: String,
+        caller: EntityHandle,
+    },
 }
 
 /// The inputs fired and not yet given.
@@ -51,12 +67,13 @@ pub(crate) fn input(lua: &Lua, target: EntityHandle, input: &str, activator: Ent
             return true;
         }
     }
-    engine_input(lua, target, input, param)
+    engine_input(lua, target, input, param, activator, caller)
 }
 
 /// What the engine does with an input of its own.
-fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str) -> bool {
-    match input.to_ascii_lowercase().as_str() {
+fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str, activator: EntityHandle, caller: EntityHandle) -> bool {
+    let lower = input.to_ascii_lowercase();
+    match lower.as_str() {
         "kill" => crate::ents::remove(lua, target),
         "killhierarchy" => {
             let children: Vec<EntityHandle> = {
@@ -64,15 +81,21 @@ fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str) -> bo
                 entities.handles().into_iter().filter(|&h| entities.get(h).is_some_and(|ent| ent.parent == target)).collect()
             };
             for child in children {
-                engine_input(lua, child, "KillHierarchy", "");
+                engine_input(lua, child, "KillHierarchy", "", activator, caller);
             }
             crate::ents::remove(lua, target);
         }
         "addoutput" => {
-            let (key, value) = param.trim().split_once(char::is_whitespace).unwrap_or((param.trim(), ""));
-            if !key.is_empty() && !key.contains(':') {
-                crate::ents::key_value(lua, target, key, value.trim());
+            if !crate::outputs::add_from_input(lua, target, param) {
+                let (key, value) = param.trim().split_once(char::is_whitespace).unwrap_or((param.trim(), ""));
+                if !key.is_empty() && !key.contains(':') {
+                    crate::ents::key_value(lua, target, key, value.trim());
+                }
             }
+        }
+        "fireuser1" | "fireuser2" | "fireuser3" | "fireuser4" => {
+            let output = format!("OnUser{}", &lower[8..]);
+            crate::outputs::fire(lua, target, &output, activator, caller, None);
         }
         "setparent" => {
             let parent = crate::ents::named(lua, param.trim()).unwrap_or(EntityHandle::NULL);
@@ -82,16 +105,80 @@ fn engine_input(lua: &Lua, target: EntityHandle, input: &str, param: &str) -> bo
         "color" => crate::ents::key_value(lua, target, "rendercolor", param),
         "alpha" => crate::ents::key_value(lua, target, "renderamt", param),
         "skin" => crate::ents::key_value(lua, target, "skin", param),
-        _ => return crate::constraint::input(lua, target, input),
+        _ => {
+            return crate::logic::input(lua, target, input, param, activator, caller)
+                || crate::triggers::input(lua, target, input, param, activator, caller)
+                || crate::movers::input(lua, target, input, param, activator, caller)
+                || crate::breakable::input(lua, target, input, param, activator)
+                || crate::items::input(lua, target, input, activator)
+                || crate::anim::input(lua, target, input, param)
+                || crate::constraint::input(lua, target, input);
+        }
     }
     true
+}
+
+/// `Entity:Use`: a scripted entity's `ENT:Use(activator, caller, type, value)`, the engine's
+/// `Use` input for the others. Whether something took it.
+pub(crate) fn use_entity(
+    lua: &Lua,
+    target: EntityHandle,
+    activator: EntityHandle,
+    caller: EntityHandle,
+    use_type: i64,
+    value: f64,
+) -> bool {
+    let scripted = host(lua).entities.get(target).is_some_and(|ent| ent.scripted);
+    if scripted {
+        let Ok(Value::UserData(ud)) = entity::push(lua, target) else { return false };
+        // its own ENT:Use, from its table: through the entity, `Use` is the engine's
+        // Entity:Use that brought us here
+        let own = entity::table_of(&ud).ok().flatten().and_then(|t| t.get::<Value>("Use").ok());
+        let Some(Value::Function(f)) = own else { return false };
+        let push = |h: EntityHandle| entity::push(lua, h).unwrap_or(Value::Nil);
+        let args =
+            MultiValue::from_iter([Value::UserData(ud), push(activator), push(caller), Value::Integer(use_type), Value::Number(value)]);
+        return crate::files::call_reporting(lua, f, args).is_ok();
+    }
+    input(lua, target, "Use", activator, caller, "")
 }
 
 /// Fires an input at an entity, to be given `delay` seconds from now.
 pub(crate) fn fire(lua: &Lua, target: EntityHandle, input: &str, param: &str, delay: f64, activator: EntityHandle, caller: EntityHandle) {
     let host = host(lua);
     let at = host.clock.cur_time.get() + delay.max(0.0);
+    let target = Target::Entity(target);
     host.inputs.events.borrow_mut().push(Event { at, target, input: input.to_string(), param: param.to_string(), activator, caller });
+}
+
+/// An output's input, to the entities named `target` (found when it is given), `delay`
+/// seconds from now: `owner` fired the output, `caller` made it fire.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_named(
+    lua: &Lua,
+    target: &str,
+    input: &str,
+    param: &str,
+    delay: f64,
+    activator: EntityHandle,
+    owner: EntityHandle,
+    caller: EntityHandle,
+) {
+    let host = host(lua);
+    let at = host.clock.cur_time.get() + delay.max(0.0);
+    let target = Target::Named { name: target.to_string(), caller };
+    let event = Event { at, target, input: input.to_string(), param: param.to_string(), activator, caller: owner };
+    host.inputs.events.borrow_mut().push(event);
+}
+
+/// Drops what `owner`'s outputs sent that is still waiting (`CancelPending`).
+pub(crate) fn cancel(lua: &Lua, owner: EntityHandle) {
+    host(lua).inputs.events.borrow_mut().retain(|e| !(matches!(e.target, Target::Named { .. }) && e.caller == owner));
+}
+
+/// Whether something `owner`'s outputs sent is still waiting.
+pub(crate) fn pending(lua: &Lua, owner: EntityHandle) -> bool {
+    host(lua).inputs.events.borrow().iter().any(|e| matches!(e.target, Target::Named { .. }) && e.caller == owner)
 }
 
 /// One tick: the inputs whose time has come are given, in the order of their times and, at
@@ -107,7 +194,13 @@ pub(crate) fn service(lua: &Lua) {
         due
     };
     for event in due {
-        input(lua, event.target, &event.input, event.activator, event.caller, &event.param);
+        let targets = match &event.target {
+            Target::Entity(target) => vec![*target],
+            Target::Named { name, caller } => crate::outputs::targets(lua, name, event.caller, event.activator, *caller),
+        };
+        for target in targets {
+            input(lua, target, &event.input, event.activator, event.caller, &event.param);
+        }
     }
 }
 
@@ -130,6 +223,14 @@ pub(crate) fn install_methods(def: &entity::Def) -> mlua::Result<()> {
         let target = entity::this(a, 1)?;
         let name = a.string(2)?;
         input(a.lua, target, &name, opt_entity(a, 3), opt_entity(a, 4), &param(a, 5));
+        Ok(Value::Nil)
+    })?;
+    // ent:Use(activator, caller, useType, value)
+    def("Use", |a| {
+        let target = entity::this(a, 1)?;
+        let use_type = if matches!(a.get(4), None | Some(Value::Nil)) { 1 } else { a.number(4)? as i64 };
+        let value = if matches!(a.get(5), None | Some(Value::Nil)) { 0.0 } else { a.number(5)? };
+        use_entity(a.lua, target, opt_entity(a, 2), opt_entity(a, 3), use_type, value);
         Ok(Value::Nil)
     })?;
     // ent:Fire(input, param, delay, activator, caller)

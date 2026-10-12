@@ -174,7 +174,7 @@ impl Default for WeaponData {
 }
 
 /// What the engine keeps for a weapon entity.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct WeaponState {
     /// Rounds in the primary and secondary clip; -1 for no clip.
     pub clip: [i64; 2],
@@ -186,6 +186,60 @@ pub struct WeaponState {
     pub deploy_speed: f32,
     /// Reloading (`DefaultReload`): when the clip fills.
     pub reload: Option<f64>,
+    /// When what the view model was last sent has played, and it may go back to idle.
+    pub idle_time: f64,
+}
+
+/// The activities of the player's model a hold type plays, from the first (`ACT_HL2MP_IDLE_*`),
+/// for those the player's animation asks for: standing, walking, running, crouching and
+/// walking so, shooting either way, reloading either way, jumping, swimming still and moving.
+const HOLD_ACTIVITIES: &[(&str, i64)] = &[
+    ("ACT_MP_STAND_IDLE", 0),
+    ("ACT_MP_WALK", 1),
+    ("ACT_MP_RUN", 2),
+    ("ACT_MP_CROUCH_IDLE", 3),
+    ("ACT_MP_CROUCHWALK", 4),
+    ("ACT_MP_ATTACK_STAND_PRIMARYFIRE", 5),
+    ("ACT_MP_ATTACK_CROUCH_PRIMARYFIRE", 5),
+    ("ACT_MP_RELOAD_STAND", 6),
+    ("ACT_MP_RELOAD_CROUCH", 6),
+    ("ACT_MP_JUMP", 7),
+    ("ACT_RANGE_ATTACK1", 8),
+    ("ACT_MP_SWIM", 9),
+];
+
+/// What a player's weapon in hand makes of an activity of the player's model
+/// (`Player:TranslateWeaponActivity`): a SWEP's `TranslateActivity`, an engine weapon's by its
+/// hold type. What it does not translate (-1, nothing) stays as it was.
+pub(crate) fn translate_activity(lua: &Lua, player: EntityHandle, act: i64) -> i64 {
+    let Some(active) = crate::player::state(lua, player, |_, p| p.active_weapon) else { return act };
+    let Some((scripted, hold)) = host(lua)
+        .entities
+        .get(active)
+        .filter(|e| !e.removed)
+        .map(|e| (e.scripted, e.weapon.as_ref().map(|w| w.hold_type.clone()).unwrap_or_default()))
+    else {
+        return act;
+    };
+    let number = |value: Option<&Value>| match value {
+        Some(Value::Integer(n)) => Some(*n),
+        Some(Value::Number(n)) => Some(*n as i64),
+        _ => None,
+    };
+    if scripted {
+        let Ok(Value::UserData(ud)) = entity::push(lua, active) else { return act };
+        let translated = crate::ents::call_method(lua, &ud, "TranslateActivity", MultiValue::from_iter([Value::Integer(act)]));
+        return translated.and_then(|values| number(values.front())).filter(|&n| n >= 0).unwrap_or(act);
+    }
+    let globals = lua.globals();
+    let enum_value = |name: &str| number(globals.raw_get::<Value>(name).ok().as_ref());
+    let suffix = match hold.as_str() {
+        "" | "normal" => String::new(),
+        "smg" => "_SMG1".to_string(),
+        other => format!("_{}", other.to_ascii_uppercase()),
+    };
+    let Some(first) = enum_value(&format!("ACT_HL2MP_IDLE{suffix}")) else { return act };
+    HOLD_ACTIVITIES.iter().find(|(name, _)| enum_value(name) == Some(act)).map_or(act, |(_, offset)| first + offset)
 }
 
 /// Weapon scripts and ammo types, kept with the [`crate::Host`].
@@ -439,6 +493,30 @@ pub(crate) fn post_frame(lua: &Lua, weapon: EntityHandle, buttons: u32, pressed:
     if buttons & IN_RELOAD != 0 {
         call(lua, weapon, "Reload", MultiValue::new());
     }
+    crate::anim::weapon_idle(lua, weapon, buttons & (IN_ATTACK | IN_ATTACK2 | IN_RELOAD) != 0);
+}
+
+/// Sets a weapon's activity (`SendWeaponAnim`).
+pub(crate) fn set_activity(lua: &Lua, weapon: EntityHandle, act: i64) {
+    host(lua).entities.with_mut(weapon, |ent| {
+        if let Some(w) = ent.weapon.as_mut() {
+            w.activity = act;
+        }
+    });
+}
+
+/// From when a weapon's view model may go back to idle.
+pub(crate) fn set_idle_time(lua: &Lua, weapon: EntityHandle, time: f64) {
+    host(lua).entities.with_mut(weapon, |ent| {
+        if let Some(w) = ent.weapon.as_mut() {
+            w.idle_time = time;
+        }
+    });
+}
+
+/// A weapon's activity, and from when it may go back to idle.
+pub(crate) fn activity_and_idle(lua: &Lua, weapon: EntityHandle) -> Option<(i64, f64)> {
+    host(lua).entities.get(weapon).and_then(|ent| ent.weapon.as_ref().map(|w| (w.activity, w.idle_time)))
 }
 
 /// The end of a reload: the clip takes what it holds from the owner's ammo.
@@ -562,10 +640,11 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let act = a.number(2)? as i64;
         change(a, |w| w.activity = act)
     })?;
-    // no animations yet: the activity is all there is of one
+    // the view model of the owner plays a sequence of the activity
     def("SendWeaponAnim", |a| {
-        let act = a.number(2)? as i64;
-        change(a, |w| w.activity = act)
+        let handle = entity::this(a, 1)?;
+        crate::anim::send_weapon_anim(a.lua, handle, a.number(2)? as i64);
+        Ok(Value::Nil)
     })?;
     def("GetDeploySpeed", |a| Ok(Value::Number(f64::from(state(a)?.1.deploy_speed))))?;
     def("SetDeploySpeed", |a| {
@@ -597,8 +676,9 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         entity::this(a, 1)?;
         Ok(Value::Nil)
     })?;
-    // starts a reload when the clip is not full and the owner has rounds for it; the clip
-    // fills when it is done (next tick: there are no animations to wait for yet)
+    // starts a reload when the clip is not full and the owner has rounds for it: the view model
+    // plays the activity, the owner the reload of their own model, and the clip fills when the
+    // view model's sequence has played (the next tick without one)
     def("DefaultReload", |a| {
         let (handle, state) = state(a)?;
         let act = a.number(2)? as i64;
@@ -612,11 +692,14 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         if state.reload.is_some() || !(room(0) || room(1)) {
             return Ok(Value::Boolean(false));
         }
-        let now = host(a.lua).clock.cur_time.get();
+        let played = crate::anim::send_weapon_anim(a.lua, handle, act);
+        crate::anim::animation_event(a.lua, owner, crate::anim::EVENT_RELOAD, 0);
+        let duration = if played { crate::anim::view_model_duration(a.lua, handle) } else { 0.0 };
+        let done = host(a.lua).clock.cur_time.get() + duration;
         change(a, |w| {
             w.activity = act;
-            w.reload = Some(now);
-            w.next_fire = [now, now];
+            w.reload = Some(done);
+            w.next_fire = [done, done];
         })?;
         Ok(Value::Boolean(true))
     })?;

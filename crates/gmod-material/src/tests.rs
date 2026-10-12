@@ -4,6 +4,8 @@ use super::*;
 use crate::decode::{half, to_rgba8};
 use crate::vtf::{flags, tag};
 
+mod proxy;
+
 /// A VTF file to build. Up to 7.2 the thumbnail and the image follow the header; from 7.3
 /// resources point at them - the image first, to show that the offsets are followed.
 struct Texture<'a> {
@@ -459,4 +461,111 @@ fn patch_materials() {
     assert_eq!(t.rgba8(0, 0, 0, 0).unwrap().rgba, [1, 2, 3, 255]);
     assert_eq!(material_path("Concrete\\Floor.VMT").as_deref(), Some("materials/concrete/floor.vmt"));
     assert_eq!(texture_path("../x"), None);
+}
+
+/// A PNG of raw scanlines (each with its filter byte already in front).
+fn png_file(width: u32, height: u32, depth: u8, color: u8, interlaced: bool, extra: &[(&[u8; 4], &[u8])], rows: &[u8]) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&gmod_fs::crc32::update(gmod_fs::crc32::crc32(kind), data).to_be_bytes());
+    };
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[depth, color, 0, 0, u8::from(interlaced)]);
+    chunk(b"IHDR", &header);
+    for (kind, data) in extra {
+        chunk(kind, data);
+    }
+    chunk(b"IDAT", &gmod_fs::deflate::zlib(rows));
+    chunk(b"IEND", &[]);
+    out
+}
+
+#[test]
+fn png_files_are_read_as_written() {
+    let pixels: Vec<u8> = (0..5 * 3 * 4).map(|i| (i * 37 % 256) as u8).collect();
+    let image = png::decode(&png::encode(5, 3, 4, &pixels)).unwrap();
+    assert_eq!((image.width, image.height), (5, 3));
+    assert_eq!(image.pixels, pixels);
+
+    let rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i * 11 % 256) as u8).collect();
+    let image = png::decode(&png::encode(4, 4, 3, &rgb)).unwrap();
+    let expected: Vec<u8> = rgb.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+    assert_eq!(image.pixels, expected);
+    assert!(png::decode(b"GIF89a").is_err());
+}
+
+#[test]
+fn png_palettes_grey_and_interlacing() {
+    // 2-bit palette, 3 x 2: indices 0 1 2 / 2 1 0; the first colour is half transparent
+    let palette = [255, 0, 0, 0, 255, 0, 0, 0, 255];
+    let rows = [0, 0b00_01_10_00, 0, 0b10_01_00_00];
+    let file = png_file(3, 2, 2, 3, false, &[(b"PLTE", &palette), (b"tRNS", &[128])], &rows);
+    let image = png::decode(&file).unwrap();
+    let px = |i: usize| &image.pixels[i * 4..i * 4 + 4];
+    assert_eq!(px(0), [255, 0, 0, 128]);
+    assert_eq!(px(1), [0, 255, 0, 255]);
+    assert_eq!(px(2), [0, 0, 255, 255]);
+    assert_eq!(px(3), [0, 0, 255, 255]);
+
+    // 16-bit grey with alpha, the second row "up"-filtered
+    let rows = [0, 0x80, 0x00, 0xFF, 0xFF, 2, 0x10, 0, 0x00, 0];
+    let image = png::decode(&png_file(1, 2, 16, 4, false, &[], &rows)).unwrap();
+    assert_eq!(image.pixels, [0x80, 0x80, 0x80, 0xFF, 0x90, 0x90, 0x90, 0xFF]);
+
+    // interlaced 8-bit grey, 2 x 2: pass 1 has (0,0), pass 6 (1,0), pass 7 the bottom row
+    let rows = [0, 10, 0, 20, 0, 30, 40];
+    let image = png::decode(&png_file(2, 2, 8, 0, true, &[], &rows)).unwrap();
+    let grey: Vec<u8> = image.pixels.chunks(4).map(|p| p[0]).collect();
+    assert_eq!(grey, [10, 20, 30, 40]);
+}
+
+#[test]
+fn surface_properties_inherit_from_their_base() {
+    let mut props = crate::SurfaceProps::default();
+    props.add_file(
+        r#""default" { "density" "2000" "stepleft" "Default.StepLeft" "gamematerial" "C" }
+        "wood" { "base" "default" "density" "700" "stepleft" "Wood.StepLeft" "impacthard" "Wood.ImpactHard" "gamematerial" "W" }
+        "wood_crate" { "base" "wood" "impacthard" "Wood_Crate.ImpactHard" }"#,
+    );
+    let crate_ = props.get("Wood_Crate").unwrap();
+    assert_eq!((crate_.density, crate_.step_left.as_str(), crate_.impact_hard.as_str()), (700.0, "Wood.StepLeft", "Wood_Crate.ImpactHard"));
+    assert_eq!(crate_.game_material, b'W');
+    assert_eq!((props.index("default"), props.index("wood"), props.index("wood_crate")), (Some(0), Some(1), Some(2)));
+    // what is not there is the default
+    assert_eq!(props.or_default("nonsense").name, "default");
+    assert_eq!(props.get("default").unwrap().impact_soft, "Default.ImpactSoft");
+}
+
+/// A JPEG of 16 by 8 pixels: red on the left half, blue on the right (made with ImageMagick).
+const JPEG: &[u8] = &[
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xdb,
+    0x00, 0x43, 0x00, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x04, 0x03, 0x02, 0x02,
+    0x02, 0x02, 0x05, 0x04, 0x04, 0x03, 0x04, 0x06, 0x05, 0x06, 0x06, 0x06, 0x05, 0x06, 0x06, 0x06, 0x07, 0x09, 0x08, 0x06, 0x07, 0x09,
+    0x07, 0x06, 0x06, 0x08, 0x0b, 0x08, 0x09, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x06, 0x08, 0x0b, 0x0c, 0x0b, 0x0a, 0x0c, 0x09, 0x0a, 0x0a,
+    0x0a, 0xff, 0xdb, 0x00, 0x43, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x05, 0x03, 0x03, 0x05, 0x0a, 0x07, 0x06, 0x07, 0x0a, 0x0a,
+    0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+    0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+    0x0a, 0x0a, 0x0a, 0x0a, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x08, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11,
+    0x01, 0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xff, 0xc4, 0x00, 0x16, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0a, 0x08, 0x09, 0xff, 0xc4, 0x00, 0x14, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3f, 0x00, 0x17, 0xa5, 0x36, 0xfe, 0x08,
+    0x65, 0x50, 0x35, 0xef, 0xff, 0xd9,
+];
+
+#[test]
+fn reads_jpeg_images() {
+    let image = crate::jpeg::decode_image(JPEG).unwrap();
+    assert_eq!((image.width, image.height), (16, 8));
+    let at = |x: usize, y: usize| &image.pixels[(y * 16 + x) * 4..][..4];
+    let near = |p: &[u8], want: [u8; 4]| p.iter().zip(want).all(|(&a, b)| a.abs_diff(b) <= 8);
+    assert!(near(at(2, 4), [255, 0, 0, 255]), "{:?}", at(2, 4));
+    assert!(near(at(13, 4), [0, 0, 255, 255]), "{:?}", at(13, 4));
+    assert!(crate::jpeg::decode(&JPEG[..100]).is_err());
 }

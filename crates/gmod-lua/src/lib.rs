@@ -24,20 +24,29 @@
 //!   ammo types), [`movedata`] (`CMoveData`, `CUserCmd`), [`damage`] (`CTakeDamageInfo`,
 //!   taking damage), [`effect`] (`EffectData`, `util.Effect`), [`sound`] (`EmitSound`,
 //!   `CreateSound`, the `sound` library, all quiet), [`trace`] (`util.TraceLine` and the like),
-//!   [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`),
+//!   [`physics`] (bodies of entities, `PhysObj`), [`physgun`] (`weapon_physgun`), [`pickup`]
+//!   (props carried with the use key), [`breakable`] (props and brushes that break and blow
+//!   up), [`items`] (HL2's items and wall chargers),
+//!   [`anim`] (what entities play on their bones: sequences, cycles, pose parameters, layers,
+//!   view models, the player's model), [`ragdoll`] (bodies on the bones of `prop_ragdoll` and
+//!   corpses), [`chat`] (`say` through `PlayerSay`, the chat box, `chat.AddText`),
 //!   [`constraint`] (welds, ropes, axes ... as joints), [`inputs`] (`Entity:Input`,
-//!   `Entity:Fire`), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
+//!   `Entity:Fire`), [`outputs`] (the map's wiring: `OnTrigger` and the like), [`logic`]
+//!   (`logic_relay`, `logic_timer`, `math_counter` ...), [`triggers`] (touching: `trigger_*`,
+//!   `StartTouch`, weapons picked up), [`movers`] (doors, buttons, platforms, the brushes that
+//!   move), [`npc`] (the engine's NPCs: standing, hurt, dying into corpses, the `NPC`
+//!   methods), [`timer`] (`CurTime`, `timer.*`), [`convar`] (ConVars, console commands), [`filesystem`]
 //!   (`file`, `File`), [`util`], [`net`], [`sql`] (SQLite), [`http`] (`HTTP`), [`material`]
 //!   (`Material`), [`engine`] (`game`, `engine`, `system`, `gmod`, the enumerations), and
-//!   [`world`] (`ai` and `motionsensor`, as they answer while there are no NPCs). They grow towards the whole
+//!   [`world`] (`ai` and `motionsensor`, as they answer without a node graph). They grow towards the whole
 //!   API - `gmod-check lua` counts how much of it is there.
 //! * starting the game ([`Runtime::start`]): `includes/init.lua`, autorun, the gamemode and
 //!   its bases, scripted entities and weapons, the hooks up to `Initialize`; the entities of
 //!   the map ([`Runtime::spawn_map`]); players joining ([`Runtime::join`]) and what they press
 //!   ([`Runtime::set_input`]); then [`Runtime::think`] moves time on, runs timers, and for
 //!   every tick the players' commands and movement, the bodies of physics, the inputs fired,
-//!   the entities that think and the `Tick` hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`])
-//!   and the models of the entities they see ([`Runtime::drawn`]).
+//!   the entities that think, the animations and the `Tick` hook; then the `Think` hook. What is to be shown: a player's view ([`Runtime::view`]),
+//!   the models of the entities they see, posed ([`Runtime::drawn`]), and what they hold before their eyes ([`Runtime::view_models`]).
 //!
 //! Errors in scripts are not errors of the runtime: as in GMod, a file that fails is
 //! reported ([`Output::Error`], [`Runtime::errors`]) and the files around it keep loading.
@@ -52,7 +61,11 @@ use std::time::Instant;
 use gmod_fs::Vfs;
 use mlua::Lua;
 
+pub mod anim;
 mod args;
+pub mod breakable;
+pub mod chat;
+pub mod client;
 pub mod console;
 pub mod constraint;
 pub mod convar;
@@ -63,35 +76,56 @@ pub mod entity;
 pub mod ents;
 pub mod files;
 pub mod filesystem;
+pub mod html;
 pub mod http;
+pub mod hud;
 pub mod inputs;
+pub mod items;
+pub mod logic;
 pub mod material;
 pub mod matrix;
+pub mod menu;
 pub mod meta;
 pub mod movedata;
+pub mod movers;
 pub mod net;
+pub mod npc;
+pub mod outputs;
 pub mod physgun;
 pub mod physics;
+pub mod pickup;
 pub mod player;
+pub mod ragdoll;
+pub mod recipients;
+pub mod resource;
 pub mod sandbox;
+pub mod snapshot;
 pub mod sound;
 pub mod sql;
 mod startup;
+pub mod surface;
+mod surfaceprops;
 pub mod timer;
 pub mod trace;
+pub mod triggers;
 pub mod util;
 pub mod vector;
+pub mod vgui;
 pub mod weapon;
 pub mod world;
 
 #[cfg(test)]
 mod tests;
 
+pub use chat::ChatMessage;
 pub use entity::EntityHandle;
 pub use ents::{Drawn, Map};
+pub use html::{WebButton, WebEvent, WebPage, WebPages};
+pub use menu::{Addon, MountableGame};
 pub use mlua;
 pub use movedata::UserCmd;
-pub use player::{PlayerInfo, PlayerView, WeaponView};
+pub use player::{PlayerInfo, PlayerView, ToClient, WeaponView};
+pub use snapshot::{EntityState, NetValue, Snapshot};
 
 /// Which of GMod's Lua states a [`Runtime`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -233,12 +267,44 @@ pub(crate) struct Host {
     pub http: http::Http,
     pub entities: entity::Entities,
     pub models: ents::Models,
+    /// The rigs of models, and the activities they name.
+    pub anims: anim::Anims,
     pub world: trace::World,
     pub weapons: weapon::Weapons,
     pub players: player::Players,
     pub physics: physics::World,
     pub physgun: physgun::Guns,
+    /// What players carry with the use key.
+    pub(crate) hands: pickup::Hands,
     pub inputs: inputs::Queue,
+    /// The 2D frame `surface` draws, and its fonts; the client and the menu have one.
+    pub screen: surface::Screen,
+    /// What the player sees and presses; the client's.
+    pub client: client::Client,
+    /// The client's panels.
+    pub panels: vgui::Panels,
+    /// The pages of its HTML panels.
+    pub pages: html::Pages,
+    /// The addons and games, and what the main menu tells the program.
+    pub menu: menu::Menu,
+    /// The engine's HUD: where its elements go, its colours.
+    pub hud: RefCell<hud::Hud>,
+    /// The sounds Lua played, for the program.
+    pub sounds: sound::Sounds,
+    /// What surfaces are made of.
+    pub surfaces: surfaceprops::Surfaces,
+    /// What is said: the server's messages for its players, a client's chat box.
+    pub chat: chat::Chat,
+    /// What touched what last tick.
+    pub(crate) touching: triggers::Touching,
+    /// What is solid of the brushes that may move.
+    pub(crate) movers: movers::Moving,
+    /// The classes of breakable props.
+    pub(crate) props: breakable::Props,
+    /// The corpses of NPCs that fade.
+    pub(crate) npcs: npc::Npcs,
+    /// What clients download.
+    pub(crate) resources: resource::Resources,
 }
 
 impl Host {
@@ -305,12 +371,28 @@ impl Runtime {
             http: http::Http::default(),
             entities: entity::Entities::default(),
             models: ents::Models::default(),
+            anims: anim::Anims::default(),
             world: trace::World::default(),
             weapons: weapon::Weapons::default(),
             players: player::Players::default(),
             physics: physics::World::default(),
             physgun: physgun::Guns::default(),
+            hands: pickup::Hands::default(),
             inputs: inputs::Queue::default(),
+            screen: surface::Screen::default(),
+            client: client::Client::default(),
+            panels: vgui::Panels::default(),
+            pages: html::Pages::default(),
+            menu: menu::Menu::default(),
+            hud: RefCell::new(hud::Hud::default()),
+            sounds: sound::Sounds::new(realm),
+            surfaces: surfaceprops::Surfaces::default(),
+            chat: chat::Chat::default(),
+            touching: triggers::Touching::default(),
+            movers: movers::Moving::default(),
+            props: breakable::Props::default(),
+            npcs: npc::Npcs::default(),
+            resources: resource::Resources::default(),
         });
         // `getmetatable` first: the sandbox's `debug.getmetatable` asks it about userdata
         meta::install(&lua)?;
@@ -324,6 +406,7 @@ impl Runtime {
         matrix::install(&lua)?;
         entity::install(&lua, realm)?;
         util::install(&lua)?;
+        anim::install_util(&lua)?;
         trace::install(&lua)?;
         effect::install(&lua)?;
         constraint::install(&lua)?;
@@ -337,9 +420,23 @@ impl Runtime {
         sql::install(&lua)?;
         http::install(&lua)?;
         net::install(&lua, realm)?;
+        if realm == Realm::Server {
+            recipients::install(&lua)?;
+            resource::install(&lua)?;
+        }
         startup::install(&lua)?;
         engine::install(&lua, realm)?;
         weapon::install(&lua)?;
+        npc::install(&lua)?;
+        if realm != Realm::Server {
+            surface::install(&lua)?;
+            client::install(&lua)?;
+            vgui::install(&lua)?;
+            surface::load_fonts(&lua);
+            client::load(&lua);
+            hud::load(&lua);
+        }
+        menu::install(&lua, realm)?;
         Ok(Runtime { lua })
     }
 
@@ -384,11 +481,15 @@ impl Runtime {
     }
 
     /// Starts the game as the engine does: `includes/init.lua`, autorun, the gamemode and
-    /// its bases, scripted entities and weapons, and the hooks up to `Initialize`. Errors
-    /// are reported on the way; [`errors`](Self::errors) has them all.
+    /// its bases, scripted entities and weapons, and the hooks up to `Initialize`; the main
+    /// menu starts with its Derma and `menu/menu.lua` (`gamemode` is the one it shows).
+    /// Errors are reported on the way; [`errors`](Self::errors) has them all.
     pub fn start(&self, gamemode: &str) {
         self.init();
-        if self.realm() != Realm::Menu {
+        if self.realm() == Realm::Menu {
+            *host(&self.lua).game.gamemode_name.borrow_mut() = gamemode.to_string();
+            startup::start_menu(self);
+        } else {
             startup::start(self, gamemode);
         }
     }
@@ -429,13 +530,25 @@ impl Runtime {
         convar::run_buffer(&self.lua);
         http::deliver(&self.lua);
         timer::run_timers(&self.lua);
+        // a client does not simulate: what moves comes from the server
+        let server = self.realm() == Realm::Server;
         for tick in 1..=ticks {
             host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::TICK_INTERVAL).min(end));
-            player::tick_all(&self.lua);
-            physgun::think(&self.lua);
-            physics::simulate(&self.lua);
-            inputs::service(&self.lua);
+            if server {
+                player::tick_all(&self.lua);
+                physgun::think(&self.lua);
+                pickup::think(&self.lua);
+                physics::simulate(&self.lua);
+                triggers::tick(&self.lua);
+                inputs::service(&self.lua);
+                logic::tick(&self.lua);
+                movers::tick(&self.lua);
+                npc::tick(&self.lua);
+            }
             ents::think(&self.lua);
+            if server {
+                anim::advance(&self.lua);
+            }
             self.call_hook("Tick", mlua::MultiValue::new());
         }
         host(&self.lua).clock.cur_time.set(end);
@@ -458,8 +571,26 @@ impl Runtime {
         }
     }
 
+    /// How many players the server takes (`game.MaxPlayers`, 1 to [`player::MAX_PLAYERS`]):
+    /// entity indices 1 to this are theirs. Given before the map spawns; 1 is a single-player
+    /// game.
+    pub fn set_max_players(&self, count: u32) {
+        host(&self.lua).game.max_players.set(count.clamp(1, player::MAX_PLAYERS));
+    }
+
+    /// How many players the server takes.
+    pub fn max_players(&self) -> u32 {
+        player::max_players(&self.lua)
+    }
+
+    /// Whether the server runs without a player of its own at the screen (`game.IsDedicated`):
+    /// no player is then the host, with its `lua_run`.
+    pub fn set_dedicated(&self, dedicated: bool) {
+        host(&self.lua).game.dedicated.set(dedicated);
+    }
+
     /// A player joins the game, as a client connecting does, and spawns. None when every
-    /// player slot is taken ([`player::MAX_PLAYERS`]).
+    /// player slot is taken ([`set_max_players`](Self::set_max_players)).
     pub fn join(&self, info: PlayerInfo) -> Option<EntityHandle> {
         player::join(&self.lua, info)
     }
@@ -472,13 +603,37 @@ impl Runtime {
     pub fn run_player_command(&self, player: EntityHandle, line: &str) {
         let trimmed = line.trim_start();
         if let Some(code) = trimmed.get(..8).filter(|start| start.eq_ignore_ascii_case("lua_run ")).map(|_| &trimmed[8..])
-            && player.index == Some(1)
+            && player::is_host(&self.lua, player)
         {
             // errors are reported as they happen
             let _ = self.run_string(code, "lua_run");
             return;
         }
         player::console(&self.lua, player, line);
+    }
+
+    /// What the server asked of its players' clients since the last call, oldest first
+    /// (`SendLua`, `ConCommand`, `PrintMessage` to the console).
+    pub fn take_to_clients(&self) -> Vec<(EntityHandle, player::ToClient)> {
+        std::mem::take(&mut *host(&self.lua).players.outbox.borrow_mut())
+    }
+
+    /// A client does what its server asked.
+    pub fn from_server(&self, what: &player::ToClient) {
+        match what {
+            player::ToClient::Lua(code) => {
+                // errors are reported as they happen
+                let _ = self.run_string(code, "SendLua");
+            }
+            player::ToClient::Command(line) => self.run_command(line),
+            player::ToClient::Print(text) => host(&self.lua).print(&format!("{text}\n")),
+        }
+    }
+
+    /// A player's client says a value of its user info (`gmod_toolmode`), which `GetInfo`
+    /// reads.
+    pub fn set_user_info(&self, player: EntityHandle, name: &str, value: &str) {
+        player::store_user_info(&self.lua, player, name, value);
     }
 
     /// What to show of a player: where they see from, their health, the weapon in hand.
@@ -490,6 +645,19 @@ impl Runtime {
     /// is not hidden, but not the player and what they carry.
     pub fn drawn(&self, viewer: EntityHandle) -> Vec<Drawn> {
         ents::drawn(&self.lua, viewer)
+    }
+
+    /// What a player holds before their eyes: the view models of the weapon in hand (and the
+    /// hands on them) at their eyes, with their bones, and the field of view they are drawn
+    /// with. None while there is no weapon to show.
+    pub fn view_models(&self, viewer: EntityHandle) -> (Vec<Drawn>, f32) {
+        anim::view_models(&self.lua, viewer)
+    }
+
+    /// Where a client's Lua puts the view models, from the eyes of its player
+    /// (`CalcViewModelView`).
+    pub fn view_model_view(&self, origin: vector::Vector, angles: vector::Angle) -> (vector::Vector, vector::Angle) {
+        anim::view_model_view(&self.lua, origin, angles)
     }
 
     /// How far game time is into the next tick, 0 to 1: where to draw between where things
@@ -509,6 +677,15 @@ impl Runtime {
     /// flashlight) and the mouse wheel go with the next tick only.
     pub fn set_input(&self, player: EntityHandle, cmd: UserCmd) {
         player::set_input(&self.lua, player, cmd);
+    }
+
+    /// A client moves its own player on from where the server last said it was, by the
+    /// commands the server has not answered yet - each with how long it was the player's -
+    /// as the server will move it ([`player`]'s prediction: the engine's movement). How far
+    /// into the next tick the commands' time goes, 0 to 1: where to draw the eyes between
+    /// where they were and are ([`PlayerView::previous_eye`]).
+    pub fn predict(&self, player: EntityHandle, commands: &[(UserCmd, f32)]) -> f32 {
+        player::predict(&self.lua, player, commands)
     }
 
     /// The players in the game.
@@ -531,6 +708,22 @@ impl Runtime {
     /// not loaded.
     pub fn call_hook(&self, name: &str, args: mlua::MultiValue) -> mlua::MultiValue {
         call_hook(&self.lua, name, args)
+    }
+
+    /// What Lua did with sounds since the last call, oldest first: what to play, change and
+    /// stop.
+    pub fn take_sounds(&self) -> Vec<sound::SoundEvent> {
+        std::mem::take(&mut *host(&self.lua).sounds.events.borrow_mut())
+    }
+
+    /// The client's `DynamicLight`s that shine now.
+    pub fn dynamic_lights(&self) -> Vec<client::DynamicLight> {
+        client::dynamic_lights(&self.lua)
+    }
+
+    /// Where an entity is in the world now, if it is still there: for its sounds to follow.
+    pub fn entity_position(&self, entity: entity::EntityHandle) -> Option<vector::Vector> {
+        host(&self.lua).entities.transform(entity).map(|(pos, _)| pos)
     }
 
     /// The `net` messages sent since the last call, oldest first.

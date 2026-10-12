@@ -1,5 +1,7 @@
 //! `gmod-check lua`: starts the Lua of the game in one realm, as the engine would, and lists
-//! what failed - above all the functions of the engine that are not there yet.
+//! what failed - above all the functions of the engine that are not there yet. A client plays
+//! a second of frames with a server behind it, the HUD and the panels painted, and opens the
+//! spawn menu (Q) and the context menu (C) on the way, clicking the first prop of the spawn menu.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -24,7 +26,8 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
         }
     };
     let started = Instant::now();
-    let runtime = match Runtime::new(realm, Arc::new(vfs)) {
+    let vfs = Arc::new(vfs);
+    let runtime = match Runtime::new(realm, vfs.clone()) {
         Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("LuaJIT could not be started: {e}");
@@ -49,14 +52,26 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
         runtime.set_data_dir(dir);
     }
     runtime.start("sandbox");
-    if let Some(map) = map.filter(|_| realm == Realm::Server) {
-        runtime.spawn_map(map);
-        // and the player of a single-player game joins
-        runtime.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() });
-    }
-    // one second of game time: the timers and hooks of the first frames
-    for _ in 0..60 {
-        runtime.think(1.0 / 60.0);
+    let mut client_report = None;
+    if realm == Realm::Client {
+        client_report = Some(play_client(&runtime, vfs, map));
+    } else {
+        if let Some(map) = map.filter(|_| realm == Realm::Server) {
+            runtime.spawn_map(map);
+            // and the player of a single-player game joins
+            runtime.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() });
+        }
+        // one second of game time: the timers and hooks of the first frames; the menu paints
+        // its panels in them
+        if realm == Realm::Menu {
+            runtime.set_screen_size(1280, 720);
+        }
+        for _ in 0..60 {
+            runtime.think(1.0 / 60.0);
+            if realm == Realm::Menu {
+                runtime.paint(1.0 / 60.0);
+            }
+        }
     }
 
     for line in printed.borrow().lines() {
@@ -75,6 +90,9 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
         out.line(format!("Map {}: {} entities.", map.name, runtime.entity_count()));
         out.line(player_report(&runtime));
     }
+    if let Some(report) = client_report {
+        out.line(report);
+    }
     let missing = missing_globals(&errors);
     if !missing.is_empty() {
         out.line("Missing in openGMOD (global, errors it caused):");
@@ -85,6 +103,122 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
     print_coverage(&runtime, all, out);
     if errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
+
+/// `KEY_Q` and `KEY_C`, which open the spawn menu and the context menu.
+const KEY_Q: i32 = 27;
+const KEY_C: i32 = 13;
+
+/// A second of a client's frames, with a server of its own behind it (on the map, if one is
+/// given): what the server has comes to the client every frame, what the client sends goes to
+/// the server, the HUD and the panels are painted; Q is held from the 10th frame to the
+/// 30th, and the first prop of the spawn menu clicked on the way; C is held from the 35th to
+/// the 50th. What showed, whether the click spawned the prop, what sounds played, and how
+/// the server did.
+fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> String {
+    let server = match Runtime::new(Realm::Server, vfs.clone()) {
+        Ok(server) => server,
+        Err(e) => return format!("The server could not be started: {e}"),
+    };
+    server.set_output(|_| {});
+    server.start("sandbox");
+    if let Some(map) = map {
+        server.spawn_map(map);
+        client.spawn_map(map);
+    }
+    let Some(player) = server.join(PlayerInfo { name: "Player".into(), ..PlayerInfo::default() }) else {
+        return "No player could join the server.".to_string();
+    };
+    client.set_screen_size(1280, 720);
+    client.set_local_player(player);
+    let (mut most_panels, mut spawn_menu, mut context_menu) = (0, 0, 0);
+    let mut vertices = 0;
+    // the first prop of the spawn list that shows, which is clicked
+    let mut clicked: Option<String> = None;
+    // the files of the sounds played, and whether the game has each
+    let mut sounds: Vec<(String, bool)> = Vec::new();
+    for frame in 0..60 {
+        let dt = 1.0 / 60.0;
+        server.think(dt);
+        client.apply_snapshot(&server.snapshot());
+        client.think(dt);
+        for (name, value) in client.take_user_info() {
+            server.set_user_info(player, &name, &value);
+        }
+        for line in client.take_server_commands() {
+            server.run_player_command(player, &line);
+        }
+        if frame == 20 {
+            let icon = client.lua().load(FIRST_ICON).eval::<(Option<String>, Option<i32>, Option<i32>)>();
+            if let Ok((Some(model), Some(x), Some(y))) = icon {
+                client.set_cursor(x, y);
+                clicked = Some(model);
+            }
+        }
+        match frame {
+            10 => client.button(KEY_Q, true),
+            21 if clicked.is_some() => client.button(MOUSE_LEFT, true),
+            22 if clicked.is_some() => client.button(MOUSE_LEFT, false),
+            30 => client.button(KEY_Q, false),
+            35 => client.button(KEY_C, true),
+            50 => client.button(KEY_C, false),
+            _ => false,
+        };
+        client.paint(dt);
+        for event in server.take_sounds().into_iter().chain(client.take_sounds()) {
+            if let gmod_lua::sound::SoundEvent::Play(play) = event {
+                let there = vfs.exists(&play.wave, "GAME");
+                sounds.push((play.wave, there));
+            }
+        }
+        vertices = vertices.max(client.with_canvas(|canvas, _| canvas.vertices().len()));
+        let shown = client.lua().load("return #vgui.GetAll()").eval::<usize>().unwrap_or(0);
+        most_panels = most_panels.max(shown);
+        match frame {
+            29 => spawn_menu = shown,
+            49 => context_menu = shown,
+            _ => {}
+        }
+    }
+    let click = match clicked {
+        None => "The spawn menu showed no prop to click.".to_string(),
+        Some(model) => {
+            let spawned = server.lua().load(SPAWNED).call::<Option<String>>(model.as_str()).ok().flatten();
+            match spawned {
+                Some(class) => format!("A click on {model} in the spawn menu spawned a {class} on the server."),
+                None => format!("A click on {model} in the spawn menu spawned nothing on the server (is the model in the game?)."),
+            }
+        }
+    };
+    let missing: Vec<&str> = sounds.iter().filter(|(_, there)| !there).map(|(wave, _)| wave.as_str()).collect();
+    let heard = match (sounds.len(), missing.first()) {
+        (0, _) => "No sounds played.".to_string(),
+        (1, None) => "1 sound played, its file there.".to_string(),
+        (n, None) => format!("{n} sounds played, their files all there."),
+        (n, Some(first)) => format!("{n} sound{} played, {} missing ({first}...).", if n == 1 { "" } else { "s" }, missing.len()),
+    };
+    format!(
+        "Client: 60 frames, at most {most_panels} panels and {vertices} vertices; {spawn_menu} panels with the spawn menu open, \
+         {context_menu} with the context menu. {click} {heard} Server behind it: {} errors.",
+        server.errors().len()
+    )
+}
+
+/// `MOUSE_LEFT`.
+const MOUSE_LEFT: i32 = 107;
+
+/// The first spawn icon that shows: its model and the middle of it on the screen.
+const FIRST_ICON: &str = "for _, p in ipairs(vgui.GetAll()) do
+        if p.ClassName == 'SpawnIcon' and p:IsVisible() then
+            local x, y = p:LocalToScreen(p:GetWide() / 2, p:GetTall() / 2)
+            return p:GetModelName(), math.floor(x), math.floor(y)
+        end
+    end";
+
+/// The class of an entity of the server with this model, if there is one.
+const SPAWNED: &str = "local model = string.lower(...)
+    for _, e in ipairs(ents.GetAll()) do
+        if string.lower(e:GetModel() or '') == model then return e:GetClass() end
+    end";
 
 /// Where the player got to in the first second, and what they hold.
 fn player_report(runtime: &Runtime) -> String {

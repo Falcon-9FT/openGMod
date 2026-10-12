@@ -12,12 +12,16 @@
 //! Every tick the bodies move on, and the entities of those awake go where their bodies are;
 //! constraints pulled too hard break ([`crate::constraint`]). Moving an entity (`SetPos`,
 //! `SetAngles`) moves its body.
+//!
+//! A ragdoll has a body for each solid of its model ([`crate::ragdoll`]): its `PhysObj`s by
+//! number, the first its entity's, which follows it.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use gmod_physics::{Body, BodyId, Physics, Shape};
-use mlua::{Lua, MultiValue, Value};
+use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::args::{self, Args};
 use crate::entity::{self, EntityHandle, PhysObjHandle};
@@ -33,6 +37,8 @@ pub(crate) struct World {
     bodies: RefCell<HashMap<BodyId, Kept>>,
     /// The physics models read, by model.
     models: RefCell<HashMap<String, Option<PhysModel>>>,
+    /// The ragdolls, by the number of their entity.
+    pub ragdolls: RefCell<HashMap<u32, crate::ragdoll::Ragdoll>>,
 }
 
 /// What a physics model gives a body.
@@ -43,14 +49,18 @@ struct PhysModel {
     damping: f32,
     rot_damping: f32,
     material: String,
-    /// How many solids it has: one for a prop, more for a ragdoll.
-    solids: usize,
+    /// All of it: the solids of a ragdoll, how they hang together.
+    phy: Arc<gmod_model::Phy>,
+    /// Its shape for traces: the convex hulls of its first solid.
+    hulls: Arc<Vec<gmod_bsp::collision::Hull>>,
 }
 
 /// What Lua keeps with a body.
 #[derive(Debug, Clone)]
 struct Kept {
     entity: EntityHandle,
+    /// Which of its entity's: 0, or a part of a ragdoll.
+    part: usize,
     material: String,
     /// Its bounds in its own space.
     mins: Vector,
@@ -58,21 +68,24 @@ struct Kept {
     game_flags: i64,
     contents: i64,
     drag: bool,
+    /// The shape of its model, which traces sweep through; none for a box, a ball or hulls
+    /// Lua made.
+    hulls: Option<Arc<Vec<gmod_bsp::collision::Hull>>>,
 }
 
-fn array(v: Vector) -> [f32; 3] {
+pub(crate) fn array(v: Vector) -> [f32; 3] {
     [v.x, v.y, v.z]
 }
 
-fn vector(v: [f32; 3]) -> Vector {
+pub(crate) fn vector(v: [f32; 3]) -> Vector {
     Vector::new(v[0], v[1], v[2])
 }
 
-fn turn(a: Angle) -> [f32; 3] {
+pub(crate) fn turn(a: Angle) -> [f32; 3] {
     [a.p, a.y, a.r]
 }
 
-fn angle(a: [f32; 3]) -> Angle {
+pub(crate) fn angle(a: [f32; 3]) -> Angle {
     Angle::new(a[0], a[1], a[2])
 }
 
@@ -102,6 +115,8 @@ pub(crate) fn load_world(lua: &Lua, collision: Option<&gmod_bsp::Collision>) {
         for (_, kept) in host.physics.bodies.borrow_mut().drain() {
             host.entities.with_mut(kept.entity, |ent| ent.physics = None);
         }
+        // their bodies went with the old world, whose handles the new one gives out again
+        host.physics.ragdolls.borrow_mut().clear();
     }
     attach_world(lua);
 }
@@ -116,12 +131,14 @@ fn attach_world(lua: &Lua) {
     let ground = host.physics.physics.borrow().ground();
     let kept = Kept {
         entity: world,
+        part: 0,
         material: "default".to_string(),
         mins: Vector::default(),
         maxs: Vector::default(),
         game_flags: 0,
         contents: 0,
         drag: false,
+        hulls: None,
     };
     host.physics.bodies.borrow_mut().insert(ground, kept);
     host.entities.with_mut(world, |ent| ent.physics = Some(ground));
@@ -139,15 +156,21 @@ fn phys_model(lua: &Lua, model: &str) -> Option<PhysModel> {
     }
     let read = || -> Option<PhysModel> {
         let mdl = gmod_model::Mdl::parse(&host.vfs.read(&path, "GAME").ok()?).ok()?;
-        let phy = gmod_model::load_physics(&host.vfs, &path, mdl.checksum).ok()??;
+        let phy = Arc::new(gmod_model::load_physics(&host.vfs, &path, mdl.checksum).ok()??);
         let solid = phy.solids.first()?;
+        let hulls = solid
+            .convexes
+            .iter()
+            .filter_map(|c| gmod_bsp::collision::Hull::new(&c.points, &c.triangles.iter().map(|t| t.map(usize::from)).collect::<Vec<_>>()))
+            .collect();
         Some(PhysModel {
             shape: Shape::Hulls(solid.convexes.iter().map(|c| c.points.clone()).collect()),
             mass: solid.mass(),
             damping: solid.keys.number("damping").unwrap_or(0.0),
             rot_damping: solid.keys.number("rotdamping").unwrap_or(0.0),
             material: solid.surface_prop().unwrap_or("default").to_string(),
-            solids: phy.solids.len(),
+            phy: phy.clone(),
+            hulls: Arc::new(hulls),
         })
     };
     let found = read();
@@ -158,7 +181,44 @@ fn phys_model(lua: &Lua, model: &str) -> Option<PhysModel> {
 /// How many solids a model's physics model has: none without one, one for a prop, more for a
 /// ragdoll.
 pub(crate) fn solids(lua: &Lua, model: &str) -> usize {
-    phys_model(lua, model).map_or(0, |m| m.solids)
+    phys_model(lua, model).map_or(0, |m| m.phy.solids.len())
+}
+
+/// A model's physics model, read once.
+pub(crate) fn phy(lua: &Lua, model: &str) -> Option<Arc<gmod_model::Phy>> {
+    phys_model(lua, model).map(|m| m.phy)
+}
+
+/// Keeps a body of an entity: what Lua keeps with it, the bounds of its shape in its own space.
+pub(crate) fn keep(lua: &Lua, id: BodyId, entity: EntityHandle, part: usize, shape: &Shape, material: &str) {
+    let (mins, maxs) = bounds(shape);
+    let kept = Kept { entity, part, material: material.to_string(), mins, maxs, game_flags: 0, contents: 0, drag: true, hulls: None };
+    host(lua).physics.bodies.borrow_mut().insert(id, kept);
+}
+
+/// Takes a body away, with what Lua keeps with it.
+pub(crate) fn remove_body(lua: &Lua, id: BodyId) {
+    host(lua).physics.physics.borrow_mut().remove(id);
+    host(lua).physics.bodies.borrow_mut().remove(&id);
+}
+
+/// The body of a `PhysObj`: of a part of a ragdoll, or an entity's own (part 0).
+pub(crate) fn part_body(lua: &Lua, handle: EntityHandle, part: usize) -> Option<BodyId> {
+    match crate::ragdoll::part_body(lua, handle, part) {
+        Some(found) => found,
+        None if part == 0 => body(lua, handle),
+        None => None,
+    }
+}
+
+/// Every body of an entity: its own, or each of a ragdoll's.
+fn bodies(lua: &Lua, handle: EntityHandle) -> Vec<BodyId> {
+    crate::ragdoll::bodies(lua, handle).unwrap_or_else(|| body(lua, handle).into_iter().collect())
+}
+
+/// How many `PhysObj`s an entity has (`GetPhysicsObjectCount`).
+pub(crate) fn count(lua: &Lua, handle: EntityHandle) -> usize {
+    crate::ragdoll::count(lua, handle).unwrap_or_else(|| usize::from(body(lua, handle).is_some()))
 }
 
 /// The body of an entity, if it has one.
@@ -181,10 +241,21 @@ fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>
     };
     let Some(id) = host.physics.physics.borrow_mut().add(&body) else { return false };
     let material = model.map_or("default", |m| &m.material).to_string();
-    let kept = Kept { entity: handle, material, mins, maxs, game_flags: 0, contents: 0, drag: true };
+    let hulls = model.map(|m| m.hulls.clone()).filter(|h| !h.is_empty());
+    let kept = Kept { entity: handle, part: 0, material, mins, maxs, game_flags: 0, contents: 0, drag: true, hulls };
     host.physics.bodies.borrow_mut().insert(id, kept);
     host.entities.with_mut(handle, |ent| ent.physics = Some(id));
     true
+}
+
+/// The shape of an entity's model that its body has, for traces: its convex hulls in its own
+/// space, and their bounds. None for an entity without a body, or with a body of another shape.
+pub(crate) fn shape(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Vec<gmod_bsp::collision::Hull>>, Vector, Vector)> {
+    let id = body(lua, handle)?;
+    let host = host(lua);
+    let bodies = host.physics.bodies.borrow();
+    let kept = bodies.get(&id)?;
+    Some((kept.hulls.clone()?, kept.mins, kept.maxs))
 }
 
 /// `PhysicsInit(SOLID_VPHYSICS)`: a body of the entity's model. Whether it got one.
@@ -204,58 +275,81 @@ pub(crate) fn init_shape(lua: &Lua, handle: EntityHandle, shape: Shape) -> bool 
     init(lua, handle, shape, None)
 }
 
-/// Takes an entity's body away. The world keeps its own.
+/// Takes an entity's bodies away: its own, a ragdoll's parts. The world keeps its own.
 pub(crate) fn destroy(lua: &Lua, handle: EntityHandle) {
     if handle.index == Some(0) {
         return;
     }
+    let all = bodies(lua, handle);
+    crate::ragdoll::forget(lua, handle);
     let host = host(lua);
-    if let Some(id) = host.entities.with_mut(handle, |ent| ent.physics.take()).flatten() {
-        host.physics.physics.borrow_mut().remove(id);
-        host.physics.bodies.borrow_mut().remove(&id);
+    host.entities.with_mut(handle, |ent| ent.physics = None);
+    for id in all {
+        remove_body(lua, id);
     }
 }
 
-/// An entity was moved: its body goes along.
+/// An entity was moved: its body goes along, a ragdoll's all of them.
 pub(crate) fn moved(lua: &Lua, handle: EntityHandle) {
+    if crate::ragdoll::moved(lua, handle) {
+        return;
+    }
     let Some(id) = body(lua, handle) else { return };
     let host = host(lua);
     let Some((pos, angles)) = host.entities.transform(handle) else { return };
     host.physics.physics.borrow_mut().set_pose(id, array(pos), turn(angles));
 }
 
-/// Freezes a body or lets it move.
+/// Freezes an entity's bodies or lets them move.
 pub(crate) fn set_motion(lua: &Lua, handle: EntityHandle, moves: bool) {
-    if let Some(id) = body(lua, handle) {
+    for id in bodies(lua, handle) {
         host(lua).physics.physics.borrow_mut().set_motion(id, moves);
     }
 }
 
 pub(crate) fn sleep(lua: &Lua, handle: EntityHandle) {
-    if let Some(id) = body(lua, handle) {
+    for id in bodies(lua, handle) {
         host(lua).physics.physics.borrow_mut().sleep(id);
     }
 }
 
 pub(crate) fn wake(lua: &Lua, handle: EntityHandle) {
-    if let Some(id) = body(lua, handle) {
+    for id in bodies(lua, handle) {
         host(lua).physics.physics.borrow_mut().wake(id);
     }
 }
 
+/// A body hit something: what Lua hears of it.
+struct Collision {
+    entity: EntityHandle,
+    part: usize,
+    material: String,
+    /// What it hit: the world, or another entity with a body, and which of its bodies.
+    other: EntityHandle,
+    other_part: usize,
+    other_material: Option<String>,
+    speed: f32,
+    point: Vector,
+    normal: Vector,
+    velocity: Vector,
+    other_velocity: Vector,
+}
+
 /// One tick: the bodies move on, gravity as `sv_gravity` says, and the entities of those awake
 /// go where their bodies are - unless they have a parent, which takes them along. Then the
-/// constraints that broke go.
+/// constraints that broke go, and the bodies that hit something make their sounds and tell
+/// Lua.
 pub(crate) fn simulate(lua: &Lua) {
     let gravity = crate::convar::value(lua, "sv_gravity").and_then(|g| g.trim().parse::<f32>().ok()).unwrap_or(600.0);
-    let broken = {
+    let (broken, collisions) = {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
         physics.set_gravity(gravity);
         physics.step(timer::TICK_INTERVAL as f32);
         let bodies = host.physics.bodies.borrow();
         for id in physics.awake() {
-            let Some(kept) = bodies.get(&id) else { continue };
+            // a ragdoll's entity follows its first part
+            let Some(kept) = bodies.get(&id).filter(|k| k.part == 0) else { continue };
             let Some((origin, angles)) = physics.pose(id) else { continue };
             let velocity = vector(physics.velocity(id));
             host.entities.with_mut(kept.entity, |ent| {
@@ -266,26 +360,115 @@ pub(crate) fn simulate(lua: &Lua) {
                 ent.velocity = velocity;
             });
         }
-        physics.broken()
+        let collisions: Vec<Collision> = physics
+            .impacts()
+            .into_iter()
+            .filter_map(|impact| {
+                let kept = bodies.get(&impact.body)?;
+                let other = impact.other_body.and_then(|id| bodies.get(&id).map(|k| (id, k)));
+                Some(Collision {
+                    entity: kept.entity,
+                    part: kept.part,
+                    material: kept.material.clone(),
+                    other: other.map_or(EntityHandle::WORLD, |(_, k)| k.entity),
+                    other_part: other.map_or(0, |(_, k)| k.part),
+                    other_material: other.map(|(_, k)| k.material.clone()),
+                    speed: impact.speed,
+                    point: vector(impact.point),
+                    normal: vector(impact.normal),
+                    velocity: vector(physics.velocity(impact.body)),
+                    other_velocity: other.map_or(Vector::default(), |(id, _)| vector(physics.velocity(id))),
+                })
+            })
+            .collect();
+        (physics.broken(), collisions)
     };
+    crate::ragdoll::moved_on(lua);
     crate::constraint::broken(lua, &broken);
+    for collision in &collisions {
+        if host(lua).entities.is_valid(collision.entity) {
+            collided(lua, collision);
+        }
+    }
+}
+
+/// An impact: the body's surface sounds it, as Source does - from 70 units/s, as loud as the
+/// square of the speed up to 320, hard from 300 - and Lua hears of it: `ENT:PhysicsCollide`
+/// and the entity's `PhysicsCollide` callbacks.
+fn collided(lua: &Lua, c: &Collision) {
+    if c.speed >= 70.0 {
+        let (_, surface) = crate::surfaceprops::named(lua, &c.material);
+        let name = if c.speed >= 300.0 { &surface.impact_hard } else { &surface.impact_soft };
+        let volume = (c.speed * c.speed / (320.0 * 320.0)).min(1.0);
+        crate::sound::emit_scaled(lua, name, c.entity, volume);
+    }
+    let Ok(Value::UserData(ud)) = entity::push(lua, c.entity) else { return };
+    let data = (|| -> mlua::Result<Table> {
+        let t = lua.create_table()?;
+        let (our, _) = crate::surfaceprops::named(lua, &c.material);
+        let (their, _) = crate::surfaceprops::named(lua, c.other_material.as_deref().unwrap_or("default"));
+        t.raw_set("HitPos", entity::vector(lua, c.point)?)?;
+        t.raw_set("HitEntity", entity::push(lua, c.other)?)?;
+        t.raw_set("HitNormal", entity::vector(lua, c.normal)?)?;
+        t.raw_set("Speed", c.speed)?;
+        t.raw_set("HitSpeed", entity::vector(lua, c.normal * c.speed)?)?;
+        // before the impact it went into what it hit as fast as the impact took away
+        t.raw_set("OurOldVelocity", entity::vector(lua, c.velocity + c.normal * c.speed)?)?;
+        t.raw_set("OurNewVelocity", entity::vector(lua, c.velocity)?)?;
+        t.raw_set("TheirOldVelocity", entity::vector(lua, c.other_velocity)?)?;
+        t.raw_set("TheirNewVelocity", entity::vector(lua, c.other_velocity)?)?;
+        t.raw_set("PhysObject", push_part(lua, c.entity, c.part)?)?;
+        t.raw_set("HitObject", push_part(lua, c.other, c.other_part)?)?;
+        t.raw_set("OurSurfaceProps", our as i64)?;
+        t.raw_set("TheirSurfaceProps", their as i64)?;
+        t.raw_set("DeltaTime", timer::TICK_INTERVAL)?;
+        Ok(t)
+    })();
+    let Ok(data) = data else { return };
+    let phys = push_part(lua, c.entity, c.part).unwrap_or(Value::Nil);
+    crate::ents::call_method(lua, &ud, "PhysicsCollide", MultiValue::from_iter([Value::Table(data.clone()), phys]));
+    if let Ok(callbacks) = entity::store_of(lua, &ud, "callbacks")
+        && let Ok(Some(list)) = callbacks.raw_get::<Option<Table>>("PhysicsCollide")
+    {
+        for function in list.sequence_values::<mlua::Function>().filter_map(Result::ok) {
+            let _ = crate::files::call_reporting(
+                lua,
+                function,
+                MultiValue::from_iter([Value::UserData(ud.clone()), Value::Table(data.clone())]),
+            );
+        }
+    }
+}
+
+/// The surface an entity's body is made of (`PhysObj:GetMaterial`), if it has a body.
+pub(crate) fn material_of(lua: &Lua, handle: EntityHandle) -> Option<String> {
+    let id = body(lua, handle)?;
+    host(lua).physics.bodies.borrow().get(&id).map(|kept| kept.material.clone())
 }
 
 /// The `PhysObj` of an entity: valid while the entity has a body.
 pub(crate) fn push(lua: &Lua, handle: EntityHandle) -> mlua::Result<Value> {
-    let owner = if body(lua, handle).is_some() { handle } else { EntityHandle::NULL };
-    Ok(Value::UserData(lua.create_userdata(PhysObjHandle(owner))?))
+    push_part(lua, handle, 0)
+}
+
+/// A `PhysObj` of an entity by number (`GetPhysicsObjectNum`): `NULL` when it has none such.
+pub(crate) fn push_part(lua: &Lua, handle: EntityHandle, part: usize) -> mlua::Result<Value> {
+    let phys = match part_body(lua, handle, part) {
+        Some(_) => PhysObjHandle(handle, part),
+        None => PhysObjHandle(EntityHandle::NULL, 0),
+    };
+    Ok(Value::UserData(lua.create_userdata(phys)?))
 }
 
 /// Whether a `PhysObj` is valid.
 pub(crate) fn valid(lua: &Lua, phys: PhysObjHandle) -> bool {
-    host(lua).entities.is_valid(phys.0) && body(lua, phys.0).is_some()
+    host(lua).entities.is_valid(phys.0) && part_body(lua, phys.0, phys.1).is_some()
 }
 
 /// The entity and body of the `PhysObj` in argument 1, which must be valid.
 fn this(a: &Args) -> mlua::Result<(EntityHandle, BodyId)> {
     let phys = a.userdata::<PhysObjHandle>(1, "PhysObj")?;
-    match body(a.lua, phys.0).filter(|_| host(a.lua).entities.is_valid(phys.0)) {
+    match part_body(a.lua, phys.0, phys.1).filter(|_| host(a.lua).entities.is_valid(phys.0)) {
         Some(id) => Ok((phys.0, id)),
         None => Err(args::error(a.lua, "Tried to use a NULL physics object!")),
     }
@@ -309,9 +492,15 @@ fn vector_value(lua: &Lua, v: Vector) -> mlua::Result<Value> {
     entity::vector(lua, v)
 }
 
-/// Where a body is, as an entity's position and angles.
+/// Where a `PhysObj` is, as an entity's position and angles: a part of a ragdoll where its
+/// bone is, which is not where its body is when welded into another part's.
 fn pose(a: &Args) -> mlua::Result<(Vector, Angle)> {
-    let (origin, angles) = with(a, |p, id| p.pose(id))?.unwrap_or_default();
+    let (handle, id) = this(a)?;
+    let part = a.userdata::<PhysObjHandle>(1, "PhysObj")?.1;
+    if let Some(found) = crate::ragdoll::part_pose(a.lua, handle, part) {
+        return Ok(found);
+    }
+    let (origin, angles) = host(a.lua).physics.physics.borrow().pose(id).unwrap_or_default();
     Ok((vector(origin), angle(angles)))
 }
 
@@ -363,20 +552,32 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let mass = a.number(2)? as f32;
         with(a, |p, id| p.set_mass(id, mass.max(0.001))).map(|_| Value::Nil)
     })?;
-    def("GetMassCenter", |a| vector_value(a.lua, vector(with(a, |p, id| p.mass_center(id))?)))?;
+    def("GetMassCenter", |a| {
+        let (handle, _) = this(a)?;
+        let part = a.userdata::<PhysObjHandle>(1, "PhysObj")?.1;
+        let center = vector(with(a, |p, id| p.mass_center(id))?);
+        vector_value(a.lua, crate::ragdoll::in_part(a.lua, handle, part, center).unwrap_or(center))
+    })?;
     def("GetVolume", |a| Ok(Value::Number(f64::from(with(a, |p, id| p.volume(id))?))))?;
     def("GetPos", |a| vector_value(a.lua, pose(a)?.0))?;
     def("GetAngles", |a| entity::angle(a.lua, pose(a)?.1))?;
+    // a part of a ragdoll moves by itself; another body moves its entity
     def("SetPos", |a| {
         let (handle, _) = this(a)?;
+        let part = a.userdata::<PhysObjHandle>(1, "PhysObj")?.1;
         let pos = a.userdata::<Vector>(2, "Vector")?;
-        entity::set_world_pos(a.lua, handle, pos);
+        if !crate::ragdoll::set_part_pose(a.lua, handle, part, Some(pos), None) {
+            entity::set_world_pos(a.lua, handle, pos);
+        }
         Ok(Value::Nil)
     })?;
     def("SetAngles", |a| {
         let (handle, _) = this(a)?;
+        let part = a.userdata::<PhysObjHandle>(1, "PhysObj")?.1;
         let angles = a.userdata::<Angle>(2, "Angle")?;
-        entity::set_world_angles(a.lua, handle, angles);
+        if !crate::ragdoll::set_part_pose(a.lua, handle, part, None, Some(angles)) {
+            entity::set_world_angles(a.lua, handle, angles);
+        }
         Ok(Value::Nil)
     })?;
     def("GetVelocity", |a| vector_value(a.lua, vector(with(a, |p, id| p.velocity(id))?)))?;

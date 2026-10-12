@@ -26,7 +26,65 @@ impl Entity {
         let v = [parts.next()??, parts.next()??, parts.next()??];
         Some(v)
     }
+
+    /// The brush model it has (`"model" "*3"`), the world's (0) left out.
+    pub fn brush_model(&self) -> Option<usize> {
+        self.get("model")?.strip_prefix('*')?.parse().ok().filter(|&m| m != 0)
+    }
+
+    /// Whether a brush entity may move, vanish or go while the game runs, so that it is to be
+    /// drawn and solid where its entity is rather than baked into the map: the engine's
+    /// movers, and any other `func_` brush with a name or a parent, which inputs may move,
+    /// hide or remove, and the breakables, which go when broken. The volumes nothing sees or
+    /// collides with do not count.
+    pub fn moves(&self) -> bool {
+        if self.brush_model().is_none() {
+            return false;
+        }
+        let class = self.class_name().to_ascii_lowercase();
+        if MOVERS.contains(&class.as_str()) {
+            return true;
+        }
+        let named = |key: &str| self.get(key).is_some_and(|v| !v.trim().is_empty());
+        class.starts_with("func_") && !VOLUMES.iter().any(|v| class.starts_with(v)) && (named("targetname") || named("parentname"))
+    }
 }
+
+/// The brush entities that move by themselves, or break and go.
+const MOVERS: [&str; 16] = [
+    "func_door",
+    "func_door_rotating",
+    "func_movelinear",
+    "func_rotating",
+    "func_button",
+    "func_rot_button",
+    "momentary_rot_button",
+    "func_tracktrain",
+    "func_train",
+    "func_plat",
+    "func_platrot",
+    "func_water_analog",
+    "func_physbox",
+    "func_physbox_multiplayer",
+    "func_breakable",
+    "func_breakable_surf",
+];
+
+/// Brushes that are volumes for the game's logic or its effects, not things.
+const VOLUMES: [&str; 12] = [
+    "func_areaportal",
+    "func_occluder",
+    "func_viscluster",
+    "func_dustmotes",
+    "func_dustcloud",
+    "func_smokevolume",
+    "func_precipitation",
+    "func_respawnroom",
+    "func_regenerate",
+    "func_nobuild",
+    "func_clip_vphysics",
+    "func_vehicleclip",
+];
 
 fn token<'a>(text: &'a str, pos: &mut usize) -> Option<&'a str> {
     let bytes = text.as_bytes();

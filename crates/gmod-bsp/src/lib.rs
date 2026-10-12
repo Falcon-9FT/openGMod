@@ -20,17 +20,20 @@ use gmod_fs::ZipArchive;
 
 pub mod collision;
 mod entities;
+pub mod light;
 mod lighting;
 pub mod lumps;
 mod math;
 pub mod mesh;
+pub mod overlay;
 pub mod props;
 
 pub use collision::{Collision, SolidShapes, Trace, mask};
 pub use entities::{Entity, parse_entities};
+pub use light::{AmbientSample, LightCube, LightKind, WorldLight};
 pub use lighting::{luxels, rgbe_to_linear};
 pub use lumps::{
-    Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Plane, TexData, TexInfo, contents, surf,
+    Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Overlay, Plane, TexData, TexInfo, contents, surf,
 };
 pub use props::{GameLump, StaticProp, StaticProps};
 
@@ -70,6 +73,8 @@ pub struct Bsp {
     pub displacements: Vec<DispInfo>,
     pub disp_verts: Vec<DispVert>,
     pub cubemaps: Vec<Cubemap>,
+    /// The `info_overlay`s, drawn over the faces they name ([`mesh`]).
+    pub overlays: Vec<Overlay>,
     pub game_lumps: Vec<GameLump>,
     pub static_props: StaticProps,
     bytes: Arc<[u8]>,
@@ -146,6 +151,8 @@ impl Bsp {
         let disp_verts =
             records(&lump(index::DISP_VERTS, "displacement vertices")?, DispVert::SIZE, "displacement vertices", DispVert::parse)?;
         let cubemaps = records(&lump(index::CUBEMAPS, "cubemaps")?, Cubemap::SIZE, "cubemaps", Cubemap::parse)?;
+        // overlays only paint: a lump that does not add up costs them, not the map
+        let overlays = records(&lump(index::OVERLAYS, "overlays")?, Overlay::SIZE, "overlays", Overlay::parse).unwrap_or_default();
         let lighting = lump(index::LIGHTING, "lighting")?.into_owned();
         let lighting_hdr = lump(index::LIGHTING_HDR, "HDR lighting")?.into_owned();
 
@@ -196,6 +203,7 @@ impl Bsp {
             displacements,
             disp_verts,
             cubemaps,
+            overlays,
             game_lumps,
             static_props,
             bytes,
@@ -320,6 +328,38 @@ impl Bsp {
     /// The `worldspawn` entity.
     pub fn worldspawn(&self) -> Option<&Entity> {
         self.entities.iter().find(|e| e.class_name() == "worldspawn")
+    }
+
+    /// The leaf of the world's tree a point is in: its index in `leaves`.
+    pub fn leaf_at(&self, point: [f32; 3]) -> Option<usize> {
+        // `parse` made sure every node's children come after it: the walk ends
+        let mut node = self.models.first()?.head_node;
+        while let Ok(i) = usize::try_from(node) {
+            let n = self.nodes.get(i)?;
+            let plane = self.planes.get(usize::try_from(n.plane).ok()?)?;
+            node = n.children[usize::from(math::dot(plane.normal, point) < plane.dist)];
+        }
+        Some((-1 - node) as usize).filter(|&leaf| leaf < self.leaves.len())
+    }
+
+    /// The area of the leaf a point is in. Compilers flood areas through the open space, so a
+    /// sealed room of its own - the 3D sky box - is an area of its own; 0 is none (outside
+    /// the world, or in the solid).
+    pub fn area_at(&self, point: [f32; 3]) -> Option<u16> {
+        self.leaves.get(self.leaf_at(point)?).map(|leaf| leaf.area).filter(|&area| area != 0)
+    }
+
+    /// The area a face of the world is seen from: that of the open space a unit in front of
+    /// its middle.
+    pub fn face_area(&self, face: &Face) -> Option<u16> {
+        let plane = self.planes.get(usize::from(face.plane))?;
+        let first = usize::try_from(face.first_edge).ok()?;
+        let count = usize::try_from(face.num_edges).ok().filter(|&n| n > 0)?;
+        self.surfedges.get(first..first + count)?;
+        let sum = self.face_vertices(face).fold([0.0; 3], math::add);
+        let middle = math::scale(sum, 1.0 / count as f32);
+        let normal = if face.side != 0 { math::scale(plane.normal, -1.0) } else { plane.normal };
+        self.area_at(math::add(middle, normal))
     }
 }
 

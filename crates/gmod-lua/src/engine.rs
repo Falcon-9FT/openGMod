@@ -32,6 +32,8 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     globals.raw_set("VERSION", VERSION)?;
     globals.raw_set("VERSIONSTR", VERSION_STR)?;
     globals.raw_set("BRANCH", "x86-64")?;
+    // the bits of an entity's index: what `net.WriteEntity` writes
+    globals.raw_set("MAX_EDICT_BITS", crate::entity::MAX_EDICTS.trailing_zeros())?;
     if realm == Realm::Menu {
         globals.raw_set("NETVERSIONSTR", VERSION_STR)?;
     }
@@ -55,6 +57,10 @@ pub(crate) struct Game {
     pub chain: RefCell<Vec<String>>,
     /// What `DeriveGamemode` named while the gamemode being loaded ran.
     pub derived: RefCell<Vec<String>>,
+    /// Player slots: entity indices 1 to this (`game.MaxPlayers`); 0 is 1.
+    pub max_players: std::cell::Cell<u32>,
+    /// A server without a player of its own at the screen (`game.IsDedicated`).
+    pub dedicated: std::cell::Cell<bool>,
 }
 
 /// The active gamemode's table, or nil.
@@ -92,9 +98,9 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     globals.raw_set("gmod", gmod)?;
 
     let game = lua.create_table()?;
-    def(lua, &game, "SinglePlayer", |_| Ok(Value::Boolean(crate::player::MAX_PLAYERS == 1)))?;
-    def(lua, &game, "MaxPlayers", |_| Ok(Value::Integer(crate::player::MAX_PLAYERS.into())))?;
-    def(lua, &game, "IsDedicated", |_| Ok(Value::Boolean(false)))?;
+    def(lua, &game, "SinglePlayer", |a| Ok(Value::Boolean(crate::player::max_players(a.lua) == 1)))?;
+    def(lua, &game, "MaxPlayers", |a| Ok(Value::Integer(crate::player::max_players(a.lua).into())))?;
+    def(lua, &game, "IsDedicated", |a| Ok(Value::Boolean(host(a.lua).game.dedicated.get())))?;
     def(lua, &game, "GetMap", |a| string(a, &host(a.lua).game.map.borrow()))?;
     def(lua, &game, "GetIPAddress", |a| string(a, "loopback"))?;
     def(lua, &game, "GetWorld", |a| crate::entity::push(a.lua, EntityHandle::WORLD))?;
@@ -159,6 +165,28 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     def(lua, &system, "BatteryPower", |_| Ok(Value::Integer(255)))?;
     globals.raw_set("system", system)?;
     Ok(())
+}
+
+/// The activities of the game's enumerations (`ACT_IDLE` ...), by name and number.
+fn activities() -> &'static [(&'static str, i64)] {
+    static LIST: std::sync::OnceLock<Vec<(&'static str, i64)>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        ENUMS
+            .lines()
+            .filter(|l| l.starts_with("ACT_"))
+            .filter_map(|l| l.split_once(' ').and_then(|(name, value)| Some((name, value.parse().ok()?))))
+            .collect()
+    })
+}
+
+/// The number of an activity of the game's (`ACT_VM_IDLE`), ignoring case.
+pub(crate) fn activity(name: &str) -> Option<i64> {
+    activities().iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|&(_, id)| id)
+}
+
+/// The name of an activity of the game's by its number.
+pub(crate) fn activity_name(id: i64) -> Option<&'static str> {
+    activities().iter().find(|&&(_, n)| n == id).map(|&(name, _)| name)
 }
 
 fn install_enums(lua: &Lua, globals: &Table) -> mlua::Result<()> {

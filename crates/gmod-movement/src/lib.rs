@@ -178,7 +178,7 @@ pub struct Command {
 }
 
 /// A player, as far as movement goes.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Player {
     /// The feet: the middle of the bottom of the box.
     pub origin: Vec3,

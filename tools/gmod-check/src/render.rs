@@ -1,10 +1,10 @@
 //! `render`: a picture of a map drawn on the CPU - the world, brush entities and static props
 //! of [`gmod_world`] with their textures and light, blended displacements, alpha testing,
-//! translucency, water and the sky box. A preview, and a check that the readers fit together;
-//! the engine itself draws with the GPU.
+//! translucency, water, overlays (as the engine draws them, after the opaque surfaces in their
+//! render order) and the sky box. A preview, and a check that the readers fit together; the
+//! engine itself draws with the GPU.
 //!
-//! Not drawn yet: models of entities, decals and overlays, the 3D sky box, fog, reflections
-//! and bump maps.
+//! Not drawn yet: models of entities, decals, the 3D sky box, fog, reflections and bump maps.
 
 use std::time::Instant;
 
@@ -338,6 +338,8 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
     let edge = |p: &Projected, q: &Projected, x: f32, y: f32| (q.x - p.x) * (y - p.y) - (q.y - p.y) * (x - p.x);
     let base = s.base.and_then(|i| scene.textures[i].as_ref());
     let base2 = s.base2.and_then(|i| scene.textures[i].as_ref());
+    // a still picture: the material as it is when the map starts
+    let look = s.look(0.0);
     for y in min_y..=max_y as usize {
         let py = y as f32 + 0.5;
         for x in min_x..=max_x as usize {
@@ -358,7 +360,7 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
             let du = [(dq[0].0 - uv[0] * dw_dx) * z, (dq[0].1 - uv[0] * dw_dy) * z];
             let dv = [(dq[1].0 - uv[1] * dw_dx) * z, (dq[1].1 - uv[1] * dw_dy) * z];
             let mut albedo = match base {
-                Some(t) => t.sample(uv, lod(t, du, dv), scene.linear),
+                Some(t) => t.sample(gmod_material::proxy::apply(&look.transform, uv), lod(t, du, dv), scene.linear),
                 None if s.water.is_some() => [1.0; 4],
                 None => missing_texture(uv),
             };
@@ -377,8 +379,8 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
                 Some(atlas) => atlas.sample([value(2), value(3)]),
                 None => [value(5), value(6), value(7)],
             };
-            let mut color: Vec3 = std::array::from_fn(|i| albedo[i] * s.tint[i] * light[i]);
-            let mut opacity = albedo[3] * s.alpha;
+            let mut color: Vec3 = std::array::from_fn(|i| albedo[i] * look.tint[i] * light[i]);
+            let mut opacity = albedo[3] * look.alpha;
             if let Some(fog) = s.water {
                 color = fog;
                 opacity = 0.75;
@@ -389,6 +391,13 @@ fn raster(frame: &mut Frame, scene: &Scene, s: &Surface, corners: [Projected; 3]
                 frame.depth[at] = w;
             } else if s.additive {
                 *pixel = std::array::from_fn(|i| pixel[i] + color[i] * opacity);
+            } else if s.modulate {
+                // twice its colour times what is behind, in gamma space: grey changes nothing;
+                // at most twice as light, as the engine's target allows
+                *pixel = std::array::from_fn(|i| {
+                    let gamma = 0.5 + (color[i].powf(1.0 / 2.2) - 0.5) * opacity;
+                    pixel[i] * (2.0 * gamma).powf(2.2).min(2.0)
+                });
             } else {
                 *pixel = std::array::from_fn(|i| pixel[i] * (1.0 - opacity) + color[i] * opacity);
             }
@@ -428,7 +437,8 @@ pub fn render(vfs: &mut Vfs, bsp: &Bsp, view: &View) -> Result<Picture, String> 
         return Err(format!("a picture of {}x{} pixels cannot be drawn", view.width, view.height));
     }
     let mounted = gmod_world::mount_pakfile(vfs, bsp).map_err(|e| format!("pakfile: {e}"))?;
-    let world = gmod_world::load(vfs, bsp);
+    // a still picture: what may move stands where the map puts it
+    let world = gmod_world::load_all(vfs, bsp);
     if mounted {
         vfs.remove(0);
     }
@@ -448,7 +458,12 @@ fn draw_world(world: &World, bsp: &Bsp, view: &View, started: Instant) -> Pictur
     let mut frame = Frame { width, height, color: vec![[0.0; 3]; width * height], depth: vec![0.0; width * height] };
     for piece in &world.pieces {
         let scene = scene(piece, &textures, &linear);
-        for s in piece.surfaces.iter().filter(|s| !s.translucent) {
+        for s in piece.surfaces.iter().filter(|s| !s.translucent && !s.overlay) {
+            draw(&mut frame, &camera, &scene, s);
+        }
+        // then the overlays on them, in their order: all are as far off their faces, so that
+        // order decides which shows over which, not the distance
+        for s in piece.surfaces.iter().filter(|s| s.overlay) {
             draw(&mut frame, &camera, &scene, s);
         }
     }
@@ -457,7 +472,7 @@ fn draw_world(world: &World, bsp: &Bsp, view: &View, started: Instant) -> Pictur
     let mut translucent: Vec<(f32, &Piece, &Surface)> = world
         .pieces
         .iter()
-        .flat_map(|piece| piece.surfaces.iter().filter(|s| s.translucent).map(move |s| (piece, s)))
+        .flat_map(|piece| piece.surfaces.iter().filter(|s| s.translucent && !s.overlay).map(move |s| (piece, s)))
         .map(|(piece, s)| {
             let indices = &piece.indices[s.first..s.first + s.count];
             let sum = indices.iter().fold([0.0; 3], |acc, &i| add(acc, piece.vertices[i as usize].position));

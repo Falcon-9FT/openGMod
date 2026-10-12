@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::testmap::{BLUE, GREEN, RED};
+use crate::testmap::{BLUE, GREEN, RED, TestBrush, TestMap};
+
+mod overlay;
 
 fn map() -> Bsp {
     Bsp::parse("test.bsp".into(), Arc::from(testmap::bytes())).unwrap()
@@ -121,4 +123,102 @@ fn faces_look_along_their_plane() {
     assert_eq!(bsp.faces[1].side, 1);
     let mesh = mesh::build(&bsp, mesh::Options::default());
     assert!(mesh.vertices[4..8].iter().all(|v| v.normal == [0.0, 1.0, 0.0]), "{:?}", mesh.vertices[4].normal);
+}
+
+#[test]
+fn the_light_for_what_moves() {
+    use crate::testmap::{TestBrush, TestLight, TestMap};
+    // a cube 1 from +z, a quarter from the rest; a lamp and the sun
+    let quarter = [64, 64, 64, (-1i8) as u8];
+    let lit = TestMap {
+        models: vec![vec![TestBrush::cuboid([-512.0, -512.0, -16.0], [512.0, 512.0, 0.0])]],
+        ambient: Some([quarter, quarter, quarter, quarter, [255, 255, 255, 0], quarter]),
+        lights: vec![
+            TestLight { kind: 1, origin: [0.0, 0.0, 100.0], intensity: [1000.0, 500.0, 0.0], normal: [0.0; 3] },
+            TestLight { kind: 3, origin: [0.0; 3], intensity: [2.0; 3], normal: [0.0, 0.0, -1.0] },
+        ],
+        ..TestMap::default()
+    };
+    let bsp = Bsp::parse("light.bsp".into(), Arc::from(lit.bytes())).unwrap();
+    let lights = bsp.world_lights();
+    assert_eq!(lights.len(), 2);
+    assert_eq!(
+        (lights[0].kind, lights[0].origin, lights[0].intensity, lights[0].quadratic),
+        (LightKind::Point, [0.0, 0.0, 100.0], [1000.0, 500.0, 0.0], 1.0)
+    );
+    assert_eq!((lights[1].kind, lights[1].normal), (LightKind::Sky, [0.0, 0.0, -1.0]));
+    let samples = bsp.ambient_samples().unwrap();
+    assert_eq!(samples.len(), bsp.leaves.len());
+    let sample = samples.iter().flatten().next().expect("a sample");
+    assert_eq!(sample.cube[4], [1.0; 3]);
+    assert!((sample.cube[0][0] - 64.0 / 255.0 / 2.0).abs() < 1e-6);
+    // in the middle of its leaf
+    let leaf = bsp.leaves.iter().zip(&samples).find(|(_, s)| !s.is_empty()).unwrap().0;
+    assert!((0..3).all(|i| sample.position[i] >= f32::from(leaf.mins[i]) && sample.position[i] <= f32::from(leaf.maxs[i])));
+    // a map without them has none
+    assert!(map().world_lights().is_empty());
+}
+
+#[test]
+fn hdr_ambient_light_that_holds_nothing_gives_way_to_ldr() {
+    let room = || vec![TestBrush::cuboid([-64.0, -64.0, -16.0], [64.0, 64.0, 0.0])];
+    let ldr = [[128, 128, 128, 0]; 6];
+    // as gm_construct's: one dark cube everywhere
+    let dark = TestMap { models: vec![room()], ambient: Some(ldr), ambient_hdr: Some([[1, 1, 1, 248]; 6]), ..TestMap::default() };
+    let bsp = Bsp::parse("dark.bsp".into(), Arc::from(dark.bytes())).unwrap();
+    assert_eq!(bsp.ambient_samples().unwrap().iter().flatten().next().unwrap().cube[4], [128.0 / 255.0; 3]);
+    // real HDR light is taken first
+    let bright = TestMap { models: vec![room()], ambient: Some(ldr), ambient_hdr: Some([[255, 255, 255, 0]; 6]), ..TestMap::default() };
+    let bsp = Bsp::parse("bright.bsp".into(), Arc::from(bright.bytes())).unwrap();
+    assert_eq!(bsp.ambient_samples().unwrap().iter().flatten().next().unwrap().cube[4], [1.0; 3]);
+}
+
+#[test]
+fn brush_entities_that_move() {
+    let entity = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| format!("\"{k}\" \"{v}\"\n")).collect::<String>();
+    let entities = [
+        entity(&[("classname", "func_door"), ("model", "*1")]),
+        entity(&[("classname", "func_brush"), ("model", "*2"), ("targetname", "wall"), ("StartDisabled", "1")]),
+        entity(&[("classname", "func_illusionary"), ("model", "*3"), ("targetname", "fake")]),
+        entity(&[("classname", "func_wall"), ("model", "*4")]),
+    ]
+    .map(|e| format!("{{\n{e}}}\n"))
+    .concat();
+    let block = |x: f32| vec![TestBrush::cuboid([x, -32.0, 0.0], [x + 8.0, 32.0, 64.0])];
+    let models = vec![
+        vec![TestBrush::cuboid([-512.0, -512.0, -32.0], [1024.0, 512.0, 0.0])],
+        block(100.0),
+        block(200.0),
+        block(300.0),
+        block(400.0),
+    ];
+    let bsp = Bsp::parse("t.bsp".into(), Arc::from(TestMap { models, entities, ..TestMap::default() }.bytes())).unwrap();
+    // the movers, and the named brushes that inputs may move or turn off; not a plain wall
+    let moves: Vec<bool> = bsp.entities.iter().map(|e| e.moves()).collect();
+    assert_eq!(moves, [false, true, true, true, false]);
+    let mut c = Collision::new(&bsp);
+    let ray = |c: &Collision| c.trace_line([0.0, 0.0, 32.0], [1000.0, 0.0, 32.0], collision::mask::ALL).end[0].round();
+    assert_eq!(ray(&c), 100.0, "the door where the map puts it");
+    // the door lifted out of the way: the wall turned off at the start lets the ray by too
+    assert!(c.place_model(1, Some(([0.0, 0.0, 200.0], [0.0; 3]))));
+    assert_eq!(ray(&c), 400.0);
+    assert!(c.place_model(2, Some(([0.0; 3], [0.0; 3]))));
+    assert_eq!(ray(&c), 200.0, "turned on");
+    assert!(c.place_model(2, None));
+    // what is never solid stays so; a brush that does not move cannot be moved
+    assert!(!c.place_model(3, Some(([0.0; 3], [0.0; 3]))));
+    assert!(!c.place_model(4, None));
+    assert!(c.place_model(1, Some(([0.0; 3], [0.0; 3]))));
+    assert_eq!(ray(&c), 100.0, "back down");
+    // the world's solid shapes leave what moves to bodies of its own
+    assert_eq!(c.solid_shapes(collision::mask::ALL).hulls.len(), 2);
+    let door = c.model_hulls(1, collision::mask::ALL);
+    assert_eq!((door.len(), door[0].len()), (1, 8));
+}
+
+#[test]
+fn breakables_may_go_without_a_name() {
+    let entity = |class: &str| Entity { pairs: vec![("classname".into(), class.into()), ("model".into(), "*2".into())] };
+    assert!(entity("func_breakable").moves() && entity("func_breakable_surf").moves());
+    assert!(!entity("func_wall").moves());
 }

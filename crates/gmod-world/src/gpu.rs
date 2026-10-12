@@ -3,7 +3,8 @@
 //!
 //! * All pieces go into one vertex and one index buffer; a [`Draw`] is a surface's range.
 //! * Textures stay block-compressed when the GPU takes BC formats: DXT1, DXT3 and DXT5 are
-//!   BC1, BC2 and BC3. Everything else becomes 8-bit RGBA.
+//!   BC1, BC2 and BC3. Everything else becomes 8-bit RGBA. The frames of an animated texture
+//!   go along, to be layers of one texture; a surface's parameters say which one shows.
 //! * Light maps become half floats (RGBA, 8 bytes a texel): light can be brighter than 1.
 //! * The camera looks the way Source counts angles and projects with depth reversed: 1 at
 //!   the near plane, 0 at infinity, which keeps float depth precise far away.
@@ -13,11 +14,37 @@ use gmod_material::decode::to_half;
 use gmod_material::vtf::flags;
 use gmod_material::{Format, Vtf};
 
-use crate::{SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
+use crate::sky::Fog;
+use crate::{Look, Piece, SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
 
 /// Bytes of one vertex: position (3 `f32`), normal (3), texture coordinates (2), light map
 /// coordinates (2), blend alpha (1) and vertex light (3).
 pub const VERTEX_SIZE: usize = 56;
+
+/// Bytes of the bones of one vertex of a model: three bone numbers and a byte of nothing, then
+/// their three weights (`f32`).
+pub const SKIN_SIZE: usize = 16;
+
+/// The bones of every vertex, in the order of [`geometry`]'s vertices; vertices of pieces
+/// that do not move have their first bone's whole weight.
+pub fn skin(pieces: &[Piece]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for piece in pieces {
+        for i in 0..piece.vertices.len() {
+            let w = piece.skin.get(i).copied().unwrap_or(crate::Weights { bones: [0; 3], weights: [1.0, 0.0, 0.0] });
+            out.extend([w.bones[0], w.bones[1], w.bones[2], 0]);
+            out.extend(w.weights.iter().flat_map(|x| x.to_le_bytes()));
+        }
+    }
+    out
+}
+
+/// How many bones a world's vertices need: one past the highest they name; 0 for one that
+/// does not move.
+pub fn bone_count(pieces: &[Piece]) -> usize {
+    let named = pieces.iter().flat_map(|p| &p.skin).flat_map(|w| (0..3).filter(|&i| w.weights[i] > 0.0).map(|i| w.bones[i]));
+    named.max().map_or(0, |b| usize::from(b) + 1)
+}
 
 /// One draw call: a surface of a piece.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,6 +56,8 @@ pub struct Draw {
     pub index_count: u32,
     /// The middle of the surface, to sort translucent ones by distance.
     pub center: Vec3,
+    /// An overlay ([`crate::Surface::overlay`]): drawn in order, not by distance.
+    pub overlay: bool,
 }
 
 /// Every piece in one vertex buffer and one index buffer (`u32`).
@@ -40,10 +69,10 @@ pub struct Geometry {
 }
 
 /// Lays out the world's triangles.
-pub fn geometry(world: &World) -> Geometry {
+pub fn geometry(pieces: &[Piece]) -> Geometry {
     let mut out = Geometry::default();
     let (mut vertex_count, mut index_count) = (0u32, 0u32);
-    for (p, piece) in world.pieces.iter().enumerate() {
+    for (p, piece) in pieces.iter().enumerate() {
         for v in &piece.vertices {
             let values = [
                 v.position[0],
@@ -73,6 +102,7 @@ pub fn geometry(world: &World) -> Geometry {
                 first_index: index_count + surface.first as u32,
                 index_count: surface.count as u32,
                 center: scale(sum, 1.0 / indices.len().max(1) as f32),
+                overlay: surface.overlay,
             });
         }
         vertex_count += piece.vertices.len() as u32;
@@ -114,14 +144,19 @@ pub struct TextureData {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
+    /// The frames of an animated texture; 1 for any other.
+    pub frames: u32,
     /// Mipmap levels, the largest first; each as wide and high as `width >> level` (at least
-    /// 1), compressed levels in whole blocks.
+    /// 1), compressed levels in whole blocks; each level's frames one after another.
     pub levels: Vec<Vec<u8>>,
     pub clamp_s: bool,
     pub clamp_t: bool,
 }
 
-/// A texture's pixels from its largest level no bigger than `max_size` down. DXT stays
+/// The most frames of an animated texture uploaded: the layers a GPU surely has.
+pub const MAX_FRAMES: u32 = 256;
+
+/// A texture's pixels from its largest level no bigger than `max_size` down, every frame. DXT stays
 /// compressed when `compressed` (the GPU takes BC) and the size is whole blocks; anything else
 /// is decoded. `None` when the pixels cannot be decoded.
 pub fn texture_data(vtf: &Vtf, compressed: bool, max_size: u32) -> Option<TextureData> {
@@ -136,16 +171,21 @@ pub fn texture_data(vtf: &Vtf, compressed: bool, max_size: u32) -> Option<Textur
         Format::Rgba8888 => Some(PixelFormat::Rgba8),
         _ => None,
     };
+    let frames = vtf.frames.clamp(1, MAX_FRAMES);
     let levels: Option<Vec<Vec<u8>>> = (first..vtf.mipmaps)
-        .map(|level| match kept {
-            Some(_) => vtf.image(level, 0, 0, 0).map(<[u8]>::to_vec),
-            None => vtf.rgba8(level, 0, 0, 0).map(|image| image.rgba),
+        .map(|level| {
+            let frame = |frame: u32| match kept {
+                Some(_) => vtf.image(level, frame, 0, 0).map(<[u8]>::to_vec),
+                None => vtf.rgba8(level, frame, 0, 0).map(|image| image.rgba),
+            };
+            (0..frames).map(frame).collect::<Option<Vec<Vec<u8>>>>().map(|frames| frames.concat())
         })
         .collect();
     Some(TextureData {
         width,
         height,
         format: kept.unwrap_or(PixelFormat::Rgba8),
+        frames,
         levels: levels?,
         clamp_s: vtf.flags & flags::CLAMP_S != 0,
         clamp_t: vtf.flags & flags::CLAMP_T != 0,
@@ -167,7 +207,7 @@ pub fn missing_texture() -> TextureData {
                 .collect()
         })
         .collect();
-    TextureData { width: 64, height: 64, format: PixelFormat::Rgba8, levels, clamp_s: false, clamp_t: false }
+    TextureData { width: 64, height: 64, format: PixelFormat::Rgba8, frames: 1, levels, clamp_s: false, clamp_t: false }
 }
 
 /// A light map as RGBA half floats.
@@ -180,22 +220,34 @@ pub const LIGHT_NONE: f32 = 0.0;
 pub const LIGHT_MAP: f32 = 1.0;
 pub const LIGHT_VERTEX: f32 = 2.0;
 
-/// The 12 floats a shader gets for a surface: tint and alpha; water colour and whether it is
-/// water; alpha test reference (0 for none), how it is lit, whether the second texture blends
-/// in, and 0.
-pub fn surface_params(surface: &Surface, has_lightmap: bool) -> [f32; 12] {
+/// How fog covers a surface: towards the fog's colour; towards nothing, for what adds its
+/// light; not at all (`$nofog`).
+pub const FOG_COLOR: f32 = 0.0;
+pub const FOG_DARK: f32 = 1.0;
+pub const FOG_NONE: f32 = 2.0;
+
+/// How many floats a shader gets for a surface.
+pub const SURFACE_PARAMS: usize = 20;
+
+/// The floats a shader gets for a surface as it `look`s at the moment: tint and alpha; water
+/// colour and whether it is water; alpha test reference (0 for none), how it is lit, whether
+/// the second texture blends in, and how fog covers it; the two rows of the base texture's
+/// transform with the layer of the frame that shows (`frame`, wrapped to the texture's
+/// `frames`) and whether it modulates.
+pub fn surface_params(surface: &Surface, look: &Look, frames: u32, has_lightmap: bool) -> [f32; SURFACE_PARAMS] {
     let light = match () {
         _ if !surface.lit => LIGHT_NONE,
         _ if has_lightmap => LIGHT_MAP,
         _ => LIGHT_VERTEX,
     };
-    let [r, g, b] = surface.tint;
+    let [r, g, b] = look.tint;
     let water = surface.water.unwrap_or([0.0; 3]);
+    let [u, v] = look.transform;
     [
         r,
         g,
         b,
-        surface.alpha,
+        look.alpha,
         water[0],
         water[1],
         water[2],
@@ -203,8 +255,32 @@ pub fn surface_params(surface: &Surface, has_lightmap: bool) -> [f32; 12] {
         surface.alpha_test.unwrap_or(0.0),
         light,
         if surface.base2.is_some() { 1.0 } else { 0.0 },
-        0.0,
+        match () {
+            _ if surface.no_fog => FOG_NONE,
+            _ if surface.additive => FOG_DARK,
+            _ => FOG_COLOR,
+        },
+        u[0],
+        u[1],
+        u[2],
+        (look.frame % frames.max(1)) as f32,
+        v[0],
+        v[1],
+        v[2],
+        if surface.modulate { 1.0 } else { 0.0 },
     ]
+}
+
+/// The 8 floats a shader gets for fog: its colour and how thick it gets at most; where it
+/// starts, one over how far it thickens, and 1 when there is fog (all 0 when there is none).
+pub fn fog_params(fog: Option<&Fog>) -> [f32; 8] {
+    match fog {
+        Some(fog) => {
+            let [r, g, b] = fog.color;
+            [r, g, b, fog.max_density, fog.start, fog.inverse_range(), 1.0, 0.0]
+        }
+        None => [0.0; 8],
+    }
 }
 
 /// The camera, with angles as Source counts them: yaw 0 looks along +x and 90 along +y,
@@ -265,15 +341,21 @@ impl Camera {
 
     /// The matrix from the world to clip space, column by column as WGSL reads it.
     pub fn view_projection(&self, aspect: f32) -> [f32; 16] {
-        self.matrix(aspect, self.eye)
+        self.matrix(aspect, self.eye, NEAR)
+    }
+
+    /// The same, cutting off only what is nearer than `near`: for what is held close to the
+    /// eyes.
+    pub fn view_projection_near(&self, aspect: f32, near: f32) -> [f32; 16] {
+        self.matrix(aspect, self.eye, near)
     }
 
     /// The same as seen from the world's origin: for the sky box, which goes along with the eye.
     pub fn sky_projection(&self, aspect: f32) -> [f32; 16] {
-        self.matrix(aspect, [0.0; 3])
+        self.matrix(aspect, [0.0; 3], NEAR)
     }
 
-    fn matrix(&self, aspect: f32, eye: Vec3) -> [f32; 16] {
+    fn matrix(&self, aspect: f32, eye: Vec3, near: f32) -> [f32; 16] {
         let forward = self.forward();
         let right = self.right();
         let up = normalize(crate::cross(right, forward));
@@ -284,7 +366,7 @@ impl Camera {
         let rows = [
             [fx * right[0], fx * right[1], fx * right[2], -fx * dot(right, eye)],
             [fy * up[0], fy * up[1], fy * up[2], -fy * dot(up, eye)],
-            [0.0, 0.0, 0.0, NEAR],
+            [0.0, 0.0, 0.0, near],
             [forward[0], forward[1], forward[2], -dot(forward, eye)],
         ];
         std::array::from_fn(|i| rows[i % 4][i / 4])
@@ -329,7 +411,7 @@ pub fn sky_quads(world: &World) -> Vec<SkyQuad> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Piece, SkyFace, Transform, Vertex, sky_face};
+    use crate::{SkyFace, Transform, Vertex, sky_face};
 
     fn surface(first: usize, count: usize) -> Surface {
         Surface { base: Some(0), missing: false, ..Surface::plain("m", first, count) }
@@ -342,11 +424,19 @@ mod tests {
                 .map(|&[x, y]| Vertex { position: [x, y, z], light: [0.5; 3], ..Vertex::default() })
                 .collect()
         };
-        let piece = |z: f32| Piece { vertices: quad(z), indices: vec![0, 1, 2, 0, 2, 3], lightmap: None, surfaces: vec![surface(0, 6)] };
+        let piece = |z: f32| Piece {
+            vertices: quad(z),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            lightmap: None,
+            surfaces: vec![surface(0, 6)],
+            skin: Vec::new(),
+        };
         World {
             pieces: vec![piece(0.0), piece(5.0)],
             textures: Vec::new(),
             sky: [None, None, None, None, Some(SkyFace { texture: 3, transform: None }), None],
+            skybox: None,
+            fog: None,
             missing_materials: Vec::new(),
             missing_textures: Vec::new(),
             missing_models: Vec::new(),
@@ -354,8 +444,21 @@ mod tests {
     }
 
     #[test]
+    fn the_bones_of_the_vertices() {
+        let mut world = world();
+        // the world does not move: every vertex its first bone's, and no bones needed
+        assert_eq!(skin(&world.pieces).len(), 8 * SKIN_SIZE);
+        assert_eq!(bone_count(&world.pieces), 0);
+        world.pieces[1].skin = vec![crate::Weights { bones: [2, 7, 0], weights: [0.5, 0.5, 0.0] }; 4];
+        let bytes = skin(&world.pieces);
+        assert_eq!(&bytes[..8], [0, 0, 0, 0, 0, 0, 0x80, 0x3f], "the first piece: bone 0, weight 1");
+        assert_eq!(&bytes[4 * SKIN_SIZE..4 * SKIN_SIZE + 8], [2, 7, 0, 0, 0, 0, 0, 0x3f]);
+        assert_eq!(bone_count(&world.pieces), 8);
+    }
+
+    #[test]
     fn one_buffer_for_all_pieces() {
-        let g = geometry(&world());
+        let g = geometry(&world().pieces);
         assert_eq!(g.vertices.len(), 8 * VERTEX_SIZE);
         let indices: Vec<u32> = g.indices.chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         assert_eq!(indices, [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
@@ -371,13 +474,26 @@ mod tests {
     #[test]
     fn surface_params_for_the_shader() {
         let mut s = surface(0, 3);
-        assert_eq!(surface_params(&s, true)[9], LIGHT_MAP);
-        assert_eq!(surface_params(&s, false)[9], LIGHT_VERTEX);
+        let params = |s: &Surface, lightmap: bool| surface_params(s, &s.look(0.0), 1, lightmap);
+        assert_eq!(params(&s, true)[9], LIGHT_MAP);
+        assert_eq!(params(&s, false)[9], LIGHT_VERTEX);
         s.lit = false;
         s.water = Some([0.1, 0.2, 0.3]);
         s.alpha_test = Some(0.4);
-        let p = surface_params(&s, true);
-        assert_eq!((p[4], p[7], p[8], p[9]), (0.1, 1.0, 0.4, LIGHT_NONE));
+        let p = params(&s, true);
+        assert_eq!((p[4], p[7], p[8], p[9], p[11]), (0.1, 1.0, 0.4, LIGHT_NONE, FOG_COLOR));
+        s.additive = true;
+        assert_eq!(params(&s, true)[11], FOG_DARK);
+        s.no_fog = true;
+        assert_eq!(params(&s, true)[11], FOG_NONE);
+        // no transform: the identity, frame 0, not modulating
+        assert_eq!(params(&s, true)[12..], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // the look of the moment: its tint, alpha, transform and frame, wrapped to the frames
+        let look = Look { frame: 7, transform: [[2.0, 0.0, 0.5], [0.0, 2.0, 0.25]], tint: [0.5; 3], alpha: 0.5 };
+        s.modulate = true;
+        let p = surface_params(&s, &look, 4, true);
+        assert_eq!((p[0], p[3]), (0.5, 0.5));
+        assert_eq!(p[12..], [2.0, 0.0, 0.5, 3.0, 0.0, 2.0, 0.25, 1.0]);
     }
 
     fn transform(m: &[f32; 16], p: Vec3) -> [f32; 4] {

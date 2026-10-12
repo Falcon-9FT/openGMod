@@ -16,7 +16,8 @@
 //! and `PostPlayerDeath`, then the weapons go - the active one dropped when it should be.
 //! Leaving ([`Runtime::leave`](crate::Runtime::leave)) runs `PlayerDisconnected`.
 //!
-//! The server has one slot ([`MAX_PLAYERS`]): openGMOD is a single-player game until stage 6.
+//! The server has as many slots as the program gives it ([`Runtime::set_max_players`](crate::Runtime::set_max_players)), one
+//! by default: a single-player game.
 //! Not yet: fall damage, using things (`+use`), vehicles, animations, the client's side of
 //! anything (`SendLua` goes to a client that is not there).
 //!
@@ -26,7 +27,7 @@
 //! sets them in their console (`gmod_toolmode weld`), as with a client's own ConVars, and
 //! `ply:ConCommand` runs a line as typed by the player.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use gmod_bsp::mask;
@@ -41,8 +42,19 @@ use crate::trace::{self, Filter, Sweep};
 use crate::vector::{Angle, Vector};
 use crate::{convar, host, weapon};
 
-/// Player slots: entity indices 1 to this.
-pub const MAX_PLAYERS: u32 = 1;
+/// The most player slots a server may have.
+pub const MAX_PLAYERS: u32 = 128;
+
+/// Player slots: entity indices 1 to this (`game.MaxPlayers`).
+pub(crate) fn max_players(lua: &Lua) -> u32 {
+    host(lua).game.max_players.get().clamp(1, MAX_PLAYERS)
+}
+
+/// Whether a player is the one at the server's own screen: the first, unless the server is
+/// dedicated.
+pub(crate) fn is_host(lua: &Lua, player: EntityHandle) -> bool {
+    player.index == Some(1) && !host(lua).game.dedicated.get()
+}
 
 /// The Steam ID 64 of `STEAM_0:0:0`.
 const STEAM_ID64_BASE: u64 = 76561197960265728;
@@ -53,6 +65,8 @@ const BOT_STEAM_ID64: u64 = 90071996842377216;
 pub mod fl {
     pub const ONGROUND: i64 = 1;
     pub const DUCKING: i64 = 2;
+    /// Ducked, for the animation of the player's model.
+    pub const ANIMDUCKING: i64 = 4;
     pub const FROZEN: i64 = 64;
     pub const CLIENT: i64 = 256;
     pub const FAKECLIENT: i64 = 512;
@@ -88,6 +102,8 @@ const EF_BONEMERGE: i64 = 1;
 const EF_DIMLIGHT: i64 = 4;
 const EF_NODRAW: i64 = 32;
 const DEFAULT_FOV: f32 = 75.0;
+/// `PrintMessage` into the chat.
+const HUD_PRINTTALK: i64 = 3;
 /// The impulse that toggles the flashlight.
 pub const IMPULSE_FLASHLIGHT: u8 = 100;
 
@@ -116,10 +132,35 @@ pub(crate) struct Players {
     pub last_user_id: Cell<i64>,
     /// Bots that have joined, which number their `SteamID64`.
     pub bots: Cell<u64>,
+    /// What the server asks of the players' clients, oldest first.
+    pub outbox: RefCell<Vec<(EntityHandle, ToClient)>>,
+}
+
+/// What the server asks of a player's client beside the entities, the chat and `net`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ToClient {
+    /// `SendLua`, `BroadcastLua`: Lua for it to run.
+    Lua(String),
+    /// `ConCommand`: a line for its console, which sends the server what it does not know.
+    Command(String),
+    /// `PrintMessage` to the console: a line for it.
+    Print(String),
+}
+
+/// Asks a player's client something. A bot has none: the server runs its console lines
+/// itself, and the rest goes nowhere.
+pub(crate) fn to_client(lua: &Lua, player: EntityHandle, what: ToClient) {
+    if state(lua, player, |_, p| p.info.bot).unwrap_or(true) {
+        if let ToClient::Command(line) = what {
+            console(lua, player, &line);
+        }
+        return;
+    }
+    host(lua).players.outbox.borrow_mut().push((player, what));
 }
 
 /// Who joins: what a client tells the server about itself.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlayerInfo {
     pub name: String,
     /// The player's Steam ID, when Steam vouches for them; bots have none.
@@ -133,7 +174,7 @@ pub struct PlayerInfo {
 }
 
 /// What the engine keeps for a player, beside what every entity has.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlayerState {
     pub info: PlayerInfo,
     pub user_id: i64,
@@ -148,6 +189,12 @@ pub struct PlayerState {
     pub max_armor: i64,
     /// Where the player looks; the entity faces the same way, upright.
     pub eye_angles: Angle,
+    /// How many times the game turned the player itself (a spawn, `SetEyeAngles`): a client
+    /// takes the angles the server has then, and otherwise looks where its mouse says.
+    pub turned: u32,
+    /// What the physics gun holds, as a snapshot carries it to a client, which has no guns
+    /// of its own ([`crate::physgun`]).
+    pub physgun: EntityHandle,
     /// Movement between ticks: ducking, the eyes, water, ladder. Its origin and velocity are
     /// the entity's.
     pub moving: gmod_movement::Player,
@@ -200,6 +247,13 @@ pub struct PlayerState {
     pub driving_mode: i64,
     pub hovered_widget: EntityHandle,
     pub pressed_widget: EntityHandle,
+    /// What the use key works while it is held (a scripted entity used continuously or on and
+    /// off).
+    pub using: EntityHandle,
+    /// What the player stands on (`GetGroundEntity`): the world, an entity, or nothing in the
+    /// air; and where that entity was, to carry the player along when it moves.
+    pub ground: EntityHandle,
+    pub ground_at: Option<(Vector, Angle)>,
     pub suit: bool,
     pub suit_power: f32,
     pub view_punch: Angle,
@@ -216,6 +270,9 @@ pub struct PlayerState {
     pub draw_view_model: bool,
     pub draw_world_model: bool,
     pub dsp: i64,
+    /// Milliseconds to the next footstep, and whether it is the right foot's.
+    pub step_time: f32,
+    pub step_right: bool,
 }
 
 impl PlayerState {
@@ -234,6 +291,8 @@ impl PlayerState {
             armor: 0,
             max_armor: 100,
             eye_angles: Angle::default(),
+            turned: 0,
+            physgun: EntityHandle::NULL,
             moving: gmod_movement::Player {
                 origin: [0.0; 3],
                 velocity: [0.0; 3],
@@ -289,6 +348,9 @@ impl PlayerState {
             driving_mode: 0,
             hovered_widget: EntityHandle::NULL,
             pressed_widget: EntityHandle::NULL,
+            using: EntityHandle::NULL,
+            ground: EntityHandle::NULL,
+            ground_at: None,
             suit: true,
             suit_power: 100.0,
             view_punch: Angle::default(),
@@ -303,6 +365,8 @@ impl PlayerState {
             draw_view_model: true,
             draw_world_model: true,
             dsp: 0,
+            step_time: 0.0,
+            step_right: false,
         }
     }
 
@@ -324,8 +388,8 @@ impl PlayerState {
     }
 
     /// `UniqueID`: 1 in a single-player game, else the CRC of `gm_<SteamID>_gm`.
-    fn unique_id(&self) -> u32 {
-        if MAX_PLAYERS == 1 { 1 } else { crc32(format!("gm_{}_gm", self.steam_id()).as_bytes()) }
+    fn unique_id(&self, single_player: bool) -> u32 {
+        if single_player { 1 } else { crc32(format!("gm_{}_gm", self.steam_id()).as_bytes()) }
     }
 
     fn user_info(&self, name: &str) -> Option<String> {
@@ -404,16 +468,24 @@ fn truthy(values: &MultiValue) -> bool {
 /// Every player there is, in index order.
 pub(crate) fn all(lua: &Lua) -> Vec<EntityHandle> {
     let entities = &host(lua).entities;
-    (1..=MAX_PLAYERS)
+    (1..=max_players(lua))
         .filter_map(|i| entities.at(i))
         .filter(|&h| entities.get(h).is_some_and(|ent| ent.player.is_some() && !ent.removed))
         .collect()
 }
 
 /// The world as a player's movement sees it: the map, and the solid entities but the player.
+/// What the movement ran into is kept: the entity, and the normal of where it was hit.
 struct Space<'a> {
     lua: &'a Lua,
     player: EntityHandle,
+    touched: RefCell<Vec<(EntityHandle, Vector)>>,
+}
+
+impl<'a> Space<'a> {
+    fn new(lua: &'a Lua, player: EntityHandle) -> Space<'a> {
+        Space { lua, player, touched: RefCell::new(Vec::new()) }
+    }
 }
 
 impl Collide for Space<'_> {
@@ -424,12 +496,16 @@ impl Collide for Space<'_> {
             mins: vector(mins),
             maxs: vector(maxs),
             mask,
-            filter: Filter::Entities(vec![self.player]),
+            // what the player carries they walk through
+            filter: Filter::Entities(vec![self.player, crate::pickup::carrying(self.lua, self.player).unwrap_or(EntityHandle::NULL)]),
             whitelist: false,
             ignore_world: false,
             group: trace::group::PLAYER_MOVEMENT,
         };
         let hit = trace::trace(self.lua, &sweep);
+        if hit.fraction < 1.0 && hit.entity.index.is_some_and(|i| i != 0) {
+            self.touched.borrow_mut().push((hit.entity, hit.normal));
+        }
         gmod_bsp::Trace {
             fraction: hit.fraction,
             end: array(hit.end),
@@ -504,7 +580,7 @@ pub(crate) fn water_level(lua: &Lua, handle: EntityHandle) -> Option<u8> {
 /// A player joins: `PlayerConnect`, the entity, `PlayerAuthed`, `PlayerInitialSpawn` and the
 /// first spawn. None when every slot is taken.
 pub(crate) fn join(lua: &Lua, info: PlayerInfo) -> Option<EntityHandle> {
-    let index = (1..=MAX_PLAYERS).find(|&i| host(lua).entities.at(i).is_none())?;
+    let index = (1..=max_players(lua)).find(|&i| host(lua).entities.at(i).is_none())?;
     let address =
         if info.address.is_empty() { if info.bot { "BOT".to_string() } else { "loopback".to_string() } } else { info.address.clone() };
     let info = PlayerInfo { address, ..info };
@@ -512,6 +588,7 @@ pub(crate) fn join(lua: &Lua, info: PlayerInfo) -> Option<EntityHandle> {
     if let (Ok(n), Ok(a)) = (lua.create_string(&name), lua.create_string(&info.address)) {
         hook(lua, "PlayerConnect", [Value::String(n), Value::String(a)]);
     }
+    crate::chat::join_leave(lua, EntityHandle::NULL, &name, &format!("Player {name} has joined the game"));
     let handle = {
         let host = host(lua);
         let now = host.clock.cur_time.get();
@@ -532,7 +609,8 @@ pub(crate) fn join(lua: &Lua, info: PlayerInfo) -> Option<EntityHandle> {
     };
     crate::ents::announce(lua, handle);
     let ply = ent_value(lua, handle);
-    let (bot, steam_id, unique_id) = state(lua, handle, |_, p| (p.info.bot, p.steam_id(), p.unique_id().to_string()))?;
+    let single = max_players(lua) == 1;
+    let (bot, steam_id, unique_id) = state(lua, handle, |_, p| (p.info.bot, p.steam_id(), p.unique_id(single).to_string()))?;
     if !bot && let (Ok(s), Ok(u)) = (lua.create_string(&steam_id), lua.create_string(&unique_id)) {
         hook(lua, "PlayerAuthed", [ply.clone(), Value::String(s), Value::String(u)]);
     }
@@ -563,7 +641,7 @@ fn make_view_models(lua: &Lua, handle: EntityHandle) {
 /// Puts a player at a point, a little higher when there is no room there.
 fn place(lua: &Lua, handle: EntityHandle, pos: Vector) {
     let Some(settings) = state(lua, handle, |_, p| settings(lua, p, p.walk_speed)) else { return };
-    let space = Space { lua, player: handle };
+    let space = Space::new(lua, handle);
     let origin = gmod_movement::Player::spawn(&space, &settings, array(pos)).map_or(pos, |p| vector(p.origin));
     entity::set_world_pos(lua, handle, origin);
 }
@@ -609,6 +687,7 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         with_player(lua, handle, |_, p| {
             p.eye_angles = eye;
             p.input.view_angles = eye;
+            p.turned = p.turned.wrapping_add(1);
         });
     }
     hook(lua, "PlayerSpawn", [ply, Value::Boolean(false)]);
@@ -706,6 +785,8 @@ pub(crate) fn leave(lua: &Lua, handle: EntityHandle) {
         return;
     }
     hook(lua, "PlayerDisconnected", [ent_value(lua, handle)]);
+    let name = state(lua, handle, |_, p| p.info.name.clone()).unwrap_or_default();
+    crate::chat::join_leave(lua, handle, &name, &format!("Player {name} left the game (Disconnect by user.)"));
     strip_weapons(lua, handle);
     let view_models = state(lua, handle, |_, p| p.view_models).unwrap_or([EntityHandle::NULL; 3]);
     for vm in view_models {
@@ -809,18 +890,37 @@ fn tick(lua: &Lua, handle: EntityHandle) {
         }
     }
     let keep = truthy(&hook(lua, "FinishMove", [Value::UserData(ply.clone()), Value::UserData(mv_ud.clone())]));
+    let grounded = host(lua).entities.get(handle).is_some_and(|ent| ent.flags & fl::ONGROUND != 0);
     if !keep {
         let mv = mv_ud.borrow::<MoveData>().map(|m| *m).unwrap_or(mv);
         finish_move(lua, handle, &mv);
     }
+    // a jump off the ground is the jump of the player's model
+    let jumped = host(lua).entities.get(handle).is_some_and(|ent| ent.flags & fl::ONGROUND == 0 && ent.velocity.z > 0.0);
+    if grounded && jumped && cmd.cmd.buttons & key::JUMP != 0 {
+        crate::anim::animation_event(lua, handle, crate::anim::EVENT_JUMP, 0);
+    }
+    crate::anim::animate_player(lua, handle);
+    footsteps(lua, handle, &ply);
     hook(lua, "PlayerTick", [Value::UserData(ply.clone()), Value::UserData(mv_ud)]);
 
     // the weapon in hand
     let active = state(lua, handle, |_, p| p.active_weapon).unwrap_or(EntityHandle::NULL);
+    let (mut buttons, mut pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
+    // carrying something, the attack key throws it and the weapon is still
+    if crate::pickup::carrying(lua, handle).is_some() {
+        if pressed & IN_ATTACK != 0 {
+            crate::pickup::drop(lua, handle, true);
+        }
+        buttons &= !(IN_ATTACK | IN_ATTACK2);
+        pressed &= !(IN_ATTACK | IN_ATTACK2);
+    }
     if host(lua).entities.is_valid(active) {
-        let (buttons, pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
         weapon::post_frame(lua, active, buttons, pressed);
-        crate::physgun::command(lua, handle, active, &cmd.cmd, pressed);
+        crate::physgun::command(lua, handle, active, &UserCmd { buttons, ..cmd.cmd }, pressed);
+    }
+    if host(lua).entities.is_valid(handle) && self::alive(lua, handle) {
+        use_key(lua, handle, buttons, pressed);
     }
     if host(lua).entities.is_valid(handle) {
         hook(lua, "PlayerPostThink", [Value::UserData(ply)]);
@@ -871,18 +971,160 @@ fn engine_move(lua: &Lua, handle: EntityHandle, mv: &mut MoveData) {
         return;
     };
     let seconds = crate::timer::TICK_INTERVAL as f32 * lag;
+    if move_type == MOVETYPE_WALK {
+        mv.origin = carried(lua, handle, mv.origin, &moving, &settings);
+    }
     moving.origin = array(mv.origin);
     moving.velocity = array(mv.velocity);
     let command =
         Command { angles: [mv.angles.p, mv.angles.y, mv.angles.r], forward_move: mv.forward, side_move: mv.side, buttons: mv.buttons };
+    let space = Space::new(lua, handle);
     match move_type {
-        MOVETYPE_WALK => moving.tick(&Space { lua, player: handle }, &settings, &command, seconds),
+        MOVETYPE_WALK => moving.tick(&space, &settings, &command, seconds),
         MOVETYPE_NOCLIP | MOVETYPE_OBSERVER => moving.noclip(&settings, &command, seconds),
         _ => return,
     }
     mv.origin = vector(moving.origin);
     mv.velocity = vector(moving.velocity);
     with_player(lua, handle, |_, p| p.moving = moving);
+    if move_type == MOVETYPE_WALK {
+        push_props(lua, mv, &space.touched.borrow());
+        find_ground(lua, handle, &moving, &settings);
+    } else {
+        with_player(lua, handle, |_, p| (p.ground, p.ground_at) = (EntityHandle::NULL, None));
+    }
+}
+
+/// A client moves its own player on from where the server last said it was, as the server
+/// will once the commands it has not answered yet arrive: each for as long as it was the
+/// player's, in the server's ticks - the engine's movement only, without the gamemode's
+/// hooks, which mostly leave it be. What the server then says puts it right. How far the time
+/// of the commands goes into a tick not run yet, 0 to 1: the eyes are drawn that far from
+/// where they were before the last tick ([`PlayerState::previous_eye`]) to where they are.
+pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32)]) -> f32 {
+    let tick = crate::timer::TICK_INTERVAL as f32;
+    let still = eye(lua, handle).map(|(eye, _)| eye);
+    with_player(lua, handle, |_, p| p.previous_eye = still);
+    // the time each tick falls in, from the oldest command on
+    let mut time = 0.0;
+    let mut until = 0.0;
+    let mut commands = commands.iter();
+    let Some(&(mut cmd, first)) = commands.next() else { return 0.0 };
+    until += first;
+    let total: f32 = until + commands.clone().map(|(_, s)| s).sum::<f32>();
+    while time + tick <= total + 1e-4 {
+        while time >= until - 1e-4
+            && let Some(&(next, seconds)) = commands.next()
+        {
+            cmd = next;
+            until += seconds;
+        }
+        time += tick;
+        let Some((alive, frozen, turning)) =
+            state(lua, handle, |ent, p| (p.alive, ent.flags & fl::FROZEN != 0, cmd.buttons & key::USE != 0 && p.physgun.index.is_some()))
+        else {
+            return 0.0;
+        };
+        if !alive {
+            return 0.0;
+        }
+        let before = eye(lua, handle).map(|(eye, _)| eye);
+        with_player(lua, handle, |_, p| {
+            p.previous_eye = before;
+            if !frozen && !turning {
+                p.eye_angles = cmd.view_angles;
+            }
+        });
+        let data = CmdData { cmd, ..CmdData::default() };
+        let Some(mut mv) = movedata(lua, handle, &data, frozen) else { return 0.0 };
+        engine_move(lua, handle, &mut mv);
+        finish_move(lua, handle, &mv);
+    }
+    ((total - time) / tick).clamp(0.0, 1.0)
+}
+
+/// How heavy a player is to what they push, in kilograms.
+const PLAYER_MASS: f32 = 85.0;
+
+/// A player walking into props pushes them: a prop that may move is given at least the speed
+/// the player means to go into it - all of it if it is no heavier than a player, less as it is
+/// heavier. What the player stands on or bumps from above is not pushed.
+fn push_props(lua: &Lua, mv: &MoveData, touched: &[(EntityHandle, Vector)]) {
+    let (forward, right, _) = Angle::new(0.0, mv.angles.y, 0.0).vectors();
+    let wish = forward * mv.forward + right * mv.side;
+    let wish = if wish.length() > mv.max_speed && wish.length() > 0.0 { wish * (mv.max_speed / wish.length()) } else { wish };
+    let mut pushed = Vec::new();
+    for &(prop, normal) in touched {
+        if normal.z.abs() > 0.7 || pushed.contains(&prop) {
+            continue;
+        }
+        let Some(id) = crate::physics::body(lua, prop) else { continue };
+        let into = -wish.dot(normal);
+        if into <= 0.0 {
+            continue;
+        }
+        let host = host(lua);
+        let mut physics = host.physics.physics.borrow_mut();
+        if !physics.motion(id) {
+            continue;
+        }
+        pushed.push(prop);
+        let mass = physics.mass(id).max(1.0);
+        let speed = into * (PLAYER_MASS / mass).min(1.0);
+        let v = physics.velocity(id);
+        let direction = normal * -1.0;
+        let along = v[0] * direction.x + v[1] * direction.y + v[2] * direction.z;
+        if along < speed {
+            let add = direction * (speed - along);
+            physics.set_velocity(id, [v[0] + add.x, v[1] + add.y, v[2] + add.z]);
+            physics.wake(id);
+        }
+    }
+}
+
+/// What a player on the ground stands on, and where it is now.
+fn find_ground(lua: &Lua, handle: EntityHandle, moving: &gmod_movement::Player, settings: &Settings) {
+    let ground = if moving.on_ground {
+        let (mins, maxs) = moving.hull(settings);
+        let down = Sweep {
+            mins: vector(mins),
+            maxs: vector(maxs),
+            mask: gmod_bsp::mask::PLAYERSOLID,
+            group: trace::group::PLAYER_MOVEMENT,
+            ..Sweep::line(vector(moving.origin), vector(moving.origin) - Vector::new(0.0, 0.0, 2.0), Filter::Entities(vec![handle]))
+        };
+        let hit = trace::trace(lua, &down);
+        if hit.fraction < 1.0 { hit.entity } else { EntityHandle::WORLD }
+    } else {
+        EntityHandle::NULL
+    };
+    let at = if ground.index.is_some_and(|i| i != 0) { host(lua).entities.transform(ground) } else { None };
+    with_player(lua, handle, |_, p| (p.ground, p.ground_at) = (ground, at));
+}
+
+/// Where a player standing on something that moved is taken with it: as far as it moved and
+/// turned under their feet since last tick, if nothing is in the way.
+fn carried(lua: &Lua, handle: EntityHandle, origin: Vector, moving: &gmod_movement::Player, settings: &Settings) -> Vector {
+    let Some((ground, Some((was, was_turned)))) = state(lua, handle, |_, p| (p.ground, p.ground_at)) else { return origin };
+    let Some((now, turned)) = host(lua).entities.transform(ground) else { return origin };
+    if now == was && turned == was_turned {
+        return origin;
+    }
+    // where the feet stood on it, as it stands now
+    let on = entity::unrotated(origin - was, was_turned);
+    let to = now + on.rotated(turned);
+    let (mins, maxs) = moving.hull(settings);
+    let sweep = Sweep {
+        mins: vector(mins),
+        maxs: vector(maxs),
+        mask: gmod_bsp::mask::PLAYERSOLID,
+        group: trace::group::PLAYER_MOVEMENT,
+        ..Sweep::line(origin, to, Filter::Entities(vec![handle, ground]))
+    };
+    let hit = trace::trace(lua, &sweep);
+    let carried = if hit.start_solid { origin } else { hit.end };
+    with_player(lua, handle, |_, p| p.ground_at = Some((now, turned)));
+    carried
 }
 
 /// The end of a tick's movement: the player takes what the `CMoveData` says.
@@ -895,9 +1137,100 @@ fn finish_move(lua: &Lua, handle: EntityHandle, mv: &MoveData) {
         let set = |flags: &mut i64, flag: i64, on: bool| if on { *flags |= flag } else { *flags &= !flag };
         set(&mut ent.flags, fl::ONGROUND, p.moving.on_ground && ent.move_type == MOVETYPE_WALK);
         set(&mut ent.flags, fl::DUCKING, p.moving.ducked);
+        set(&mut ent.flags, fl::ANIMDUCKING, p.moving.ducked);
         set(&mut ent.flags, fl::INWATER, p.moving.water_level > 0);
         (ent.mins, ent.maxs) = if p.moving.ducked { p.duck_hull } else { p.hull };
     });
+}
+
+/// Footsteps, as Source makes them (`UpdateStepSound`): on the ground or a ladder and moving,
+/// one every `PlayerStepSoundTime` milliseconds (the gamemode's hook; 400 walking, 300
+/// running, 100 more ducked), left and right in turn, the sound of the surface underfoot -
+/// or of the water waded in - as loud as the pace. `PlayerFootstep` returning true keeps one
+/// quiet.
+fn footsteps(lua: &Lua, handle: EntityHandle, ply: &AnyUserData) {
+    const TICK_MS: f32 = (crate::timer::TICK_INTERVAL * 1000.0) as f32;
+    let Some((moving, ducked_speed, origin, wait)) = with_player(lua, handle, |ent, p| {
+        p.step_time = (p.step_time - TICK_MS).max(0.0);
+        let walking = ent.move_type == MOVETYPE_WALK;
+        (walking.then_some(p.moving), p.moving.ducked, ent.local_pos, p.step_time)
+    }) else {
+        return;
+    };
+    let Some(moving) = moving else { return };
+    let ladder = moving.ladder.is_some();
+    if wait > 0.0 || !(moving.on_ground || ladder) {
+        return;
+    }
+    let [vx, vy, vz] = moving.velocity;
+    let speed = if ladder { (vx * vx + vy * vy + vz * vz).sqrt() } else { (vx * vx + vy * vy).sqrt() };
+    // the engine plays a step at any pace once the last one's time is up; what drifts is not
+    // a pace
+    let run = if ducked_speed || ladder { 80.0 } else { 220.0 };
+    if speed < 10.0 {
+        return;
+    }
+    let walking = speed < run;
+    let kind = match moving.water_level {
+        _ if ladder => 1,
+        2 => 2,
+        1 => 3,
+        _ => 0,
+    };
+    let default_time = if walking { 400.0 } else { 300.0 };
+    let time = match hook(lua, "PlayerStepSoundTime", [Value::UserData(ply.clone()), Value::Integer(kind), Value::Boolean(walking)]).front()
+    {
+        Some(Value::Number(ms)) => *ms as f32,
+        Some(Value::Integer(ms)) => *ms as f32,
+        _ => default_time,
+    } + if ducked_speed { 100.0 } else { 0.0 };
+    // the surface: the water waded in, else what is underfoot
+    let surface = match moving.water_level {
+        2.. => crate::surfaceprops::named(lua, "wade").1,
+        1 => crate::surfaceprops::named(lua, "water").1,
+        _ => {
+            let down = Vector::new(origin.x, origin.y, origin.z - 64.0);
+            let up = Vector::new(origin.x, origin.y, origin.z + 1.0);
+            let hit = trace::trace(lua, &Sweep::line(up, down, Filter::Entities(vec![handle])));
+            if hit.entity == EntityHandle::WORLD && !hit.texture.starts_with("**") {
+                crate::surfaceprops::of_material(lua, &hit.texture).1
+            } else {
+                let body = crate::physics::material_of(lua, hit.entity).unwrap_or_else(|| "default".to_string());
+                crate::surfaceprops::named(lua, &body).1
+            }
+        }
+    };
+    let right = with_player(lua, handle, |_, p| {
+        p.step_time = time;
+        p.step_right = !p.step_right;
+        !p.step_right
+    })
+    .unwrap_or(false);
+    let sound = if right { &surface.step_right } else { &surface.step_left };
+    let mut volume = if walking { 0.2 } else { 0.5 };
+    if ducked_speed {
+        volume *= 0.65;
+    }
+    let pos = entity::vector(lua, origin).unwrap_or(Value::Nil);
+    let quiet = hook(
+        lua,
+        "PlayerFootstep",
+        [
+            Value::UserData(ply.clone()),
+            pos,
+            Value::Integer(i64::from(right)),
+            Value::String(match lua.create_string(sound) {
+                Ok(s) => s,
+                Err(_) => return,
+            }),
+            Value::Number(f64::from(volume)),
+            Value::Nil,
+        ],
+    );
+    if !truthy(&quiet) {
+        // a script's volume is the loudest a step is; walking is quieter
+        crate::sound::emit_scaled(lua, sound, handle, volume * 2.0);
+    }
 }
 
 fn set_flashlight(lua: &Lua, handle: EntityHandle, on: bool) {
@@ -922,6 +1255,10 @@ pub struct PlayerView {
     /// The physics gun holds something: the mouse wheel takes it farther or nearer rather
     /// than choosing a weapon, and the mouse turns it while E is down.
     pub holding: bool,
+    /// The flashlight is on (`EF_DIMLIGHT`).
+    pub flashlight: bool,
+    /// How many times the game turned the player itself ([`PlayerState::turned`]).
+    pub turned: u32,
 }
 
 /// The weapon in a player's hands.
@@ -937,8 +1274,8 @@ pub struct WeaponView {
 
 pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
     let (eye, _) = eye(lua, handle)?;
-    let (previous_eye, angles, fov, alive, armor, active) =
-        state(lua, handle, |_, p| (p.previous_eye.unwrap_or(eye), p.eye_angles, p.fov, p.alive, p.armor, p.active_weapon))?;
+    let (previous_eye, angles, fov, alive, armor, active, turned) =
+        state(lua, handle, |_, p| (p.previous_eye.unwrap_or(eye), p.eye_angles, p.fov, p.alive, p.armor, p.active_weapon, p.turned))?;
     let health = host(lua).entities.get(handle).map_or(0, |ent| ent.health);
     let weapon = host(lua).entities.get(active).filter(|ent| !ent.removed).map(|ent| {
         let data = weapon::data(lua, active).unwrap_or_default();
@@ -946,14 +1283,17 @@ pub(crate) fn view(lua: &Lua, handle: EntityHandle) -> Option<PlayerView> {
         let ammo = ammo_count(lua, handle, weapon::ammo_id(lua, &data.ammo[0]));
         WeaponView { class: ent.class.clone(), name: data.print_name, clip, ammo }
     });
-    let holding = crate::physgun::holding(lua, handle).is_some();
-    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon, holding })
+    let held = state(lua, handle, |_, p| p.physgun).filter(|&h| host(lua).entities.is_valid(h));
+    let holding = crate::physgun::holding(lua, handle).or(held).is_some();
+    let flashlight = host(lua).entities.get(handle).is_some_and(|ent| ent.effects & EF_DIMLIGHT != 0);
+    Some(PlayerView { eye, previous_eye, angles, fov, alive, health, armor, weapon, holding, flashlight, turned })
 }
 
 /// The engine's commands a player types into the console: `noclip`, `kill` and `explode`,
 /// `give <class>`, and choosing a weapon - `use <class>`, `lastinv`, `invnext`, `invprev`,
-/// `slot1` to `slot6` (what the weapon selection of the client's HUD would send). Whether
-/// `words` was one of them, which then ran.
+/// `slot1` to `slot6` (what the weapon selection of the client's HUD would send) - and, with
+/// `sv_cheats 1`, `ent_fire <target> <input> [param] [delay]`. Whether `words` was one of
+/// them, which then ran.
 pub(crate) fn command(lua: &Lua, handle: EntityHandle, words: &[String]) -> bool {
     let Some((name, args)) = words.split_first() else { return false };
     let name = name.to_ascii_lowercase();
@@ -978,6 +1318,7 @@ pub(crate) fn command(lua: &Lua, handle: EntityHandle, words: &[String]) -> bool
                 switch_weapon(lua, handle, item);
             }
         }
+        "ent_fire" => ent_fire(lua, handle, args),
         "invnext" => select_weapon(lua, handle, 1, None),
         "invprev" => select_weapon(lua, handle, -1, None),
         _ => match name.strip_prefix("slot").and_then(|n| n.parse::<i64>().ok()).filter(|n| (1..=6).contains(n)) {
@@ -986,6 +1327,29 @@ pub(crate) fn command(lua: &Lua, handle: EntityHandle, words: &[String]) -> bool
         },
     }
     true
+}
+
+/// `ent_fire <target> <input> [param] [delay]`, a cheat: the input goes to what the target
+/// names as an output's would (`!self` and `!activator` being the player, `!picker` what they
+/// look at), the player its activator.
+fn ent_fire(lua: &Lua, handle: EntityHandle, args: &[String]) {
+    if convar::value(lua, "sv_cheats").is_none_or(|v| convar::atof(&v) == 0.0) {
+        host(lua).print("Can't use cheat command ent_fire in multiplayer, unless the server has sv_cheats set to 1.\n");
+        return;
+    }
+    let (Some(target), Some(input)) = (args.first(), args.get(1)) else { return };
+    let param = args.get(2).map_or("", String::as_str);
+    let delay = args.get(3).map_or(0.0, |d| convar::atof(d));
+    if target.eq_ignore_ascii_case("!picker") {
+        let Some((eye, aim)) = eye(lua, handle) else { return };
+        let sweep = Sweep { mask: gmod_bsp::mask::SHOT, ..Sweep::line(eye, eye + aim * 8192.0, Filter::Entities(vec![handle])) };
+        let picked = trace::trace(lua, &sweep).entity;
+        if picked.index.is_some_and(|i| i != 0) {
+            crate::inputs::fire(lua, picked, input, param, delay, handle, handle);
+        }
+        return;
+    }
+    crate::inputs::fire_named(lua, target, input, param, delay, handle, handle, handle);
 }
 
 /// Runs a line of console commands as typed by a player: the engine's commands for players,
@@ -1037,13 +1401,17 @@ fn set_user_info(lua: &Lua, handle: EntityHandle, name: &str, args: &[String]) -
         host(lua).print(&format!("\"{name}\" = \"{now}\"\n"));
         return true;
     }
-    let value = args.join(" ");
+    store_user_info(lua, handle, name, &args.join(" "));
+    true
+}
+
+/// A value of a player's user info, as their client says it.
+pub(crate) fn store_user_info(lua: &Lua, handle: EntityHandle, name: &str, value: &str) {
     with_player(lua, handle, |_, p| {
         let own = &mut p.info.user_info;
         own.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
-        own.push((name.to_string(), value));
+        own.push((name.to_string(), value.to_string()));
     });
-    true
 }
 
 /// `noclip`: flying through walls and back, when `PlayerNoClip` allows it.
@@ -1168,6 +1536,139 @@ pub(crate) fn give(lua: &Lua, handle: EntityHandle, class: &str, no_ammo: bool) 
     Ok(item)
 }
 
+/// A player touches a weapon on the ground (`BumpWeapon`). Having one of its class, they take
+/// the ammo in it - what is in its clips, or what it would give without clips - and it goes
+/// if they took any; else they pick it up, if `PlayerCanPickupWeapon` lets them.
+pub(crate) fn bump_weapon(lua: &Lua, handle: EntityHandle, item: EntityHandle) {
+    let Some(class) = host(lua).entities.get(item).map(|ent| ent.class.clone()) else { return };
+    let data = weapon::data(lua, item).unwrap_or_default();
+    if weapon_of(lua, handle, &class).is_some() {
+        let clips = host(lua).entities.get(item).and_then(|ent| ent.weapon.as_ref().map(|w| w.clip)).unwrap_or([-1, -1]);
+        let mut took = 0;
+        for (i, clip) in clips.into_iter().enumerate() {
+            let amount = if clip >= 0 { clip } else { data.default_clip[i].max(0) };
+            took += give_ammo(lua, handle, weapon::ammo_id(lua, &data.ammo[i]), amount);
+        }
+        if took > 0 {
+            crate::ents::remove(lua, item);
+        }
+        return;
+    }
+    let allowed = hook(lua, "PlayerCanPickupWeapon", [ent_value(lua, handle), ent_value(lua, item)]);
+    if matches!(allowed.front(), Some(Value::Boolean(false))) || !host(lua).entities.is_valid(item) {
+        return;
+    }
+    crate::physics::destroy(lua, item);
+    equip(lua, handle, item, false);
+}
+
+/// How far the use key reaches, from the eyes.
+const USE_REACH: f32 = 80.0;
+const IN_USE: u32 = 32;
+const IN_ATTACK: u32 = 1;
+const IN_ATTACK2: u32 = 2048;
+/// `SetUseType`'s kinds, and the kinds of use `ENT:Use` is given.
+const CONTINUOUS_USE: i64 = 0;
+const ONOFF_USE: i64 = 1;
+const USE_OFF: i64 = 0;
+const USE_ON: i64 = 1;
+
+/// What a player would use: the entity before their eyes within reach - by a ray, or else a
+/// small box for the thin and the small - as `FindUseEntity` may change it.
+fn find_use_entity(lua: &Lua, handle: EntityHandle) -> EntityHandle {
+    let Some((eye, aim)) = eye(lua, handle) else { return EntityHandle::NULL };
+    let end = eye + aim * USE_REACH;
+    let mut found = EntityHandle::NULL;
+    for size in [0.0, 8.0] {
+        let reach = Vector::new(size, size, size);
+        let sweep =
+            Sweep { mins: reach * -1.0, maxs: reach, mask: gmod_bsp::mask::SOLID, ..Sweep::line(eye, end, Filter::Entities(vec![handle])) };
+        let hit = trace::trace(lua, &sweep).entity;
+        if hit.index.is_some_and(|i| i != 0) {
+            found = hit;
+            break;
+        }
+    }
+    let chosen = hook(lua, "FindUseEntity", [ent_value(lua, handle), ent_value(lua, found)]);
+    match chosen.front() {
+        Some(value @ Value::UserData(_)) => entity::handle_of(Some(value)).unwrap_or(found),
+        _ => found,
+    }
+}
+
+/// The use key (`+use`): pressed, the player uses what is before their eyes if `PlayerUse`
+/// lets them - a scripted entity's `ENT:Use`, the engine's `Use` input (doors, buttons) -
+/// and hears the denial when there is nothing. A scripted entity used continuously
+/// (`CONTINUOUS_USE`, the default) is used every tick while the key is held and it is still
+/// there; one used on and off (`ONOFF_USE`) is used off when the key is let go.
+fn use_key(lua: &Lua, handle: EntityHandle, buttons: u32, pressed: u32) {
+    if crate::physgun::holding(lua, handle).is_some() {
+        return;
+    }
+    let using = state(lua, handle, |_, p| p.using).unwrap_or(EntityHandle::NULL);
+    let use_type = |e: EntityHandle| host(lua).entities.get(e).map_or(-1, |ent| ent.use_type);
+    if buttons & IN_USE == 0 {
+        if host(lua).entities.is_valid(using) && use_type(using) == ONOFF_USE {
+            crate::inputs::use_entity(lua, using, handle, handle, USE_OFF, 0.0);
+        }
+        with_player(lua, handle, |_, p| p.using = EntityHandle::NULL);
+        return;
+    }
+    if pressed & IN_USE == 0 {
+        // held: what is used continuously, while it is still before the eyes
+        if host(lua).entities.is_valid(using) && use_type(using) == CONTINUOUS_USE && find_use_entity(lua, handle) == using {
+            crate::inputs::use_entity(lua, using, handle, handle, USE_ON, 1.0);
+        }
+        return;
+    }
+    // carrying something, the use key lets it go
+    if crate::pickup::carrying(lua, handle).is_some() {
+        crate::pickup::drop(lua, handle, false);
+        return;
+    }
+    let target = find_use_entity(lua, handle);
+    if !host(lua).entities.is_valid(target) {
+        crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
+        return;
+    }
+    let allowed = hook(lua, "PlayerUse", [ent_value(lua, handle), ent_value(lua, target)]);
+    if matches!(allowed.front(), Some(Value::Boolean(false))) {
+        return;
+    }
+    let scripted = host(lua).entities.get(target).is_some_and(|ent| ent.scripted);
+    // a prop is picked up; so is a scripted entity of physics that does nothing when used
+    let prop =
+        host(lua).entities.get(target).is_some_and(|ent| !ent.scripted && ent.class.to_ascii_lowercase().starts_with("prop_physics"));
+    if (prop || scripted && !has_own_use(lua, target)) && crate::pickup::can_carry(lua, target) {
+        if !crate::pickup::pick_up(lua, handle, target, false) {
+            crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
+        }
+        return;
+    }
+    if (scripted || crate::items::is_charger(lua, target)) && matches!(use_type(target), CONTINUOUS_USE | ONOFF_USE) {
+        with_player(lua, handle, |_, p| p.using = target);
+    }
+    if !crate::inputs::use_entity(lua, target, handle, handle, USE_ON, 1.0) {
+        crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
+    }
+}
+
+/// Whether a scripted entity has an `ENT:Use` of its own.
+fn has_own_use(lua: &Lua, handle: EntityHandle) -> bool {
+    let Ok(Value::UserData(ud)) = entity::push(lua, handle) else { return false };
+    entity::table_of(&ud).ok().flatten().is_some_and(|t| matches!(t.get::<Value>("Use"), Ok(Value::Function(_))))
+}
+
+/// Turns where a player looks (`SetEyeAngles`); their body turns with the yaw.
+pub(crate) fn set_eye_angles(lua: &Lua, handle: EntityHandle, angles: Angle) {
+    with_player(lua, handle, |_, p| {
+        p.eye_angles = angles;
+        p.input.view_angles = angles;
+        p.turned = p.turned.wrapping_add(1);
+    });
+    entity::set_world_angles(lua, handle, Angle::new(0.0, angles.y, 0.0));
+}
+
 /// A weapon goes into a player's hands (`Weapon_Equip`): it follows them, its ammo beyond a
 /// full clip goes to the player (none with `no_ammo`), the SWEP's `Equip` and the
 /// `WeaponEquip` hook run, and the player takes it up if it is better than what they hold.
@@ -1244,6 +1745,9 @@ pub(crate) fn switch_weapon(lua: &Lua, handle: EntityHandle, item: EntityHandle)
         p.active_weapon = item;
     });
     host(lua).entities.with_mut(item, |ent| ent.effects &= !EF_NODRAW);
+    // the engine puts the weapon's view model on and plays drawing it; the weapon's own
+    // `Deploy` comes after, and may play something else
+    crate::anim::deploy(lua, handle, item);
     weapon::call(lua, item, "Deploy", MultiValue::new());
     true
 }
@@ -1306,16 +1810,24 @@ pub(crate) fn forget(lua: &Lua, gone: EntityHandle) {
     }
 }
 
-/// The death ragdoll (`CreateRagdoll`): an `hl2mp_ragdoll` with the player's model where the
-/// player is, in place of the last one. It does not fall yet: there is no physics.
+/// The death ragdoll (`CreateRagdoll`): an `hl2mp_ragdoll` with the player's model, in place
+/// of the last one - a ragdoll ([`crate::ragdoll`]) posed as the player was drawn, falling on
+/// as the player moved. A model without the physics of one leaves the corpse unseen. In GMod
+/// the corpse is the client's alone, so here it lies on the world and on what does not move,
+/// but goes through props that move, which neither push it nor feel it.
 fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
     let old = state(lua, handle, |_, p| p.ragdoll).unwrap_or(EntityHandle::NULL);
     if host(lua).entities.is_valid(old) {
         crate::ents::remove(lua, old);
     }
     let Some(ragdoll) = crate::ents::create_engine(lua, "hl2mp_ragdoll", Kind::Entity)? else { return Ok(()) };
-    let (pos, angles) = host(lua).entities.transform(handle).unwrap_or_default();
-    let (model, skin, color) = host(lua).entities.get(handle).map(|ent| (ent.model.clone(), ent.skin, ent.color)).unwrap_or_default();
+    let (pos, _) = host(lua).entities.transform(handle).unwrap_or_default();
+    let angles = state(lua, handle, |_, p| p.render_angles).unwrap_or_default();
+    let (model, skin, color, anim, velocity) = host(lua)
+        .entities
+        .get(handle)
+        .map(|ent| (ent.model.clone(), ent.skin, ent.color, ent.anim.clone(), ent.velocity))
+        .unwrap_or_default();
     entity::set_model(lua, ragdoll, &model);
     entity::set_world_pos(lua, ragdoll, pos);
     entity::set_world_angles(lua, ragdoll, angles);
@@ -1323,7 +1835,16 @@ fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
         ent.owner = handle;
         ent.skin = skin;
         ent.color = color;
+        ent.anim = anim;
     });
+    if crate::ragdoll::init(lua, ragdoll, velocity) {
+        let bodies = crate::ragdoll::bodies(lua, ragdoll).unwrap_or_default();
+        let host = host(lua);
+        let mut physics = host.physics.physics.borrow_mut();
+        for id in bodies {
+            physics.set_aloof(id, true);
+        }
+    }
     with_player(lua, handle, |_, p| p.ragdoll = ragdoll);
     Ok(())
 }
@@ -1331,7 +1852,7 @@ fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
 // --- Lua ---
 
 /// The player in argument 1.
-fn this(a: &Args) -> mlua::Result<EntityHandle> {
+pub(crate) fn this(a: &Args) -> mlua::Result<EntityHandle> {
     let handle = entity::this(a, 1)?;
     if is_player(a.lua, handle) { Ok(handle) } else { Err(a.bad(1, "Player")) }
 }
@@ -1412,8 +1933,11 @@ fn weapon_arg(a: &Args, handle: EntityHandle, position: usize) -> mlua::Result<E
 
 /// Prints what a player was sent to read: the player of a single-player game reads the
 /// server's console.
-fn print_to(a: &Args, text: &str) {
-    host(a.lua).print(&format!("{text}\n"));
+/// A line for the consoles of players' clients.
+fn print_to(a: &Args, players: Vec<EntityHandle>, text: &str) {
+    for player in players {
+        to_client(a.lua, player, ToClient::Print(text.to_string()));
+    }
 }
 
 macro_rules! float_field {
@@ -1512,6 +2036,26 @@ pub(crate) fn install(lua: &Lua, realm: crate::Realm) -> mlua::Result<()> {
             let joined = join(a.lua, PlayerInfo { name, bot: true, ..PlayerInfo::default() });
             entity::push(a.lua, joined.unwrap_or(EntityHandle::NULL))
         })?;
+        // to every player: `HUD_PRINTTALK` into the chat (the base gamemode tells of a team
+        // changed so), the rest to the console
+        def_lib(lua, &globals, "PrintMessage", |a| {
+            let text = a.string(2)?;
+            if a.number(1)? as i64 == HUD_PRINTTALK {
+                for player in all(a.lua) {
+                    crate::chat::tell(a.lua, player, &text);
+                }
+            } else {
+                print_to(a, all(a.lua), &text);
+            }
+            Ok(Value::Nil)
+        })?;
+        def_lib(lua, &globals, "BroadcastLua", |a| {
+            let code = a.string(1)?;
+            for player in all(a.lua) {
+                to_client(a.lua, player, ToClient::Lua(code.clone()));
+            }
+            Ok(Value::Nil)
+        })?;
     }
     globals.raw_set("player", library)?;
 
@@ -1562,9 +2106,13 @@ fn install_identity(def: &entity::Def) -> mlua::Result<()> {
         let id = read(a, |_, p| p.steam_id64())?;
         integer(if id == 0 { 0 } else { i64::from(id as u32) })
     })?;
-    def("UniqueID", |a| integer(read(a, |_, p| p.unique_id())?.into()))?;
+    def("UniqueID", |a| {
+        let single = max_players(a.lua) == 1;
+        integer(read(a, |_, p| p.unique_id(single))?.into())
+    })?;
     def("UniqueIDTable", |a| {
-        let (unique, key) = (read(a, |_, p| p.unique_id())?, a.string(2)?);
+        let single = max_players(a.lua) == 1;
+        let (unique, key) = (read(a, |_, p| p.unique_id(single))?, a.string(2)?);
         let tables: Table = match a.lua.named_registry_value::<Option<Table>>("gmod-lua.unique-id-tables")? {
             Some(t) => t,
             None => {
@@ -1592,7 +2140,7 @@ fn install_identity(def: &entity::Def) -> mlua::Result<()> {
     def("IsFullyAuthenticated", |a| boolean(read(a, |_, p| !p.info.bot && p.info.steam_id64.is_some())?))?;
     def("IsListenServerHost", |a| {
         let handle = this(a)?;
-        boolean(handle.index == Some(1) && read(a, |_, p| !p.info.bot)?)
+        boolean(is_host(a.lua, handle) && read(a, |_, p| !p.info.bot)?)
     })?;
     def("GetInfo", |a| {
         let name = a.string(2)?;
@@ -2031,15 +2579,11 @@ fn install_weapons(def: &entity::Def) -> mlua::Result<()> {
         write(a, |_, p| p.activity = act)
     })?;
     // the gamemode's `TranslateActivity` says what the weapon's hold type makes of it
+    // the weapon's, not the gamemode's: the base gamemode's `TranslateActivity` asks this
     def("TranslateWeaponActivity", |a| {
         let handle = this(a)?;
         let act = a.number(2)? as i64;
-        let translated = hook(a.lua, "TranslateActivity", [ent_value(a.lua, handle), Value::Integer(act)]);
-        match translated.front() {
-            Some(Value::Integer(n)) => integer(*n),
-            Some(Value::Number(n)) => integer(*n as i64),
-            _ => integer(act),
-        }
+        integer(weapon::translate_activity(a.lua, handle, act))
     })?;
     bool_field!(def, "GetAllowWeaponsInVehicle", "SetAllowWeaponsInVehicle", allow_weapons_in_vehicle);
     def("ShouldDropWeapon", |a| {
@@ -2068,12 +2612,7 @@ fn install_view(def: &entity::Def) -> mlua::Result<()> {
     // the client's view snaps there too: the commands it sends look that way from now on
     def("SetEyeAngles", |a| {
         let angles = a.userdata::<Angle>(2, "Angle")?;
-        let handle = this(a)?;
-        with_player(a.lua, handle, |_, p| {
-            p.eye_angles = angles;
-            p.input.view_angles = angles;
-        });
-        entity::set_world_angles(a.lua, handle, Angle::new(0.0, angles.y, 0.0));
+        set_eye_angles(a.lua, this(a)?, angles);
         Ok(Value::Nil)
     })?;
     def("GetEyeTrace", |a| {
@@ -2172,69 +2711,59 @@ fn install_view(def: &entity::Def) -> mlua::Result<()> {
 /// Chat and messages, and what has nothing to act on yet.
 fn install_rest(def: &entity::Def) -> mlua::Result<()> {
     def("ChatPrint", |a| {
-        this(a)?;
-        print_to(a, &a.string(2)?);
+        let handle = this(a)?;
+        crate::chat::tell(a.lua, handle, &a.string(2)?);
         Ok(Value::Nil)
     })?;
+    // `HUD_PRINTTALK` goes to the chat, the rest to the console
     def("PrintMessage", |a| {
-        this(a)?;
-        print_to(a, &a.string(3)?);
+        let handle = this(a)?;
+        let text = a.string(3)?;
+        if a.number(2)? as i64 == HUD_PRINTTALK {
+            crate::chat::tell(a.lua, handle, &text);
+        } else {
+            print_to(a, vec![handle], &text);
+        }
         Ok(Value::Nil)
     })?;
     // what the player says goes through `PlayerSay`, which may change it or keep it quiet
     def("Say", |a| {
         let handle = this(a)?;
-        let (text, team) = (a.string(2)?, a.boolean(3));
-        let said = hook(a.lua, "PlayerSay", [ent_value(a.lua, handle), Value::String(a.lua.create_string(&text)?), Value::Boolean(team)]);
-        let text = match said.front() {
-            Some(Value::String(s)) => s.to_string_lossy(),
-            _ => text,
-        };
-        if !text.is_empty() {
-            let name = read(a, |_, p| p.info.name.clone())?;
-            print_to(a, &format!("{name}: {text}"));
-        }
+        crate::chat::say(a.lua, handle, &a.string(2)?, a.boolean(3));
         Ok(Value::Nil)
     })?;
-    // for the player's client, which is not there yet
+    // for the player's client: it runs the line, and sends the server what it does not know
     def("ConCommand", |a| {
         let (handle, line) = (this(a)?, a.string(2)?);
-        console(a.lua, handle, &line);
+        to_client(a.lua, handle, ToClient::Command(line));
         Ok(Value::Nil)
     })?;
-    for name in ["SendLua", "SendHint", "SuppressHint", "ScreenFade", "LagCompensation", "PlayStepSound", "SprayDecal"] {
+    def("SendLua", |a| {
+        let (handle, code) = (this(a)?, a.string(2)?);
+        to_client(a.lua, handle, ToClient::Lua(code));
+        Ok(Value::Nil)
+    })?;
+    for name in ["SendHint", "SuppressHint", "ScreenFade", "LagCompensation", "PlayStepSound", "SprayDecal"] {
         def(name, nothing)?;
     }
     def("AllowImmediateDecalPainting", nothing)?;
-    // animations come with models that move
-    for name in [
-        "AddVCDSequenceToGestureSlot",
-        "AnimResetGestureSlot",
-        "AnimRestartGesture",
-        "AnimRestartMainSequence",
-        "AnimSetGestureSequence",
-        "AnimSetGestureWeight",
-        "DoAnimationEvent",
-        "DoAttackEvent",
-        "DoCustomAnimEvent",
-        "DoReloadEvent",
-        "DoSecondaryAttack",
-        "SetAnimation",
-    ] {
-        def(name, nothing)?;
-    }
+    // the gesture slots and the animation events of the player's model
+    crate::anim::install_player(def)?;
+    crate::pickup::install_player(def)?;
     // the base gamemode makes the physics gun's own in Lua (`AddFrozenPhysicsObject`,
     // `PhysgunUnfreeze`, `UnfreezePhysicsObjects`); these stand in without it. Nothing is
-    // carried by hand or with the gravity gun yet, and there are no vehicles.
-    for name in
-        ["AddFrozenPhysicsObject", "DropObject", "PickupObject", "SimulateGravGunDrop", "SimulateGravGunPickup", "DetonateTripmines"]
-    {
+    // carried with the gravity gun yet, and there are no vehicles.
+    for name in ["AddFrozenPhysicsObject", "SimulateGravGunDrop", "SimulateGravGunPickup", "DetonateTripmines"] {
         def(name, nothing)?;
     }
     def("PhysgunUnfreeze", zero)?;
     def("UnfreezePhysicsObjects", nothing)?;
     def("GetPreferredCarryAngles", nothing)?;
-    def("GetEntityInUse", null)?;
+    // what the player carries with the use key
+    def("GetEntityInUse", |a| {
+        let handle = this(a)?;
+        entity::push(a.lua, crate::pickup::carrying(a.lua, handle).unwrap_or(EntityHandle::NULL))
+    })?;
     def("GetUseEntity", null)?;
     def("GetVehicle", null)?;
     def("InVehicle", no)?;

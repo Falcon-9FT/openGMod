@@ -36,7 +36,34 @@ const ENGINE_CONVARS: &[(&str, &str, &str)] = &[
     ("skill", "1", "Game skill level (1-3)."),
     ("deathmatch", "1", "Running a deathmatch server."),
     ("coop", "0", "Cooperative play."),
+    ("crosshair", "1", ""),
+    // the NPC menu of the spawn menu's bar
+    ("ai_disabled", "0", "Disables all NPC thinking"),
+    ("ai_ignoreplayers", "0", "NPCs ignore players"),
+    ("ai_serverragdolls", "0", "Ragdolls of dead NPCs stay on the server, as physics"),
+    ("npc_citizen_auto_player_squad", "1", "Citizens join the player's squad"),
 ];
+
+/// ConVars of a client's engine that the game's Lua reads.
+const CLIENT_CONVARS: &[(&str, &str, &str)] = &[
+    ("cl_drawhud", "1", "Enable the rendering of the hud"),
+    ("fov_desired", "75", "Sets the base field-of-view."),
+    ("sensitivity", "3", "Mouse sensitivity."),
+    ("m_pitch", "0.022", "Mouse pitch factor."),
+    ("m_yaw", "0.022", "Mouse yaw factor."),
+    ("cl_showfps", "0", "Draw fps meter at top of screen"),
+    ("r_drawviewmodel", "1", ""),
+    ("hud_fastswitch", "0", ""),
+    ("mat_fullbright", "0", ""),
+    ("r_shadows", "1", ""),
+    ("r_drawdetailprops", "1", ""),
+    ("name", "Player", "Current user name"),
+    ("hud_saytext_time", "12", "How long lines of chat show"),
+    ("cl_chatfilters", "63", "What the chat shows"),
+];
+
+/// A ConVar of a client the server is told of (`GetInfo`).
+const FCVAR_USERINFO: i64 = 512;
 
 struct ConVar {
     name: String,
@@ -145,8 +172,33 @@ fn create(lua: &Lua, name: &str, default: &str, help: &str, flags: i64, min: Opt
         min,
         max,
     });
-    console.by_name.borrow_mut().insert(name.to_ascii_lowercase(), convars.len() - 1);
-    ConVarHandle(convars.len() - 1)
+    let index = convars.len() - 1;
+    drop(convars);
+    console.by_name.borrow_mut().insert(name.to_ascii_lowercase(), index);
+    if flags & FCVAR_USERINFO != 0 {
+        send_user_info(lua, name, default);
+    }
+    ConVarHandle(index)
+}
+
+/// A client tells the server a value of its user info, as it does when it joins and when the
+/// value changes.
+fn send_user_info(lua: &Lua, name: &str, value: &str) {
+    let host = host(lua);
+    if host.realm == crate::Realm::Client {
+        let mut user_info = host.client.user_info.borrow_mut();
+        user_info.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+        user_info.push((name.to_string(), value.to_string()));
+    }
+}
+
+/// A word of a console line, in quotes when it has to be.
+pub(crate) fn quoted(word: &str) -> String {
+    if word.is_empty() || word.contains(|c: char| c.is_whitespace() || c == ';' || c == '"') {
+        format!("\"{}\"", word.replace('"', "'"))
+    } else {
+        word.to_string()
+    }
 }
 
 /// Sets a ConVar, clamped to its limits, and tells Lua when the value changed.
@@ -167,10 +219,13 @@ fn set(lua: &Lua, handle: ConVarHandle, value: &str) {
             None
         } else {
             let old = std::mem::replace(&mut convar.value, value.clone());
-            Some((convar.name.clone(), old, value))
+            Some((convar.name.clone(), old, value, convar.flags & FCVAR_USERINFO != 0))
         }
     };
-    if let Some((name, old, new)) = changed {
+    if let Some((name, old, new, user_info)) = changed {
+        if user_info {
+            send_user_info(lua, &name, &new);
+        }
         let callback = || -> mlua::Result<Option<mlua::Function>> {
             let Some(cvars) = lua.globals().get::<Option<Table>>("cvars")? else { return Ok(None) };
             cvars.get::<Option<mlua::Function>>("OnConVarChanged")
@@ -258,6 +313,13 @@ pub fn split_commands(text: &str) -> Vec<Vec<String>> {
     commands
 }
 
+/// Whether there is a ConVar, a command of Lua or one of the chat of that name.
+pub(crate) fn is_known(lua: &Lua, name: &str) -> bool {
+    find(lua, name).is_some()
+        || host(lua).console.commands.borrow().contains_key(&name.to_ascii_lowercase())
+        || crate::chat::is_command(lua, name)
+}
+
 /// Runs one command now: sets a ConVar, or calls a command of Lua.
 pub(crate) fn execute(lua: &Lua, words: &[String]) {
     execute_as(lua, words, EntityHandle::NULL);
@@ -279,8 +341,18 @@ pub(crate) fn execute_as(lua: &Lua, words: &[String], player: EntityHandle) {
         return;
     }
     let known = host(lua).console.commands.borrow().contains_key(&name.to_ascii_lowercase());
+    if !known && crate::chat::command(lua, player, words) {
+        return;
+    }
     if !known {
-        host(lua).print(&format!("Unknown command \"{name}\"\n"));
+        let host = host(lua);
+        if host.realm != crate::Realm::Server {
+            // the server's, as a client's console sends what it does not know; the menu's
+            // go to the engine (`map`, `disconnect` ...)
+            host.client.to_server.borrow_mut().push(words.iter().map(|w| quoted(w)).collect::<Vec<_>>().join(" "));
+        } else {
+            host.print(&format!("Unknown command \"{name}\"\n"));
+        }
         return;
     }
     let run = || -> mlua::Result<Option<(mlua::Function, MultiValue)>> {
@@ -311,6 +383,11 @@ pub(crate) fn run_buffer(lua: &Lua) {
 pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     for (name, value, help) in ENGINE_CONVARS.iter().chain(crate::physgun::CONVARS) {
         create(lua, name, value, help, 0, None, None);
+    }
+    if host(lua).realm != crate::Realm::Server {
+        for (name, value, help) in CLIENT_CONVARS {
+            create(lua, name, value, help, 0, None, None);
+        }
     }
     let globals = lua.globals();
     let def = |table: &Table, name: &'static str, f: fn(&Args) -> mlua::Result<Value>| -> mlua::Result<()> {

@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
-use mlua::{Lua, MultiValue, Table, Value};
+use mlua::{IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::args::Args;
 use crate::host;
@@ -66,6 +66,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let data = bytes(a, 1)?;
         Ok(Value::String(a.lua.create_string(gmod_fs::crc32::crc32(&data).to_string())?))
     })?;
+    // Steam's filter of words is not there: text stays as it is
+    def("FilterText", |a| Ok(Value::String(a.lua.create_string(a.string(1)?)?)))?;
     def("Base64Encode", |a| {
         let encoded = base64_encode(&bytes(a, 1)?, !a.boolean(2));
         Ok(Value::String(a.lua.create_string(encoded)?))
@@ -120,6 +122,42 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     })?;
     lua.globals().raw_set("util", util)?;
     lua.globals().raw_set("PrecacheParticleSystem", lua.create_function(|_, _: MultiValue| Ok(()))?)?;
+    let globals = lua.globals();
+    let def = |name: &'static str, f: fn(&Args) -> mlua::Result<MultiValue>| -> mlua::Result<()> {
+        globals.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
+    };
+    def("ColorToHSV", |a| {
+        let [r, g, b, _] = crate::surface::color_table(&a.table(1)?)?.map(|c| f64::from(c) / 255.0);
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let delta = max - min;
+        let hue = if delta == 0.0 {
+            0.0
+        } else if max == r {
+            60.0 * ((g - b) / delta).rem_euclid(6.0)
+        } else if max == g {
+            60.0 * ((b - r) / delta + 2.0)
+        } else {
+            60.0 * ((r - g) / delta + 4.0)
+        };
+        let saturation = if max == 0.0 { 0.0 } else { delta / max };
+        (hue, saturation, max).into_lua_multi(a.lua)
+    })?;
+    def("HSVToColor", |a| {
+        let (hue, saturation, value) = (a.number(1)?.rem_euclid(360.0), a.number(2)?.clamp(0.0, 1.0), a.number(3)?.clamp(0.0, 1.0));
+        let chroma = value * saturation;
+        let x = chroma * (1.0 - ((hue / 60.0).rem_euclid(2.0) - 1.0).abs());
+        let (r, g, b) = match (hue / 60.0) as u32 {
+            0 => (chroma, x, 0.0),
+            1 => (x, chroma, 0.0),
+            2 => (0.0, chroma, x),
+            3 => (0.0, x, chroma),
+            4 => (x, 0.0, chroma),
+            _ => (chroma, 0.0, x),
+        };
+        let m = value - chroma;
+        let channel = |c: f64| ((c + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+        crate::surface::push_color(a.lua, [channel(r), channel(g), channel(b), 255]).map(|v| MultiValue::from_iter([v]))
+    })?;
     Ok(())
 }
 
@@ -150,7 +188,7 @@ fn kv_scalar(lua: &Lua, text: &str) -> mlua::Result<Value> {
     Ok(Value::String(lua.create_string(text)?))
 }
 
-fn kv_block(lua: &Lua, block: &gmod_kv::Block, ordered: bool, keep_case: bool) -> mlua::Result<Table> {
+pub(crate) fn kv_block(lua: &Lua, block: &gmod_kv::Block, ordered: bool, keep_case: bool) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     for pair in block {
         let key = if keep_case { pair.key.clone() } else { pair.key.to_lowercase() };
@@ -164,8 +202,11 @@ fn kv_block(lua: &Lua, block: &gmod_kv::Block, ordered: bool, keep_case: bool) -
             entry.raw_set("Value", value)?;
             table.raw_push(entry)?;
         } else {
+            // a key that is a number is one, as `tonumber` takes it: a table of entries numbered
+            // 1, 2, 2.5 ... is sorted by number, not half by text
             let key = match lua.coerce_number(Value::String(lua.create_string(&key)?))? {
-                Some(n) if n == n.trunc() => Value::Integer(n as i64),
+                Some(n) if n == n.trunc() && n.abs() < 9e15 => Value::Integer(n as i64),
+                Some(n) if n.is_finite() => Value::Number(n),
                 _ => Value::String(lua.create_string(&key)?),
             };
             table.raw_set(key, value)?;
@@ -209,7 +250,7 @@ fn scalar_text(lua: &Lua, value: &Value) -> mlua::Result<Option<String>> {
     })
 }
 
-fn write_keyvalues(lua: &Lua, out: &mut String, name: &str, table: &Table, depth: usize) -> mlua::Result<()> {
+pub(crate) fn write_keyvalues(lua: &Lua, out: &mut String, name: &str, table: &Table, depth: usize) -> mlua::Result<()> {
     let indent = "\t".repeat(depth);
     let _ = writeln!(out, "{indent}{}", quote_kv(name));
     let _ = writeln!(out, "{indent}{{");
@@ -268,7 +309,8 @@ fn sequence_length(table: &Table) -> mlua::Result<Option<usize>> {
             _ => return Ok(None),
         }
     }
-    Ok((count > 0 && table.raw_len() == count).then_some(count))
+    // an empty table is an empty array, as GMod writes it
+    Ok((table.raw_len() == count).then_some(count))
 }
 
 fn write_json(lua: &Lua, out: &mut String, value: &Value, pretty: bool, depth: usize) -> mlua::Result<()> {
@@ -611,4 +653,17 @@ fn sprite_trail(a: &Args) -> mlua::Result<Value> {
     crate::entity::set_parent(a.lua, trail, target);
     crate::ents::spawn(a.lua, trail);
     crate::entity::push(a.lua, trail)
+}
+
+/// A JSON document as Lua values, as `util.JSONToTable` reads it but for any value and
+/// without its limits: what a page sends Lua.
+pub(crate) fn from_json(lua: &Lua, text: &str) -> Option<Value> {
+    Json { text: text.as_bytes(), at: 0, lua, limits: false, conversions: false }.document()
+}
+
+/// A Lua value as JSON, as `util.TableToJSON` writes tables: what Lua sends a page.
+pub(crate) fn to_json(lua: &Lua, value: &Value) -> mlua::Result<String> {
+    let mut out = String::new();
+    write_json(lua, &mut out, value, false, 0)?;
+    Ok(out)
 }

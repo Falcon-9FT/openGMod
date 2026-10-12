@@ -3,8 +3,10 @@
 //! A surface in a map or on a model names a material; the material names a shader, its
 //! textures and its settings ([`vmt`]). Textures are images in one of 30 pixel formats
 //! ([`Format`]), with mipmaps, animation frames and cube map faces ([`vtf`]); [`decode`]
-//! turns any of them into RGBA. [`load_material`] and [`load_texture`] read them from the
-//! game's files; a [`Library`] keeps what was read. [`png`] writes images.
+//! turns any of them into RGBA. A material's proxies change its parameters as time goes on
+//! ([`proxy`]): animated and scrolling textures, pulsing colours. [`load_material`] and
+//! [`load_texture`] read them from the game's files; a [`Library`] keeps what was read.
+//! [`png`] writes images.
 
 #![forbid(unsafe_code)]
 
@@ -14,13 +16,18 @@ use gmod_fs::Vfs;
 
 pub mod decode;
 pub mod format;
+pub mod jpeg;
 mod library;
 pub mod png;
+pub mod proxy;
+pub mod surfaceprop;
 pub mod vmt;
 pub mod vtf;
 
 pub use format::Format;
 pub use library::Library;
+pub use proxy::Proxies;
+pub use surfaceprop::{SurfaceProp, SurfaceProps};
 pub use vmt::{Material, Patch, Vmt};
 pub use vtf::{Image, Vtf};
 

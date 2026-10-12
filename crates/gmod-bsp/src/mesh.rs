@@ -11,10 +11,16 @@
 //! * Only the first lightmap of a face is used (style 0; with bump mapping the first of four
 //!   is the unbumped one). Faces without one are lit by a white luxel.
 //! * Faces flagged nodraw, sky, trigger, hint or skip are left out.
+//! * The overlays on the faces built come after them, a batch each from the lowest render
+//!   order up, lifted a little off their faces and lit by their light maps
+//!   ([`crate::overlay`]). Only the world has them: brush entities' faces are in their own
+//!   space.
+
+use std::collections::HashMap;
 
 use crate::lighting::rgbe_to_linear;
 use crate::math::{Vec3, add, cross, dot, lerp3, normalize, scale, sub};
-use crate::{Bsp, Face, TexInfo, surf};
+use crate::{Bsp, Face, Overlay, TexInfo, overlay, surf};
 
 /// A vertex of the world.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -36,6 +42,8 @@ pub struct Batch {
     pub material: usize,
     pub first_index: u32,
     pub index_count: u32,
+    /// An overlay's, drawn over the faces.
+    pub overlay: bool,
 }
 
 /// The lightmaps of all faces, in linear light.
@@ -140,6 +148,12 @@ fn pack(sizes: &[(u32, u32)]) -> (u32, u32, Vec<(u32, u32)>) {
 
 /// Builds the triangles of a brush model.
 pub fn build(bsp: &Bsp, options: Options) -> Mesh {
+    build_faces(bsp, options, |_| true)
+}
+
+/// The same, of the faces `keep` says yes to (by their index in the map's faces): the world
+/// split in two, the 3D sky box and the rest.
+pub fn build_faces(bsp: &Bsp, options: Options, keep: impl Fn(usize) -> bool) -> Mesh {
     let hdr = options.hdr && !bsp.faces_hdr.is_empty() && !bsp.lighting_hdr.is_empty();
     // a map compiled for HDR only has no LDR lighting
     let hdr = hdr || (bsp.lighting.is_empty() && !bsp.faces_hdr.is_empty());
@@ -150,7 +164,7 @@ pub fn build(bsp: &Bsp, options: Options) -> Mesh {
     // faces to draw, by material
     let mut drawn: Vec<(usize, usize)> = Vec::new();
     for index in model.first_face as usize..(model.first_face + model.num_faces) as usize {
-        let Some(face) = faces.get(index) else { continue };
+        let Some(face) = faces.get(index).filter(|_| keep(index)) else { continue };
         let Some(info) = usize::try_from(face.texinfo).ok().and_then(|i| bsp.texinfo.get(i)) else { continue };
         if info.flags & SKIPPED != 0 {
             if info.flags & surf::SKY != 0 {
@@ -225,17 +239,60 @@ pub fn build(bsp: &Bsp, options: Options) -> Mesh {
             Some(batch) if batch.material == material => batch.index_count += count,
             _ => {
                 mesh.batches.extend(current.take());
-                current = Some(Batch { material, first_index, index_count: count });
+                current = Some(Batch { material, first_index, index_count: count, overlay: false });
             }
         }
     }
     mesh.batches.extend(current);
+    // overlays lie on the world in its coordinates; a brush entity's faces are in its own,
+    // and the entity moves them about, so none are put on them
+    if options.model == 0 && !bsp.overlays.is_empty() {
+        let placed = drawn.iter().enumerate().map(|(k, &(_, index))| {
+            (index, slot[k].map(|slot| Placement { x: positions[slot].0, y: positions[slot].1, face: faces[index] }))
+        });
+        overlays(bsp, faces, &placed.collect(), &mut mesh);
+    }
 
     for vertex in &mut mesh.vertices {
         vertex.lightmap_uv = [vertex.lightmap_uv[0] / width as f32, vertex.lightmap_uv[1] / height as f32];
     }
     mesh.lightmap = Lightmap { width, height, texels };
     mesh
+}
+
+/// The overlays on the faces built - `placed` has each one's index and where its light map
+/// went - from the lowest render order up, a batch each.
+fn overlays(bsp: &Bsp, faces: &[Face], placed: &HashMap<usize, Option<Placement>>, mesh: &mut Mesh) {
+    let mut order: Vec<&Overlay> = bsp.overlays.iter().collect();
+    order.sort_by_key(|o| o.render_order);
+    for overlay in order {
+        let Some(info) = usize::try_from(overlay.texinfo).ok().and_then(|i| bsp.texinfo.get(i)) else { continue };
+        let Ok(material) = usize::try_from(info.texdata) else { continue };
+        let first_index = mesh.indices.len() as u32;
+        for &index in &overlay.faces {
+            let Some(index) = usize::try_from(index).ok() else { continue };
+            let (Some(face), Some(&placement)) = (faces.get(index), placed.get(&index)) else { continue };
+            if face.dispinfo >= 0 {
+                continue;
+            }
+            // a face built has its texinfo and plane
+            let face_info = bsp.texinfo[face.texinfo as usize];
+            let normal = bsp.planes[face.plane as usize].normal;
+            let polygon = overlay::on_face(bsp, overlay, face);
+            let base = mesh.vertices.len() as u32;
+            for &(p, uv) in &polygon {
+                let position = add(p, scale(normal, overlay::LIFT));
+                mesh.vertices.push(Vertex { position, normal, uv, lightmap_uv: luxel(&face_info, placement, p), alpha: 0.0 });
+            }
+            for i in 1..(polygon.len() as u32).saturating_sub(1) {
+                mesh.indices.extend([base, base + i, base + i + 1]);
+            }
+        }
+        let index_count = mesh.indices.len() as u32 - first_index;
+        if index_count > 0 {
+            mesh.batches.push(Batch { material, first_index, index_count, overlay: true });
+        }
+    }
 }
 
 fn polygon(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placement: Option<Placement>, mesh: &mut Mesh) {

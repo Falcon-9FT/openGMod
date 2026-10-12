@@ -2,7 +2,7 @@
 //! and a nodraw face, with lightmaps of known colours, an LZMA-compressed entity lump, one
 //! static prop and a pakfile.
 
-use crate::lumps::index;
+use crate::lumps::{Overlay, index};
 
 pub const RED: [u8; 4] = [255, 0, 0, 0];
 pub const GREEN: [u8; 4] = [0, 255, 0, 0];
@@ -280,6 +280,17 @@ pub struct TestDisplacement {
     pub heights: Vec<f32>,
 }
 
+/// A light of a [`TestMap`] (`dworldlight_t`), falling off as one over the square of the
+/// distance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TestLight {
+    /// `emittype_t`: 1 a point, 2 a spot, 3 the sun.
+    pub kind: i32,
+    pub origin: [f32; 3],
+    pub intensity: [f32; 3],
+    pub normal: [f32; 3],
+}
+
 /// A static prop of a [`TestMap`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestStaticProp {
@@ -290,19 +301,62 @@ pub struct TestStaticProp {
     pub solid: u8,
 }
 
+/// A face of a [`TestMap`]'s world, without light map: its corners, clockwise seen from the
+/// front as the game winds them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestFace {
+    pub corners: Vec<[f32; 3]>,
+    pub material: &'static str,
+    /// `surf` flags.
+    pub flags: i32,
+}
+
+/// An overlay of a [`TestMap`], its material by name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestOverlay {
+    pub material: &'static str,
+    /// The record as written, but for its texinfo: the material's.
+    pub overlay: Overlay,
+}
+
+impl TestOverlay {
+    /// A square `size` units a side around `origin`, facing `normal` with its U axis `u`, the
+    /// whole texture once, on the map's faces `faces` (the displacements' first, then
+    /// [`TestMap::faces`]).
+    pub fn square(material: &'static str, faces: Vec<i32>, origin: [f32; 3], normal: [f32; 3], u: [f32; 3], size: f32) -> TestOverlay {
+        let h = size / 2.0;
+        let points = [[-h, -h, u[0]], [-h, h, u[1]], [h, h, u[2]], [h, -h, 0.0]];
+        let overlay = Overlay { id: 0, texinfo: 0, render_order: 0, faces, u: [0.0, 1.0], v: [0.0, 1.0], points, origin, normal };
+        TestOverlay { material, overlay }
+    }
+}
+
 /// A map of brushes for tests, lump by lump: the world and brush entities, each with a BSP
-/// tree split along its brushes' bounds, displacements in the world, static props, and
-/// entities.
+/// tree split along its brushes' bounds, displacements and faces in the world, static props,
+/// and entities.
 #[derive(Debug, Clone, Default)]
 pub struct TestMap {
     /// The brushes of each brush model; the first are the world's.
     pub models: Vec<Vec<TestBrush>>,
     pub displacements: Vec<TestDisplacement>,
+    pub faces: Vec<TestFace>,
+    /// Faces of the brush models after the first, in the model's own space: (model, face).
+    pub model_faces: Vec<(usize, TestFace)>,
+    /// Areas of the world's leaves: a leaf whose middle is inside a box (mins, maxs) is in its
+    /// area; the others in none (0).
+    pub areas: Vec<([f32; 3], [f32; 3], u16)>,
     pub static_props: Vec<TestStaticProp>,
     /// The entities after `worldspawn`, as the entity lump writes them.
     pub entities: String,
     /// The leaves as maps of version 19 write them, with an ambient light cube each.
     pub old_leaves: bool,
+    /// One ambient light sample in the middle of every leaf, of this cube (`ColorRGBExp32`
+    /// for +x, -x, +y, -y, +z, -z), in the lumps of version 20.
+    pub ambient: Option<[[u8; 4]; 6]>,
+    /// The same in the HDR lumps.
+    pub ambient_hdr: Option<[[u8; 4]; 6]>,
+    pub lights: Vec<TestLight>,
+    pub overlays: Vec<TestOverlay>,
 }
 
 /// A brush as the tree builder sees it: its index and bounds.
@@ -319,6 +373,7 @@ struct Tree {
     leaf_brushes: Vec<u8>,
     leaf_brush_count: usize,
     old_leaves: bool,
+    areas: Vec<([f32; 3], [f32; 3], u16)>,
 }
 
 impl Tree {
@@ -334,7 +389,11 @@ impl Tree {
     fn leaf(&mut self, brushes: &[Boxed], contents: &[u32], region: ([f32; 3], [f32; 3])) -> i32 {
         let mut leaf = brushes.iter().fold(0u32, |c, b| c | contents[b.0]).to_le_bytes().to_vec();
         leaf.extend(0i16.to_le_bytes()); // cluster
-        leaf.extend(0u16.to_le_bytes()); // area and flags
+        let middle: [f32; 3] = std::array::from_fn(|i| (region.0[i] + region.1[i]) / 2.0);
+        let inside = |(lo, hi, _): &&([f32; 3], [f32; 3], u16)| (0..3).all(|i| lo[i] <= middle[i] && middle[i] <= hi[i]);
+        // leaf 0 is outside everything
+        let area = self.areas.iter().find(inside).filter(|_| self.leaf_count > 0).map_or(0, |a| a.2);
+        leaf.extend(area.to_le_bytes()); // area, and no flags
         for v in region.0.iter().chain(&region.1) {
             leaf.extend((v.clamp(-32768.0, 32767.0) as i16).to_le_bytes());
         }
@@ -374,8 +433,16 @@ impl Tree {
                 }
             }
         }
-        let (axis, value) = match best {
-            Some((axis, value, _)) => (axis, value),
+        // the areas split the tree too, so that no leaf is partly in one
+        let overlaps = |(lo, hi, _): &&([f32; 3], [f32; 3], u16)| (0..3).all(|i| lo[i] < region.1[i] && hi[i] > region.0[i]);
+        let area_side = self
+            .areas
+            .iter()
+            .filter(overlaps)
+            .flat_map(|(lo, hi, _)| (0..3).flat_map(move |axis| [(axis, lo[axis]), (axis, hi[axis])]))
+            .find(|&(axis, value)| region.0[axis] < value && value < region.1[axis]);
+        let (axis, value) = match area_side.or(best.map(|(axis, value, _)| (axis, value))) {
+            Some((axis, value)) => (axis, value),
             None if node_needed => (0, (region.0[0] + region.1[0]) / 2.0),
             None => return self.leaf(brushes, contents, region),
         };
@@ -406,7 +473,7 @@ impl Tree {
 impl TestMap {
     /// The map's bytes.
     pub fn bytes(&self) -> Vec<u8> {
-        let mut tree = Tree { old_leaves: self.old_leaves, ..Tree::default() };
+        let mut tree = Tree { old_leaves: self.old_leaves, areas: self.areas.clone(), ..Tree::default() };
         // leaf 0, as compilers write it: outside everything
         tree.leaf(&[], &[], ([0.0; 3], [0.0; 3]));
 
@@ -462,9 +529,19 @@ impl TestMap {
             }
             let region = (lo.map(|v| v - 1.0), hi.map(|v| v + 1.0));
             let head = tree.build(&boxed, &contents, region, 0, true);
-            let faces = if m == 0 { self.displacements.len() as i32 } else { 0 };
+            // areas are the world's
+            tree.areas.clear();
+            // the world's faces first, then each model's in turn
+            let world_faces = self.displacements.len() + self.faces.len();
+            let (first, faces) = match m {
+                0 => (0, world_faces),
+                _ => {
+                    let before = self.model_faces.iter().filter(|(model, _)| (1..m).contains(model)).count();
+                    (world_faces + before, self.model_faces.iter().filter(|(model, _)| *model == m).count())
+                }
+            };
             models.extend(f32s(&[lo, hi, [0.0; 3]].concat()));
-            models.extend(i32s(&[head, 0, faces]));
+            models.extend(i32s(&[head, first as i32, faces as i32]));
         }
 
         // the displacements: a four-sided face each, and the grid over it
@@ -500,6 +577,32 @@ impl TestMap {
             }
             vert_count += side * side;
         }
+        let mut model_faces: Vec<&(usize, TestFace)> = self.model_faces.iter().filter(|(m, _)| *m > 0 && *m < self.models.len()).collect();
+        model_faces.sort_by_key(|(m, _)| *m);
+        for test_face in self.faces.iter().chain(model_faces.into_iter().map(|(_, face)| face)) {
+            let first_vertex = vertices.len() / 12;
+            let first_edge = surfedges.len() / 4;
+            let n = test_face.corners.len();
+            for (c, corner) in test_face.corners.iter().enumerate() {
+                vertices.extend(f32s(corner));
+                let edge = edges.len() / 4;
+                edges.extend(((first_vertex + c) as u16).to_le_bytes());
+                edges.extend(((first_vertex + (c + 1) % n) as u16).to_le_bytes());
+                surfedges.extend((edge as i32).to_le_bytes());
+            }
+            // clockwise from the front: the normal is the second edge across the first
+            let [a, b, c] = [0, 1, 2].map(|i| test_face.corners[i]);
+            let (ab, ac) = (crate::math::sub(b, a), crate::math::sub(c, a));
+            let normal = crate::math::normalize(crate::math::cross(ac, ab));
+            let plane = tree.plane(normal, crate::math::dot(normal, a));
+            let texinfo = surface(test_face.material, test_face.flags);
+            let mut bytes = face(plane as u16, first_edge as i32, texinfo, -1, -1, [0, 0], [0, 0]);
+            bytes[8..10].copy_from_slice(&(n as i16).to_le_bytes()); // the number of edges
+            faces.extend(bytes);
+        }
+
+        let overlays: Vec<u8> =
+            self.overlays.iter().flat_map(|o| Overlay { texinfo: surface(o.material, 0), ..o.overlay.clone() }.bytes()).collect();
 
         let mut string_data = Vec::new();
         let mut string_table = Vec::new();
@@ -517,7 +620,37 @@ impl TestMap {
             .collect();
         let entities = format!("{{\n\"classname\" \"worldspawn\"\n}}\n{}", self.entities).into_bytes();
 
+        let ambient_lumps = |cube: Option<[[u8; 4]; 6]>| {
+            let (mut index, mut samples) = (Vec::new(), Vec::new());
+            if let Some(cube) = cube {
+                for leaf in 0..tree.leaf_count {
+                    index.extend(1u16.to_le_bytes());
+                    index.extend((leaf as u16).to_le_bytes());
+                    samples.extend(cube.iter().flatten());
+                    samples.extend([128, 128, 128, 0]);
+                }
+            }
+            (index, samples)
+        };
+        let (ambient_index, ambient_samples) = ambient_lumps(self.ambient);
+        let (ambient_index_hdr, ambient_samples_hdr) = ambient_lumps(self.ambient_hdr);
+        let mut world_lights = Vec::new();
+        for light in &self.lights {
+            world_lights.extend(f32s(&[light.origin, light.intensity, light.normal].concat()));
+            // cluster, type, style
+            world_lights.extend(i32s(&[0, light.kind, 0]));
+            // stopdot, stopdot2, exponent, radius, constant, linear, quadratic
+            world_lights.extend(f32s(&[0.9, 0.8, 1.0, 0.0, 0.0, 0.0, 1.0]));
+            // flags, texinfo, owner
+            world_lights.extend(i32s(&[0, -1, 0]));
+        }
+
         let lumps: Vec<(usize, Vec<u8>, u32)> = vec![
+            (15, world_lights, 0),
+            (51, ambient_index_hdr, 0),
+            (52, ambient_index, 0),
+            (55, ambient_samples_hdr, 0),
+            (56, ambient_samples, 0),
             (index::ENTITIES, entities, 0),
             (index::PLANES, tree.planes, 0),
             (index::TEXDATA, texdata, 0),
@@ -536,6 +669,7 @@ impl TestMap {
             (index::DISP_VERTS, disp_verts, 0),
             (index::TEXDATA_STRING_DATA, string_data, 0),
             (index::TEXDATA_STRING_TABLE, string_table, 0),
+            (index::OVERLAYS, overlays, 0),
         ];
         let mut out = vec![0u8; 8 + 64 * 16 + 4];
         out[0..4].copy_from_slice(b"VBSP");

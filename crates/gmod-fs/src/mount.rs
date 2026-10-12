@@ -11,6 +11,7 @@
 //! Search path IDs: what `gameinfo.txt` gives (`GAME`, `MOD`, `PLATFORM`, `DOWNLOAD`),
 //! `WORKSHOP` for addon files, and the name from `mount.cfg` for a mounted game.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gmod_kv::{Document, Options};
@@ -37,11 +38,13 @@ pub struct MountOptions {
     /// Where old compressed workshop downloads (`.bin`) are unpacked: a folder of openGMOD's
     /// own (never inside the installation). Without one they are not mounted.
     pub unpack_dir: Option<PathBuf>,
+    /// Addons switched off, by [`workshop::addon_key`]: not mounted.
+    pub disabled: HashSet<String>,
 }
 
 impl Default for MountOptions {
     fn default() -> MountOptions {
-        MountOptions { addons: true, server_downloads: false, mount_cfg: true, unpack_dir: None }
+        MountOptions { addons: true, server_downloads: false, mount_cfg: true, unpack_dir: None, disabled: HashSet::new() }
     }
 }
 
@@ -124,7 +127,7 @@ pub fn mount_install(install: &Install, options: &MountOptions) -> (Vfs, Vec<Str
                 Origin::Subscribed | Origin::AddonsFolder => options.addons,
                 Origin::ServerDownload => options.server_downloads,
             };
-            if !wanted {
+            if !wanted || options.disabled.contains(&workshop::addon_key(&addon)) {
                 continue;
             }
             let path = if addon.packed {
@@ -144,7 +147,10 @@ pub fn mount_install(install: &Install, options: &MountOptions) -> (Vfs, Vec<Str
             };
             match GmaArchive::open(&path) {
                 Ok(gma) => {
-                    vfs.insert(slot, Mount::new(&["GAME", "WORKSHOP"], Backing::Gma(gma)));
+                    // the addon's title is a search path of its own, as in GMod
+                    let title = gma.info().title.clone();
+                    let ids: Vec<&str> = if title.is_empty() { vec!["GAME", "WORKSHOP"] } else { vec!["GAME", "WORKSHOP", &title] };
+                    vfs.insert(slot, Mount::new(&ids, Backing::Gma(gma)));
                     slot += 1;
                 }
                 Err(e) => warnings.push(e.to_string()),
@@ -268,6 +274,13 @@ mod tests {
         assert_eq!(vfs.read("models/css.mdl", "cstrike").unwrap(), b"css");
         assert_eq!(vfs.find("lua/autorun/*", "GAME").files, ["legacy.lua", "ws.lua"]);
         assert_eq!(vfs.find("lua/autorun/*", "WORKSHOP").files, ["ws.lua"]);
+        // an addon's title is a search path too
+        assert_eq!(vfs.find("lua/autorun/*", "Workshop Addon").files, ["ws.lua"]);
+
+        // an addon switched off is not mounted
+        let disabled = ["123".to_string()].into_iter().collect();
+        let (vfs, _) = mount_install(&install, &MountOptions { disabled, ..MountOptions::default() });
+        assert_eq!(vfs.read("materials/x.vmt", "GAME").unwrap(), b"from garrysmod.vpk");
 
         let (vfs, _) = mount_install(&install, &MountOptions { addons: false, mount_cfg: false, ..MountOptions::default() });
         assert_eq!(vfs.mounts().len(), 6);

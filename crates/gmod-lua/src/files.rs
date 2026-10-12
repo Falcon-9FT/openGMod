@@ -78,6 +78,13 @@ fn find(lua: &Lua, name: &str, from: Option<&str>) -> Option<String> {
     })
 }
 
+/// The game path of the Lua file `name` refers to next to the file `from`, if it exists.
+fn find_relative(lua: &Lua, name: &str, from: &str) -> Option<String> {
+    let host = host(lua);
+    let candidate = gmod_fs::path::normalize(&format!("{}/{name}", folder_in_search_path(from)))?;
+    ROOTS.iter().map(|root| format!("{root}/{candidate}")).find(|path| host.vfs.locate(path, "GAME").is_some())
+}
+
 /// Reads and compiles a file of the game.
 fn load_file(lua: &Lua, path: &str) -> mlua::Result<Function> {
     let bytes = host(lua).vfs.read(path, "GAME").map_err(|e| mlua::Error::RuntimeError(format!("{path}: {e}")))?;
@@ -151,8 +158,19 @@ fn caller_place(lua: &Lua) -> String {
 /// `include(file)`: runs a Lua file and returns what it returns; a failure is reported.
 fn include(lua: &Lua, name: Value) -> mlua::Result<MultiValue> {
     let name = string_arg(&name, 1, "include")?;
-    let from = file_at(lua, 1);
-    let Some(path) = find(lua, &name, from.as_deref()) else {
+    // relative to the file that calls, else to a file further out that is running: a file
+    // `vgui.RegisterFile` includes is next to the one that asked for it
+    let mut from: Vec<String> = Vec::new();
+    for level in 1..64 {
+        if lua.inspect_stack(level, |_| ()).is_none() {
+            break;
+        }
+        if let Some(file) = file_at(lua, level).filter(|f| !from.contains(f)) {
+            from.push(file);
+        }
+    }
+    let found = from.iter().find_map(|file| find_relative(lua, &name, file)).or_else(|| find(lua, &name, None));
+    let Some(path) = found else {
         let place = caller_place(lua);
         host(lua).report(ScriptError::new(format!("Couldn't include file '{name}' - File not found ({place})")));
         return Ok(MultiValue::new());

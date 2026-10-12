@@ -8,3 +8,4 @@ description = "Source engine textures (.vtf 7.0-7.5: every pixel format, DXT dec
 [dependencies]
 gmod-kv.workspace = true
 gmod-fs.workspace = true
+zune-jpeg.workspace = true

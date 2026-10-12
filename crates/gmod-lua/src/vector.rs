@@ -10,14 +10,14 @@ use mlua::{AnyUserData, IntoLuaMulti, Lua, MultiValue, Table, UserData, UserData
 use crate::args::{self, Args};
 use crate::meta::{self, type_id};
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Vector {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Angle {
     pub p: f32,
     pub y: f32,
@@ -413,6 +413,19 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             }
         }
         Ok(())
+    })?;
+    // the engine's linear interpolations, which Derma's animations (MoveTo, SizeTo) go through
+    def(lua, &globals, "LerpVector", |a| {
+        let t = a.number(1)? as f32;
+        let (from, to) = (a.userdata::<Vector>(2, "Vector")?, a.userdata::<Vector>(3, "Vector")?);
+        Ok(Vector::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t, from.z + (to.z - from.z) * t))
+    })?;
+    // each angle the short way round
+    def(lua, &globals, "LerpAngle", |a| {
+        let t = a.number(1)? as f32;
+        let (from, to) = (a.userdata::<Angle>(2, "Angle")?, a.userdata::<Angle>(3, "Angle")?);
+        let turn = |from: f32, to: f32| from + ((to - from + 180.0).rem_euclid(360.0) - 180.0) * t;
+        Ok(Angle { p: turn(from.p, to.p), y: turn(from.y, to.y), r: turn(from.r, to.r) })
     })?;
     vector_methods(lua, &meta::meta_table(lua, "Vector", type_id::VECTOR)?)?;
     angle_methods(lua, &meta::meta_table(lua, "Angle", type_id::ANGLE)?)?;

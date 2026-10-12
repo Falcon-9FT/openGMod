@@ -62,6 +62,9 @@ pub struct Report {
     pub models: Tally,
     /// Physics models (`.phy`) of the models that read.
     pub physics: Tally,
+    /// Models with animations whose every frame reads, and how many frames that was.
+    pub animations: Tally,
+    pub frames: usize,
     pub maps: Tally,
     /// Maps where a player put at the start stands: what is solid there is read right.
     pub collision: Tally,
@@ -77,10 +80,20 @@ pub struct Report {
 
 impl Report {
     pub fn failures(&self) -> usize {
-        [&self.keyvalues, &self.lua, &self.textures, &self.materials, &self.models, &self.physics, &self.maps, &self.collision]
-            .iter()
-            .map(|t| t.failed.len())
-            .sum::<usize>()
+        [
+            &self.keyvalues,
+            &self.lua,
+            &self.textures,
+            &self.materials,
+            &self.models,
+            &self.physics,
+            &self.animations,
+            &self.maps,
+            &self.collision,
+        ]
+        .iter()
+        .map(|t| t.failed.len())
+        .sum::<usize>()
             + self.unreadable.len()
             + self.crc.as_ref().map_or(0, |t| t.failed.len())
     }
@@ -119,6 +132,12 @@ impl Report {
             self.physics.failed.len()
         ));
         out.line(format!(
+            "  Animations {:>8} read   {:>6} failed   (sequences of those models: {} frames, .ani blocks included)",
+            self.animations.ok,
+            self.animations.failed.len(),
+            self.frames
+        ));
+        out.line(format!(
             "  Maps       {:>8} read   {:>6} failed   (BSP: world, lightmaps, displacements, static props, brushes)",
             self.maps.ok,
             self.maps.failed.len()
@@ -137,7 +156,7 @@ impl Report {
         let missing = self.missing_textures.len() + self.missing_materials.len() + self.missing_models.len();
         if missing > 0 {
             out.line(format!(
-                "  Missing: {} textures named by materials, {} materials named by models and maps, {} models named by maps",
+                "  Missing: {} textures named by materials, {} materials named by models and maps, {} models named by maps and models",
                 self.missing_textures.len(),
                 self.missing_materials.len(),
                 self.missing_models.len()
@@ -151,6 +170,7 @@ impl Report {
             ("Material failures", &self.materials.failed),
             ("Model failures", &self.models.failed),
             ("Physics failures", &self.physics.failed),
+            ("Animation failures", &self.animations.failed),
             ("Map failures", &self.maps.failed),
             ("Collision failures", &self.collision.failed),
             ("Unreadable", &self.unreadable),
@@ -313,6 +333,22 @@ fn check_model(vfs: &Vfs, path: &str, where_: &str, report: &mut Report) {
         Ok(None) => {}
         Err(e) => report.physics.failed.push(format!("{where_}: {e}")),
     }
+    // its own animations, every frame (those of the models it includes are checked as those
+    // models); the models it includes should be there
+    if !model.mdl.animations.is_empty() {
+        match gmod_model::Rig::load(vfs, path).and_then(|rig| rig.read_own()) {
+            Ok(frames) => {
+                report.animations.ok += 1;
+                report.frames += frames;
+            }
+            Err(e) => report.animations.failed.push(format!("{where_}: {e}")),
+        }
+    }
+    for include in &model.mdl.include_models {
+        if !vfs.exists(&include.replace('\\', "/"), "GAME") {
+            report.missing_models.push(format!("{where_}: includes {include}"));
+        }
+    }
     for texture in 0..model.mdl.textures.len() {
         let candidates = model.mdl.material_candidates(texture);
         if !candidates.iter().any(|name| material_path(name).is_some_and(|file| vfs.exists(&file, "GAME")))
@@ -385,7 +421,7 @@ fn verify_archives(vfs: &Vfs) -> Tally {
             Err(e) => tally.failed.push(format!("{path} [{}]: {e}", mount_name(vfs, index))),
         };
         match &mount.backing {
-            Backing::Dir(_) => {}
+            Backing::Dir(_) | Backing::Memory(_) => {}
             Backing::Vpk(vpk) => vpk.entries().iter().for_each(|e| check(&e.path, vpk.verify(e))),
             Backing::Gma(gma) => gma.entries().iter().for_each(|e| check(&e.path, gma.verify(e))),
             Backing::Zip(zip) => zip.entries().iter().for_each(|e| check(&e.path, zip.verify(e))),
@@ -486,6 +522,31 @@ mod tests {
         write(&game.join("models/broken.mdl"), b"IDST cut short");
         write(&game.join("lua/broken.lua"), b"x = 1 /* never closed");
         write(&game.join("scripts/sentences.txt"), b"NOT KEYVALUES {");
+        // a model with animations, one in a block of its .ani; one that includes a model not
+        // there; one whose .ani is not there
+        let mut rig = gmod_model::testmodel::TestRig {
+            name: "anim.mdl".into(),
+            checksum: 3,
+            bones: vec![gmod_model::testmodel::TestBone { name: "root".into(), parent: -1, position: [0.0; 3], euler: [0.0; 3] }],
+            animations: vec![gmod_model::testmodel::TestAnimation::turning("@a", 0, 5, 0.0, 1.0)],
+            sequences: vec![gmod_model::testmodel::TestSequence::new("a", "ACT_IDLE", 0)],
+            animation_file: "models/anim.ani".into(),
+            ..Default::default()
+        };
+        rig.animations.push(gmod_model::testmodel::TestAnimation { block: 1, ..rig.animations[0].clone() });
+        let (mdl, ani) = rig.files();
+        let no_ani = gmod_model::testmodel::TestRig { animation_file: "models/gone.ani".into(), ..rig.clone() }.files().0;
+        for (name, data) in [("anim", &mdl), ("noani", &no_ani)] {
+            write(&game.join(format!("models/{name}.mdl")), data);
+            write(&game.join(format!("models/{name}.vvd")), &gmod_model::testmodel::empty_vvd(3));
+            write(&game.join(format!("models/{name}.dx90.vtx")), &gmod_model::testmodel::empty_vtx(3));
+        }
+        write(&game.join("models/anim.ani"), &ani.unwrap());
+        rig.animations.pop();
+        rig.include_models = vec!["models/m_anm.mdl".into()];
+        write(&game.join("models/player.mdl"), &rig.files().0);
+        write(&game.join("models/player.vvd"), &gmod_model::testmodel::empty_vvd(3));
+        write(&game.join("models/player.dx90.vtx"), &gmod_model::testmodel::empty_vtx(3));
         let workshop = root.parent().unwrap().parent().unwrap().join("workshop/content/4000/42");
         std::fs::create_dir_all(&workshop).unwrap();
         gma::write(
@@ -512,10 +573,15 @@ mod tests {
         assert_eq!(report.textures.ok, 1);
         assert!(report.textures.failed[0].starts_with("materials/broken.vtf [folder garrysmod]: "), "{:?}", report.textures.failed);
         assert_eq!((report.maps.ok, report.maps.failed.len()), (0, 1));
-        assert_eq!((report.models.ok, report.models.failed.len()), (0, 1));
+        assert_eq!((report.models.ok, report.models.failed.len()), (3, 1), "{:?}", report.models.failed);
         assert!(report.models.failed[0].starts_with("models/broken.mdl [folder garrysmod]: "), "{:?}", report.models.failed);
+        // every frame of the animations, in the model and in its .ani
+        assert_eq!((report.animations.ok, report.frames), (2, 5 + 5 + 5), "{:?}", report.animations.failed);
+        assert_eq!(report.animations.failed.len(), 1);
+        assert!(report.animations.failed[0].starts_with("models/noani.mdl [folder garrysmod]: "), "{:?}", report.animations.failed);
+        assert_eq!(report.missing_models, ["models/player.mdl [folder garrysmod]: includes models/m_anm.mdl"]);
         let crc = report.crc.as_ref().unwrap();
         assert_eq!((crc.ok, crc.failed.len()), (6, 0));
-        assert_eq!(report.failures(), 5);
+        assert_eq!(report.failures(), 6);
     }
 }

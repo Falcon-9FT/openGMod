@@ -3,7 +3,7 @@ name = "gmod-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Source engine models: .mdl headers, bones, skins and body parts, .vvd vertices, .vtx triangles, .phy physics; static meshes for drawing props"
+description = "Source engine models: .mdl headers, bones, skins and body parts, .vvd vertices, .vtx triangles, .phy physics, animations and .ani blocks; meshes to draw and the poses of what they play"
 
 [dependencies]
 gmod-fs.workspace = true

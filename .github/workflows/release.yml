@@ -32,7 +32,28 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          $programs = @("target/release/opengmod.exe", "target/release/gmod-check.exe")
+          # opengmod.exe needs Chromium's files beside it: it goes out as a zip of them all;
+          # gmod-check.exe alone, too. Chromium's files are where CEF's build downloaded them
+          # (cef-dll-sys's out folder); target/release has them only when that build ran now,
+          # not when it came from the cache
+          $dist = "dist/openGMOD"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item target/release/opengmod.exe, target/release/gmod-check.exe $dist
+          $cef = Get-ChildItem target/release/build -Directory -Filter "cef-dll-sys-*" |
+            ForEach-Object { Join-Path $_.FullName "out/cef_windows_x86_64" } |
+            Where-Object { Test-Path (Join-Path $_ "libcef.dll") } |
+            Select-Object -First 1
+          if (-not $cef) { $cef = "target/release" }
+          Write-Output "Chromium's files from $cef"
+          Get-ChildItem $cef -File |
+            Where-Object { $_.Extension -in ".dll", ".pak", ".dat", ".bin" -or $_.Name -in "vk_swiftshader_icd.json", "CREDITS.html" } |
+            Copy-Item -Destination $dist
+          Copy-Item -Recurse (Join-Path $cef "locales") "$dist/locales"
+          foreach ($needed in "libcef.dll", "icudtl.dat", "resources.pak", "locales/en-US.pak") {
+            if (-not (Test-Path (Join-Path $dist $needed))) { Write-Error "$needed is missing from the release"; exit 1 }
+          }
+          Compress-Archive -Path "$dist/*" -DestinationPath openGMOD-windows-x64.zip -Force
+          $programs = @("openGMOD-windows-x64.zip", "target/release/gmod-check.exe")
           if ($env:REF_TYPE -eq "tag") {
             $tag = $env:REF_NAME
           } else {

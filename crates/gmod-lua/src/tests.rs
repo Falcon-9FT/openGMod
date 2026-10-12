@@ -11,6 +11,16 @@ use mlua::Value;
 
 use super::*;
 
+mod chat;
+mod items;
+mod mapio;
+mod movers;
+mod multiplayer;
+mod npc;
+mod ragdoll;
+mod shapes;
+mod triggers;
+
 /// A folder that is removed when dropped.
 struct TempDir(PathBuf);
 
@@ -520,6 +530,7 @@ fn util_library() {
     assert_eq!(g.eval::<String>("return util.Base64Encode('hello world')"), "aGVsbG8gd29ybGQ=");
     assert_eq!(g.eval::<String>("return util.Base64Decode('aGVsbG8gd29ybGQ=')"), "hello world");
     assert_eq!(g.eval::<String>("return util.TableToJSON({1, 2, 'x', true})"), "[1,2,\"x\",true]");
+    assert_eq!(g.eval::<String>("return util.TableToJSON({})"), "[]");
     assert_eq!(g.eval::<String>("return util.TableToJSON({a = {b = 1.5}})"), "{\"a\":{\"b\":1.5}}");
     assert_eq!(g.eval::<String>("return util.TableToJSON({v = Vector(1, 2, 3)})"), "{\"v\":\"[1 2 3]\"}");
     assert!(g.eval::<bool>(
@@ -654,8 +665,8 @@ fn a_gamemode_starts() {
     assert_eq!(
         g.printed(),
         "autorun\nautorun server\nhook\tPreGamemodeLoaded\tfalse\nbase\tbase\tgamemodes/base\ngamemode\tbase\tnil\ngamemode\tmine\tbase\n\
-         hook\tOnGamemodeLoaded\ttrue\nentity\tbase_anim\tbase/entities/entities/base_anim\tnil\n\
-         entity\tthing\tmine/entities/entities/thing\tbase_anim\nweapon\tgun\ttrue\nhook\tPostGamemodeLoaded\ttrue\n\
+         entity\tbase_anim\tbase/entities/entities/base_anim\tnil\nentity\tthing\tmine/entities/entities/thing\tbase_anim\n\
+         weapon\tgun\ttrue\nhook\tOnGamemodeLoaded\ttrue\nhook\tPostGamemodeLoaded\ttrue\n\
          hook\tCreateTeams\ttrue\ninitialize\tmine\n"
     );
     assert!(g.eval::<bool>("return GAMEMODE == gamemode.Get('mine') and GM == nil and ENT == nil and SWEP == nil"));
@@ -1895,6 +1906,10 @@ fn what_a_players_client_would_say() {
     // typed in the console, or run by `ConCommand`, it is set
     g.runtime.run_player_command(alice, "gmod_toolmode weld; weld_forcelimit 1000; gmod_toolmode");
     g.runtime.run_string("Entity(1):ConCommand('cl_playerskin 3; finger_0 1 2')", "concommand").unwrap();
+    // the client runs it, and sends the server what it does not know
+    let asked = g.runtime.take_to_clients();
+    assert_eq!(asked, [(alice, ToClient::Command("cl_playerskin 3; finger_0 1 2".into()))]);
+    g.runtime.run_player_command(alice, "cl_playerskin 3; finger_0 1 2");
     assert!(g.eval::<bool>(
         "local p = Entity(1)
          return p:GetInfo('gmod_toolmode') == 'weld' and p:GetInfoNum('weld_forcelimit', 0) == 1000 and p:GetInfoNum('cl_playerskin', 0) == 3"
@@ -1946,15 +1961,964 @@ fn what_scripts_ask_of_entities() {
              and e:GetBoneCount() == 0 and e:LookupBone('root') == nil and e:LookupAttachment('muzzle') == 0 and e:GetFlexNum() == 0
              and ents.Create('info_target'):LookupAttachment('muzzle') == -1 and e:GetWorkshopID() == nil"
     ));
-    // sounds are taken and kept quiet
+    // sounds: what Lua asks for (the events are in sounds_are_what_lua_asks_for)
     assert!(g.eval::<bool>(
         "E:EmitSound('Weapon_Pistol.Single') E:StopSound('Weapon_Pistol.Single') EmitSound('a.wav', Vector(), 0)
          sound.Add({ name = 'Test.Sound', sound = 'test.wav', level = 80 })
          local patch = CreateSound(E, 'Test.Sound')
          patch:PlayEx(0.5, 120) local playing = patch:IsPlaying() and patch:GetVolume() == 0.5 and patch:GetPitch() == 120
          patch:Stop()
+         local first = E:StartLoopingSound('a.wav')
          return playing and not patch:IsPlaying() and sound.GetProperties('test.sound').level == 80 and sound.GetTable()[1] == 'Test.Sound'
-             and E:StartLoopingSound('a.wav') == 1 and E:StartLoopingSound('b.wav') == 2"
+             and E:StartLoopingSound('b.wav') == first + 1"
     ));
     assert_eq!(g.messages(), ["on purpose"]);
+}
+
+// --- the client ---------------------------------------------------------------------------
+
+/// The client's half of the game's Lua, cut down: [`ENTITY_LUA`], and commands of Lua on the
+/// table `COMMANDS` as `concommand` keeps them.
+const CLIENT_LUA: &str = r#"
+    COMMANDS = {}
+    concommand = {
+        Add = function(name, f) COMMANDS[name:lower()] = f AddConsoleCommand(name) end,
+        Run = function(p, name, args, line)
+            local f = COMMANDS[name:lower()]
+            if f then f(p, name, args, line) return true end
+            return false
+        end,
+    }
+"#;
+
+/// A client runtime with [`ENTITY_LUA`] and [`CLIENT_LUA`] run, on a screen 640 by 480.
+fn client_game(files: &[(&str, &str)]) -> Game {
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let mut all = vec![("lua/includes/init.lua", init.as_str()), ("scripts/weapons/weapon_pistol.txt", PISTOL)];
+    all.extend_from_slice(files);
+    let g = game(Realm::Client, &all);
+    g.runtime.init();
+    g.runtime.set_screen_size(640, 480);
+    g
+}
+
+/// The vertices drawn in a colour.
+fn drawn_in(g: &Game, color: [u8; 4]) -> Vec<[f32; 2]> {
+    g.runtime.with_canvas(|canvas, _| canvas.vertices().iter().filter(|v| v.color == color).map(|v| v.pos).collect())
+}
+
+#[test]
+fn panels_are_laid_out_painted_and_clicked() {
+    let g = client_game(&[]);
+    g.runtime
+        .run_string(
+            "P = vgui.Create('Panel') P:SetPos(10, 10) P:SetSize(200, 100) P:MakePopup()
+             function P:Paint(w, h) surface.SetDrawColor(255, 0, 0, 255) surface.DrawRect(0, 0, w, h) end
+             B = vgui.Create('Button', P) B:Dock(FILL) B:DockMargin(5, 5, 5, 5)
+             function B:DoClick() CLICKED = (CLICKED or 0) + 1 end
+             Q = vgui.Create('Panel') Q:SetPos(300, 10) Q:SetSize(100, 40) Q:MakePopup()
+             T = vgui.Create('TextEntry', Q) T:Dock(FILL)
+             HOOKS.GUIMousePressed = function(code, aim) PRESSED = code end",
+            "panels",
+        )
+        .unwrap();
+    assert!(g.runtime.cursor_visible());
+    g.runtime.paint(0.016);
+    // docked inside its parent, less the margin
+    assert!(g.eval::<bool>(
+        "local x, y = B:GetPos() local w, h = B:GetSize() return x == 5 and y == 5 and w == 190 and h == 90 and B:GetParent() == P"
+    ));
+    let red = drawn_in(&g, [255, 0, 0, 255]);
+    assert!(red.contains(&[10.0, 10.0]) && red.contains(&[210.0, 110.0]), "{red:?}");
+
+    // a label wrapped to its width is as tall as its lines
+    assert!(g.eval::<bool>(
+        "surface.CreateFont('Default', { font = 'Tahoma', size = 13 })
+         local text = 'one two three four five six seven eight'
+         local L = vgui.Create('Label') L:SetText(text)
+         local W = vgui.Create('Label') W:SetSize(60, 20) W:SetWrap(true) W:SetText(text)
+         local lw, lh = L:GetContentSize() local ww, wh = W:GetContentSize()
+         L:Remove() W:Remove()
+         return lw > 60 and ww <= 60 and wh >= 3 * lh"
+    ));
+
+    // a click on the button, one beside the panels, which goes to the world
+    g.runtime.set_cursor(50, 50);
+    assert!(g.eval::<bool>("return vgui.GetHoveredPanel() == B and B.Hovered"));
+    assert!(g.runtime.button(107, true) && g.runtime.button(107, false));
+    g.runtime.set_cursor(500, 300);
+    assert!(g.runtime.button(107, true) && g.runtime.button(107, false));
+    assert!(g.eval::<bool>("return CLICKED == 1 and PRESSED == MOUSE_LEFT and not B.Hovered"));
+
+    // typing into the text entry clicked
+    g.runtime.set_cursor(320, 20);
+    g.runtime.button(107, true);
+    g.runtime.button(107, false);
+    assert!(g.runtime.type_text("hey"));
+    assert!(g.runtime.button(66, true) && g.runtime.button(66, false));
+    assert!(g.eval::<bool>("return vgui.GetKeyboardFocus() == T and T:GetValue() == 'he'"));
+
+    // gone at the end of the frame, and with them the cursor
+    g.runtime.run_string("P:Remove() Q:Remove()", "remove").unwrap();
+    g.runtime.paint(0.016);
+    assert!(!g.runtime.cursor_visible());
+    assert!(g.eval::<bool>("return not P:IsValid() and not T:IsValid()"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn keys_run_what_they_are_bound_to() {
+    let g = client_game(&[("cfg/config_default.cfg", "bind \"q\" \"+menu\"\nbind \"v\" \"noclip\"\nbind \"e\" \"+use\"\n")]);
+    g.runtime
+        .run_string(
+            "concommand.Add('+menu', function() MENU = true end)
+             concommand.Add('-menu', function() MENU = false end)
+             HOOKS.PlayerBindPress = function(p, bind, pressed, code) if bind == '+use' then BLOCKED = code return true end end
+             CreateConVar('gmod_toolmode', 'weld', FCVAR_USERINFO or 512)
+             RunConsoleCommand('gm_spawn', 'models/a b.mdl') RunConsoleCommand('gmod_toolmode', 'rope')",
+            "binds",
+        )
+        .unwrap();
+    // Q is the client's own; V is the server's; E is taken by Lua
+    assert!(g.runtime.button(27, true));
+    assert!(g.eval::<bool>("return MENU == true and input.IsKeyDown(KEY_Q or 27)"));
+    assert!(g.runtime.button(27, false));
+    assert!(g.eval::<bool>("return MENU == false"));
+    assert!(!g.runtime.button(32, true));
+    assert!(g.runtime.button(15, true));
+    assert!(g.eval::<bool>("return BLOCKED == 15"));
+    // what the client does not know goes to the server, user info too
+    g.runtime.think(0.01);
+    assert_eq!(g.runtime.take_server_commands(), ["gm_spawn \"models/a b.mdl\""]);
+    assert!(g.runtime.take_server_commands().is_empty());
+    assert_eq!(g.runtime.take_user_info(), [("gmod_toolmode".to_string(), "rope".to_string())]);
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn the_client_has_the_servers_entities() {
+    const SENT: &str = "scripted_ents.Register({ Type = 'anim',
+        Initialize = function(self) INIT = (INIT or 0) + 1 end,
+        OnRemove = function(self) REMOVED = true end }, 'sent_test')";
+    let server = player_game();
+    server.runtime.run_string(SENT, "sent").unwrap();
+    let alice = server.runtime.join(alice()).unwrap();
+    server
+        .runtime
+        .run_string(
+            "E = ents.Create('prop_physics') E:SetModel('models/box.mdl') E:SetPos(Vector(30, 0, 0)) E:Spawn()
+             E:SetNWInt('n', 7) E:SetNWEntity('who', Entity(1)) E:SetNW2Vector('v', Vector(1, 2, 3))
+             S = ents.Create('sent_test') S:Spawn()",
+            "props",
+        )
+        .unwrap();
+    server.runtime.think(0.02);
+
+    let client = client_game(&[]);
+    client.runtime.run_string(SENT, "sent").unwrap();
+    client.runtime.spawn_map(&player_map());
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.set_local_player(alice);
+    assert!(client.eval::<bool>(
+        "local p, e = LocalPlayer(), ents.FindByClass('prop_physics')[1]
+         return p:IsPlayer() and p:Nick() == 'Alice' and p:Health() == 100 and p:GetActiveWeapon():GetClass() == 'weapon_pistol'
+             and e:GetPos() == Vector(30, 0, 0) and e:GetModel() == 'models/box.mdl' and e:GetNWInt('n') == 7
+             and e:GetNWEntity('who') == p and e:GetNW2Vector('v') == Vector(1, 2, 3)
+             and #ents.FindByClass('info_player_start') == 0 and INIT == 1 and ents.FindByClass('sent_test')[1].Initialize ~= nil"
+    ));
+    let clip = server.eval::<i64>("return Entity(1):GetActiveWeapon():Clip1()");
+    assert_eq!(client.eval::<i64>("return LocalPlayer():GetActiveWeapon():Clip1()"), clip);
+
+    // what goes on the server goes on the client; the same entity stays the same
+    server.runtime.run_string("S:Remove() E:SetPos(Vector(40, 0, 0))", "move").unwrap();
+    server.runtime.think(0.02);
+    client.runtime.run_string("PROP = ents.FindByClass('prop_physics')[1]", "keep").unwrap();
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    assert!(client.eval::<bool>(
+        "return REMOVED and INIT == 1 and #ents.FindByClass('sent_test') == 0 and PROP:IsValid() and PROP:GetPos() == Vector(40, 0, 0)"
+    ));
+    assert!(server.messages().is_empty(), "{:?}", server.messages());
+    assert!(client.messages().is_empty(), "{:?}", client.messages());
+}
+
+#[test]
+fn the_hud_shows_what_the_player_has() {
+    let server = player_game();
+    let alice = server.runtime.join(alice()).unwrap();
+    server.runtime.think(0.02);
+    let client = client_game(&[]);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.set_local_player(alice);
+    client.runtime.run_string("ASKED = {} HOOKS.HUDShouldDraw = function(name) ASKED[name] = true end", "hud").unwrap();
+    client.runtime.paint(0.016);
+    // health and ammo, no suit without armour, no second ammo for the pistol
+    assert!(client.eval::<bool>(
+        "return ASKED.CHudHealth and ASKED.CHudAmmo and ASKED.CHudCrosshair and ASKED.CHudGMod
+             and not ASKED.CHudBattery and not ASKED.CHudSecondaryAmmo"
+    ));
+    // the boxes, at the bottom left and right of a screen 480 tall
+    let boxes = drawn_in(&client, [0, 0, 0, 90]);
+    let health = |p: &&[f32; 2]| (16.0..=118.0).contains(&p[0]) && (432.0..=468.0).contains(&p[1]);
+    let ammo = |p: &&[f32; 2]| (490.0..=626.0).contains(&p[0]) && (432.0..=468.0).contains(&p[1]);
+    assert!(boxes.iter().any(|p| health(&p)) && boxes.iter().any(|p| ammo(&p)), "{boxes:?}");
+
+    // Lua hides an element
+    client.runtime.run_string("HOOKS.HUDShouldDraw = function(name) return name ~= 'CHudHealth' end", "hide").unwrap();
+    client.runtime.paint(0.016);
+    let boxes = drawn_in(&client, [0, 0, 0, 90]);
+    assert!(!boxes.iter().any(|p| health(&p)) && boxes.iter().any(|p| ammo(&p)), "{boxes:?}");
+    assert!(client.messages().is_empty(), "{:?}", client.messages());
+}
+
+#[test]
+fn lerps_of_vectors_and_angles() {
+    let g = game(Realm::Server, &[]);
+    assert!(g.eval::<bool>("return LerpVector(0.25, Vector(0, 0, 0), Vector(4, 8, -12)) == Vector(1, 2, -3)"));
+    // the short way round: from 170 to -170 through 180
+    assert!(g.eval::<bool>("local a = LerpAngle(0.5, Angle(0, 170, 0), Angle(10, -170, 0)) return math.abs(a.p - 5) < 1e-3 and math.abs(math.abs(a.y) - 180) < 1e-3"));
+}
+
+#[test]
+fn the_engine_fields_of_an_entity() {
+    let g = entity_game(Realm::Server);
+    // the sun's light comes down at 60 degrees along +x: the direction points back up at the sun
+    let (x, y, z) = g.eval::<(f32, f32, f32)>(
+        "local sun = ents.Create('env_sun') sun:SetKeyValue('pitch', '-60') sun:SetKeyValue('angle', '0')
+         sun:SetName('sun')
+         local d = sun:GetInternalVariable('m_vDirection')
+         assert(sun:GetInternalVariable('m_iName') == 'sun' and sun:GetInternalVariable('nonsense') == nil)
+         return d.x, d.y, d.z",
+    );
+    assert!((x + 0.5).abs() < 1e-3 && y.abs() < 1e-3 && (z - 0.866).abs() < 1e-3, "{x} {y} {z}");
+}
+
+#[test]
+fn text_of_a_token_is_its_phrase() {
+    let g = client_game(&[("resource/localization/en/test.properties", "test.hello=Hello there\n")]);
+    let (token, phrase, raw) = g.eval::<(i64, i64, i64)>(
+        "surface.CreateFont('T', { font = 'Arial', size = 20 }) surface.SetFont('T')
+         return surface.GetTextSize('#test.hello'), surface.GetTextSize('Hello there'), surface.GetTextSize('test.hello')",
+    );
+    assert_eq!(token, phrase);
+    assert_ne!(token, raw);
+}
+
+#[test]
+fn sounds_are_what_lua_asks_for() {
+    use crate::sound::SoundEvent;
+    let g = game(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA),
+            ("scripts/game_sounds_manifest.txt", "\"game_sounds_manifest\" { \"precache_file\" \"scripts/game_sounds_test.txt\" }"),
+            (
+                "scripts/game_sounds_test.txt",
+                "\"Test.Engine\" { \"channel\" \"CHAN_WEAPON\" \"volume\" \"0.5\" \"soundlevel\" \"SNDLVL_GUNFIRE\" \"wave\" \")weapons/shot.wav\" }",
+            ),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(
+        "E = ents.Create('prop_physics') E:Spawn()
+         E:EmitSound('Test.Engine')
+         sound.Add({ name = 'Test.Lua', channel = CHAN_ITEM or 3, volume = { 0.2, 0.4 }, level = 80, pitch = 110, sound = { 'a.wav', 'b.wav' } })
+         sound.Play('Test.Lua', Vector(1, 2, 3))
+         EmitSound('ambient/file.mp3', Vector(), 0, 0, 0.7)
+         E:EmitSound('nothing at all')
+         E:StopSound('Test.Engine')
+         P = CreateSound(E, 'loop.wav') P:Play() P:ChangePitch(150) P:Stop()",
+        "test",
+    )
+    .unwrap();
+    let events = g.runtime.take_sounds();
+    let SoundEvent::Play(engine) = &events[0] else { panic!("{events:?}") };
+    assert_eq!((engine.wave.as_str(), engine.volume, engine.level, engine.channel), ("sound/weapons/shot.wav", 0.5, 140.0, 1));
+    assert!(engine.entity.is_some() && engine.position.is_none());
+    let SoundEvent::Play(scripted) = &events[1] else { panic!() };
+    assert!(scripted.wave == "sound/a.wav" || scripted.wave == "sound/b.wav");
+    assert!(
+        (0.2..=0.4).contains(&scripted.volume) && (scripted.pitch - 1.1).abs() < 1e-4 && scripted.level == 80.0 && scripted.channel == 3
+    );
+    assert!(scripted.position.is_some_and(|p| p.y == 2.0));
+    let SoundEvent::Play(file) = &events[2] else { panic!() };
+    assert_eq!((file.wave.as_str(), file.volume), ("sound/ambient/file.mp3", 0.7));
+    // an unknown name plays nothing; a stop by name; the patch plays, changes and stops
+    assert!(matches!(&events[3], SoundEvent::Stop { name, .. } if name == "Test.Engine"));
+    let SoundEvent::Play(patch) = &events[4] else { panic!() };
+    let id = patch.patch.expect("a patch");
+    assert_eq!(&events[5..], [SoundEvent::ChangePatch { patch: id, volume: 1.0, pitch: 1.5 }, SoundEvent::StopPatch(id)]);
+    assert!(g.runtime.take_sounds().is_empty());
+}
+
+#[test]
+fn footsteps_and_impacts_sound_their_surfaces() {
+    use crate::sound::SoundEvent;
+    use gmod_model::testmodel::{self, TestConvex};
+    let mdl = testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let phy = testmodel::phy(
+        1,
+        &[vec![TestConvex::cuboid([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0])]],
+        false,
+        "solid { \"index\" \"0\" \"mass\" \"25\" \"surfaceprop\" \"wood\" }",
+    );
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/box.mdl", &mdl),
+            ("models/crate.mdl", &mdl),
+            ("models/crate.phy", &phy),
+            ("scripts/weapons/weapon_pistol.txt", PISTOL.as_bytes()),
+            ("scripts/surfaceproperties_manifest.txt", b"\"surfaces\" { \"file\" \"scripts/surfaceproperties.txt\" }"),
+            (
+                "scripts/surfaceproperties.txt",
+                b"\"default\" { \"stepleft\" \"Default.StepLeft\" \"stepright\" \"Default.StepRight\" }
+                  \"wood\" { \"base\" \"default\" \"stepleft\" \"Wood.StepLeft\" \"stepright\" \"Wood.StepRight\"
+                             \"impacthard\" \"Wood.ImpactHard\" \"impactsoft\" \"Wood.ImpactSoft\" \"gamematerial\" \"W\" }",
+            ),
+            // the floor of the map is wood
+            ("materials/dev/dev_measuregeneric01.vmt", b"\"LightmappedGeneric\" { \"$surfaceprop\" \"wood\" }"),
+            ("scripts/game_sounds_manifest.txt", b"\"game_sounds_manifest\" { \"precache_file\" \"scripts/game_sounds_test.txt\" }"),
+            (
+                "scripts/game_sounds_test.txt",
+                b"\"Wood.StepLeft\" { \"wave\" \"step_l.wav\" } \"Wood.StepRight\" { \"wave\" \"step_r.wav\" }
+                  \"Wood.ImpactHard\" { \"wave\" \"hard.wav\" } \"Wood.ImpactSoft\" { \"wave\" \"soft.wav\" }",
+            ),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    g.runtime.spawn_map(&player_map());
+    let alice = g.runtime.join(alice()).unwrap();
+    let waves = |g: &Game| -> Vec<String> {
+        g.runtime.take_sounds().into_iter().filter_map(|e| if let SoundEvent::Play(p) = e { Some(p.wave) } else { None }).collect()
+    };
+    waves(&g);
+
+    // a second's walk on wood: a step every 400 ms, left and right in turn
+    g.runtime.set_input(alice, walking(90.0, 0));
+    g.runtime.think(1.0);
+    let steps = waves(&g);
+    assert!((2..=3).contains(&steps.len()), "{steps:?}");
+    assert!(
+        steps.windows(2).all(|w| w[0] != w[1]) && steps.iter().all(|w| w == "sound/step_l.wav" || w == "sound/step_r.wav"),
+        "{steps:?}"
+    );
+    // the gamemode keeps them quiet
+    g.runtime.run_string("HOOKS.PlayerFootstep = function(ply, pos, foot, sound, volume) LAST = sound return true end", "quiet").unwrap();
+    g.runtime.think(1.0);
+    assert!(waves(&g).is_empty());
+    assert!(g.eval::<bool>("return LAST == 'Wood.StepLeft' or LAST == 'Wood.StepRight'"));
+
+    // what traces hit is wood
+    assert!(g.eval::<bool>(
+        "local t = util.TraceLine({ start = Vector(0, -500, 50), endpos = Vector(0, -500, -50) })
+         return t.MatType == MAT_WOOD and t.SurfaceProps == 1"
+    ));
+
+    // a crate dropped from 150 units hits the floor hard, and tells Lua
+    g.runtime.set_input(alice, UserCmd::default());
+    g.runtime
+        .run_string(
+            "local c = ents.Create('prop_physics') c:SetModel('models/crate.mdl') c:SetPos(Vector(-300, -300, 150)) c:Spawn()
+             c:AddCallback('PhysicsCollide', function(ent, data) HIT = HIT or data.Speed end)",
+            "crate",
+        )
+        .unwrap();
+    g.runtime.think(1.5);
+    assert!(waves(&g).contains(&"sound/hard.wav".to_string()));
+    assert!(g.eval::<bool>("return HIT and HIT > 250"));
+}
+
+#[test]
+fn dynamic_lights_shine_until_they_die() {
+    let g = client_game(&[]);
+    g.runtime
+        .run_string(
+            "local l = DynamicLight(7) l.Pos = Vector(1, 2, 3) l.r, l.g, l.b = 255, 128, 0 l.Brightness = 2 l.Size = 256
+             l.DieTime = CurTime() + 0.5 l.nomodel = true
+             SAME = DynamicLight(7) == l
+             local dark = DynamicLight(8) dark.Pos = Vector() dark.Size = 100 dark.DieTime = CurTime() - 1",
+            "lights",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("return SAME"));
+    let lights = g.runtime.dynamic_lights();
+    assert_eq!(lights.len(), 1, "{lights:?}");
+    let l = lights[0];
+    assert_eq!((l.position.z, l.radius, l.world, l.models), (3.0, 256.0, true, false));
+    assert!((l.color[0] - 4.0).abs() < 1e-5 && (l.color[1] - 128.0 * 4.0 / 255.0).abs() < 1e-5 && l.color[2] == 0.0);
+    g.runtime.think(1.0);
+    assert!(g.runtime.dynamic_lights().is_empty());
+}
+
+/// A page that tells what it was asked to, and tells what the test wants.
+#[derive(Default)]
+struct FakePage {
+    calls: RefCell<Vec<String>>,
+    events: RefCell<Vec<crate::WebEvent>>,
+    picture: RefCell<Option<gmod_material::png::Rgba>>,
+    loading: std::cell::Cell<bool>,
+}
+
+struct SharedPage(Rc<FakePage>);
+
+impl crate::WebPage for SharedPage {
+    fn open_url(&self, url: &str) {
+        self.0.calls.borrow_mut().push(format!("open {url}"));
+        self.0.loading.set(true);
+    }
+    fn set_html(&self, html: &str) {
+        self.0.calls.borrow_mut().push(format!("html {html}"));
+    }
+    fn run_js(&self, js: &str) {
+        self.0.calls.borrow_mut().push(format!("js {js}"));
+    }
+    fn add_function(&self, object: &str, function: &str) {
+        self.0.calls.borrow_mut().push(format!("function {object}.{function}"));
+    }
+    fn answer(&self, callback: u64, values: &str) {
+        self.0.calls.borrow_mut().push(format!("answer {callback} {values}"));
+    }
+    fn is_loading(&self) -> bool {
+        self.0.loading.get()
+    }
+    fn stop(&self) {}
+    fn reload(&self) {}
+    fn go_back(&self) {}
+    fn go_forward(&self) {}
+    fn resize(&self, width: u32, height: u32) {
+        self.0.calls.borrow_mut().push(format!("size {width}x{height}"));
+    }
+    fn take_picture(&self) -> Option<gmod_material::png::Rgba> {
+        self.0.picture.borrow_mut().take()
+    }
+    fn take_events(&self) -> Vec<crate::WebEvent> {
+        std::mem::take(&mut *self.0.events.borrow_mut())
+    }
+    fn focus(&self, on: bool) {
+        self.0.calls.borrow_mut().push(format!("focus {on}"));
+    }
+    fn mouse_move(&self, x: i32, y: i32, _: u32) {
+        self.0.calls.borrow_mut().push(format!("move {x},{y}"));
+    }
+    fn mouse_leave(&self) {}
+    fn mouse_button(&self, x: i32, y: i32, button: crate::WebButton, down: bool, _: u32) {
+        self.0.calls.borrow_mut().push(format!("button {button:?} {down} {x},{y}"));
+    }
+    fn mouse_wheel(&self, _: i32, _: i32, notches: i32, _: u32) {
+        self.0.calls.borrow_mut().push(format!("wheel {notches}"));
+    }
+    fn key(&self, virtual_key: i32, down: bool, modifiers: u32) {
+        self.0.calls.borrow_mut().push(format!("key {virtual_key:#x} {down} {modifiers}"));
+    }
+    fn type_text(&self, text: &str, _: u32) {
+        self.0.calls.borrow_mut().push(format!("text {text}"));
+    }
+}
+
+#[test]
+fn html_panels_show_pages_and_talk_to_them() {
+    let g = client_game(&[]);
+    let page = Rc::new(FakePage::default());
+    let made = page.clone();
+    g.runtime.set_web_pages(Rc::new(move |w, h| {
+        made.calls.borrow_mut().push(format!("new {w}x{h}"));
+        Some(Box::new(SharedPage(made.clone())) as Box<dyn crate::WebPage>)
+    }));
+    g.runtime
+        .run_string(
+            "H = vgui.Create('HTML') H:SetPos(10, 20) H:SetSize(300, 200) H:MakePopup()
+             H:NewObject('lua') H:NewObjectCallback('lua', 'Run')
+             H:OpenURL('asset://garrysmod/html/menu.html')
+             LOADING = H:IsLoading()
+             function H:OnCallback(object, func, args) CALLED = object .. '.' .. func .. '(' .. table.concat(args, ',') .. ')' return 'Phrase', 2 end
+             function H:OnDocumentReady(url) READY = url end
+             function H:ConsoleMessage(msg, file, line, level) LOGGED = msg .. '@' .. file .. ':' .. line .. ' ' .. level end",
+            "html",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("return LOADING"));
+    assert_eq!(
+        page.calls.borrow()[..3],
+        ["new 300x200".to_string(), "function lua.Run".to_string(), "open asset://garrysmod/html/menu.html".to_string()]
+    );
+
+    // what the page tells reaches Lua; a call that waits is answered with what Lua returned
+    page.events.borrow_mut().extend([
+        crate::WebEvent::Loaded { url: "asset://garrysmod/html/menu.html".into() },
+        crate::WebEvent::Callback {
+            object: "language".into(),
+            function: "Update".into(),
+            callback: Some(7),
+            args: "[\"new_game\",3]".into(),
+        },
+        crate::WebEvent::Console { message: "hi".into(), source: "menu.js".into(), line: 4, level: "warn" },
+    ]);
+    *page.picture.borrow_mut() = Some(gmod_material::png::Rgba { width: 300, height: 200, pixels: vec![0; 300 * 200 * 4] });
+    g.runtime.paint(0.016);
+    assert!(g.eval::<bool>(
+        "return READY == 'asset://garrysmod/html/menu.html' and CALLED == 'language.Update(new_game,3)' and LOGGED == 'hi@menu.js:4 warn'"
+    ));
+    assert!(page.calls.borrow().contains(&"answer 7 [\"Phrase\",2]".to_string()), "{:?}", page.calls.borrow());
+
+    // its picture is drawn where the panel is, once the program has it
+    let pictures = g.runtime.take_page_pictures();
+    assert_eq!(pictures.len(), 1);
+    let id = pictures[0].0;
+    let drawn = g.runtime.with_canvas(|canvas, _| canvas.batches().iter().any(|b| b.texture == gmod_ui::Texture::Image(id)));
+    assert!(drawn);
+
+    // the mouse and the keys go to the page, in its pixels
+    g.runtime.set_cursor(60, 70);
+    g.runtime.button(107, true);
+    g.runtime.button(107, false);
+    g.runtime.button(11, true); // KEY_A
+    g.runtime.type_text("a");
+    let calls = page.calls.borrow().clone();
+    for call in ["move 50,50", "focus true", "button Left true 50,50", "button Left false 50,50", "key 0x41 true 0", "text a"] {
+        assert!(calls.contains(&call.to_string()), "{call}: {calls:?}");
+    }
+
+    // resized with the panel; gone with it
+    g.runtime.run_string("H:SetSize(400, 300)", "resize").unwrap();
+    g.runtime.paint(0.016);
+    assert!(page.calls.borrow().contains(&"size 400x300".to_string()));
+    g.runtime.run_string("H:Remove()", "remove").unwrap();
+    g.runtime.paint(0.016);
+    assert_eq!(Rc::strong_count(&page), 2, "the page went with its panel");
+}
+
+#[test]
+fn points_of_the_world_on_the_screen() {
+    let g = client_game(&[]);
+    g.runtime.set_view(crate::client::View {
+        origin: crate::vector::Vector::new(0.0, 0.0, 0.0),
+        angles: crate::vector::Angle::default(),
+        fov: 90.0,
+    });
+    // straight ahead is the middle of the screen; behind is not seen
+    assert!(g.eval::<bool>(
+        "local s = Vector(100, 0, 0):ToScreen() return math.abs(s.x - 320) < 0.5 and math.abs(s.y - 240) < 0.5 and s.visible"
+    ));
+    assert!(g.eval::<bool>("local s = Vector(100, 0, 20):ToScreen() return s.y < 240 and s.visible"));
+    assert!(g.eval::<bool>("return not Vector(-100, 0, 0):ToScreen().visible"));
+    // keys that are numbers are numbers, whole or not
+    assert!(g.eval::<bool>("local t = util.KeyValuesToTable('\"r\" { \"1\" \"a\" \"2.5\" \"b\" }') return t[1] == 'a' and t[2.5] == 'b'"));
+}
+
+/// A model of three bones - root, upper (10 up), lower (10 along the upper's x), a tip on the
+/// lower - with sequences: idle turns the upper from 0 to 1 radian over a third of a second,
+/// looping; two attacks of one activity turn it back over half a second; aim blends the root
+/// from -0.5 to 0.5 radian along `aim_yaw`; dance has an activity of its own.
+fn arm_model() -> Vec<u8> {
+    use gmod_model::testmodel::{TestAnimation, TestBone, TestRig, TestSequence};
+    let bone = |name: &str, parent: i32, position: [f32; 3]| TestBone { name: name.into(), parent, position, euler: [0.0; 3] };
+    let still = |name: &str, angle: f32| TestAnimation {
+        frames: vec![vec![(0, None, [0.0, 0.0, angle])]; 2],
+        ..TestAnimation::turning(name, 0, 2, angle, angle)
+    };
+    let mut idle = TestSequence::new("idle", "ACT_IDLE", 0);
+    idle.flags = gmod_model::anim::flags::LOOPING;
+    let mut favourite = TestSequence::new("attack2", "ACT_RANGE_ATTACK1", 1);
+    favourite.activity_weight = 3;
+    let mut aim = TestSequence::new("aim", "", 2);
+    aim.animations = vec![2, 3];
+    aim.blend = [2, 1];
+    aim.parameters = [0, -1];
+    aim.parameter_start = [-45.0, 0.0];
+    aim.parameter_end = [45.0, 0.0];
+    TestRig {
+        name: "arm.mdl".into(),
+        checksum: 5,
+        bones: vec![bone("root", -1, [0.0; 3]), bone("upper", 0, [0.0, 0.0, 10.0]), bone("lower", 1, [10.0, 0.0, 0.0])],
+        animations: vec![
+            TestAnimation::turning("@idle", 1, 11, 0.0, 1.0),
+            TestAnimation::turning("@attack", 1, 16, 0.0, -1.0),
+            still("@left", -0.5),
+            still("@right", 0.5),
+        ],
+        sequences: vec![
+            idle,
+            TestSequence::new("attack", "ACT_RANGE_ATTACK1", 1),
+            favourite,
+            aim,
+            TestSequence::new("dance", "ACT_OPENGMOD_DANCE", 0),
+        ],
+        pose_parameters: vec![gmod_model::PoseParameter { name: "aim_yaw".into(), flags: 0, start: -45.0, end: 45.0, wrap: 0.0 }],
+        attachments: vec![("tip".into(), 2, [5.0, 0.0, 0.0])],
+        ..TestRig::default()
+    }
+    .files()
+    .0
+}
+
+#[test]
+fn entities_play_their_sequences() {
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let g = game_with(
+        Realm::Server,
+        &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/arm.mdl", &arm_model()), ("models/box.mdl", &mdl)],
+    );
+    g.runtime.init();
+    g.runtime.run_string("E = ents.Create('prop_dynamic') E:SetModel('models/arm.mdl') E:Spawn()", "arm").unwrap();
+
+    // the sequences, their activities, how long they take
+    assert!(g.eval::<bool>(
+        "local seq, duration = E:LookupSequence('ATTACK')
+         local none, zero = E:LookupSequence('nope')
+         return seq == 1 and math.abs(duration - 0.5) < 1e-4 and none == -1 and zero == 0
+             and E:GetSequenceCount() == 5 and E:GetSequenceName(0) == 'idle' and E:GetSequenceName(9) == 'Unknown'
+             and E:GetSequenceList()[0] == 'idle' and E:GetSequenceList()[4] == 'dance'
+             and E:GetSequenceActivity(1) == ACT_RANGE_ATTACK1 and E:GetSequenceActivityName(2) == 'ACT_RANGE_ATTACK1'
+             and math.abs(E:SequenceDuration(0) - 1 / 3) < 1e-4 and E:GetSequenceInfo(3).numblends == 2
+             and E:GetAnimCount() == 4 and E:GetAnimInfo(1).numframes == 16 and E:GetAnimInfo(1).label == '@attack'"
+    ));
+    // activities of the game, and one of the model's own, numbered after them
+    assert!(g.eval::<bool>(
+        "local dance = E:GetSequenceActivity(4)
+         return util.GetActivityIDByName('ACT_VM_IDLE') == 174 and util.GetActivityNameByID(174) == 'ACT_VM_IDLE'
+             and dance > LAST_SHARED_ACTIVITY and util.GetActivityNameByID(dance) == 'ACT_OPENGMOD_DANCE'
+             and util.GetActivityIDByName('act_opengmod_dance') == dance and E:SelectWeightedSequence(ACT_WALK) == -1
+             and E:SelectWeightedSequenceSeeded(ACT_RANGE_ATTACK1, 0) == 1 and E:SelectWeightedSequenceSeeded(ACT_RANGE_ATTACK1, 3) == 2"
+    ));
+    // chosen by weight: attack2 three times as often as attack
+    let (attack, favourite): (u32, u32) = g.eval(
+        "local n = { [1] = 0, [2] = 0 }
+         for i = 1, 400 do local s = E:SelectWeightedSequence(ACT_RANGE_ATTACK1) n[s] = n[s] + 1 end
+         return n[1], n[2]",
+    );
+    assert!(attack + favourite == 400 && favourite > attack * 2 && attack > 40, "{attack} {favourite}");
+
+    // a prop_dynamic plays by itself: idle at half rate, a fifth of a second is 0.3 of its cycle
+    g.runtime.run_string("E:ResetSequence('idle') E:SetCycle(0) E:SetPlaybackRate(0.5)", "play").unwrap();
+    g.runtime.think(0.2);
+    let cycle: f32 = g.eval("return E:GetCycle()");
+    assert!((cycle - 0.3).abs() < 0.03, "{cycle}");
+    g.runtime.think(2.0);
+    assert!(g.eval::<bool>("local c = E:GetCycle() return c >= 0 and c < 1 and not E:IsSequenceFinished()"), "it loops");
+    // attack does not loop: it ends, finished
+    g.runtime.run_string("E:ResetSequence(1) E:SetCycle(0) E:SetPlaybackRate(1)", "attack").unwrap();
+    g.runtime.think(0.25);
+    assert!(g.eval::<bool>("return math.abs(E:GetCycle() - 0.5) < 0.05 and not E:IsSequenceFinished()"));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>("return E:GetCycle() == 1 and E:IsSequenceFinished()"));
+
+    // where its bones and its attachment are: idle half way, the upper turned half a radian
+    assert!(g.eval::<bool>(
+        "E:SetPos(Vector(100, 0, 0)) E:SetSequence(0) E:SetCycle(0.5) E:SetPlaybackRate(0)
+         local pos, ang = E:GetBonePosition(2)
+         local tip = E:GetAttachment(1)
+         return close(pos, Vector(100 + 10 * math.cos(0.5), 10 * math.sin(0.5), 10)) and math.abs(ang.y - math.deg(0.5)) < 0.1
+             and close(tip.Pos, Vector(100 + 15 * math.cos(0.5), 15 * math.sin(0.5), 10)) and tip.Bone == 2
+             and E:GetAttachment(2) == nil and E:GetBonePosition(7) == nil
+             and close(E:GetBoneMatrix(1):GetTranslation(), Vector(100, 0, 10)) and #E:GetChildBones(0) == 1
+             and math.abs(E:BoneLength(2) - 10) < 1e-3"
+    ));
+    // pose parameters: kept from 0 to 1 on the server; the aim grid follows them
+    assert!(g.eval::<bool>(
+        "E:SetSequence('aim') E:SetPoseParameter('aim_yaw', 22.5)
+         local lo, hi = E:GetPoseParameterRange(0)
+         return E:GetPoseParameter('aim_yaw') == 0.75 and E:GetPoseParameter(0) == 0.75 and lo == -45 and hi == 45
+             and E:LookupPoseParameter('AIM_YAW') == 0 and E:LookupPoseParameter('nope') == -1
+             and E:GetNumPoseParameters() == 1 and E:GetPoseParameterName(0) == 'aim_yaw'
+             and math.abs(E:GetBoneMatrix(0):GetAngles().y - math.deg(0.25)) < 0.1"
+    ));
+    assert!(g.eval::<bool>("E:ClearPoseParameters() return E:GetPoseParameter('aim_yaw') == 0.5"));
+
+    // layers: a gesture plays once and goes; a layered sequence stays
+    assert!(g.eval::<bool>(
+        "E:SetSequence(0) E:SetPlaybackRate(1)
+         GESTURE = E:AddGestureSequence(1) LAYER = E:AddLayeredSequence(0, 5) E:SetLayerWeight(LAYER, 0.5)
+         return GESTURE == 0 and LAYER == 1 and E:IsValidLayer(GESTURE) and E:GetLayerSequence(GESTURE) == 1
+             and E:GetLayerWeight(LAYER) == 0.5 and E:FindGestureSequenceLayer(1) == 0 and not E:IsValidLayer(7)"
+    ));
+    g.runtime.think(0.75);
+    assert!(g.eval::<bool>("return not E:IsValidLayer(GESTURE) and E:IsValidLayer(LAYER) and E:GetLayerCycle(LAYER) > 0"));
+
+    // what does not animate by itself moves when told
+    assert!(g.eval::<bool>(
+        "S = ents.Create('prop_physics') S:SetModel('models/arm.mdl') S:Spawn() S:ResetSequence(1) S:SetCycle(0) return true"
+    ));
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("local before = S:GetCycle() S:FrameAdvance(0.25) return before == 0 and math.abs(S:GetCycle() - 0.5) < 1e-3"));
+
+    // drawn posed: the arm with its three bones, the box as it was made
+    g.runtime.run_string("B = ents.Create('prop_physics') B:SetModel('models/box.mdl') B:Spawn()", "box").unwrap();
+    let drawn = g.runtime.drawn(EntityHandle::NULL);
+    let bones = |model: &str| drawn.iter().find(|d| d.model == model).map(|d| d.bones.len());
+    assert_eq!((bones("models/arm.mdl"), bones("models/box.mdl")), (Some(3), Some(0)));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+/// A view model: a hand bone, and draw, idle, fire and reload sequences (a third of a second,
+/// looping, a sixth, one second). Hands: the hand bone and a finger.
+fn view_model_files() -> (Vec<u8>, Vec<u8>) {
+    use gmod_model::testmodel::{TestAnimation, TestBone, TestRig, TestSequence};
+    let bone = |name: &str, parent: i32, position: [f32; 3]| TestBone { name: name.into(), parent, position, euler: [0.0; 3] };
+    let mut idle = TestSequence::new("idle", "ACT_VM_IDLE", 1);
+    idle.flags = gmod_model::anim::flags::LOOPING;
+    let weapon = TestRig {
+        name: "v_test.mdl".into(),
+        checksum: 7,
+        bones: vec![bone("root", -1, [0.0; 3]), bone("ValveBiped.Bip01_R_Hand", 0, [20.0, -5.0, -5.0])],
+        animations: vec![
+            TestAnimation::turning("@draw", 1, 11, 1.0, 0.0),
+            TestAnimation::turning("@idle", 1, 2, 0.0, 0.0),
+            TestAnimation::turning("@fire", 1, 6, 0.3, 0.0),
+            TestAnimation::turning("@reload", 1, 31, 0.0, 0.0),
+        ],
+        sequences: vec![
+            TestSequence::new("draw", "ACT_VM_DRAW", 0),
+            idle,
+            TestSequence::new("fire", "ACT_VM_PRIMARYATTACK", 2),
+            TestSequence::new("reload", "ACT_VM_RELOAD", 3),
+        ],
+        ..TestRig::default()
+    };
+    let hands = TestRig {
+        name: "c_hands.mdl".into(),
+        checksum: 8,
+        bones: vec![bone("ValveBiped.Bip01_R_Hand", -1, [0.0; 3]), bone("finger", 0, [3.0, 0.0, 0.0])],
+        animations: vec![TestAnimation::turning("@idle", 0, 2, 0.0, 0.0)],
+        sequences: vec![TestSequence::new("idle", "", 0)],
+        ..TestRig::default()
+    };
+    (weapon.files().0, hands.files().0)
+}
+
+#[test]
+fn the_view_model_plays_the_weapon_in_hand() {
+    let (weapon_model, hands_model) = view_model_files();
+    let pistol = PISTOL.replace("\"weight\"", "\"viewmodel\"          \"models/weapons/v_test.mdl\"\n    \"weight\"");
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/weapons/v_test.mdl", &weapon_model),
+            ("models/weapons/c_hands.mdl", &hands_model),
+            ("scripts/weapons/weapon_pistol.txt", pistol.as_bytes()),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    g.runtime
+        .run_string(
+            "weapons.list.weapon_test = {
+                 ViewModel = 'models/weapons/v_test.mdl', UseHands = true, ViewModelFOV = 70, Weight = 10,
+                 Primary = { ClipSize = 6, DefaultClip = 12, Ammo = 'Pistol', Automatic = false },
+                 Secondary = { ClipSize = -1, DefaultClip = -1, Ammo = 'none' },
+                 PrimaryAttack = function(self) self:SendWeaponAnim(ACT_VM_PRIMARYATTACK) self:SetClip1(self:Clip1() - 1) end,
+                 Reload = function(self) self:DefaultReload(ACT_VM_RELOAD) end,
+             }
+             HOOKS.PlayerSpawn = function(p) p:Give('weapon_pistol') end
+             CHANGED = {}
+             HOOKS.OnViewModelChanged = function(vm, old, new) CHANGED[#CHANGED + 1] = new end",
+            "weapon",
+        )
+        .unwrap();
+    g.runtime.spawn_map(&player_map());
+    let alice = g.runtime.join(alice()).unwrap();
+
+    // the engine's pistol came out: its view model shows it drawing, then goes back to idle
+    assert!(g.eval::<bool>(
+        "local vm = Entity(1):GetViewModel()
+         VM = vm
+         return vm:GetModel() == 'models/weapons/v_test.mdl' and vm:GetSequence() == 0 and vm:GetCycle() == 0
+             and CHANGED[1] == 'models/weapons/v_test.mdl' and Entity(1):GetActiveWeapon():GetActivity() == ACT_VM_DRAW
+             and vm:ViewModelIndex() == 0"
+    ));
+    g.runtime.think(0.2);
+    assert!(g.eval::<bool>("return VM:GetSequence() == 0 and VM:GetCycle() > 0.4"), "still drawing");
+    g.runtime.think(0.3);
+    assert!(g.eval::<bool>("return VM:GetSequence() == 1 and Entity(1):GetActiveWeapon():GetActivity() == ACT_VM_IDLE"), "idle");
+
+    // a scripted weapon: hands on its view model, its field of view
+    g.runtime
+        .run_string(
+            "local p = Entity(1)
+             local hands = ents.Create('prop_dynamic') hands:SetModel('models/weapons/c_hands.mdl')
+             hands:AddEffects(EF_BONEMERGE) hands:SetParent(p:GetViewModel()) hands:Spawn() p:SetHands(hands)
+             TEST = p:Give('weapon_test')",
+            "give",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("return Entity(1):GetActiveWeapon() == TEST and VM:GetSequence() == 0"));
+    let (models, fov) = g.runtime.view_models(alice);
+    assert_eq!(fov, 70.0);
+    assert_eq!(models.iter().map(|d| d.model.as_str()).collect::<Vec<_>>(), ["models/weapons/v_test.mdl", "models/weapons/c_hands.mdl"]);
+    assert!(models.iter().all(|d| d.bones.len() == 2), "{models:?}");
+    // the hands' bone is the view model's hand, wherever that is: drawing starts turned a
+    // radian, and the hand's skinning moves it from where the hands model has it
+    let hand = models[1].bones[0];
+    let moved = (hand[0][3] - 20.0).abs() < 1e-3 && (hand[1][3] + 5.0).abs() < 1e-3;
+    assert!(moved && (hand[0][0] - 1f32.cos()).abs() < 1e-3, "{hand:?}");
+
+    // firing plays its sequence; a scripted weapon stays where it was sent
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::ATTACK, ..UserCmd::default() });
+    g.runtime.think(0.015);
+    g.runtime.set_input(alice, UserCmd::default());
+    assert!(g.eval::<bool>("return VM:GetSequence() == 2 and TEST:Clip1() == 5"));
+    g.runtime.think(1.0);
+    assert!(g.eval::<bool>("return VM:GetSequence() == 2 and VM:GetCycle() == 1"), "a SWEP says when to go back to idle");
+
+    // a reload takes as long as its sequence: the clip is full after a second, not before
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::RELOAD, ..UserCmd::default() });
+    g.runtime.think(0.015);
+    g.runtime.set_input(alice, UserCmd::default());
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>("return VM:GetSequence() == 3 and TEST:Clip1() == 5"));
+    g.runtime.think(0.6);
+    assert!(g.eval::<bool>("return TEST:Clip1() == 6"));
+
+    // nothing to show without a weapon, or when the view model is not drawn
+    g.runtime.run_string("Entity(1):DrawViewModel(false)", "hide").unwrap();
+    assert!(g.runtime.view_models(alice).0.is_empty());
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn players_animate_as_the_gamemode_says() {
+    use gmod_model::testmodel::{TestAnimation, TestBone, TestRig, TestSequence};
+    let bone = |name: &str, parent: i32, position: [f32; 3]| TestBone { name: name.into(), parent, position, euler: [0.0; 3] };
+    let mut walk = TestSequence::new("walk_all", "ACT_HL2MP_WALK", 1);
+    walk.flags = gmod_model::anim::flags::LOOPING;
+    let mut idle = TestSequence::new("idle_all", "ACT_HL2MP_IDLE", 0);
+    idle.flags = gmod_model::anim::flags::LOOPING;
+    let mut walking_animation = TestAnimation::turning("@walk", 1, 31, 0.0, 0.0);
+    walking_animation.moves = Some([100.0, 0.0, 0.0]);
+    let pose = |name: &str, start: f32, end: f32| gmod_model::PoseParameter { name: name.into(), flags: 0, start, end, wrap: 0.0 };
+    let model = TestRig {
+        name: "player.mdl".into(),
+        checksum: 9,
+        bones: vec![bone("ValveBiped.Bip01_Pelvis", -1, [0.0, 0.0, 40.0]), bone("ValveBiped.Bip01_Spine", 0, [0.0, 0.0, 5.0])],
+        animations: vec![TestAnimation::turning("@idle", 1, 2, 0.0, 0.0), walking_animation],
+        sequences: vec![idle, walk, TestSequence::new("gesture", "ACT_MP_ATTACK_STAND_PRIMARYFIRE", 0)],
+        pose_parameters: vec![
+            pose("move_x", -1.0, 1.0),
+            pose("move_y", -1.0, 1.0),
+            pose("aim_yaw", -60.0, 60.0),
+            pose("aim_pitch", -90.0, 90.0),
+        ],
+        ..TestRig::default()
+    };
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/player.mdl", &model.files().0),
+            ("scripts/weapons/weapon_pistol.txt", PISTOL.as_bytes()),
+        ],
+    );
+    g.runtime.init();
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    g.runtime
+        .run_string(
+            "HOOKS.PlayerSpawn = function(p) p:SetModel('models/player.mdl') p:SetWalkSpeed(200) end
+             HOOKS.CalcMainActivity = function(p, velocity)
+                 return velocity:Length2D() > 1 and ACT_MP_WALK or ACT_MP_STAND_IDLE, -1
+             end
+             HOOKS.TranslateActivity = function(p, act)
+                 return act == ACT_MP_WALK and ACT_HL2MP_WALK or act == ACT_MP_STAND_IDLE and ACT_HL2MP_IDLE or act
+             end
+             HOOKS.UpdateAnimation = function(p, velocity, ground) RATE = velocity:Length() / ground p:SetPlaybackRate(RATE) end
+             HOOKS.DoAnimationEvent = function(p, event)
+                 if event == PLAYERANIMEVENT_ATTACK_PRIMARY then p:AnimRestartGesture(GESTURE_SLOT_ATTACK_AND_RELOAD, ACT_MP_ATTACK_STAND_PRIMARYFIRE, true) end
+                 EVENTS = (EVENTS or '') .. event .. ' '
+             end",
+            "animations",
+        )
+        .unwrap();
+    g.runtime.spawn_map(&player_map());
+    let alice = g.runtime.join(alice()).unwrap();
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("return Entity(1):GetSequence() == 0"), "standing: idle");
+
+    // walking along y: the walk, at the rate the gamemode makes of its ground speed; the legs
+    // turn with the eyes, the aim stays ahead
+    g.runtime.set_input(alice, walking(90.0, 0));
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetSequence() == 1 and math.abs(RATE - p:GetVelocity():Length() / 100) < 1e-3 and RATE > 1
+             and p:GetPoseParameter('move_x') > 0.9 and math.abs(p:GetPoseParameter('move_y') - 0.5) < 0.01
+             and math.abs(p:GetPoseParameter('aim_yaw') - 0.5) < 0.01 and math.abs(p:GetRenderAngles().y - 90) < 0.1"
+    ));
+    // stopped, then looking 30 degrees to the side: the legs stay, the aim turns
+    g.runtime.set_input(alice, UserCmd { view_angles: vector::Angle::new(0.0, 90.0, 0.0), ..UserCmd::default() });
+    g.runtime.think(2.0);
+    g.runtime.set_input(alice, UserCmd { view_angles: vector::Angle::new(0.0, 120.0, 0.0), ..UserCmd::default() });
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetSequence() == 0 and math.abs(p:GetRenderAngles().y - 90) < 0.1
+             and math.abs(p:GetPoseParameter('aim_yaw') - 0.75) < 0.01"
+    ));
+    // the gesture of an attack, over the rest
+    assert!(g.eval::<bool>(
+        "local p = Entity(1) p:SetAnimation(PLAYER_ATTACK1)
+         return EVENTS == '0 ' and p:IsPlayingGesture(ACT_MP_ATTACK_STAND_PRIMARYFIRE) and p:GetLayerSequence(0) == 2"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn dynamic_props_play_what_the_map_says() {
+    let g = game_with(Realm::Server, &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/arm.mdl", &arm_model())]);
+    g.runtime.init();
+    // as the map gives it: its default animation from the start
+    g.runtime
+        .run_string(
+            "D = ents.Create('prop_dynamic') D:SetKeyValue('model', 'models/arm.mdl') D:SetKeyValue('DefaultAnim', 'idle') D:Spawn()",
+            "map",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>("return D:GetSequence() == 0"));
+    // an animation once, then the default again; a new default and a rate
+    g.runtime.run_string("D:Fire('SetAnimation', 'attack')", "fire").unwrap();
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("return D:GetSequence() == 1"));
+    g.runtime.think(0.6);
+    assert!(g.eval::<bool>("return D:GetSequence() == 0 and not D:IsSequenceFinished()"), "back to idle");
+    g.runtime
+        .run_string("D:Fire('SetDefaultAnimation', 'dance') D:Fire('SetPlaybackRate', '2') D:Fire('SetAnimation', 'attack')", "fire")
+        .unwrap();
+    g.runtime.think(0.4);
+    assert!(g.eval::<bool>("return D:GetSequence() == 4 and D:GetPlaybackRate() == 2"), "the new default, at the rate set");
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn weapons_translate_the_activities_of_their_holders() {
+    let g = player_game();
+    // as the base gamemode's: the gamemode asks the player, who asks the weapon
+    g.runtime
+        .run_string("HOOKS.TranslateActivity = function(p, act) CALLS = (CALLS or 0) + 1 return p:TranslateWeaponActivity(act) end", "base")
+        .unwrap();
+    g.runtime.join(alice()).unwrap();
+    g.runtime.think(0.1);
+    // the engine's pistol, by its hold type
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetActiveWeapon():GetClass() == 'weapon_pistol' and p:TranslateWeaponActivity(ACT_MP_RUN) == ACT_HL2MP_RUN_PISTOL
+             and p:TranslateWeaponActivity(ACT_MP_JUMP) == ACT_HL2MP_JUMP_PISTOL and p:TranslateWeaponActivity(ACT_LAND) == ACT_LAND
+             and hook.Call('TranslateActivity', nil, p, ACT_MP_WALK) == ACT_HL2MP_WALK_PISTOL and CALLS == 1"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+    // a SWEP's own, and what it leaves
+    g.runtime
+        .run_string(
+            "weapons.list.weapon_mine = { Base = 'weapon_base', TranslateActivity = function(self, act) return act == ACT_MP_RUN and 4242 or -1 end }
+             local p = Entity(1) p:StripWeapons() p:Give('weapon_mine')",
+            "mine",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>(
+        "local p = Entity(1)
+         return p:GetActiveWeapon():GetClass() == 'weapon_mine' and p:TranslateWeaponActivity(ACT_MP_RUN) == 4242
+             and p:TranslateWeaponActivity(ACT_MP_WALK) == ACT_MP_WALK"
+    ));
+    // nothing in hand: as it was
+    g.runtime.run_string("Entity(1):StripWeapons()", "strip").unwrap();
+    assert!(g.eval::<bool>("return Entity(1):TranslateWeaponActivity(ACT_MP_RUN) == ACT_MP_RUN"));
 }

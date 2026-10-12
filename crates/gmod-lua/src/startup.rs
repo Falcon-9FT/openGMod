@@ -1,6 +1,8 @@
 //! Starting the game as the engine does, after `includes/init.lua`:
 //!
 //! 1. autorun: `lua/autorun/*.lua`, then `lua/autorun/server/*.lua` or `lua/autorun/client/*.lua`;
+//!    a client loads Derma before (`lua/derma/init.lua`) and its controls after:
+//!    `lua/postprocess/`, `lua/vgui/`, `lua/matproxy/`, `lua/skins/`;
 //! 2. the gamemode: its base first (the `"base"` of `<name>.txt`, or what `DeriveGamemode`
 //!    names), each loaded into a fresh `GM` table and handed to `gamemode.Register`;
 //!    `GAMEMODE` is the result;
@@ -8,10 +10,10 @@
 //!    chain, base first, then those of `lua/`; each into a fresh `ENT`, `SWEP` or `EFFECT`
 //!    and registered with `scripted_ents`, `weapons` or `effects`, whose `OnLoaded` then
 //!    runs (it fills the base classes `DEFINE_BASECLASS` hands out);
-//! 4. the hooks `PreGamemodeLoaded` (before 2), `OnGamemodeLoaded`, `PostGamemodeLoaded`,
-//!    `CreateTeams` and `Initialize`.
+//! 4. the hooks `PreGamemodeLoaded` (before 2), `OnGamemodeLoaded` and `PostGamemodeLoaded`
+//!    (after 3), `CreateTeams` and `Initialize`.
 
-use mlua::{Function, Lua, MultiValue, Table, Value};
+use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::args::Args;
 use crate::engine;
@@ -183,12 +185,44 @@ fn run_folder(lua: &Lua, folder: &str) {
     }
 }
 
+/// The main menu after `includes/init_menu.lua`: Derma and its controls and skins, then the
+/// menu itself (`lua/menu/menu.lua`), which makes its panel on the first frame.
+pub(crate) fn start_menu(runtime: &crate::Runtime) {
+    let lua = runtime.lua();
+    include_from_engine(lua, "derma/init.lua");
+    // the controls of spawn icons add what they show to the spawn menu's content types
+    if let Ok(require) = lua.globals().get::<Function>("require") {
+        let _ = crate::files::call_reporting(lua, require, "spawnmenu".into_lua_multi(lua).unwrap_or_default());
+    }
+    for folder in ["vgui", "skins"] {
+        run_folder(lua, folder);
+    }
+    include_from_engine(lua, "menu/menu.lua");
+    runtime.call_hook("MenuStart", MultiValue::new());
+}
+
 /// Everything after `includes/init.lua`, up to and with the `Initialize` hook.
 pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
     let lua = runtime.lua();
     let realm = runtime.realm();
+    if realm == Realm::Client {
+        // the engine's client has `notification` before any of the game's Lua uses it
+        if lua.globals().get::<Option<Table>>("notification").ok().flatten().is_none()
+            && let Ok(require) = lua.globals().get::<Function>("require")
+        {
+            let _ = crate::files::call_reporting(lua, require, "notification".into_lua_multi(lua).unwrap_or_default());
+        }
+        include_from_engine(lua, "derma/init.lua");
+    }
     run_folder(lua, "autorun");
     run_folder(lua, if realm == Realm::Server { "autorun/server" } else { "autorun/client" });
+    if realm == Realm::Client {
+        // Derma's controls and skins come after autorun: an addon's autorun cannot make a
+        // `DFrame` as it loads, as in GMod
+        for folder in ["postprocess", "vgui", "matproxy", "skins"] {
+            run_folder(lua, folder);
+        }
+    }
 
     *host(lua).game.gamemode_name.borrow_mut() = gamemode.to_string();
     runtime.call_hook("PreGamemodeLoaded", MultiValue::new());
@@ -198,7 +232,6 @@ pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
         let _ = lua.globals().raw_set("GAMEMODE", gm);
     }
     *host(lua).game.gamemode.borrow_mut() = active;
-    runtime.call_hook("OnGamemodeLoaded", MultiValue::new());
 
     let chain = host(lua).game.chain.borrow().clone();
     let mut kinds = vec![Kind::Entity, Kind::Weapon];
@@ -223,6 +256,8 @@ pub(crate) fn start(runtime: &crate::Runtime, gamemode: &str) {
             let _ = files::call_reporting(lua, f, MultiValue::new());
         }
     }
+    // after the entities and weapons: sandbox makes its spawn menu then, of what is loaded
+    runtime.call_hook("OnGamemodeLoaded", MultiValue::new());
     runtime.call_hook("PostGamemodeLoaded", MultiValue::new());
     runtime.call_hook("CreateTeams", MultiValue::new());
     runtime.call_hook("Initialize", MultiValue::new());

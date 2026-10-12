@@ -27,6 +27,7 @@ macro_rules! say {
 }
 
 mod check;
+mod light;
 mod lua;
 mod out;
 mod render;
@@ -34,7 +35,7 @@ mod trace;
 
 use out::Out;
 
-const COMMANDS: [&str; 9] = ["check", "info", "ls", "find", "cat", "glua", "lua", "render", "trace"];
+const COMMANDS: [&str; 10] = ["check", "info", "ls", "find", "cat", "glua", "lua", "render", "trace", "light"];
 
 const USAGE: &str = "\
 gmod-check - what openGMOD can read of a Garry's Mod installation
@@ -56,6 +57,8 @@ COMMANDS:
                      is there; with --map, the server loads that map's entities
     render <MAP>     a picture of a map (gm_construct, or a .bsp file) drawn on the CPU:
                      the world with textures and light maps, saved as PNG
+    light <MAP>      the light a map has for the world and for models, and what a model
+                     gets at --from (default: the player start, and above it)
     trace <MAP>      a sweep through a map from --from to --to, as util.TraceLine makes
                      it (util.TraceHull with --mins and --maxs), printed as TraceResult
 
@@ -184,7 +187,7 @@ impl Args {
         if let Some(extra) = positional.next() {
             return Err(format!("unexpected argument {extra:?}"));
         }
-        let needs_operand = ["ls", "find", "cat", "glua", "render", "trace"].contains(&args.command.as_str());
+        let needs_operand = ["ls", "find", "cat", "glua", "render", "trace", "light"].contains(&args.command.as_str());
         if !COMMANDS.contains(&args.command.as_str()) {
             return Err(format!("unknown command {:?}", args.command));
         }
@@ -290,7 +293,13 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
         }
     };
     let unpack_dir = if args.unpack { UserDir::default_root().map(|root| root.join("cache").join("workshop")) } else { None };
-    let options = MountOptions { addons: args.addons, server_downloads: args.server_downloads, mount_cfg: true, unpack_dir };
+    let options = MountOptions {
+        addons: args.addons,
+        server_downloads: args.server_downloads,
+        mount_cfg: true,
+        unpack_dir,
+        ..MountOptions::default()
+    };
     let (mut vfs, warnings) = mount_install(&install, &options);
     let mounted_in = started.elapsed();
 
@@ -346,6 +355,7 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
         }
         "render" => render_map(&mut vfs, operand, args),
         "trace" => trace_map(&mut vfs, operand, args),
+        "light" => light_map(&mut vfs, operand, args),
         _ => unreachable!("commands are checked when parsing"),
     }
 }
@@ -399,6 +409,28 @@ fn trace_map(vfs: &mut Vfs, map: &str, args: &Args) -> ExitCode {
     }
     for physics in failed {
         say!("Not solid, its physics model could not be read: {physics}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `light`: the map's light, and a model's at a point.
+fn light_map(vfs: &mut Vfs, map: &str, args: &Args) -> ExitCode {
+    let bsp = match read_map(vfs, map) {
+        Ok(bsp) => bsp,
+        Err(e) => return fail(&e),
+    };
+    let mounted = gmod_world::mount_pakfile(vfs, &bsp).unwrap_or(false);
+    let (collision, _) = gmod_world::collision(vfs, &bsp);
+    if mounted {
+        vfs.remove(0);
+    }
+    let points: Vec<[f32; 3]> = match (args.view.eye, gmod_world::spawn_point(&bsp)) {
+        (Some(p), _) => vec![p],
+        (None, Some((p, _))) => [0.0, 32.0, 128.0].iter().map(|up| [p[0], p[1], p[2] + up]).collect(),
+        (None, None) => Vec::new(),
+    };
+    for line in light::report(&bsp, &collision, &points) {
+        say!("{line}");
     }
     ExitCode::SUCCESS
 }
@@ -484,6 +516,7 @@ fn entries(backing: &Backing) -> Option<usize> {
         Backing::Vpk(v) => Some(v.len()),
         Backing::Gma(g) => Some(g.len()),
         Backing::Zip(z) => Some(z.len()),
+        Backing::Memory(m) => Some(m.len()),
     }
 }
 
@@ -503,6 +536,10 @@ fn print_mount_summary(out: &mut Out, vfs: &Vfs) {
             Backing::Zip(z) => {
                 packs += 1;
                 pack_files += z.len();
+            }
+            Backing::Memory(m) => {
+                packs += 1;
+                pack_files += m.len();
             }
         }
     }

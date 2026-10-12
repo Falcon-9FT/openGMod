@@ -7,7 +7,9 @@
 //! from the game's files. A model that collides has a physics model as well ([`phy`],
 //! [`load_physics`]): its convex pieces, masses and the joints of ragdolls.
 //!
-//! What is read so far is what static props need, and physics: no animations or flexes.
+//! A model that moves has sequences and the animations they play ([`anim`]); [`Rig`] puts a
+//! model together with the models it includes and the `.ani` file of its animation blocks, and
+//! works out where its bones are for what it plays. Flexes are not read yet.
 
 #![forbid(unsafe_code)]
 
@@ -15,17 +17,21 @@ use std::io;
 
 use gmod_fs::Vfs;
 
+pub mod anim;
 pub mod mdl;
 pub mod mesh;
 pub mod phy;
+pub mod pose;
 mod reader;
 pub mod vhv;
 pub mod vtx;
 pub mod vvd;
 
+pub use anim::{Animation, Local, PoseParameter, Sequence};
 pub use mdl::{Attachment, BodyPart, Bone, Mdl, SubModel};
 pub use mesh::{Batch, StaticMesh};
 pub use phy::{Convex, Phy, RagdollConstraint, Solid};
+pub use pose::{Layer, Matrix, Rig};
 pub use vhv::Vhv;
 pub use vtx::Vtx;
 pub use vvd::{Vertex, Vvd};

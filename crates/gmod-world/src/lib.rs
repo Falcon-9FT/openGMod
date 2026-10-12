@@ -3,10 +3,14 @@
 //!
 //! [`load`] turns a map into [`Piece`]s - the world, every brush entity that can be seen
 //! (`func_brush`, doors ...) moved to where it stands, and every static prop with its model -
-//! each a list of triangles grouped into [`Surface`]s by material. Brushes are lit by their
-//! light maps, props by the light baked into the map for each of their vertices. Alongside
-//! come the textures the materials use, still as VTF files (a GPU takes DXT as it is), and the
-//! sky box.
+//! each a list of triangles grouped into [`Surface`]s by material. The overlays of the map
+//! (`info_overlay`) come with the faces they lie on ([`gmod_bsp::overlay`]). Brushes are lit
+//! by their light maps, props by the light baked into the map for each of their vertices. A
+//! surface whose material has proxies changes as time goes on ([`Surface::look`]): the frame
+//! of an animated texture, a scrolling texture, a pulsing colour. Alongside
+//! come the textures the materials use, still as VTF files (a GPU takes DXT as it is), the
+//! sky box, and the fog. What stands in the room of the 3D sky box is kept apart from the
+//! world, to be drawn behind it ([`sky`]).
 //!
 //! The map's pakfile holds materials, models and the props' light: mount it in front first
 //! ([`mount_pakfile`]), as the engine does while the map is played. [`gpu`] lays the world out
@@ -25,10 +29,13 @@ use gmod_bsp::collision::{Collision, Hull};
 use gmod_bsp::props::solid;
 use gmod_bsp::{Bsp, mesh};
 use gmod_fs::{Backing, Mount, Vfs};
-use gmod_material::{Library, Material, Vtf};
+use gmod_material::proxy::{self, IDENTITY, Matrix};
+use gmod_material::{Library, Material, Proxies, Vtf};
 use gmod_model::{Mdl, Model, Vhv};
 
 pub mod gpu;
+pub mod light;
+pub mod sky;
 
 pub use gmod_bsp::mesh::Lightmap;
 
@@ -90,6 +97,8 @@ pub struct Surface {
     pub alpha_test: Option<f32>,
     pub translucent: bool,
     pub additive: bool,
+    /// `$nofog`: fog does not cover it (glows and the like).
+    pub no_fog: bool,
     /// Lit by light (map or vertex); `UnlitGeneric` and water are not.
     pub lit: bool,
     /// Drawn from both sides.
@@ -102,6 +111,30 @@ pub struct Surface {
     pub water: Option<Vec3>,
     /// The material was not found: the game shows purple and black squares.
     pub missing: bool,
+    /// `$basetexturetransform`: how the base texture's coordinates are scaled, turned and moved.
+    pub transform: Option<Matrix>,
+    /// `$frame`: the frame of an animated base texture that shows.
+    pub frame: u32,
+    /// The material's proxies, which change the frame, the transform, the tint and the alpha
+    /// as time goes on.
+    pub proxies: Option<Arc<Proxies>>,
+    /// `DecalModulate`: darkens and lightens what is behind it, by twice its colour (cracks,
+    /// dirt); grey changes nothing.
+    pub modulate: bool,
+    /// An overlay's, lying on faces of the world: drawn just after the opaque surfaces, in the
+    /// order of the piece (the overlays' render order), as they are all as far off their faces
+    /// and only that order decides which shows over which.
+    pub overlay: bool,
+}
+
+/// How a surface looks at a moment, its material's proxies run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Look {
+    /// The frame of the base texture, counting on: wrap it to the frames the texture has.
+    pub frame: u32,
+    pub transform: Matrix,
+    pub tint: Vec3,
+    pub alpha: f32,
 }
 
 impl Surface {
@@ -115,14 +148,50 @@ impl Surface {
             alpha_test: None,
             translucent: false,
             additive: false,
+            no_fog: false,
             lit: true,
             no_cull: false,
             tint: [1.0; 3],
             alpha: 1.0,
             water: None,
             missing: true,
+            transform: None,
+            frame: 0,
+            proxies: None,
+            modulate: false,
+            overlay: false,
         }
     }
+
+    /// How it looks `time` seconds into the map: as the material sets it, then as its proxies
+    /// change it.
+    pub fn look(&self, time: f32) -> Look {
+        let mut look = Look { frame: self.frame, transform: self.transform.unwrap_or(IDENTITY), tint: self.tint, alpha: self.alpha };
+        if let Some(proxies) = &self.proxies {
+            let vars = proxies.at(time);
+            if let Some(frame) = vars.number("$frame") {
+                look.frame = frame.max(0.0) as u32;
+            }
+            if let Some(transform) = vars.matrix("$basetexturetransform") {
+                look.transform = transform;
+            }
+            if let Some(tint) = vars.vector("$color") {
+                look.tint = tint;
+            }
+            if let Some(alpha) = vars.number("$alpha") {
+                look.alpha = alpha.clamp(0.0, 1.0);
+            }
+        }
+        look
+    }
+}
+
+/// The bones that move a vertex of a model, and how much each: up to three, the weights adding
+/// up to 1.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Weights {
+    pub bones: [u8; 3],
+    pub weights: [f32; 3],
 }
 
 /// Something drawn: the world, a brush entity or a prop, moved to where it stands.
@@ -133,6 +202,8 @@ pub struct Piece {
     /// The light map of a brush model; props have vertex light instead.
     pub lightmap: Option<mesh::Lightmap>,
     pub surfaces: Vec<Surface>,
+    /// For a model that moves, the bones of each vertex; empty for what stands still.
+    pub skin: Vec<Weights>,
 }
 
 /// A texture a material uses.
@@ -217,6 +288,10 @@ pub struct World {
     pub textures: Vec<Texture>,
     /// The sky box faces, in the order of [`SKY_FACES`].
     pub sky: [Option<SkyFace>; 6],
+    /// The 3D sky box, drawn between the sky box and the world ([`sky`]).
+    pub skybox: Option<sky::Skybox>,
+    /// The world's fog.
+    pub fog: Option<sky::Fog>,
     /// What the map needs but the game does not have.
     pub missing_materials: Vec<String>,
     pub missing_textures: Vec<String>,
@@ -224,8 +299,10 @@ pub struct World {
 }
 
 impl World {
+    /// The triangles drawn: the world's and the 3D sky box's.
     pub fn triangles(&self) -> usize {
-        self.pieces.iter().map(|p| p.indices.len() / 3).sum()
+        let pieces = self.pieces.iter().chain(self.skybox.iter().flat_map(|s| &s.pieces));
+        pieces.map(|p| p.indices.len() / 3).sum()
     }
 }
 
@@ -350,15 +427,21 @@ const UNSEEN: [&str; 12] = [
     "func_clip_vphysics",
 ];
 
-/// The brush models to draw: the world (model 0) and every brush entity that can be seen, with
-/// its origin and angles.
+/// The brush models to draw with the world: the world (model 0) and every brush entity that
+/// can be seen and stays where it is, with its origin and angles. Those that may move
+/// ([`gmod_bsp::Entity::moves`]) are drawn where their entities are ([`brush_model`]).
 pub fn placed_models(bsp: &Bsp) -> Vec<(usize, Vec3, Vec3)> {
+    brush_models_to_draw(bsp, false)
+}
+
+/// The brush models to draw with the world, those that may move too if `moving`.
+fn brush_models_to_draw(bsp: &Bsp, moving: bool) -> Vec<(usize, Vec3, Vec3)> {
     let mut models = vec![(0, [0.0; 3], [0.0; 3])];
     for entity in &bsp.entities {
-        let Some(model) = entity.get("model").and_then(|m| m.strip_prefix('*')).and_then(|m| m.parse::<usize>().ok()) else { continue };
+        let Some(model) = entity.brush_model() else { continue };
         let class = entity.class_name();
         let hidden = entity.get("rendermode") == Some("10") || entity.get("StartDisabled") == Some("1");
-        if model == 0 || model >= bsp.models.len() || hidden || UNSEEN.iter().any(|unseen| class.starts_with(unseen)) {
+        if model >= bsp.models.len() || hidden || !moving && entity.moves() || UNSEEN.iter().any(|unseen| class.starts_with(unseen)) {
             continue;
         }
         models.push((model, entity.vec3("origin").unwrap_or([0.0; 3]), entity.vec3("angles").unwrap_or([0.0; 3])));
@@ -369,12 +452,16 @@ pub fn placed_models(bsp: &Bsp) -> Vec<(usize, Vec3, Vec3)> {
 /// Moves vertices from their own space into the world: turned by pitch, yaw and roll
 /// (degrees), then moved to `origin`.
 pub fn place(vertices: &mut [Vertex], origin: Vec3, angles: Vec3) {
-    let [forward, left, up] = axes(angles);
-    let turn = |v: Vec3| add(add(scale(forward, v[0]), scale(left, v[1])), scale(up, v[2]));
+    let axes = axes(angles);
     for vertex in vertices {
-        vertex.position = add(origin, turn(vertex.position));
-        vertex.normal = turn(vertex.normal);
+        vertex.position = add(origin, turn(axes, vertex.position));
+        vertex.normal = turn(axes, vertex.normal);
     }
+}
+
+/// A direction of a thing's own space in the world's, by the thing's `axes`.
+fn turn([forward, left, up]: [Vec3; 3], v: Vec3) -> Vec3 {
+    add(add(scale(forward, v[0]), scale(left, v[1])), scale(up, v[2]))
 }
 
 /// Where a thing turned by `angles` (pitch, yaw, roll in degrees, as the game gives them) has
@@ -469,6 +556,7 @@ impl Gather<'_> {
         s.additive = m.flag("$additive");
         s.translucent = m.flag("$translucent") || s.additive || s.alpha < 1.0;
         s.no_cull = m.flag("$nocull");
+        s.no_fog = m.flag("$nofog");
         s.tint = m.vector("$color").unwrap_or([1.0; 3]);
         s.lit = !m.shader.starts_with("unlit");
         if m.shader == "water" {
@@ -476,15 +564,39 @@ impl Gather<'_> {
             s.translucent = true;
             s.lit = false;
         }
+        s.transform = m.get("$basetexturetransform").and_then(proxy::transform);
+        s.frame = m.float("$frame").map_or(0, |f| f.max(0.0) as u32);
+        s.proxies = Proxies::new(m).map(Arc::new);
+        // what proxies fade is drawn over what is behind it
+        s.translucent |= s.proxies.as_ref().is_some_and(|p| p.writes("$alpha"));
+        if m.shader == "decalmodulate" {
+            s.modulate = true;
+            s.translucent = true;
+            s.lit = false;
+        }
         s
     }
 }
 
-/// Gathers a map ready to draw. The map's pakfile should be mounted ([`mount_pakfile`]).
+/// Gathers a map ready to draw. The map's pakfile should be mounted ([`mount_pakfile`]). The
+/// brush entities that may move are left to be drawn where their entities are
+/// ([`brush_model`]).
 pub fn load(vfs: &Vfs, bsp: &Bsp) -> World {
+    gather_map(vfs, bsp, false)
+}
+
+/// The map as it stands when it starts, every brush entity baked in where the map puts it:
+/// for a still picture of it.
+pub fn load_all(vfs: &Vfs, bsp: &Bsp) -> World {
+    gather_map(vfs, bsp, true)
+}
+
+fn gather_map(vfs: &Vfs, bsp: &Bsp, moving: bool) -> World {
     let mut gather = Gather::new(vfs);
-    let mut pieces = brushes(bsp, &mut gather);
-    let missing_models = static_props(bsp, &mut gather, &mut pieces);
+    let camera = sky::sky_camera(bsp);
+    let sky_area = camera.map(|c| c.area);
+    let [mut pieces, mut sky_pieces] = brushes(bsp, &mut gather, sky_area, moving);
+    let missing_models = static_props(bsp, &mut gather, sky_area, [&mut pieces, &mut sky_pieces]);
     let sky_name = bsp.worldspawn().and_then(|w| w.get("skyname")).unwrap_or("").to_string();
     let sky = std::array::from_fn(|i| {
         if sky_name.is_empty() {
@@ -498,50 +610,102 @@ pub fn load(vfs: &Vfs, bsp: &Bsp) -> World {
         pieces,
         textures: gather.textures,
         sky,
+        skybox: camera.map(|camera| sky::Skybox { camera, pieces: sky_pieces }),
+        fog: sky::fog(bsp),
         missing_materials: gather.missing_materials,
         missing_textures: gather.missing_textures,
         missing_models,
     }
 }
 
-/// The world and the brush entities, each moved to where it stands.
-fn brushes(bsp: &Bsp, gather: &mut Gather) -> Vec<Piece> {
+/// The world and the brush entities, each moved to where it stands: those outside the 3D sky
+/// box's area, and those in it.
+fn brushes(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>, moving: bool) -> [Vec<Piece>; 2] {
     let mut materials: HashMap<usize, Option<Arc<Material>>> = HashMap::new();
-    let mut pieces = Vec::new();
-    for (model, origin, angles) in placed_models(bsp) {
-        let mesh = mesh::build(bsp, mesh::Options { model, ..mesh::Options::default() });
-        if mesh.indices.is_empty() {
+    let mut pieces = [Vec::new(), Vec::new()];
+    // which faces of the world are the sky box's (the HDR faces go along with the others)
+    let faces = if bsp.faces.is_empty() { &bsp.faces_hdr } else { &bsp.faces };
+    let in_sky: Vec<bool> = match sky_area {
+        Some(area) => faces.iter().map(|face| bsp.face_area(face) == Some(area)).collect(),
+        None => Vec::new(),
+    };
+    // the world in two when there is a sky box; a brush entity is where the middle of its
+    // bounds is, turned with it (the bounds are in its own space, around its origin)
+    let mut placed = Vec::new();
+    for (model, origin, angles) in brush_models_to_draw(bsp, moving) {
+        if model == 0 {
+            placed.push((false, model, origin, angles));
+            if sky_area.is_some() {
+                placed.push((true, model, origin, angles));
+            }
             continue;
         }
-        let mut vertices: Vec<Vertex> = mesh
-            .vertices
-            .iter()
-            .map(|v| Vertex {
-                position: v.position,
-                normal: v.normal,
-                uv: v.uv,
-                lightmap_uv: v.lightmap_uv,
-                alpha: v.alpha,
-                light: [1.0; 3],
-            })
-            .collect();
+        let middle = bsp.models.get(model).map(|m| add(origin, turn(axes(angles), scale(add(m.mins, m.maxs), 0.5))));
+        placed.push((sky_area.is_some() && middle.is_some_and(|m| bsp.area_at(m) == sky_area), model, origin, angles));
+    }
+    for (sky, model, origin, angles) in placed {
+        let options = mesh::Options { model, ..mesh::Options::default() };
+        let mesh = if model == 0 {
+            mesh::build_faces(bsp, options, |i| in_sky.get(i).copied().unwrap_or(false) == sky)
+        } else {
+            mesh::build(bsp, options)
+        };
+        let Some(mut piece) = brush_piece(bsp, gather, &mut materials, mesh) else { continue };
         if model != 0 {
-            place(&mut vertices, origin, angles);
+            place(&mut piece.vertices, origin, angles);
         }
-        let mut surfaces = Vec::new();
-        for batch in &mesh.batches {
-            let name = bsp.materials.get(batch.material).map_or("", String::as_str);
-            let material = materials.entry(batch.material).or_insert_with(|| gather.material(name)).clone();
-            surfaces.push(gather.surface(name, material.as_deref(), batch.first_index as usize, batch.index_count as usize));
-        }
-        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces });
+        pieces[usize::from(sky)].push(piece);
     }
     pieces
 }
 
-/// The static props, each with its model and baked light; returns the models that could not
-/// be read.
-fn static_props(bsp: &Bsp, gather: &mut Gather, pieces: &mut Vec<Piece>) -> Vec<String> {
+/// A brush model's mesh as a piece in its own space, with its light map and materials.
+fn brush_piece(bsp: &Bsp, gather: &mut Gather, materials: &mut HashMap<usize, Option<Arc<Material>>>, mesh: mesh::Mesh) -> Option<Piece> {
+    if mesh.indices.is_empty() {
+        return None;
+    }
+    let vertices: Vec<Vertex> = mesh
+        .vertices
+        .iter()
+        .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: v.lightmap_uv, alpha: v.alpha, light: [1.0; 3] })
+        .collect();
+    let mut surfaces = Vec::new();
+    for batch in &mesh.batches {
+        let name = bsp.materials.get(batch.material).map_or("", String::as_str);
+        let material = materials.entry(batch.material).or_insert_with(|| gather.material(name)).clone();
+        let surface = gather.surface(name, material.as_deref(), batch.first_index as usize, batch.index_count as usize);
+        surfaces.push(Surface { overlay: batch.overlay, ..surface });
+    }
+    Some(Piece { vertices, indices: mesh.indices, lightmap: Some(mesh.lightmap), surfaces, skin: Vec::new() })
+}
+
+/// A brush model of the map on its own, to draw wherever its entity is (a door, a button, a
+/// platform): one piece in the model's space with its light map, its materials and textures.
+/// Empty when the map has no such model or it has nothing to draw.
+pub fn brush_model(vfs: &Vfs, bsp: &Bsp, model: usize) -> World {
+    let mut gather = Gather::new(vfs);
+    let mut materials = HashMap::new();
+    let pieces = if model == 0 || model >= bsp.models.len() {
+        Vec::new()
+    } else {
+        let mesh = mesh::build(bsp, mesh::Options { model, ..mesh::Options::default() });
+        brush_piece(bsp, &mut gather, &mut materials, mesh).into_iter().collect()
+    };
+    World {
+        pieces,
+        textures: gather.textures,
+        sky: Default::default(),
+        skybox: None,
+        fog: None,
+        missing_materials: gather.missing_materials,
+        missing_textures: gather.missing_textures,
+        missing_models: Vec::new(),
+    }
+}
+
+/// The static props, each with its model and baked light, into the pieces of the world or of
+/// the 3D sky box by their area; returns the models that could not be read.
+fn static_props(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>, [world, skybox]: [&mut Vec<Piece>; 2]) -> Vec<String> {
     let mut models: HashMap<u16, Option<Model>> = HashMap::new();
     let mut missing = Vec::new();
     let hdr = !bsp.lighting_hdr.is_empty();
@@ -589,7 +753,13 @@ fn static_props(bsp: &Bsp, gather: &mut Gather, pieces: &mut Vec<Piece>) -> Vec<
             }
         }
         let surfaces = model_surfaces(gather, model, &mesh);
-        pieces.push(Piece { vertices, indices: mesh.indices, lightmap: None, surfaces });
+        // in the area of the leaves the map lists for it, else of where it stands
+        let first = usize::from(prop.first_leaf);
+        let leaves = bsp.static_props.leaves.get(first..first + usize::from(prop.leaf_count)).unwrap_or(&[]);
+        let listed = leaves.iter().filter_map(|&leaf| bsp.leaves.get(usize::from(leaf))).map(|leaf| leaf.area).find(|&area| area != 0);
+        let sky = sky_area.is_some() && listed.or_else(|| bsp.area_at(prop.origin)) == sky_area;
+        let piece = Piece { vertices, indices: mesh.indices, lightmap: None, surfaces, skin: Vec::new() };
+        if sky { skybox.push(piece) } else { world.push(piece) }
     }
     missing
 }
@@ -617,9 +787,27 @@ fn model_surfaces(gather: &mut Gather, model: &Model, mesh: &gmod_model::StaticM
     surfaces
 }
 
+/// The bones of a model's vertex: those it names, their weights made to add up to 1.
+fn weights(vertex: &gmod_model::Vertex) -> Weights {
+    let count = usize::from(vertex.bone_count).clamp(1, 3);
+    let total: f32 = vertex.weights[..count].iter().map(|w| w.max(0.0)).sum();
+    let mut out = Weights { bones: vertex.bones, weights: [0.0; 3] };
+    for i in 0..count {
+        out.weights[i] = if total > 0.0 {
+            vertex.weights[i].max(0.0) / total
+        } else if i == 0 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    out
+}
+
 /// A model on its own, to draw wherever an entity has it: one piece in the model's space (its
-/// first body group, in the pose it was made in), with its materials and textures. The
-/// light comes from where it is drawn, so the vertices have none of their own.
+/// first body group, in the pose it was made in, with the bones of every vertex to pose it),
+/// with its materials and textures. The light comes from where it is drawn, so the vertices
+/// have none of their own.
 pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
     let model = gmod_model::load(vfs, name)?;
     let mesh = model.mesh(0, skin)?;
@@ -629,11 +817,14 @@ pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
         .iter()
         .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: [0.0; 2], alpha: 0.0, light: [1.0; 3] })
         .collect();
+    let bones = mesh.vertices.iter().map(weights).collect();
     let surfaces = model_surfaces(&mut gather, &model, &mesh);
     Ok(World {
-        pieces: vec![Piece { vertices, indices: mesh.indices, lightmap: None, surfaces }],
+        pieces: vec![Piece { vertices, indices: mesh.indices, lightmap: None, surfaces, skin: bones }],
         textures: gather.textures,
         sky: Default::default(),
+        skybox: None,
+        fog: None,
         missing_materials: gather.missing_materials,
         missing_textures: gather.missing_textures,
         missing_models: Vec::new(),
@@ -643,6 +834,8 @@ pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod materials;
 
     #[test]
     fn sky_box_faces() {
@@ -714,7 +907,7 @@ mod tests {
         let files: [(&str, &[u8]); 7] = [
             ("materials/dev/dev_measuregeneric01.vmt", b"LightmappedGeneric { $basetexture dev/grid }"),
             ("materials/dev/grid.vtf", &texture()),
-            ("materials/brick/brickwall001a.vmt", b"LightmappedGeneric { $basetexture brick/gone $alphatest 1 }"),
+            ("materials/brick/brickwall001a.vmt", b"LightmappedGeneric { $basetexture brick/gone $alphatest 1 $nofog 1 }"),
             ("materials/nature/blendgroundtograss.vmt", b"WorldVertexTransition { $basetexture dev/grid $basetexture2 nature/grass }"),
             ("materials/nature/grass.vtf", &texture()),
             (
@@ -744,7 +937,7 @@ mod tests {
         assert_eq!(names, ["DEV/DEV_MEASUREGENERIC01", "BRICK/BRICKWALL001A", "NATURE/BLENDGROUNDTOGRASS"]);
         let (floor, wall, ground) = (&surfaces[0], &surfaces[1], &surfaces[2]);
         assert_eq!((floor.base, floor.missing, floor.lit), (Some(0), false, true));
-        assert_eq!((wall.base, wall.alpha_test), (None, Some(0.5)));
+        assert_eq!((wall.base, wall.alpha_test, wall.no_fog, floor.no_fog), (None, Some(0.5), true, false));
         assert_eq!((ground.base, ground.base2), (Some(0), Some(1)));
         assert_eq!(world.textures.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["dev/grid", "nature/grass"]);
         assert_eq!(world.missing_textures, ["brick/gone"]);
@@ -816,8 +1009,49 @@ mod tests {
     }
 
     #[test]
+    fn the_weights_of_a_vertex_add_up() {
+        let vertex =
+            |bones: [u8; 3], weights: [f32; 3], count: u8| gmod_model::Vertex { bones, weights, bone_count: count, ..Default::default() };
+        // as the model has them
+        assert_eq!(weights(&vertex([3, 4, 0], [0.75, 0.25, 0.0], 2)), Weights { bones: [3, 4, 0], weights: [0.75, 0.25, 0.0] });
+        // only as many as it says it has, made to add up to 1
+        assert_eq!(weights(&vertex([1, 2, 9], [0.2, 0.2, 0.6], 2)).weights, [0.5, 0.5, 0.0]);
+        // none at all: the first bone's
+        assert_eq!(weights(&vertex([5, 0, 0], [0.0; 3], 0)), Weights { bones: [5, 0, 0], weights: [1.0, 0.0, 0.0] });
+    }
+
+    #[test]
     fn plain_light_comes_from_above() {
         assert!(plain_light([0.0, 0.0, 1.0])[0] > plain_light([0.0, 0.0, -1.0])[0]);
         assert_eq!(plain_light([0.0, 0.0, -1.0]), [0.35; 3]);
+    }
+
+    #[test]
+    fn brushes_that_move_are_models_of_their_own() {
+        use gmod_bsp::testmap::{TestBrush, TestMap};
+        let entities =
+            "{\n\"classname\" \"func_door\"\n\"model\" \"*1\"\n}\n{\n\"classname\" \"func_wall\"\n\"model\" \"*2\"\n}\n".to_string();
+        let block = |x: f32| vec![TestBrush::cuboid([x, -32.0, 0.0], [x + 8.0, 32.0, 64.0])];
+        let models = vec![vec![TestBrush::cuboid([-512.0, -512.0, -32.0], [1024.0, 512.0, 0.0])], block(100.0), block(200.0)];
+        // the door's face toward -x, in its own space
+        let face = gmod_bsp::testmap::TestFace {
+            corners: vec![[100.0, -32.0, 0.0], [100.0, 32.0, 0.0], [100.0, 32.0, 64.0], [100.0, -32.0, 64.0]],
+            material: "TEST/DOOR",
+            flags: 0,
+        };
+        let test = TestMap { models, entities, model_faces: vec![(1, face)], ..TestMap::default() };
+        let bsp = Bsp::parse("t.bsp".into(), Arc::from(test.bytes())).unwrap();
+        // the door is not baked into the map; the wall is
+        let placed: Vec<usize> = placed_models(&bsp).into_iter().map(|(m, _, _)| m).collect();
+        assert_eq!(placed, [0, 2]);
+        let vfs = Vfs::new();
+        let door = brush_model(&vfs, &bsp, 1);
+        assert_eq!(door.pieces.len(), 1);
+        let piece = &door.pieces[0];
+        assert!(piece.lightmap.is_some() && !piece.surfaces.is_empty());
+        assert!(piece.vertices.iter().all(|v| (100.0..=108.0).contains(&v.position[0])), "in its own space");
+        assert!(brush_model(&vfs, &bsp, 0).pieces.is_empty() && brush_model(&vfs, &bsp, 9).pieces.is_empty());
+        // a still picture has the door where the map puts it
+        assert_eq!(load_all(&vfs, &bsp).pieces.len(), load(&vfs, &bsp).pieces.len() + 1);
     }
 }

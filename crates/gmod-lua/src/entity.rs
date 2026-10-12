@@ -24,7 +24,7 @@ use crate::{Realm, host};
 pub const MAX_EDICTS: u32 = 8192;
 
 /// What an entity is to Lua: which named metatable it has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Entity,
     Player,
@@ -48,7 +48,7 @@ impl Kind {
 }
 
 /// A handle to an entity: its index and serial number, or none for `NULL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityHandle {
     pub index: Option<u32>,
     pub serial: u32,
@@ -62,7 +62,7 @@ impl EntityHandle {
 
 /// One entity, as the engine keeps it. Position and angles are relative to the parent, if
 /// there is one.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Ent {
     pub class: String,
     pub kind: Kind,
@@ -118,16 +118,21 @@ pub struct Ent {
     /// What only weapons have.
     pub weapon: Option<crate::weapon::WeaponState>,
     /// Its body, when it has physics ([`crate::physics`]).
+    #[serde(skip)]
     pub physics: Option<gmod_physics::BodyId>,
-    /// What a constraint holds together, as `SetPhysConstraintObjects` gave it: the owners of
-    /// the two bodies ([`crate::constraint`]).
-    pub constrained: Option<[EntityHandle; 2]>,
+    /// What a constraint holds together, as `SetPhysConstraintObjects` gave it: the two
+    /// bodies ([`crate::constraint`]).
+    pub constrained: Option<[PhysObjHandle; 2]>,
     /// The joint a constraint made.
+    #[serde(skip)]
     pub joint: Option<gmod_physics::JointId>,
     /// Entities given for keys (`SetEntity`): a rope's ends.
     pub links: Vec<(String, EntityHandle)>,
     /// Whether it shows the effect of being spawned (`SetSpawnEffect`).
     pub spawn_effect: bool,
+    /// Where the bones of a ragdoll's parts are in the world - bone, origin, angles - as a
+    /// snapshot carries them: a client has no bodies to read them from ([`crate::ragdoll`]).
+    pub ragdoll_pose: Vec<(u16, Vector, Angle)>,
     /// How it is drawn changing (`kRenderFx`): pulsing, fading, a hologram.
     pub render_fx: i64,
     /// Materials in place of the model's own, by slot (`SetSubMaterial`).
@@ -137,10 +142,30 @@ pub struct Ent {
     pub flex_weights: Vec<(i64, f32)>,
     /// Bones moved, turned and scaled from where the model has them (`ManipulateBone*`).
     pub bone_manipulations: Vec<BoneManipulation>,
+    /// What it plays on its bones ([`crate::anim`]).
+    pub anim: crate::anim::AnimState,
+    /// The connections of its outputs, for an engine's entity ([`crate::outputs`]).
+    #[serde(skip)]
+    pub outputs: Vec<crate::outputs::Output>,
+    /// What an entity of the map's logic keeps ([`crate::logic`]).
+    #[serde(skip)]
+    pub logic: Option<Box<crate::logic::State>>,
+    /// What a trigger of the map keeps ([`crate::triggers`]).
+    #[serde(skip)]
+    pub trigger_state: Option<Box<crate::triggers::Trigger>>,
+    /// What a door, a button or a platform keeps ([`crate::movers`]).
+    #[serde(skip)]
+    pub mover: Option<Box<crate::movers::Mover>>,
+    /// What a charger on a wall keeps ([`crate::items`]).
+    #[serde(skip)]
+    pub charger: Option<Box<crate::items::Charger>>,
+    /// What an NPC keeps ([`crate::npc`]).
+    #[serde(skip)]
+    pub npc: Option<Box<crate::npc::Npc>>,
 }
 
 /// How a bone is moved from where its model has it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BoneManipulation {
     pub bone: i64,
     pub position: Vector,
@@ -211,11 +236,19 @@ impl Ent {
             joint: None,
             links: Vec::new(),
             spawn_effect: false,
+            ragdoll_pose: Vec::new(),
             render_fx: 0,
             sub_materials: Vec::new(),
             flex_scale: 1.0,
             flex_weights: Vec::new(),
             bone_manipulations: Vec::new(),
+            anim: crate::anim::AnimState::default(),
+            outputs: Vec::new(),
+            logic: None,
+            trigger_state: None,
+            mover: None,
+            charger: None,
+            npc: None,
         }
     }
 
@@ -293,6 +326,18 @@ impl Entities {
         let slot = &mut slots[index];
         slot.ent = Some(ent);
         Some(EntityHandle { index: Some(index as u32), serial: slot.serial, kind })
+    }
+
+    /// Puts an entity at an index under a serial number given: a client's copy of the
+    /// server's entity there. What was at the index is gone.
+    pub(crate) fn put(&self, index: u32, serial: u32, ent: Ent) -> EntityHandle {
+        let mut slots = self.slots.borrow_mut();
+        while slots.len() <= index as usize {
+            slots.push(Slot { serial: 0, ent: None });
+        }
+        let kind = ent.kind;
+        slots[index as usize] = Slot { serial, ent: Some(ent) };
+        EntityHandle { index: Some(index), serial, kind }
     }
 
     /// Frees an index: the handles to what was there become NULL.
@@ -429,10 +474,11 @@ const TYPES: &[(&str, i32, bool)] = {
 const ENTITY_KINDS: &[(&str, bool)] =
     &[("Player", false), ("Weapon", false), ("NPC", false), ("Vehicle", false), ("NextBot", false), ("CSEnt", true)];
 
-/// The physics object of an entity: valid while the entity has a body ([`crate::physics`]).
-/// That of an entity without one holds `NULL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PhysObjHandle(pub EntityHandle);
+/// A physics object of an entity, by number - 0 its own body, others the parts of a ragdoll
+/// ([`crate::ragdoll`]): valid while the entity has that body ([`crate::physics`]). That of
+/// an entity without one holds `NULL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PhysObjHandle(pub EntityHandle, pub usize);
 
 impl UserData for PhysObjHandle {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
@@ -660,8 +706,8 @@ pub(crate) fn set_model(lua: &Lua, handle: EntityHandle, model: &str) {
     let bounds = crate::ents::model_bounds(lua, model);
     host(lua).entities.with_mut(handle, |ent| {
         ent.model = model.to_string();
-        // a player's box is its hull, whatever the model
-        if let Some((mins, maxs)) = bounds.filter(|_| ent.player.is_none()) {
+        // a player's box is its hull, whatever the model, and so is an NPC's
+        if let Some((mins, maxs)) = bounds.filter(|_| ent.player.is_none() && ent.npc.is_none()) {
             ent.mins = mins;
             ent.maxs = maxs;
         }
@@ -735,6 +781,7 @@ fn install_many(def: &DefMany) -> mlua::Result<()> {
         let color = read(a, |ent| ent.color)?;
         Ok(color.into_iter().map(|part| Value::Integer(part.into())).collect())
     })?;
+    crate::anim::install_many(def)?;
     crate::constraint::install_many(def)
 }
 
@@ -796,6 +843,23 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         set_world_pos(a.lua, handle, a.userdata::<Vector>(2, "Vector")?);
         Ok(Value::Nil)
     })?;
+    // down to what is below, up to 256 units, as the engine's UTIL_DropToFloor
+    def("DropToFloor", |a| {
+        let handle = this(a, 1)?;
+        let pos = transform(a)?.0;
+        let (mins, maxs) = read(a, |ent| (ent.mins, ent.maxs))?;
+        let sweep = crate::trace::Sweep {
+            mins,
+            maxs,
+            mask: gmod_bsp::mask::SOLID,
+            ..crate::trace::Sweep::line(pos, pos - Vector::new(0.0, 0.0, 256.0), crate::trace::Filter::Entities(vec![handle]))
+        };
+        let hit = crate::trace::trace(a.lua, &sweep);
+        if !hit.all_solid && hit.fraction < 1.0 {
+            set_world_pos(a.lua, handle, hit.end);
+        }
+        Ok(Value::Nil)
+    })?;
     def("SetAngles", |a| {
         let handle = this(a, 1)?;
         set_world_angles(a.lua, handle, a.userdata::<Angle>(2, "Angle")?);
@@ -851,6 +915,19 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("AlignAngles", |a| {
         let (_, angles) = transform(a)?;
         angle(a.lua, align(angles, a.userdata::<Angle>(2, "Angle")?, a.userdata::<Angle>(3, "Angle")?))
+    })?;
+    // what a player stands on: the world, an entity, NULL in the air
+    def("GetGroundEntity", |a| {
+        let handle = this(a, 1)?;
+        let ground = crate::player::state(a.lua, handle, |_, p| p.ground).unwrap_or(EntityHandle::NULL);
+        push(a.lua, if host(a.lua).entities.is_valid(ground) { ground } else { EntityHandle::NULL })
+    })?;
+    def("SetGroundEntity", |a| {
+        let handle = this(a, 1)?;
+        let ground = handle_of(a.get(2)).unwrap_or(EntityHandle::NULL);
+        let at = if ground.index.is_some_and(|i| i != 0) { host(a.lua).entities.transform(ground) } else { None };
+        crate::player::with_player(a.lua, handle, |_, p| (p.ground, p.ground_at) = (ground, at));
+        Ok(Value::Nil)
     })?;
     def("GetVelocity", |a| vector(a.lua, read(a, |ent| ent.velocity)?))?;
     def("GetAbsVelocity", |a| vector(a.lua, read(a, |ent| ent.velocity)?))?;
@@ -1141,6 +1218,29 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         crate::ents::key_value(a.lua, handle, &key, &value);
         Ok(Value::Nil)
     })?;
+    // the engine's own fields of an entity, by their names in its data map; those Lua reads
+    def("GetInternalVariable", |a| {
+        let handle = this(a, 1)?;
+        let name = a.string(2)?;
+        let (_, angles) = host(a.lua).entities.transform(handle).expect("checked above");
+        let ent = host(a.lua).entities.get(handle).expect("checked above").clone();
+        let number = |key: &str| ent.keyvalue(key).and_then(|v| v.trim().parse::<f32>().ok());
+        Ok(match name.as_str() {
+            // towards the sun: the light's direction as Source sets it up from a yaw (`angle`,
+            // else the angles') and a `pitch` (negative is down, else the angles'), turned round
+            "m_vDirection" => {
+                let yaw = number("angle").filter(|y| *y != -1.0).unwrap_or(angles.y).to_radians();
+                let pitch = number("pitch").unwrap_or(-angles.p).to_radians();
+                let light = Vector::new(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin());
+                vector(a.lua, Vector::new(-light.x, -light.y, -light.z))?
+            }
+            "m_iName" => Value::String(a.lua.create_string(&ent.name)?),
+            "m_ModelName" => Value::String(a.lua.create_string(&ent.model)?),
+            "m_nSkin" => Value::Integer(ent.skin),
+            "m_spawnflags" => Value::Integer(ent.spawn_flags),
+            _ => Value::Nil,
+        })
+    })?;
     def("GetKeyValues", |a| {
         let handle = this(a, 1)?;
         let (pos, angles) = host(a.lua).entities.transform(handle).expect("checked above");
@@ -1348,9 +1448,21 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("GetPhysicsObject", |a| crate::physics::push(a.lua, this(a, 1)?))?;
     def("GetPhysicsObjectNum", |a| {
         let handle = this(a, 1)?;
-        if a.number(2)? as i64 == 0 { crate::physics::push(a.lua, handle) } else { crate::physics::push(a.lua, EntityHandle::NULL) }
+        match usize::try_from(a.number(2)? as i64) {
+            Ok(part) => crate::physics::push_part(a.lua, handle, part),
+            Err(_) => crate::physics::push(a.lua, EntityHandle::NULL),
+        }
     })?;
-    def("GetPhysicsObjectCount", |a| integer(i64::from(crate::physics::body(a.lua, this(a, 1)?).is_some())))?;
+    def("GetPhysicsObjectCount", |a| integer(crate::physics::count(a.lua, this(a, 1)?) as i64))?;
+    def("TranslatePhysBoneToBone", |a| {
+        let handle = this(a, 1)?;
+        let part = usize::try_from(a.number(2)? as i64).unwrap_or(usize::MAX);
+        integer(crate::ragdoll::bone_of_part(a.lua, handle, part))
+    })?;
+    def("TranslateBoneToPhysBone", |a| {
+        let handle = this(a, 1)?;
+        integer(crate::ragdoll::part_of_bone(a.lua, handle, a.number(2)? as i64))
+    })?;
 
     // flags
     def("GetFlags", |a| integer(read(a, |ent| ent.flags)?))?;
@@ -1465,8 +1577,10 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     })?;
 
     crate::inputs::install_methods(def)?;
+    crate::pickup::install_methods(def)?;
     crate::constraint::install_methods(def)?;
     crate::sound::install_methods(def)?;
+    crate::anim::install_methods(def)?;
     crate::ents::install_variables(def)
 }
 

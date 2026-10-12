@@ -3,6 +3,7 @@
 //!
 //! constraint.lua - and so the tools of sandbox - makes them: it creates the entity, gives it
 //! key-values and the two bodies (`SetPhysConstraintObjects`), and spawns and activates it.
+//! The bodies may be parts of ragdolls (constraint.lua's bone arguments, `GetPhysicsObjectNum`).
 //! A map names the two entities instead (`attach1`, `attach2`; none is the world), and its
 //! constraints are activated once all its entities have spawned. The joint is made when the
 //! constraint is activated, as the bodies are then; its points are where the entity is
@@ -17,7 +18,9 @@
 //! - `phys_spring`: a spring from where it is to `springaxis`, `length` long (0: as far as
 //!   they are), `constant` stiff and `damping` damped. It pulls them together and pushes them
 //!   apart: "stretch only" (spawn flag 1) is not kept yet.
-//! - `phys_ragdollconstraint`: a ball and socket; its limits are not kept yet.
+//! - `phys_ragdollconstraint`: a ball and socket whose second body turns from how it is no
+//!   farther than `xmin`..`xmax`, `ymin`..`ymax` and `zmin`..`zmax` degrees about the axes of
+//!   the constraint's angles, as a ragdoll's joints do ([`gmod_physics::Joint::Ragdoll`]).
 //! - `logic_collision_pair`: the two go through each other while it is disabled
 //!   (`startdisabled`, the input `DisableCollisions`) until `EnableCollisions`. Removed, it
 //!   leaves them as they were, unless `disable_on_remove` says to let them collide again.
@@ -69,6 +72,8 @@ const CONSTRAINTS: &[&str] = &[
 const SF_NO_COLLISION: i64 = 1;
 /// A rope that does not get shorter.
 const SF_RIGID: i64 = 2;
+/// A ragdoll constraint that holds only how the two turn ("free movement").
+const SF_FREE: i64 = 2;
 /// Not held until `TurnOn`.
 const SF_START_INACTIVE: i64 = 4;
 
@@ -81,17 +86,20 @@ fn class_of(lua: &Lua, handle: EntityHandle) -> Option<String> {
 }
 
 /// The body of what a constraint holds: the world's when it is the world or nothing.
-fn body_of(lua: &Lua, owner: EntityHandle) -> Option<BodyId> {
-    let owner = if host(lua).entities.is_valid(owner) { owner } else { EntityHandle::WORLD };
-    crate::physics::body(lua, owner)
+fn body_of(lua: &Lua, phys: PhysObjHandle) -> Option<BodyId> {
+    if host(lua).entities.is_valid(phys.0) {
+        crate::physics::part_body(lua, phys.0, phys.1)
+    } else {
+        crate::physics::body(lua, EntityHandle::WORLD)
+    }
 }
 
-/// What a constraint holds: what `SetPhysConstraintObjects` gave it, else the entities its
-/// key-values name.
-fn owners(lua: &Lua, handle: EntityHandle) -> [EntityHandle; 2] {
+/// What a constraint holds: the bodies `SetPhysConstraintObjects` gave it, else those of the
+/// entities its key-values name.
+fn objects(lua: &Lua, handle: EntityHandle) -> [PhysObjHandle; 2] {
     let (given, names) = {
         let host = host(lua);
-        let Some(ent) = host.entities.get(handle) else { return [EntityHandle::NULL; 2] };
+        let Some(ent) = host.entities.get(handle) else { return [PhysObjHandle(EntityHandle::NULL, 0); 2] };
         let name = |key: &str| ent.keyvalue(key).filter(|n| !n.is_empty()).map(str::to_string);
         (ent.constrained, [name("attach1"), name("attach2")])
     };
@@ -99,8 +107,8 @@ fn owners(lua: &Lua, handle: EntityHandle) -> [EntityHandle; 2] {
         return given;
     }
     names.map(|name| match name {
-        Some(name) => crate::ents::named(lua, &name).unwrap_or(EntityHandle::NULL),
-        None => EntityHandle::WORLD,
+        Some(name) => PhysObjHandle(crate::ents::named(lua, &name).unwrap_or(EntityHandle::NULL), 0),
+        None => PhysObjHandle(EntityHandle::WORLD, 0),
     })
 }
 
@@ -112,8 +120,8 @@ fn make(lua: &Lua, handle: EntityHandle) {
     if !holds {
         return;
     }
-    let owners = owners(lua, handle);
-    let (Some(first), Some(second)) = (body_of(lua, owners[0]), body_of(lua, owners[1])) else { return };
+    let objects = objects(lua, handle);
+    let (Some(first), Some(second)) = (body_of(lua, objects[0]), body_of(lua, objects[1])) else { return };
     if first == second {
         return;
     }
@@ -125,7 +133,7 @@ fn make(lua: &Lua, handle: EntityHandle) {
             let [x, y, z] = crate::ents::three(ent.keyvalue(key).unwrap_or(""));
             [x, y, z]
         };
-        let Some((pos, _)) = host.entities.transform(handle) else { return };
+        let Some((pos, angles)) = host.entities.transform(handle) else { return };
         let at = [pos.x, pos.y, pos.z];
         let axis = |key: &str| {
             let to = point(key);
@@ -134,7 +142,12 @@ fn make(lua: &Lua, handle: EntityHandle) {
         let mut collide = ent.spawn_flags & SF_NO_COLLISION == 0;
         let joint = match class.as_str() {
             "phys_constraint" => Joint::Weld,
-            "phys_ballsocket" | "phys_ragdollconstraint" => Joint::Ball { point: at },
+            "phys_ballsocket" => Joint::Ball { point: at },
+            "phys_ragdollconstraint" => {
+                let limits = ["x", "y", "z"].map(|axis| [number(&format!("{axis}min")), number(&format!("{axis}max"))]);
+                // "only rotation" (constraint.AdvBallsocket's onlyrotation) lets it go anywhere
+                Joint::Ragdoll { point: at, angles: [angles.p, angles.y, angles.r], limits, free: ent.spawn_flags & SF_FREE != 0 }
+            }
             "phys_hinge" => Joint::Hinge { point: at, axis: axis("hingeaxis") },
             "phys_slideconstraint" => Joint::Slider { point: at, axis: axis("slideaxis") },
             "phys_lengthconstraint" => {
@@ -173,8 +186,7 @@ fn release(lua: &Lua, handle: EntityHandle) {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
         physics.unjoin(joint);
-        let owners = owners(lua, handle);
-        for body in owners.into_iter().filter_map(|o| body_of(lua, o)) {
+        for body in objects(lua, handle).into_iter().filter_map(|o| body_of(lua, o)) {
             physics.wake(body);
         }
     }
@@ -256,9 +268,10 @@ pub(crate) fn broken(lua: &Lua, joints: &[JointId]) {
 }
 
 /// What the constraint in argument 1 holds, the world for nothing.
-fn held(a: &Args) -> mlua::Result<[EntityHandle; 2]> {
+fn held(a: &Args) -> mlua::Result<[PhysObjHandle; 2]> {
     let handle = entity::this(a, 1)?;
-    Ok(owners(a.lua, handle).map(|o| if host(a.lua).entities.is_valid(o) { o } else { EntityHandle::WORLD }))
+    let world = PhysObjHandle(EntityHandle::WORLD, 0);
+    Ok(objects(a.lua, handle).map(|o| if host(a.lua).entities.is_valid(o.0) { o } else { world }))
 }
 
 /// The methods of constraints that give two values: what they hold, as entities and as
@@ -266,11 +279,12 @@ fn held(a: &Args) -> mlua::Result<[EntityHandle; 2]> {
 pub(crate) fn install_many(def: &entity::DefMany) -> mlua::Result<()> {
     def("GetConstrainedEntities", |a| {
         let [first, second] = held(a)?;
-        Ok(MultiValue::from_iter([entity::push(a.lua, first)?, entity::push(a.lua, second)?]))
+        Ok(MultiValue::from_iter([entity::push(a.lua, first.0)?, entity::push(a.lua, second.0)?]))
     })?;
     def("GetConstrainedPhysObjects", |a| {
         let [first, second] = held(a)?;
-        Ok(MultiValue::from_iter([crate::physics::push(a.lua, first)?, crate::physics::push(a.lua, second)?]))
+        let push = |phys: PhysObjHandle| crate::physics::push_part(a.lua, phys.0, phys.1);
+        Ok(MultiValue::from_iter([push(first)?, push(second)?]))
     })?;
     Ok(())
 }
@@ -283,8 +297,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
 pub(crate) fn install_methods(def: &entity::Def) -> mlua::Result<()> {
     def("SetPhysConstraintObjects", |a| {
         let handle = entity::this(a, 1)?;
-        let first = a.userdata::<PhysObjHandle>(2, "PhysObj")?.0;
-        let second = a.userdata::<PhysObjHandle>(3, "PhysObj")?.0;
+        let first = a.userdata::<PhysObjHandle>(2, "PhysObj")?;
+        let second = a.userdata::<PhysObjHandle>(3, "PhysObj")?;
         host(a.lua).entities.with_mut(handle, |ent| ent.constrained = Some([first, second]));
         Ok(Value::Nil)
     })?;

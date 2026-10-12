@@ -12,7 +12,7 @@ use crate::meta::{self, type_id};
 use crate::vector::{Angle, Vector};
 
 /// What a player asks for in a tick, as a client sends it.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserCmd {
     /// Where the player looks.
     pub view_angles: Angle,
@@ -30,7 +30,7 @@ pub struct UserCmd {
 }
 
 /// `CUserCmd`: a command with its number and tick.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CmdData {
     pub cmd: UserCmd,
     pub number: i64,

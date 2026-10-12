@@ -14,10 +14,14 @@ gmod-model.workspace = true
 gmod-movement.workspace = true
 gmod-physics.workspace = true
 gmod-glua.workspace = true
+gmod-ui.workspace = true
+gmod-audio.workspace = true
 mlua.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
 gmod-bsp = { workspace = true, features = ["testmap"] }
 gmod-model = { workspace = true, features = ["testmodel"] }
+postcard.workspace = true

@@ -1,0 +1,452 @@
+//! The server of a game: the Lua of the server running the map, with the player at this
+//! computer (a single-player game, or the host of a listen server) and those who connect over
+//! the network ([`proto`](crate::proto)). A dedicated server has only the latter.
+//!
+//! Each frame the server reads what its clients sent (their commands, what they say and
+//! ask), runs the game, and sends each what is theirs: a snapshot of the entities when a tick
+//! has passed, the chat said to them, the `net` messages for them, the sounds, what the
+//! server's Lua asks of their clients. What is for the host's client the caller takes
+//! ([`ForHost`]): that client is in the same program and sees the server's entities directly.
+
+use std::io::Write;
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
+
+use gmod_fs::Vfs;
+use gmod_lua::net::NetMessage;
+use gmod_lua::sound::SoundEvent;
+use gmod_lua::{ChatMessage, EntityHandle, Map, Output, PlayerInfo, Realm, Runtime, ToClient};
+use gmod_net::{ClientId, ServerEvent};
+
+use crate::proto::{self, FileInfo, FromServer, Hello, SnapshotSender, ToServer, Welcome};
+
+/// How much of a file goes in one message.
+const FILE_PIECE: usize = 1 << 20;
+
+/// A Lua state of the game on the game's files, printing to the terminal and keeping its data
+/// in openGMOD's folder.
+pub fn runtime(realm: Realm, vfs: Arc<Vfs>) -> Result<Runtime, String> {
+    let runtime = Runtime::new(realm, vfs).map_err(|e| format!("LuaJIT could not be started: {e}"))?;
+    runtime.set_output(|output| match output {
+        Output::Text(text) => {
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+        }
+        Output::Error(error) => eprintln!("{error}"),
+    });
+    if let Some(dir) = gmod_fs::UserDir::default_root().and_then(|root| gmod_fs::UserDir::open(root, None).ok()) {
+        runtime.set_data_dir(dir);
+    }
+    Ok(runtime)
+}
+
+/// What the server's frame left for the host's client.
+#[derive(Debug, Default)]
+pub struct ForHost {
+    pub chat: Vec<ChatMessage>,
+    pub net: Vec<NetMessage>,
+    pub asked: Vec<ToClient>,
+    pub sounds: Vec<SoundEvent>,
+}
+
+/// A client connected over the network.
+struct Remote {
+    id: ClientId,
+    addr: SocketAddr,
+    name: String,
+    /// Its player, once it has loaded and joined.
+    player: Option<EntityHandle>,
+    snapshots: SnapshotSender,
+    /// The number of the last command taken.
+    command: u32,
+}
+
+/// The files clients are to have, worked out when the first connects (and again when the
+/// server's Lua sent more).
+struct Files {
+    lua: Vec<FileInfo>,
+    content: Vec<FileInfo>,
+    /// How many files of each the server's Lua named then.
+    named: (usize, usize),
+}
+
+pub struct Server {
+    runtime: Runtime,
+    vfs: Arc<Vfs>,
+    map: String,
+    gamemode: String,
+    /// `hostname`.
+    pub name: String,
+    net: Option<gmod_net::Server>,
+    remotes: Vec<Remote>,
+    host: Option<EntityHandle>,
+    files: Option<Files>,
+    /// The tick of the last snapshot sent.
+    last_tick: i64,
+    started: Instant,
+}
+
+impl Server {
+    /// Starts the Lua of the server on the map, for `max_players` (1: a single-player game).
+    pub fn start(vfs: Arc<Vfs>, map: &Map, gamemode: &str, max_players: u32, dedicated: bool) -> Result<Server, String> {
+        let runtime = runtime(Realm::Server, vfs.clone())?;
+        runtime.set_max_players(max_players);
+        runtime.set_dedicated(dedicated);
+        runtime.start(gamemode);
+        runtime.spawn_map(map);
+        Ok(Server {
+            runtime,
+            vfs,
+            map: map.name.clone(),
+            gamemode: gamemode.to_string(),
+            name: "openGMOD".to_string(),
+            net: None,
+            remotes: Vec::new(),
+            host: None,
+            files: None,
+            last_tick: -1,
+            started: Instant::now(),
+        })
+    }
+
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    /// Takes clients from the network at `addr` from now on: where it listens.
+    pub fn listen(&mut self, addr: SocketAddr) -> std::io::Result<SocketAddr> {
+        let net = gmod_net::Server::bind(addr)?;
+        let at = net.local_addr()?;
+        self.net = Some(net);
+        Ok(at)
+    }
+
+    /// Whether clients may join over the network.
+    pub fn listening(&self) -> bool {
+        self.net.is_some()
+    }
+
+    /// The player at this computer joins.
+    pub fn join_host(&mut self, name: &str) -> Option<EntityHandle> {
+        let player = self.runtime.join(PlayerInfo { name: name.to_string(), ..PlayerInfo::default() })?;
+        self.host = Some(player);
+        Some(player)
+    }
+
+    /// The players connected over the network, by name, with their round trip.
+    pub fn remote_players(&self) -> Vec<(String, Option<std::time::Duration>)> {
+        let net = self.net.as_ref();
+        self.remotes.iter().map(|r| (r.name.clone(), net.and_then(|n| n.client_info(r.id)).map(|(_, rtt)| rtt))).collect()
+    }
+
+    /// One frame of `seconds`: what the clients sent, the game, and what goes to them.
+    pub fn frame(&mut self, seconds: f64) -> ForHost {
+        self.receive();
+        self.runtime.think(seconds);
+        self.send()
+    }
+
+    /// Tells every client the server goes, and lets them go.
+    pub fn shut_down(&mut self, reason: &str) {
+        if let Some(net) = &mut self.net {
+            for remote in &self.remotes {
+                net.disconnect(remote.id, reason);
+            }
+        }
+        self.remotes.clear();
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now().max(self.started)
+    }
+
+    fn receive(&mut self) {
+        let now = self.now();
+        let Some(net) = &mut self.net else { return };
+        for event in net.poll(now) {
+            match event {
+                ServerEvent::Request { addr, hello } => self.request(addr, &hello),
+                ServerEvent::Message { client, data } => match proto::decode::<ToServer>(&data) {
+                    Some(message) => self.message(client, message),
+                    None => self.drop_client(client, "sent what is no message"),
+                },
+                ServerEvent::Disconnected { client, reason } => self.gone(client, &reason),
+            }
+        }
+    }
+
+    /// Someone asks to connect: let in if there is room and they speak our messages.
+    fn request(&mut self, addr: SocketAddr, hello: &[u8]) {
+        let now = self.now();
+        let Some(hello) = proto::decode::<Hello>(hello) else {
+            self.deny(addr, "not an openGMOD client");
+            return;
+        };
+        if hello.version != proto::VERSION {
+            self.deny(addr, &format!("the server runs openGMOD's messages {}, the client {}", proto::VERSION, hello.version));
+            return;
+        }
+        let max = self.runtime.max_players() as usize;
+        let taken = self.runtime.players().len() + self.remotes.iter().filter(|r| r.player.is_none()).count();
+        if taken >= max {
+            self.deny(addr, "the server is full");
+            return;
+        }
+        let name: String = self.name.chars().take(64).collect();
+        let welcome = Welcome { server: name, map: self.map.clone(), gamemode: self.gamemode.clone(), max_players: max as u32 };
+        let Some(net) = &mut self.net else { return };
+        let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
+        let name = clean_name(&hello.name);
+        println!("{name} is connecting from {addr}");
+        self.remotes.push(Remote { id, addr, name, player: None, snapshots: SnapshotSender::default(), command: 0 });
+        let (lua, content) = {
+            let files = self.files();
+            (files.lua.clone(), files.content.clone())
+        };
+        self.send_to(id, &FromServer::Files { lua, content }, true);
+    }
+
+    fn deny(&mut self, addr: SocketAddr, reason: &str) {
+        if let Some(net) = &mut self.net {
+            net.deny(addr, reason);
+        }
+    }
+
+    /// The client Lua and the downloads, with what they are.
+    fn files(&mut self) -> &Files {
+        let named = (self.runtime.sent_files().len(), self.runtime.downloads().len());
+        if self.files.as_ref().is_none_or(|f| f.named != named) {
+            self.files = Some(self.list_files(named));
+        }
+        self.files.as_ref().expect("just made")
+    }
+
+    fn list_files(&self, named: (usize, usize)) -> Files {
+        let info = |path: &str| self.vfs.read(path, "GAME").ok().map(|data| FileInfo::of(path, &data));
+        // what the client Lua is: the files sent, and the gamemodes' descriptions it starts by
+        let mut lua: Vec<FileInfo> = self.runtime.sent_files().iter().filter_map(|p| info(p)).collect();
+        for gamemode in self.runtime.gamemodes() {
+            lua.extend(info(&format!("gamemodes/{gamemode}/{gamemode}.txt")));
+        }
+        let mut content: Vec<FileInfo> = self.runtime.downloads().iter().filter(|p| downloadable(p)).filter_map(|p| info(p)).collect();
+        content.extend(info(&format!("maps/{}.bsp", self.map)));
+        Files { lua, content, named }
+    }
+
+    fn remote(&mut self, client: ClientId) -> Option<&mut Remote> {
+        self.remotes.iter_mut().find(|r| r.id == client)
+    }
+
+    fn send_to(&mut self, client: ClientId, message: &FromServer, reliable: bool) {
+        let Some(net) = &mut self.net else { return };
+        let bytes = proto::encode(message);
+        let reliable = reliable || bytes.len() > gmod_net::MAX_UNRELIABLE;
+        if net.send(client, &bytes, reliable).is_err() {
+            self.drop_client(client, "too much to send");
+        }
+    }
+
+    fn message(&mut self, client: ClientId, message: ToServer) {
+        let Some(remote) = self.remote(client) else { return };
+        let player = remote.player;
+        match message {
+            ToServer::Want(paths) => self.send_files(client, &paths),
+            ToServer::Ready if player.is_none() => {
+                let (name, addr) = (remote.name.clone(), remote.addr);
+                let joined = self.runtime.join(PlayerInfo { name: name.clone(), address: addr.to_string(), ..PlayerInfo::default() });
+                match joined {
+                    Some(player) => {
+                        if let Some(remote) = self.remote(client) {
+                            remote.player = Some(player);
+                        }
+                        println!("{name} joined the game");
+                        self.send_to(client, &FromServer::Joined { player }, true);
+                    }
+                    None => self.drop_client(client, "the server is full"),
+                }
+            }
+            ToServer::Ready => {}
+            ToServer::Commands { last, commands, ack } => {
+                remote.snapshots.ack(ack);
+                if let Some(player) = player
+                    && let Some(cmd) = proto::merge_commands(remote.command, last, &commands)
+                {
+                    remote.command = last;
+                    self.runtime.set_input(player, cmd);
+                }
+            }
+            ToServer::Command(line) => {
+                if let Some(player) = player {
+                    self.runtime.run_player_command(player, &line);
+                }
+            }
+            ToServer::UserInfo(name, value) => {
+                if let Some(player) = player {
+                    self.runtime.set_user_info(player, &name, &value);
+                }
+            }
+            ToServer::Net { name, data } => {
+                if let Some(player) = player {
+                    self.runtime.receive_net_message(&name, &data, player);
+                }
+            }
+        }
+    }
+
+    /// Sends a client the files it asked for, of those it was told of.
+    fn send_files(&mut self, client: ClientId, paths: &[String]) {
+        let files = self.files();
+        let known: Vec<String> = paths.iter().filter(|p| files.lua.iter().chain(&files.content).any(|f| &f.path == *p)).cloned().collect();
+        for path in known {
+            let Ok(data) = self.vfs.read(&path, "GAME") else { continue };
+            let size = data.len() as u64;
+            let mut offset = 0;
+            loop {
+                let end = (offset + FILE_PIECE).min(data.len());
+                let piece = FromServer::File { path: path.clone(), offset: offset as u64, size, data: data[offset..end].to_vec() };
+                self.send_to(client, &piece, true);
+                offset = end;
+                if offset >= data.len() {
+                    break;
+                }
+            }
+        }
+        self.send_to(client, &FromServer::FilesSent, true);
+    }
+
+    /// Lets a client go that broke the rules or could not be served.
+    fn drop_client(&mut self, client: ClientId, reason: &str) {
+        if let Some(net) = &mut self.net {
+            net.disconnect(client, reason);
+        }
+        self.gone(client, reason);
+    }
+
+    /// A client is gone: its player leaves.
+    fn gone(&mut self, client: ClientId, reason: &str) {
+        let Some(i) = self.remotes.iter().position(|r| r.id == client) else { return };
+        let remote = self.remotes.remove(i);
+        println!("{} left the game ({reason})", remote.name);
+        if let Some(player) = remote.player {
+            self.runtime.leave(player);
+        }
+    }
+
+    /// What the frame made for each: snapshots, the chat, `net`, sounds, what Lua asked.
+    fn send(&mut self) -> ForHost {
+        let mut host = ForHost::default();
+        let joined: Vec<(ClientId, EntityHandle)> = self.remotes.iter().filter_map(|r| Some((r.id, r.player?))).collect();
+        let route = |player: EntityHandle| -> Option<Option<ClientId>> {
+            if Some(player) == self.host {
+                return Some(None);
+            }
+            joined.iter().find(|(_, p)| *p == player).map(|(id, _)| Some(*id))
+        };
+        let mut out: Vec<(ClientId, FromServer, bool)> = Vec::new();
+        for (to, message) in self.runtime.take_chat() {
+            match route(to) {
+                Some(None) => host.chat.push(message),
+                Some(Some(id)) => out.push((id, FromServer::Chat(message), true)),
+                None => {}
+            }
+        }
+        for message in self.runtime.take_net_messages() {
+            for &index in &message.to {
+                let Some(player) = self.runtime.players().into_iter().find(|p| p.index == Some(index)) else { continue };
+                match route(player) {
+                    Some(None) => host.net.push(message.clone()),
+                    Some(Some(id)) => {
+                        out.push((id, FromServer::Net { name: message.name.clone(), data: message.data.clone() }, !message.unreliable))
+                    }
+                    None => {}
+                }
+            }
+        }
+        for (to, asked) in self.runtime.take_to_clients() {
+            match route(to) {
+                Some(None) => host.asked.push(asked),
+                Some(Some(id)) => out.push((id, FromServer::Asked(asked), true)),
+                None => {}
+            }
+        }
+        let sounds = self.runtime.take_sounds();
+        if !sounds.is_empty() {
+            for (id, _) in &joined {
+                out.push((*id, FromServer::Sounds(sounds.clone()), true));
+            }
+        }
+        host.sounds = sounds;
+        // the entities, once a tick has passed
+        let tick = (self.runtime.cur_time() / gmod_lua::timer::TICK_INTERVAL).floor() as i64;
+        if tick != self.last_tick && !joined.is_empty() {
+            self.last_tick = tick;
+            let encoded = Rc::new(proto::encode_entities(&self.runtime.snapshot()));
+            let time = self.runtime.cur_time();
+            for remote in self.remotes.iter_mut().filter(|r| r.player.is_some()) {
+                let delta = remote.snapshots.delta(&encoded, time, remote.command);
+                out.push((remote.id, FromServer::Snapshot(delta), false));
+            }
+        }
+        for (id, message, reliable) in out {
+            self.send_to(id, &message, reliable);
+        }
+        let now = self.now();
+        if let Some(net) = &mut self.net {
+            net.flush(now);
+        }
+        host
+    }
+}
+
+/// A player's name as the server takes it: printable, not too long, not empty.
+fn clean_name(name: &str) -> String {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(32).collect();
+    let name = name.trim();
+    if name.is_empty() { "unnamed".to_string() } else { name.to_string() }
+}
+
+/// What a server may have its clients download: the game's content, never code.
+pub fn downloadable(path: &str) -> bool {
+    const KINDS: &[&str] = &[
+        "bsp",
+        "nav",
+        "ain",
+        "mdl",
+        "vvd",
+        "vtx",
+        "phy",
+        "ani",
+        "jpg",
+        "png",
+        "vmt",
+        "vtf",
+        "wav",
+        "mp3",
+        "ogg",
+        "pcf",
+        "ttf",
+        "txt",
+        "res",
+        "properties",
+    ];
+    let Some(path) = gmod_fs::path::normalize(path) else { return false };
+    let extension = path.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    KINDS.contains(&extension) && !path.starts_with("lua/") && !path.starts_with("cfg/") && !path.starts_with("bin/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_and_downloads_are_kept_in_bounds() {
+        assert_eq!(clean_name("  Al\u{7}ice  "), "Alice");
+        assert_eq!(clean_name("\n"), "unnamed");
+        assert_eq!(clean_name(&"x".repeat(100)).len(), 32);
+        assert!(downloadable("models/thing.mdl") && downloadable("maps/gm_x.bsp") && downloadable("sound/a/b.wav"));
+        assert!(!downloadable("lua/autorun/x.lua") && !downloadable("bin/client.dll") && !downloadable("../evil.mdl"));
+        assert!(!downloadable("cfg/autoexec.txt") && !downloadable("models/x.exe"));
+    }
+}
