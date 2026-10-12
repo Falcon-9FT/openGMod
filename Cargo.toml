@@ -10,6 +10,7 @@ members = [
     "crates/gmod-model",
     "crates/gmod-world",
     "crates/gmod-movement",
+    "crates/gmod-net",
     "crates/gmod-physics",
     "crates/gmod-ui",
     "crates/gmod-audio",
@@ -35,6 +36,7 @@ gmod-material = { path = "crates/gmod-material" }
 gmod-model = { path = "crates/gmod-model" }
 gmod-world = { path = "crates/gmod-world" }
 gmod-movement = { path = "crates/gmod-movement" }
+gmod-net = { path = "crates/gmod-net" }
 gmod-physics = { path = "crates/gmod-physics" }
 gmod-ui = { path = "crates/gmod-ui" }
 gmod-audio = { path = "crates/gmod-audio" }
