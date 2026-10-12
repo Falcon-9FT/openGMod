@@ -3,6 +3,7 @@ name = "gmod-check"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Checks how much of a Garry's Mod installation openGMOD can read; browses the game file system"
 
 [dependencies]

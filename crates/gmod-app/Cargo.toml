@@ -3,6 +3,7 @@ name = "gmod-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "opengmod: a Garry's Mod map from your installation with the game's Lua and the addons running in it, to walk around in"
 
 [[bin]]

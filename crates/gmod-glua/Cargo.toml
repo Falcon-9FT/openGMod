@@ -3,6 +3,7 @@ name = "gmod-glua"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Garry's Mod Lua dialect (GLua) translated into plain LuaJIT source, line for line"
 
 [dependencies]

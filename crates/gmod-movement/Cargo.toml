@@ -3,6 +3,7 @@ name = "gmod-movement"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "How players move, as in Source: walking and running, stairs, sliding along walls, jumping, ducking, falling and swimming"
 
 [dependencies]

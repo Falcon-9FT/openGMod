@@ -3,6 +3,7 @@ name = "gmod-audio"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Sounds of the Source engine: decoding (WAV with its loops, MP3, OGG), sound scripts (game_sounds), and a mixer that places them in the world as Source does"
 
 [dependencies]

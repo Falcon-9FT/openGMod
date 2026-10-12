@@ -39,6 +39,7 @@ jobs:
           $dist = "dist/openGMOD"
           New-Item -ItemType Directory -Force $dist | Out-Null
           Copy-Item target/release/opengmod.exe, target/release/gmod-check.exe $dist
+          Copy-Item LICENSE "$dist/LICENSE.txt"   # the GPL goes with the program
           $cef = Get-ChildItem target/release/build -Directory -Filter "cef-dll-sys-*" |
             ForEach-Object { Join-Path $_.FullName "out/cef_windows_x86_64" } |
             Where-Object { Test-Path (Join-Path $_ "libcef.dll") } |

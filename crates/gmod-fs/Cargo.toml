@@ -3,6 +3,7 @@ name = "gmod-fs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "The game's files: Garry's Mod installation discovery, VPK and GMA archives, the read-only virtual file system, openGMOD's own writable folder"
 
 [dependencies]

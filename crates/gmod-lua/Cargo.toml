@@ -3,6 +3,7 @@ name = "gmod-lua"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "The Lua runtime: LuaJIT with Garry's Mod's loader (include, require, AddCSLuaFile), realms and the functions GMod implements in C++"
 
 [dependencies]

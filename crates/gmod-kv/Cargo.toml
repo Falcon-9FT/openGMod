@@ -3,6 +3,7 @@ name = "gmod-kv"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Reader for Valve's KeyValues text format: gameinfo.txt, materials, sound scripts, VGUI resources, Steam's .vdf/.acf"
 
 [dependencies]
