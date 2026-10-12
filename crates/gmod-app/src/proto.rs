@@ -166,6 +166,9 @@ pub struct SnapshotDelta {
     pub baseline: u32,
     /// The server's `CurTime`.
     pub time: f64,
+    /// The last of the client's commands the server had taken: the client moves its player
+    /// on from this snapshot by those after it.
+    pub command: u32,
     /// The entities of the baseline that are gone.
     pub removed: Vec<u32>,
     /// The entities new or changed, serialized: as they are, or (`true`) as the bytes that
@@ -192,8 +195,9 @@ impl SnapshotSender {
         }
     }
 
-    /// The next snapshot for the client: what changed since the newest it has.
-    pub fn delta(&mut self, entities: &Rc<Encoded>, time: f64) -> SnapshotDelta {
+    /// The next snapshot for the client, made after its command `command`: what changed since
+    /// the newest it has.
+    pub fn delta(&mut self, entities: &Rc<Encoded>, time: f64, command: u32) -> SnapshotDelta {
         self.last += 1;
         let seq = self.last;
         let base = self.history.iter().find(|(s, _)| *s == self.acked).map(|(_, e)| e.clone());
@@ -215,7 +219,7 @@ impl SnapshotSender {
         while self.history.len() > HISTORY || self.history.front().is_some_and(|(s, _)| *s < self.acked) {
             self.history.pop_front();
         }
-        SnapshotDelta { seq, baseline: if base.is_some() { self.acked } else { 0 }, time, removed, changed }
+        SnapshotDelta { seq, baseline: if base.is_some() { self.acked } else { 0 }, time, command, removed, changed }
     }
 }
 
@@ -327,7 +331,7 @@ mod tests {
         let mut receiver = SnapshotReceiver::default();
         // the first has everything
         let first = snapshot(1.0, (1..=50).map(|i| state(i, i as f32)).collect());
-        let delta = sender.delta(&Rc::new(encode_entities(&first)), first.time);
+        let delta = sender.delta(&Rc::new(encode_entities(&first)), first.time, 0);
         assert_eq!((delta.baseline, delta.changed.len()), (0, 50));
         let got = receiver.receive(delta).unwrap();
         assert_eq!(positions(&got), positions(&first));
@@ -339,7 +343,7 @@ mod tests {
         second.entities[4].ent.local_pos.x = 99.0;
         second.entities.remove(9);
         second.entities.push(state(60, 60.0));
-        let delta = sender.delta(&Rc::new(encode_entities(&second)), second.time);
+        let delta = sender.delta(&Rc::new(encode_entities(&second)), second.time, 0);
         assert_eq!(delta.baseline, 1);
         assert_eq!(delta.removed, [10]);
         assert_eq!(delta.changed.iter().map(|(i, diff, _)| (*i, *diff)).collect::<Vec<_>>(), [(5, true), (60, false)]);
@@ -354,15 +358,15 @@ mod tests {
         // lost on the way: the next is against what the client still has
         let mut third = second.clone();
         third.entities[0].ent.local_pos.x = -1.0;
-        let lost = sender.delta(&Rc::new(encode_entities(&third)), 1.2);
+        let lost = sender.delta(&Rc::new(encode_entities(&third)), 1.2, 0);
         let mut fourth = third.clone();
         fourth.entities[1].ent.local_pos.x = -2.0;
-        let delta = sender.delta(&Rc::new(encode_entities(&fourth)), 1.3);
+        let delta = sender.delta(&Rc::new(encode_entities(&fourth)), 1.3, 0);
         assert_eq!((lost.baseline, delta.baseline), (1, 1), "the client never said it had 2");
         let got = receiver.receive(delta).unwrap();
         assert_eq!(positions(&got), positions(&fourth));
         // a delta against a snapshot the client does not have makes nothing
-        let orphan = SnapshotDelta { seq: 99, baseline: 77, time: 2.0, removed: Vec::new(), changed: Vec::new() };
+        let orphan = SnapshotDelta { seq: 99, baseline: 77, time: 2.0, command: 0, removed: Vec::new(), changed: Vec::new() };
         assert!(receiver.receive(orphan).is_none());
     }
 

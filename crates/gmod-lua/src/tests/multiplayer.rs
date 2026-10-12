@@ -244,3 +244,45 @@ fn resources_name_what_clients_download() {
     assert_eq!(g.runtime.workshop_downloads(), ["104603291"]);
     assert!(g.printed().contains("resource.AddFile: couldn't find 'models/none.mdl'"));
 }
+
+#[test]
+fn a_client_moves_its_player_as_the_server_will() {
+    let server = server_for(1);
+    let alice = server.runtime.join(named("Alice")).unwrap();
+    server.runtime.think(0.1);
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let client = game_with(
+        Realm::Client,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/box.mdl", &mdl),
+            ("scripts/weapons/weapon_pistol.txt", PISTOL.as_bytes()),
+        ],
+    );
+    client.runtime.init();
+    client.runtime.spawn_map(&player_map());
+    let tick = crate::timer::TICK_INTERVAL;
+    // what the server does in a while, and how many of its ticks that was
+    let run = |cmd: UserCmd, seconds: f64| -> u32 {
+        let before = (server.runtime.cur_time() / tick).floor();
+        server.runtime.set_input(alice, cmd);
+        server.runtime.think(seconds);
+        ((server.runtime.cur_time() / tick).floor() - before) as u32
+    };
+    let place = |runtime: &Runtime| runtime.position(alice).unwrap();
+    // walking along y, then running into the wall at x 100 at an angle
+    for (cmd, seconds) in [(walking(90.0, 0), 0.3), (walking(30.0, crate::player::key::SPEED), 0.6)] {
+        client.runtime.apply_snapshot(&server.runtime.snapshot());
+        let ticks = run(cmd, seconds);
+        let fraction = client.runtime.predict(alice, &[(cmd, ticks as f32 * tick as f32)]);
+        let (on_server, predicted) = (place(&server.runtime), place(&client.runtime));
+        assert!((on_server - predicted).length() < 0.05, "{on_server:?} {predicted:?}");
+        assert!(fraction < 0.01, "{fraction}");
+    }
+    assert!(place(&client.runtime).x > 80.0 && place(&client.runtime).x < 100.0, "against the wall: {:?}", place(&client.runtime));
+    // the eyes look where the commands said; half a tick more is drawn half way into it
+    assert!((client.runtime.view(alice).unwrap().angles.y - 30.0).abs() < 0.01);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    let fraction = client.runtime.predict(alice, &[(walking(90.0, 0), 1.5 * tick as f32)]);
+    assert!((fraction - 0.5).abs() < 0.01, "{fraction}");
+}

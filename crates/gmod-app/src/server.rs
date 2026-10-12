@@ -385,7 +385,7 @@ impl Server {
             let encoded = Rc::new(proto::encode_entities(&self.runtime.snapshot()));
             let time = self.runtime.cur_time();
             for remote in self.remotes.iter_mut().filter(|r| r.player.is_some()) {
-                let delta = remote.snapshots.delta(&encoded, time);
+                let delta = remote.snapshots.delta(&encoded, time, remote.command);
                 out.push((remote.id, FromServer::Snapshot(delta), false));
             }
         }

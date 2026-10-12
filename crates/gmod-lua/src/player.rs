@@ -995,6 +995,54 @@ fn engine_move(lua: &Lua, handle: EntityHandle, mv: &mut MoveData) {
     }
 }
 
+/// A client moves its own player on from where the server last said it was, as the server
+/// will once the commands it has not answered yet arrive: each for as long as it was the
+/// player's, in the server's ticks - the engine's movement only, without the gamemode's
+/// hooks, which mostly leave it be. What the server then says puts it right. How far the time
+/// of the commands goes into a tick not run yet, 0 to 1: the eyes are drawn that far from
+/// where they were before the last tick ([`PlayerState::previous_eye`]) to where they are.
+pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32)]) -> f32 {
+    let tick = crate::timer::TICK_INTERVAL as f32;
+    let still = eye(lua, handle).map(|(eye, _)| eye);
+    with_player(lua, handle, |_, p| p.previous_eye = still);
+    // the time each tick falls in, from the oldest command on
+    let mut time = 0.0;
+    let mut until = 0.0;
+    let mut commands = commands.iter();
+    let Some(&(mut cmd, first)) = commands.next() else { return 0.0 };
+    until += first;
+    let total: f32 = until + commands.clone().map(|(_, s)| s).sum::<f32>();
+    while time + tick <= total + 1e-4 {
+        while time >= until - 1e-4
+            && let Some(&(next, seconds)) = commands.next()
+        {
+            cmd = next;
+            until += seconds;
+        }
+        time += tick;
+        let Some((alive, frozen, turning)) =
+            state(lua, handle, |ent, p| (p.alive, ent.flags & fl::FROZEN != 0, cmd.buttons & key::USE != 0 && p.physgun.index.is_some()))
+        else {
+            return 0.0;
+        };
+        if !alive {
+            return 0.0;
+        }
+        let before = eye(lua, handle).map(|(eye, _)| eye);
+        with_player(lua, handle, |_, p| {
+            p.previous_eye = before;
+            if !frozen && !turning {
+                p.eye_angles = cmd.view_angles;
+            }
+        });
+        let data = CmdData { cmd, ..CmdData::default() };
+        let Some(mut mv) = movedata(lua, handle, &data, frozen) else { return 0.0 };
+        engine_move(lua, handle, &mut mv);
+        finish_move(lua, handle, &mv);
+    }
+    ((total - time) / tick).clamp(0.0, 1.0)
+}
+
 /// How heavy a player is to what they push, in kilograms.
 const PLAYER_MASS: f32 = 85.0;
 

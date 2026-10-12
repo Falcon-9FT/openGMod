@@ -318,7 +318,7 @@ impl Game {
             Link::Local(server) => {
                 server.runtime().set_input(self.player, cmd);
             }
-            Link::Remote(connection) => connection.command(cmd),
+            Link::Remote(connection) => connection.command(cmd, seconds as f32),
         }
         self.send_client_commands();
         for line in lines {
@@ -336,7 +336,13 @@ impl Game {
             }
             Link::Remote(connection) => {
                 let events = connection.poll();
-                if let Some(snapshot) = connection.shown(seconds) {
+                if let Some(mut snapshot) = connection.shown(seconds) {
+                    // the player itself where the server last said, not a while ago
+                    if let Some(own) = connection.newest(self.player)
+                        && let Some(at) = snapshot.entities.iter_mut().find(|e| e.index == own.index && e.serial == own.serial)
+                    {
+                        *at = own.clone();
+                    }
                     self.client.apply_snapshot(&snapshot);
                 }
                 for event in events {
@@ -348,8 +354,10 @@ impl Game {
                         Event::Joined(_) => {}
                     }
                 }
+                // and moved on by what it asked since, as the server will move it
+                let fraction = self.client.predict(self.player, &connection.unanswered());
                 let view = self.client.view(self.player)?;
-                [view.eye.x, view.eye.y, view.eye.z]
+                between(view.previous_eye, view.eye, fraction)
             }
         };
         let view = self.client.view(self.player)?;
@@ -692,6 +700,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(16));
         }
         assert!(eye[1] > 100.0 && eye[0].abs() < 1.0 && (eye[2] - 64.0).abs() < 1.0, "{eye:?}");
+        // standing still a while: where the client moved its player is where the server has it
+        for _ in 0..40 {
+            game.frame(&Keys::default(), &Buttons::default(), 0.0, 90.0, 1.0 / 60.0);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let Link::Remote(connection) = &game.link else { unreachable!() };
+        let on_server = connection.newest(game.player).unwrap().ent.local_pos;
+        let predicted = game.client.position(game.player).unwrap();
+        assert!((on_server - predicted).length() < 0.5, "{on_server:?} {predicted:?}");
+        assert!(connection.unanswered().len() < 10);
         assert_eq!(game.client().lua().load("return GOT").eval::<String>().unwrap(), "welcome: hi Alice");
         assert!(game.multiplayer() && game.closed().is_none());
 

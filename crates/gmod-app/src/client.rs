@@ -21,6 +21,8 @@ use crate::proto::{self, FileInfo, FromServer, Hello, SnapshotReceiver, ToServer
 const INTERPOLATION: f64 = 0.1;
 /// How many of the latest commands each packet of commands carries.
 const COMMANDS_SENT: usize = 4;
+/// How many commands are kept to move the player on by while the server has not answered.
+const MAX_UNANSWERED: usize = 256;
 /// How long to wait for the server to answer, and to hear from it again while it sends the
 /// files and lets the player join.
 const CONNECT_FOR: Duration = Duration::from_secs(12);
@@ -43,8 +45,12 @@ pub struct Connection {
     net: gmod_net::Client,
     pub welcome: Welcome,
     snapshots: SnapshotReceiver,
-    commands: VecDeque<UserCmd>,
+    /// The commands sent and not yet answered by a snapshot, numbered, with how long each
+    /// was the player's.
+    commands: VecDeque<(u32, UserCmd, f32)>,
     last_command: u32,
+    /// The last command the newest snapshot answers.
+    answered: u32,
     /// Snapshots received, oldest first, to draw between.
     buffer: VecDeque<Snapshot>,
     /// The server's time the picture shows.
@@ -72,6 +78,7 @@ impl Connection {
             snapshots: SnapshotReceiver::default(),
             commands: VecDeque::new(),
             last_command: 0,
+            answered: 0,
             buffer: VecDeque::new(),
             shown: None,
             inbox: VecDeque::new(),
@@ -232,12 +239,29 @@ impl Connection {
     }
 
     fn snapshot(&mut self, delta: proto::SnapshotDelta) {
+        let command = delta.command;
         if let Some(snapshot) = self.snapshots.receive(delta) {
             // one older than the newest came late: it is no use
             if self.buffer.back().is_none_or(|b| b.time < snapshot.time) {
                 self.buffer.push_back(snapshot);
+                self.answered = self.answered.max(command);
+                while self.commands.front().is_some_and(|(n, _, _)| *n <= self.answered) {
+                    self.commands.pop_front();
+                }
             }
         }
+    }
+
+    /// The player's own entity in the newest snapshot: where the server last said it was.
+    pub fn newest(&self, player: EntityHandle) -> Option<&gmod_lua::EntityState> {
+        let index = player.index?;
+        self.buffer.back()?.entities.iter().find(|e| e.index == index && e.serial == player.serial)
+    }
+
+    /// The commands the newest snapshot does not answer yet, oldest first, with how long each
+    /// was the player's: what to move the player on by from there.
+    pub fn unanswered(&self) -> Vec<(UserCmd, f32)> {
+        self.commands.iter().map(|&(_, cmd, seconds)| (cmd, seconds)).collect()
     }
 
     /// Reads what arrived and sends what is due: what happened since the last call.
@@ -246,16 +270,18 @@ impl Connection {
         self.inbox.drain(..).filter_map(event_of).collect()
     }
 
-    /// The player's command of this frame, sent with those before it (one lost on the way
-    /// comes with the next) and the newest snapshot here.
-    pub fn command(&mut self, cmd: UserCmd) {
+    /// The player's command of this frame of `seconds`, sent with those before it (one lost on
+    /// the way comes with the next) and the newest snapshot here.
+    pub fn command(&mut self, cmd: UserCmd, seconds: f32) {
         self.last_command += 1;
-        self.commands.push_back(cmd);
-        while self.commands.len() > COMMANDS_SENT {
+        self.commands.push_back((self.last_command, cmd, seconds));
+        // a server that answers nothing: only the latest are kept
+        while self.commands.len() > MAX_UNANSWERED {
             self.commands.pop_front();
         }
-        let message =
-            ToServer::Commands { last: self.last_command, commands: self.commands.iter().copied().collect(), ack: self.snapshots.newest };
+        let first = self.commands.len().saturating_sub(COMMANDS_SENT);
+        let sent = self.commands.iter().skip(first).map(|&(_, cmd, _)| cmd).collect();
+        let message = ToServer::Commands { last: self.last_command, commands: sent, ack: self.snapshots.newest };
         self.send(&message, false);
         self.net.flush(Instant::now());
     }
