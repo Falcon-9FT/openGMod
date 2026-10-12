@@ -10,11 +10,15 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            runner: [self-hosted, linux, rust]    # Docker-раннер
+          - os: windows-latest
+            runner: [self-hosted, windows]        # раннер прямо на Windows
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -30,9 +34,9 @@ jobs:
 
   # the oldest Rust the workspace promises to build with (rust-version in Cargo.toml)
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, rust]
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
