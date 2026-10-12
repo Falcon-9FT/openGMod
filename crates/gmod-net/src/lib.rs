@@ -41,6 +41,11 @@
 //!   its map...: [`Server::set_info`]). The question is as long as any answer can be, so a
 //!   forged sender address gets no more than was sent in its name: a server is no amplifier.
 //!   A query sent to a broadcast address finds the servers of a local network ([`Query`]).
+//! * `HEARTBEAT` (a server to a master server, padded to a whole packet): the protocol's
+//!   version; the master asks the server with a `QUERY` and lists it once it answers. `LIST`
+//!   (anyone to a master, padded): a number the asker picked, the protocol's version and the
+//!   place of the first server wanted; `SERVERS`: that number, how many servers there are, the
+//!   place of the first, and as many addresses as fit ([`master`]).
 //!
 //! A side that hears nothing for 15 seconds drops the connection; one with nothing to say still
 //! sends an empty `DATA` packet ten times a second, which keeps the other side's
@@ -54,9 +59,11 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 pub mod crypto;
+pub mod master;
 
 use crypto::{Ephemeral, KEY, Opener, SIGNATURE, Sealer, SessionKeys, TAG};
 pub use crypto::{Identity, PublicKey};
+pub use master::{MASTER_PORT, Master};
 
 /// The version of the protocol: a client and a server of different ones do not connect.
 pub const PROTOCOL: u16 = 2;
@@ -71,6 +78,9 @@ const QUERY: u8 = 6;
 const INFO: u8 = 7;
 const CHALLENGE: u8 = 8;
 const JOIN: u8 = 9;
+const LIST: u8 = 10;
+const SERVERS: u8 = 11;
+const HEARTBEAT: u8 = 12;
 
 const RELIABLE: u8 = 1;
 const UNRELIABLE: u8 = 2;
@@ -687,6 +697,15 @@ impl<W: Wire> Server<W> {
         self.info = if info.len() <= MAX_INFO { info.to_vec() } else { Vec::new() };
     }
 
+    /// Tells a master server this server is here ([`Master`]): it asks what the server is,
+    /// and lists it once it answers - which it does while it has something to say
+    /// ([`set_info`](Self::set_info)). Again every minute or so, or the master forgets it.
+    pub fn announce(&mut self, master: SocketAddr) -> io::Result<()> {
+        let mut heartbeat = control(HEARTBEAT, &[&PROTOCOL.to_le_bytes()]);
+        heartbeat.resize(MAX_PACKET, 0);
+        self.wire.send_to(&heartbeat, master)
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.wire.local_addr()
     }
@@ -1225,6 +1244,25 @@ pub struct Answer {
     pub info: Vec<u8>,
 }
 
+/// A page of a master server's list ([`Query::ask_master`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// The question's number.
+    pub question: u64,
+    pub from: SocketAddr,
+    /// How many servers the master lists in all, and the place of the first of this page.
+    pub total: u32,
+    pub start: u32,
+    pub servers: Vec<SocketAddr>,
+}
+
+/// What came of the questions of a [`Query`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reply {
+    Info(Answer),
+    Page(Page),
+}
+
 impl Query<Udp> {
     /// A socket for questions, which may go to broadcast addresses.
     pub fn open() -> io::Result<Query<Udp>> {
@@ -1239,11 +1277,13 @@ impl<W: Wire> Query<W> {
         Query { wire, asked: Vec::new() }
     }
 
-    /// Asks the server at `to` (or every one a broadcast address reaches); the question's
-    /// number, which its answers carry.
-    pub fn ask(&mut self, to: SocketAddr, now: Instant) -> io::Result<u64> {
+    /// Sends a question, padded to a whole packet: its number, which its answers carry.
+    fn send(&mut self, kind: u8, to: SocketAddr, rest: &[&[u8]], now: Instant) -> io::Result<u64> {
         let question = random();
-        let mut packet = control(QUERY, &[&question.to_le_bytes()]);
+        let number = question.to_le_bytes();
+        let mut parts: Vec<&[u8]> = vec![&number];
+        parts.extend_from_slice(rest);
+        let mut packet = control(kind, &parts);
         packet.resize(MAX_PACKET, 0);
         self.wire.send_to(&packet, to)?;
         self.asked.push((question, to, now));
@@ -1252,20 +1292,46 @@ impl<W: Wire> Query<W> {
         Ok(question)
     }
 
+    /// Asks the server at `to` (or every one a broadcast address reaches); the question's
+    /// number, which its answers carry.
+    pub fn ask(&mut self, to: SocketAddr, now: Instant) -> io::Result<u64> {
+        self.send(QUERY, to, &[], now)
+    }
+
+    /// Asks a master server for the servers of this protocol it lists, from the `start`-th
+    /// on ([`Master`]): the question's number, which the page carries.
+    pub fn ask_master(&mut self, master: SocketAddr, start: u32, now: Instant) -> io::Result<u64> {
+        self.send(LIST, master, &[&PROTOCOL.to_le_bytes(), &start.to_le_bytes()], now)
+    }
+
     /// The answers that came.
-    pub fn poll(&mut self, now: Instant) -> Vec<Answer> {
-        let mut answers = Vec::new();
+    pub fn poll(&mut self, now: Instant) -> Vec<Reply> {
+        let mut replies = Vec::new();
         let mut buf = [0u8; 2048];
         while let Ok(Some((n, from))) = self.wire.recv_from(&mut buf) {
             let mut r = Reader { data: &buf[..n.min(buf.len())] };
-            if r.take(4) != Some(&MAGIC[..]) || r.u8() != Some(INFO) {
+            if r.take(4) != Some(&MAGIC[..]) {
                 continue;
             }
+            let kind = r.u8();
             let Some(question) = r.u64() else { continue };
             let Some(&(_, asked, at)) = self.asked.iter().find(|(q, ..)| *q == question) else { continue };
-            answers.push(Answer { question, asked, from, took: now.duration_since(at), info: r.rest().to_vec() });
+            match kind {
+                Some(INFO) => {
+                    replies.push(Reply::Info(Answer { question, asked, from, took: now.duration_since(at), info: r.rest().to_vec() }));
+                }
+                Some(SERVERS) => {
+                    let (Some(total), Some(start)) = (r.u32(), r.u32()) else { continue };
+                    let mut servers = Vec::new();
+                    while let Some(addr) = master::read_address(&mut r) {
+                        servers.push(addr);
+                    }
+                    replies.push(Reply::Page(Page { question, from, total, start, servers }));
+                }
+                _ => {}
+            }
         }
-        answers
+        replies
     }
 }
 

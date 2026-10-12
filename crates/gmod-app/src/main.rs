@@ -54,6 +54,7 @@ USAGE:
     opengmod [OPTIONS] [MAP]
     opengmod --connect <ADDRESS> [OPTIONS]
     opengmod --dedicated [OPTIONS] MAP
+    opengmod --master [--port <PORT>]
 
     MAP                  a map to start in: one of the game (gm_construct), or a .bsp file;
                          without one, the main menu
@@ -74,6 +75,12 @@ OPTIONS:
                          status lists the players, lua_run runs Lua, quit
                          stops it
     --hostname <NAME>    the server's name its players see
+    --announce <ADDRESS> a master server this server tells it is here, for the browsers'
+                         internet list (also those in ~/.opengmod/servers/masters.txt;
+                         none with sv_lan 1)
+    --master             a master server: the list of the servers that tell it they are
+                         here, for the browsers of those who name it in their masters.txt
+                         (UDP port 27011 unless --port says otherwise)
     -h, --help           this text
 
 CONTROLS:
@@ -111,11 +118,14 @@ struct Args {
     html: bool,
     gamemode: Option<String>,
     max_players: Option<u32>,
-    port: u16,
+    port: Option<u16>,
     name: Option<String>,
     connect: Option<String>,
     dedicated: bool,
     hostname: Option<String>,
+    /// Master servers a server here tells it is here.
+    announce: Vec<String>,
+    master: bool,
 }
 
 fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
@@ -127,11 +137,13 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
         html: true,
         gamemode: None,
         max_players: None,
-        port: proto::DEFAULT_PORT,
+        port: None,
         name: None,
         connect: None,
         dedicated: false,
         hostname: None,
+        announce: Vec::new(),
+        master: false,
     };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
@@ -145,11 +157,13 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
                 let n = raw.next().and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=gmod_lua::player::MAX_PLAYERS).contains(n));
                 args.max_players = Some(n.ok_or(format!("--maxplayers needs a number from 1 to {}", gmod_lua::player::MAX_PLAYERS))?);
             }
-            "--port" => args.port = raw.next().and_then(|p| p.parse().ok()).ok_or("--port needs a port")?,
+            "--port" => args.port = Some(raw.next().and_then(|p| p.parse().ok()).ok_or("--port needs a port")?),
             "--name" => args.name = Some(raw.next().ok_or("--name needs a name")?),
             "--connect" => args.connect = Some(raw.next().ok_or("--connect needs an address")?),
             "--dedicated" => args.dedicated = true,
             "--hostname" => args.hostname = Some(raw.next().ok_or("--hostname needs a name")?),
+            "--announce" => args.announce.push(raw.next().ok_or("--announce needs a master server's address")?),
+            "--master" => args.master = true,
             "-h" | "--help" => return Ok(None),
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if args.map.is_none() => args.map = Some(arg),
@@ -171,6 +185,8 @@ struct Setup {
     /// Players a game started here takes: more than one, it listens for them on `port`.
     max_players: u32,
     port: u16,
+    /// Master servers a server here tells it is here, besides those of `servers/masters.txt`.
+    announce: Vec<String>,
     /// The player's name, and their key: who they are on every server.
     name: String,
     identity: gmod_net::Identity,
@@ -379,6 +395,31 @@ fn load_from(mut vfs: Vfs, map: &str, lua: bool) -> Result<Loaded, String> {
 
 /// A dedicated server: the game on a map for those who join over the network, without a
 /// window; lines typed are its console. Runs until `quit`.
+/// A master server: lists the servers that tell it they are here, for the browsers that ask.
+/// Lines typed are its console: `status` lists the servers, `quit` stops it.
+fn master(port: u16) -> Result<(), String> {
+    let mut master = gmod_net::Master::bind(SocketAddr::from(([0, 0, 0, 0], port))).map_err(|e| format!("port {port}: {e}"))?;
+    println!("openGMOD master server on UDP port {port}; type status or quit");
+    loop {
+        master.poll(Instant::now());
+        for line in game::typed_lines() {
+            match line.trim() {
+                "quit" | "exit" => return Ok(()),
+                "status" => {
+                    let servers = master.servers();
+                    println!("{} servers", servers.len());
+                    for server in servers {
+                        println!("  {server}");
+                    }
+                }
+                "" => {}
+                other => println!("{other}: status or quit"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
     let install = Install::locate(setup.gmod.as_deref()).map_err(|e| e.to_string())?;
     println!("Garry's Mod: {}", install.root.display());
@@ -396,6 +437,7 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
     let identity = keys::server_identity();
     let key = identity.public();
     let at = server.listen(SocketAddr::from(([0, 0, 0, 0], setup.port)), identity).map_err(|e| format!("port {}: {e}", setup.port))?;
+    server.set_masters(browser::masters(&setup.announce));
     println!(
         "{hostname}: {name} ({}) for {} players, started in {:.1} s, on UDP port {}; type status, quit or the server's commands",
         setup.gamemode,
@@ -1757,6 +1799,12 @@ fn main() -> ExitCode {
         Err(e) => return fail(&format!("{e}\n\n{USAGE}")),
     };
     println!("openGMOD {}", env!("CARGO_PKG_VERSION"));
+    if args.master {
+        return match master(args.port.unwrap_or(gmod_net::MASTER_PORT)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
     let disabled = menu::disabled_file().map(|file| gmod_fs::workshop::read_disabled(&file)).unwrap_or_default();
     let setup = Setup {
         gmod: args.gmod.clone(),
@@ -1765,7 +1813,8 @@ fn main() -> ExitCode {
         gamemode: args.gamemode.clone().unwrap_or_else(|| "sandbox".into()),
         disabled,
         max_players: args.max_players.unwrap_or(if args.dedicated { 16 } else { 1 }),
-        port: args.port,
+        port: args.port.unwrap_or(proto::DEFAULT_PORT),
+        announce: args.announce.clone(),
         name: args.name.clone().unwrap_or_else(default_name),
         // a dedicated server has no player of its own
         identity: if args.dedicated { gmod_net::Identity::generate() } else { keys::player_identity() },

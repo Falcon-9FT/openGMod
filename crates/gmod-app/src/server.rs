@@ -26,6 +26,8 @@ use crate::proto::{self, FileInfo, FromServer, Hello, ServerInfo, SnapshotSender
 
 /// How much of a file goes in one message.
 const FILE_PIECE: usize = 1 << 20;
+/// How often a server tells its master servers it is here: they forget it after five minutes.
+const ANNOUNCE_EVERY: Duration = Duration::from_secs(60);
 
 /// A Lua state of the game on the game's files, printing to the terminal and keeping its data
 /// in openGMOD's folder.
@@ -100,6 +102,9 @@ pub struct Server {
     title: Option<String>,
     /// What tells this server from others that answer at the same address ([`ServerInfo`]).
     instance: u64,
+    /// The master servers it tells it is here, and when it last did.
+    masters: Vec<SocketAddr>,
+    announced: Option<Instant>,
     started: Instant,
 }
 
@@ -129,6 +134,8 @@ impl Server {
                 use std::hash::{BuildHasher, RandomState};
                 RandomState::new().hash_one(std::time::SystemTime::now())
             },
+            masters: Vec::new(),
+            announced: None,
             started: Instant::now(),
         })
     }
@@ -144,6 +151,13 @@ impl Server {
         let at = net.local_addr()?;
         self.net = Some(net);
         Ok(at)
+    }
+
+    /// The master servers it tells it is here, for the browsers' internet list: every minute,
+    /// unless `sv_lan` is 1.
+    pub fn set_masters(&mut self, masters: Vec<SocketAddr>) {
+        self.masters = masters;
+        self.announced = None;
     }
 
     /// Whether clients may join over the network.
@@ -200,6 +214,17 @@ impl Server {
         };
         if let Some(net) = &mut self.net {
             net.set_info(&info.encode());
+        }
+        let lan = self.runtime.convar("sv_lan").is_some_and(|v| v.trim().parse::<f64>().is_ok_and(|n| n != 0.0));
+        if !lan && !self.masters.is_empty() && self.announced.is_none_or(|at| at.elapsed() >= ANNOUNCE_EVERY) {
+            self.announced = Some(Instant::now());
+            if let Some(net) = &mut self.net {
+                for master in &self.masters {
+                    if let Err(e) = net.announce(*master) {
+                        eprintln!("master server {master}: {e}");
+                    }
+                }
+            }
         }
     }
 

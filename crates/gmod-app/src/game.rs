@@ -134,7 +134,10 @@ impl Game {
         let mut server = Server::start(vfs.clone(), map, gamemode, max_players, false)?;
         if let Some(addr) = listen {
             match server.listen(addr, crate::keys::server_identity()) {
-                Ok(at) => println!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port()),
+                Ok(at) => {
+                    println!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port());
+                    server.set_masters(crate::browser::masters(&[]));
+                }
                 Err(e) => println!("Others cannot join: {addr}: {e}"),
             }
         }
@@ -785,8 +788,21 @@ mod tests {
         let at = server.listen("127.0.0.1:0".parse().unwrap(), gmod_net::Identity::generate()).unwrap();
         server.runtime().join(gmod_lua::PlayerInfo { name: "Bob".into(), bot: true, ..Default::default() }).unwrap();
 
+        // a master server the server tells it is here, which lists it once it answers
+        let mut master = gmod_net::Master::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let master_at = master.local_addr().unwrap();
+        server.set_masters(vec![master_at]);
+        let listed = Instant::now();
+        while master.servers().is_empty() && listed.elapsed() < Duration::from_secs(3) {
+            server.frame(0.01);
+            master.poll(Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(master.servers(), [at]);
+
         let saved = Folder::new("browse-lists", &[]);
         std::fs::write(saved.0.join("favorites.txt"), format!("{at}\n127.0.0.1:1\n")).unwrap();
+        std::fs::write(saved.0.join("masters.txt"), format!("{master_at}\n")).unwrap();
         let mut browser = crate::browser::Browser::new(Some(saved.0.clone()));
         let menu = Runtime::new(Realm::Menu, Arc::new(Vfs::new())).unwrap();
         menu.set_favorite_servers(browser.favorites());
@@ -802,24 +818,32 @@ mod tests {
                      Callback = function(ping, name) table.insert(FAV, name) return true end,
                      CallbackFailed = function(address) table.insert(FAV, 'failed ' .. address) return true end,
                      Finished = function() FAV_DONE = true end }})
-                 serverlist.Query({{ Type = 'internet', Finished = function() INTERNET_DONE = true end }})"
+                 NET = {{}}
+                 serverlist.Query({{ Type = 'internet', Callback = function(ping, name) table.insert(NET, name) return true end,
+                     Finished = function() INTERNET_DONE = true end }})"
             ),
             "browse",
         )
         .unwrap();
         let started = Instant::now();
-        let done = || menu.lua().load("return FAV_DONE == true and PING ~= nil and DEAD ~= nil and PLAYERS ~= nil").eval::<bool>().unwrap();
+        let done = || {
+            menu.lua()
+                .load("return FAV_DONE == true and INTERNET_DONE == true and PING ~= nil and DEAD ~= nil and PLAYERS ~= nil")
+                .eval::<bool>()
+                .unwrap()
+        };
         while !done() && started.elapsed() < Duration::from_secs(5) {
             server.frame(0.01);
+            master.poll(Instant::now());
             browser.poll(&menu);
             std::thread::sleep(Duration::from_millis(5));
         }
         let got: String = menu
             .lua()
-            .load("return table.concat({ PING, DEAD, PLAYERS, table.concat(FAV, ','), tostring(INTERNET_DONE) }, '\\n')")
+            .load("return table.concat({ PING, DEAD, PLAYERS, table.concat(FAV, ','), table.concat(NET, ',') }, '\\n')")
             .eval()
             .unwrap();
-        assert_eq!(got, "Alice's game|Sandbox|gm_test|0|4|1\nno answer\nBob\nAlice's game,failed 127.0.0.1:1\ntrue");
+        assert_eq!(got, "Alice's game|Sandbox|gm_test|0|4|1\nno answer\nBob\nAlice's game,failed 127.0.0.1:1\nAlice's game");
         // the servers played on, newest first
         browser.played_on("10.0.0.1:27015");
         browser.played_on(&at.to_string());

@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::*;
+use crate::master::Master;
 
 /// A network for tests: packets wait a few steps, some are lost, some come twice, some
 /// overtake others - as the dice say, the same every run.
@@ -381,13 +382,16 @@ fn servers_say_what_they_are_to_whoever_asks() {
     server.poll(start);
     std::thread::sleep(Duration::from_millis(20));
     assert!(query.poll(start).is_empty());
+    let infos = |replies: Vec<Reply>| -> Vec<Answer> {
+        replies.into_iter().filter_map(|r| if let Reply::Info(a) = r { Some(a) } else { None }).collect()
+    };
     // asked, it answers the question with what it is
     server.set_info(b"gm_construct, 3 of 8");
     let question = query.ask(at, start).unwrap();
     let mut answers = Vec::new();
     for _ in 0..200 {
         server.poll(start);
-        answers.extend(query.poll(start + Duration::from_millis(30)));
+        answers.extend(infos(query.poll(start + Duration::from_millis(30))));
         if !answers.is_empty() {
             break;
         }
@@ -559,4 +563,78 @@ fn old_and_short_requests_get_no_more_than_they_sent() {
     padded.resize(MAX_PACKET, 0);
     let told = answers(padded, &mut server);
     assert!(told.len() == 1 && told[0][4] == CHALLENGE && told[0].len() < MAX_PACKET, "{told:?}");
+}
+
+#[test]
+fn a_master_lists_the_servers_that_are_there() {
+    let net = Rc::new(RefCell::new(Net { dice: 11, ..Net::default() }));
+    let wire = |port| TestWire { net: net.clone(), addr: addr(port) };
+    let mut master = Master::with_wire(wire(27011));
+    let mut server = Server::with_wire(wire(27015), Identity::generate());
+    let mut quiet = Server::with_wire(wire(27016), Identity::generate());
+    let mut query = Query::with_wire(wire(50000));
+    let mut now = Instant::now();
+    let run = |master: &mut Master<TestWire>, servers: &mut [&mut Server<TestWire>], now: Instant| {
+        for _ in 0..4 {
+            net.borrow_mut().step += 1;
+            master.poll(now);
+            for server in servers.iter_mut() {
+                server.poll(now);
+            }
+        }
+    };
+    // a server that says what it is is listed; one with nothing to say, or an address that
+    // only claims to be a server, is not
+    server.set_info(b"gm_construct");
+    server.announce(addr(27011)).unwrap();
+    quiet.announce(addr(27011)).unwrap();
+    let mut forged = control(HEARTBEAT, &[&PROTOCOL.to_le_bytes()]);
+    forged.resize(MAX_PACKET, 0);
+    net.borrow_mut().flying.push((0, addr(27011), addr(40000), forged.clone()));
+    // nor does a short one get an answer
+    net.borrow_mut().flying.push((0, addr(27011), addr(40001), forged[..20].to_vec()));
+    run(&mut master, &mut [&mut server, &mut quiet], now);
+    assert_eq!(master.servers(), [addr(27015)]);
+    assert!(net.borrow().flying.iter().all(|f| f.1 != addr(40001)), "answered a short heartbeat");
+
+    // a browser asks for the list, a page at a time, of its own protocol
+    let asked = query.ask_master(addr(27011), 0, now).unwrap();
+    run(&mut master, &mut [], now);
+    let replies = query.poll(now);
+    assert!(
+        matches!(replies.as_slice(), [Reply::Page(Page { question, total: 1, start: 0, servers, .. })] if *question == asked && servers == &[addr(27015)]),
+        "{replies:?}"
+    );
+    let mut short = control(LIST, &[&7u64.to_le_bytes(), &PROTOCOL.to_le_bytes(), &0u32.to_le_bytes()]);
+    net.borrow_mut().flying.push((0, addr(27011), addr(40002), std::mem::take(&mut short)));
+    run(&mut master, &mut [], now);
+    assert!(net.borrow().flying.iter().all(|f| f.1 != addr(40002)), "answered a short question");
+
+    // many servers come in pages
+    let mut many: Vec<Server<TestWire>> = (0..200).map(|i| Server::with_wire(wire(30000 + i), Identity::generate())).collect();
+    for s in &mut many {
+        s.set_info(b"x");
+        s.announce(addr(27011)).unwrap();
+    }
+    let mut all: Vec<&mut Server<TestWire>> = many.iter_mut().collect();
+    run(&mut master, &mut all, now);
+    let mut listed = Vec::new();
+    let mut total = u32::MAX;
+    while (listed.len() as u32) < total {
+        query.ask_master(addr(27011), listed.len() as u32, now).unwrap();
+        run(&mut master, &mut [], now);
+        let Some(Reply::Page(page)) = query.poll(now).pop() else { panic!("no page") };
+        assert!(!page.servers.is_empty() && page.servers.len() < 200);
+        total = page.total;
+        listed.extend(page.servers);
+    }
+    assert_eq!(listed.len(), 201);
+
+    // one that stops announcing itself goes after a while
+    now += Duration::from_secs(200);
+    server.announce(addr(27011)).unwrap();
+    run(&mut master, &mut [&mut server], now);
+    now += Duration::from_secs(200);
+    run(&mut master, &mut [], now);
+    assert_eq!(master.servers(), [addr(27015)]);
 }
