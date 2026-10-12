@@ -2,7 +2,7 @@
 //! and a nodraw face, with lightmaps of known colours, an LZMA-compressed entity lump, one
 //! static prop and a pakfile.
 
-use crate::lumps::index;
+use crate::lumps::{Overlay, index};
 
 pub const RED: [u8; 4] = [255, 0, 0, 0];
 pub const GREEN: [u8; 4] = [0, 255, 0, 0];
@@ -311,6 +311,26 @@ pub struct TestFace {
     pub flags: i32,
 }
 
+/// An overlay of a [`TestMap`], its material by name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestOverlay {
+    pub material: &'static str,
+    /// The record as written, but for its texinfo: the material's.
+    pub overlay: Overlay,
+}
+
+impl TestOverlay {
+    /// A square `size` units a side around `origin`, facing `normal` with its U axis `u`, the
+    /// whole texture once, on the map's faces `faces` (the displacements' first, then
+    /// [`TestMap::faces`]).
+    pub fn square(material: &'static str, faces: Vec<i32>, origin: [f32; 3], normal: [f32; 3], u: [f32; 3], size: f32) -> TestOverlay {
+        let h = size / 2.0;
+        let points = [[-h, -h, u[0]], [-h, h, u[1]], [h, h, u[2]], [h, -h, 0.0]];
+        let overlay = Overlay { id: 0, texinfo: 0, render_order: 0, faces, u: [0.0, 1.0], v: [0.0, 1.0], points, origin, normal };
+        TestOverlay { material, overlay }
+    }
+}
+
 /// A map of brushes for tests, lump by lump: the world and brush entities, each with a BSP
 /// tree split along its brushes' bounds, displacements and faces in the world, static props,
 /// and entities.
@@ -336,6 +356,7 @@ pub struct TestMap {
     /// The same in the HDR lumps.
     pub ambient_hdr: Option<[[u8; 4]; 6]>,
     pub lights: Vec<TestLight>,
+    pub overlays: Vec<TestOverlay>,
 }
 
 /// A brush as the tree builder sees it: its index and bounds.
@@ -580,6 +601,9 @@ impl TestMap {
             faces.extend(bytes);
         }
 
+        let overlays: Vec<u8> =
+            self.overlays.iter().flat_map(|o| Overlay { texinfo: surface(o.material, 0), ..o.overlay.clone() }.bytes()).collect();
+
         let mut string_data = Vec::new();
         let mut string_table = Vec::new();
         let mut texdata = Vec::new();
@@ -645,6 +669,7 @@ impl TestMap {
             (index::DISP_VERTS, disp_verts, 0),
             (index::TEXDATA_STRING_DATA, string_data, 0),
             (index::TEXDATA_STRING_TABLE, string_table, 0),
+            (index::OVERLAYS, overlays, 0),
         ];
         let mut out = vec![0u8; 8 + 64 * 16 + 4];
         out[0..4].copy_from_slice(b"VBSP");

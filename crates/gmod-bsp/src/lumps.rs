@@ -28,6 +28,7 @@ pub mod index {
     pub const CUBEMAPS: usize = 42;
     pub const TEXDATA_STRING_DATA: usize = 43;
     pub const TEXDATA_STRING_TABLE: usize = 44;
+    pub const OVERLAYS: usize = 45;
     pub const LIGHTING_HDR: usize = 53;
     pub const FACES_HDR: usize = 58;
 }
@@ -514,5 +515,58 @@ impl Cubemap {
 
     pub(crate) fn parse(f: &mut Fields) -> Cubemap {
         Cubemap { origin: [f.i32(), f.i32(), f.i32()], size: f.i32() }
+    }
+}
+
+/// An `info_overlay` as the compiler leaves it: a picture laid over faces of the world.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Overlay {
+    pub id: i32,
+    /// Its material, through a texinfo.
+    pub texinfo: i16,
+    /// Of overlays on the same faces, those of a higher order are drawn over (0 to 3).
+    pub render_order: u8,
+    /// The faces it lies on (at most 64).
+    pub faces: Vec<i32>,
+    /// Texture coordinates from the first corner to the last: start and end along U and V.
+    pub u: [f32; 2],
+    pub v: [f32; 2],
+    /// The four corners along its U and V axes from the origin; the compiler keeps the U axis
+    /// in the third numbers of the first three, which lie in the plane and need none.
+    pub points: [[f32; 3]; 4],
+    pub origin: [f32; 3],
+    /// Its normal: the faces' it was placed on.
+    pub normal: [f32; 3],
+}
+
+impl Overlay {
+    pub(crate) const SIZE: usize = 352;
+    /// How many faces an overlay names at most.
+    pub const MAX_FACES: usize = 64;
+
+    pub(crate) fn parse(f: &mut Fields) -> Overlay {
+        let id = f.i32();
+        let texinfo = f.i16();
+        let count = f.u16();
+        let all: Vec<i32> = (0..Overlay::MAX_FACES).map(|_| f.i32()).collect();
+        let faces = all[..usize::from(count & 0x3fff).min(Overlay::MAX_FACES)].to_vec();
+        let (u, v) = ([f.f32(), f.f32()], [f.f32(), f.f32()]);
+        let points = [f.vec3(), f.vec3(), f.vec3(), f.vec3()];
+        Overlay { id, texinfo, render_order: (count >> 14) as u8, faces, u, v, points, origin: f.vec3(), normal: f.vec3() }
+    }
+
+    /// The record as the compiler writes it.
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Overlay::SIZE);
+        out.extend(self.id.to_le_bytes());
+        out.extend(self.texinfo.to_le_bytes());
+        let count = self.faces.len().min(Overlay::MAX_FACES) as u16 | u16::from(self.render_order.min(3)) << 14;
+        out.extend(count.to_le_bytes());
+        for i in 0..Overlay::MAX_FACES {
+            out.extend(self.faces.get(i).copied().unwrap_or(0).to_le_bytes());
+        }
+        let floats = [self.u.as_slice(), &self.v, self.points.as_flattened(), &self.origin, &self.normal].concat();
+        out.extend(floats.iter().flat_map(|v| v.to_le_bytes()));
+        out
     }
 }

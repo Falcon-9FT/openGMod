@@ -25,6 +25,7 @@ mod lighting;
 pub mod lumps;
 mod math;
 pub mod mesh;
+pub mod overlay;
 pub mod props;
 
 pub use collision::{Collision, SolidShapes, Trace, mask};
@@ -32,7 +33,7 @@ pub use entities::{Entity, parse_entities};
 pub use light::{AmbientSample, LightCube, LightKind, WorldLight};
 pub use lighting::{luxels, rgbe_to_linear};
 pub use lumps::{
-    Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Plane, TexData, TexInfo, contents, surf,
+    Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Overlay, Plane, TexData, TexInfo, contents, surf,
 };
 pub use props::{GameLump, StaticProp, StaticProps};
 
@@ -72,6 +73,8 @@ pub struct Bsp {
     pub displacements: Vec<DispInfo>,
     pub disp_verts: Vec<DispVert>,
     pub cubemaps: Vec<Cubemap>,
+    /// The `info_overlay`s, drawn over the faces they name ([`mesh`]).
+    pub overlays: Vec<Overlay>,
     pub game_lumps: Vec<GameLump>,
     pub static_props: StaticProps,
     bytes: Arc<[u8]>,
@@ -148,6 +151,8 @@ impl Bsp {
         let disp_verts =
             records(&lump(index::DISP_VERTS, "displacement vertices")?, DispVert::SIZE, "displacement vertices", DispVert::parse)?;
         let cubemaps = records(&lump(index::CUBEMAPS, "cubemaps")?, Cubemap::SIZE, "cubemaps", Cubemap::parse)?;
+        // overlays only paint: a lump that does not add up costs them, not the map
+        let overlays = records(&lump(index::OVERLAYS, "overlays")?, Overlay::SIZE, "overlays", Overlay::parse).unwrap_or_default();
         let lighting = lump(index::LIGHTING, "lighting")?.into_owned();
         let lighting_hdr = lump(index::LIGHTING_HDR, "HDR lighting")?.into_owned();
 
@@ -198,6 +203,7 @@ impl Bsp {
             displacements,
             disp_verts,
             cubemaps,
+            overlays,
             game_lumps,
             static_props,
             bytes,

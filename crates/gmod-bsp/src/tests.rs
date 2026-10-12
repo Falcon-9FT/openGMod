@@ -3,6 +3,8 @@ use std::sync::Arc;
 use super::*;
 use crate::testmap::{BLUE, GREEN, RED, TestBrush, TestMap};
 
+mod overlay;
+
 fn map() -> Bsp {
     Bsp::parse("test.bsp".into(), Arc::from(testmap::bytes())).unwrap()
 }
