@@ -16,7 +16,7 @@ concurrency: release
 
 jobs:
   windows:
-    runs-on: [self-hosted, windows]
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -53,7 +53,7 @@ jobs:
             if (-not (Test-Path (Join-Path $dist $needed))) { Write-Error "$needed is missing from the release"; exit 1 }
           }
           # Windows' own tar.exe (bsdtar) makes the zip: Compress-Archive calls .NET methods,
-          # which PowerShell's Constrained Language mode (on the self-hosted runner) forbids
+          # which PowerShell's Constrained Language mode forbids where it is on
           Remove-Item openGMOD-windows-x64.zip -ErrorAction SilentlyContinue
           tar.exe -a -c -f openGMOD-windows-x64.zip -C $dist (Get-ChildItem $dist).Name
           if ($LASTEXITCODE -ne 0) { Write-Error "zipping the release failed"; exit 1 }
