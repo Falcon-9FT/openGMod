@@ -89,6 +89,11 @@ pub(crate) struct Moving {
 
 const SOLID_NONE: i64 = 0;
 
+/// How open a door (or any mover) is, 0 shut to 1 open; `None` for what is no mover.
+pub(crate) fn openness(lua: &Lua, handle: EntityHandle) -> Option<f32> {
+    host(lua).entities.get(handle).and_then(|e| e.mover.as_ref().map(|m| m.at))
+}
+
 /// The brush model of an entity that may move, by the rule the map's drawing follows.
 pub(crate) fn moving_brush(ent: &Ent) -> Option<usize> {
     if !ent.model.starts_with('*') {

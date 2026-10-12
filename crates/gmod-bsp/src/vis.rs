@@ -11,6 +11,11 @@
 //!
 //! A map compiled without `vvis` has no lump: everything sees everything. So does a point in no
 //! cluster - a player flying outside the world sees it all.
+//!
+//! The open space is also cut into areas, joined by area portals (lumps 20 and 21): a portal
+//! names the area on its other side and the key of the `func_areaportal` that opens and shuts
+//! it - a door between two rooms. What is behind a shut portal is not seen, whatever the PVS
+//! says ([`Visibility::connected_areas`]).
 
 use crate::Bsp;
 use crate::lumps::{Fields, index, lump_bytes};
@@ -31,6 +36,10 @@ pub struct Visibility {
     /// Each cluster's rows, unpacked: a bit for every cluster.
     pvs: Vec<Vec<u8>>,
     pas: Vec<Vec<u8>>,
+    /// Each leaf's area, 0 for none.
+    leaf_areas: Vec<u16>,
+    /// Each area's portals: the key that opens it, and the area on the other side.
+    portals: Vec<Vec<(u16, u16)>>,
 }
 
 /// Unpacks a row at `at` of the lump into `bytes` bytes; `None` when it runs out of the lump.
@@ -84,7 +93,54 @@ impl Visibility {
             .collect::<Option<Vec<_>>>()?;
         let head = bsp.models.first()?.head_node;
         let leaf_clusters = bsp.leaves.iter().map(|l| if (l.cluster as isize) < clusters as isize { l.cluster } else { -1 }).collect();
-        Some(Visibility { nodes, head, leaf_clusters, clusters, pvs, pas })
+        let leaf_areas = bsp.leaves.iter().map(|l| l.area).collect();
+        let portals = bsp
+            .areas
+            .iter()
+            .map(|area| {
+                let first = usize::try_from(area.first_portal).unwrap_or(0);
+                let count = usize::try_from(area.portals).unwrap_or(0);
+                bsp.area_portals.get(first..first.saturating_add(count)).unwrap_or(&[]).iter().map(|p| (p.key, p.other_area)).collect()
+            })
+            .collect();
+        Some(Visibility { nodes, head, leaf_clusters, clusters, pvs, pas, leaf_areas, portals })
+    }
+
+    /// The area a point is in; `None` in none (the solid, outside the world).
+    pub fn area_at(&self, point: [f32; 3]) -> Option<u16> {
+        self.leaf_areas.get(self.leaf_at(point)?).copied().filter(|&a| a != 0)
+    }
+
+    /// The areas a box touches, each once, into `out`.
+    pub fn areas_in_box(&self, mins: [f32; 3], maxs: [f32; 3], out: &mut Vec<u16>) {
+        out.clear();
+        self.leaves_in_box(mins, maxs, |leaf| {
+            if let Some(&area) = self.leaf_areas.get(leaf).filter(|&&a| a != 0)
+                && !out.contains(&area)
+            {
+                out.push(area);
+            }
+            true
+        });
+    }
+
+    /// The areas `from` reaches through the portals `open` says are open (by key), `from`
+    /// among them: a flag for each area. With no areas, an empty list.
+    pub fn connected_areas(&self, from: u16, open: &dyn Fn(u16) -> bool) -> Vec<bool> {
+        let mut reached = vec![false; self.portals.len()];
+        let mut stack = vec![from];
+        while let Some(area) = stack.pop() {
+            let Some(flag) = reached.get_mut(usize::from(area)) else { continue };
+            if std::mem::replace(flag, true) {
+                continue;
+            }
+            for &(key, other) in &self.portals[usize::from(area)] {
+                if open(key) {
+                    stack.push(other);
+                }
+            }
+        }
+        reached
     }
 
     /// How many clusters the map has.
@@ -118,6 +174,21 @@ impl Visibility {
     /// [`MAX_ENTITY_CLUSTERS`] (`out` then has some of them).
     pub fn clusters_in_box(&self, mins: [f32; 3], maxs: [f32; 3], out: &mut Vec<usize>) -> bool {
         out.clear();
+        self.leaves_in_box(mins, maxs, |leaf| {
+            let Some(cluster) = self.leaf_clusters.get(leaf).and_then(|&c| usize::try_from(c).ok()) else { return true };
+            if !out.contains(&cluster) {
+                if out.len() == MAX_ENTITY_CLUSTERS {
+                    return false;
+                }
+                out.push(cluster);
+            }
+            true
+        })
+    }
+
+    /// Each leaf a box touches, to `f`, until it says to stop; `false` when it did, or the
+    /// tree is too tangled to walk.
+    fn leaves_in_box(&self, mins: [f32; 3], maxs: [f32; 3], mut f: impl FnMut(usize) -> bool) -> bool {
         let middle: [f32; 3] = std::array::from_fn(|i| (mins[i] + maxs[i]) * 0.5);
         let half: [f32; 3] = std::array::from_fn(|i| (maxs[i] - mins[i]).abs() * 0.5);
         let mut stack = vec![self.head];
@@ -140,13 +211,8 @@ impl Visibility {
                     }
                 }
                 Err(_) => {
-                    let leaf = (-1 - node) as usize;
-                    let Some(cluster) = self.leaf_clusters.get(leaf).and_then(|&c| usize::try_from(c).ok()) else { continue };
-                    if !out.contains(&cluster) {
-                        if out.len() == MAX_ENTITY_CLUSTERS {
-                            return false;
-                        }
-                        out.push(cluster);
+                    if !f((-1 - node) as usize) {
+                        return false;
                     }
                 }
             }

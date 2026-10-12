@@ -71,3 +71,46 @@ fn a_map_without_the_lump_has_no_visibility() {
     let bsp = Bsp::parse("t.bsp".into(), Arc::from(map.bytes())).unwrap();
     assert!(Visibility::new(&bsp).is_none());
 }
+
+#[test]
+fn shut_area_portals_part_the_areas() {
+    // three rooms in a row, each an area, a portal of key 1 between the first two and of key 2
+    // between the last two
+    let mut world = vec![TestBrush::cuboid([-16.0, -16.0, -16.0], [432.0, 144.0, 0.0])];
+    world.push(TestBrush::cuboid([128.0, 0.0, 0.0], [144.0, 128.0, 128.0]));
+    world.push(TestBrush::cuboid([272.0, 0.0, 0.0], [288.0, 128.0, 128.0]));
+    let map = TestMap {
+        models: vec![world],
+        clusters: vec![
+            ([0.0, 0.0, 0.0], [128.0, 128.0, 128.0]),
+            ([144.0, 0.0, 0.0], [272.0, 128.0, 128.0]),
+            ([288.0, 0.0, 0.0], [416.0, 128.0, 128.0]),
+        ],
+        sees: vec![(0, 1), (1, 2), (0, 2)],
+        areas: vec![
+            ([0.0, 0.0, 0.0], [128.0, 128.0, 128.0], 1),
+            ([144.0, 0.0, 0.0], [272.0, 128.0, 128.0], 2),
+            ([288.0, 0.0, 0.0], [416.0, 128.0, 128.0], 3),
+        ],
+        area_portals: vec![(1, 2, 1), (2, 3, 2)],
+        ..TestMap::default()
+    };
+    let bsp = Bsp::parse("areas.bsp".into(), Arc::from(map.bytes())).unwrap();
+    assert_eq!((bsp.areas.len(), bsp.area_portals.len()), (4, 4));
+    let vis = Visibility::new(&bsp).unwrap();
+    assert_eq!(
+        (vis.area_at([64.0, 64.0, 64.0]), vis.area_at([352.0, 64.0, 64.0]), vis.area_at([64.0, 64.0, 500.0])),
+        (Some(1), Some(3), None)
+    );
+    let mut areas = Vec::new();
+    vis.areas_in_box([100.0, 32.0, 0.0], [160.0, 96.0, 72.0], &mut areas);
+    areas.sort();
+    assert_eq!(areas, [1, 2]);
+    // all open: all joined; the second shut: the last room is apart; the first: only the first
+    let reached = |open: &dyn Fn(u16) -> bool| -> Vec<u16> {
+        vis.connected_areas(1, open).iter().enumerate().filter(|(_, r)| **r).map(|(a, _)| a as u16).collect()
+    };
+    assert_eq!(reached(&|_| true), [1, 2, 3]);
+    assert_eq!(reached(&|key| key != 2), [1, 2]);
+    assert_eq!(reached(&|key| key != 1), [1]);
+}

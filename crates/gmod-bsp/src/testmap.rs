@@ -352,6 +352,8 @@ pub struct TestMap {
     /// Which clusters see each other, both ways; each sees itself. A cluster hears what those it
     /// sees see.
     pub sees: Vec<(usize, usize)>,
+    /// Area portals: two areas (of `areas`) and the key of the `func_areaportal` between them.
+    pub area_portals: Vec<(u16, u16, u16)>,
     pub static_props: Vec<TestStaticProp>,
     /// The entities after `worldspawn`, as the entity lump writes them.
     pub entities: String,
@@ -506,6 +508,36 @@ fn pack(row: &[u8]) -> Vec<u8> {
 }
 
 impl TestMap {
+    /// The area and area portal lumps: area 0 for none, then each area with its portals.
+    fn area_lump(&self) -> (Vec<u8>, Vec<u8>) {
+        let count = self.areas.iter().map(|a| a.2).max().map_or(0, |m| usize::from(m) + 1);
+        if count == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let (mut areas, mut portals) = (Vec::new(), Vec::new());
+        let mut written = 0;
+        for area in 0..count as u16 {
+            let mine: Vec<(u16, u16)> = self
+                .area_portals
+                .iter()
+                .filter_map(|&(a, b, key)| match area {
+                    _ if a == area => Some((key, b)),
+                    _ if b == area => Some((key, a)),
+                    _ => None,
+                })
+                .collect();
+            areas.extend(i32s(&[mine.len() as i32, written]));
+            for (key, other) in mine {
+                portals.extend(key.to_le_bytes());
+                portals.extend(other.to_le_bytes());
+                portals.extend([0; 4]);
+                portals.extend(0i32.to_le_bytes());
+                written += 1;
+            }
+        }
+        (areas, portals)
+    }
+
     /// The visibility lump of the clusters; empty without them.
     fn visibility(&self) -> Vec<u8> {
         let n = self.clusters.len();
@@ -735,6 +767,8 @@ impl TestMap {
             (index::TEXDATA_STRING_TABLE, string_table, 0),
             (index::OVERLAYS, overlays, 0),
             (index::VISIBILITY, self.visibility(), 0),
+            (index::AREAS, self.area_lump().0, 0),
+            (index::AREA_PORTALS, self.area_lump().1, 0),
         ];
         let mut out = vec![0u8; 8 + 64 * 16 + 4];
         out[0..4].copy_from_slice(b"VBSP");

@@ -260,3 +260,105 @@ fn clients_keep_what_is_out_of_sight_dormant() {
     assert!(client.eval::<bool>(&format!("return not Entity({far}):IsValid()")));
     assert!(client.messages().is_empty(), "{:?}", client.messages());
 }
+
+/// [`rooms_map`] with each room an area of its own (1 to 4) and portals between them: key 1
+/// between the first two (a `func_areaportal` shut at first), key 2 between the second and the
+/// third (one that goes with the door `door`, a `func_door` in the third room), key 3 between
+/// the last two (open).
+fn portal_rooms_map() -> Map {
+    use gmod_bsp::testmap::{TestBrush, TestMap};
+    let length = STEP * 4.0;
+    let mut world = vec![
+        TestBrush::cuboid([-16.0, -16.0, -16.0], [length, 272.0, 0.0]),
+        TestBrush::cuboid([-16.0, -16.0, 192.0], [length, 272.0, 208.0]),
+        TestBrush::cuboid([-16.0, -16.0, 0.0], [length, 0.0, 192.0]),
+        TestBrush::cuboid([-16.0, 256.0, 0.0], [length, 272.0, 192.0]),
+        TestBrush::cuboid([-16.0, 0.0, 0.0], [0.0, 256.0, 192.0]),
+    ];
+    let (mut clusters, mut areas) = (Vec::new(), Vec::new());
+    for i in 0..4 {
+        let lo = STEP * i as f32;
+        clusters.push(([lo, 0.0, 0.0], [lo + ROOM, 256.0, 192.0]));
+        areas.push(([lo, 0.0, 0.0], [lo + ROOM, 256.0, 192.0], i as u16 + 1));
+        world.push(TestBrush::cuboid([lo + ROOM, 0.0, 0.0], [lo + STEP, 256.0, 192.0]));
+    }
+    let door = vec![TestBrush::cuboid([STEP * 2.0 + 200.0, 200.0, 0.0], [STEP * 2.0 + 240.0, 240.0, 64.0])];
+    let test = TestMap {
+        models: vec![world, door],
+        clusters,
+        sees: vec![(0, 1), (1, 2), (2, 3)],
+        areas,
+        area_portals: vec![(1, 2, 1), (2, 3, 2), (3, 4, 3)],
+        ..TestMap::default()
+    };
+    let bsp = gmod_bsp::Bsp::parse("portals.bsp".into(), Arc::from(test.bytes())).unwrap();
+    let mut map = Map::from_bsp("gm_portals", &bsp, Arc::new(gmod_bsp::Collision::new(&bsp)));
+    let pairs = |list: &[(&str, &str)]| list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    map.entities = vec![
+        pairs(&[("classname", "worldspawn")]),
+        pairs(&[("classname", "info_player_start"), ("origin", "128 128 0"), ("angles", "0 0 0")]),
+        pairs(&[("classname", "func_areaportal"), ("targetname", "first"), ("portalnumber", "1"), ("StartOpen", "0")]),
+        pairs(&[("classname", "func_areaportal"), ("portalnumber", "2"), ("target", "door")]),
+        pairs(&[("classname", "func_areaportal"), ("portalnumber", "3")]),
+        pairs(&[("classname", "func_door"), ("targetname", "door"), ("model", "*1"), ("speed", "100"), ("movedir", "0 90 0")]),
+    ];
+    map
+}
+
+#[test]
+fn shut_portals_keep_what_is_behind_them() {
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let g = game_with(
+        Realm::Server,
+        &[
+            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+            ("models/box.mdl", &mdl),
+            ("scripts/weapons/weapon_pistol.txt", PISTOL.as_bytes()),
+        ],
+    );
+    g.runtime.set_max_players(2);
+    g.runtime.init();
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    g.runtime.spawn_map(&portal_rooms_map());
+    let alice = g.runtime.join(alice()).unwrap();
+    let bob = g.runtime.join(PlayerInfo { name: "Bob".into(), ..PlayerInfo::default() }).unwrap();
+    g.eval::<()>(&format!(
+        "Entity(2):SetPos({})
+         BOX = {{}}
+         for i, at in ipairs({{ {}, {}, {}, {} }}) do
+             local b = ents.Create('prop_physics') b:SetModel('models/box.mdl') b:SetPos(at + Vector(0, 40, 0)) b:Spawn()
+             BOX[i] = b
+         end",
+        room(2),
+        room(0),
+        room(1),
+        room(2),
+        room(3)
+    ));
+    let boxes: Vec<u32> = (1..=4).map(|i| index(&g, &format!("BOX[{i}]"))).collect();
+    // the first portal shut: Alice does not get the second room's box, though she may see it
+    assert!(!sent(&g, alice).contains(&boxes[1]));
+    // the door shut: Bob does not get the second room's box either; the last portal is open
+    let to_bob = sent(&g, bob);
+    assert!(!to_bob.contains(&boxes[1]) && to_bob.contains(&boxes[3]) && to_bob.contains(&boxes[2]));
+    // opened, shut, toggled
+    g.eval::<()>("ents.FindByName('first')[1]:Fire('Open')");
+    g.runtime.think(0.05);
+    assert!(sent(&g, alice).contains(&boxes[1]));
+    g.eval::<()>("ents.FindByName('first')[1]:Fire('Close')");
+    g.runtime.think(0.05);
+    assert!(!sent(&g, alice).contains(&boxes[1]));
+    g.eval::<()>("ents.FindByName('first')[1]:Fire('Toggle')");
+    g.runtime.think(0.05);
+    assert!(sent(&g, alice).contains(&boxes[1]));
+    // the door opening opens its portal
+    g.eval::<()>("ents.FindByName('door')[1]:Fire('Open')");
+    g.runtime.think(0.2);
+    assert!(sent(&g, bob).contains(&boxes[1]));
+    // and the portals themselves go to no client
+    let portals: Vec<u32> =
+        g.eval::<Vec<u32>>("local t = {} for _, p in ipairs(ents.FindByClass('func_areaportal')) do t[#t + 1] = p:EntIndex() end return t");
+    assert_eq!(portals.len(), 3);
+    assert!(portals.iter().all(|p| !sent(&g, alice).contains(p)));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}

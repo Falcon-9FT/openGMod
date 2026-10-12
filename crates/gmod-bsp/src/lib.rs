@@ -35,7 +35,8 @@ pub use entities::{Entity, parse_entities};
 pub use light::{AmbientSample, LightCube, LightKind, WorldLight};
 pub use lighting::{luxels, rgbe_to_linear};
 pub use lumps::{
-    Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Overlay, Plane, TexData, TexInfo, contents, surf,
+    Area, AreaPortal, Brush, BrushSide, Cubemap, DispInfo, DispVert, Face, Leaf, LumpEntry, Model, Node, Overlay, Plane, TexData, TexInfo,
+    contents, surf,
 };
 pub use props::{GameLump, StaticProp, StaticProps};
 pub use vis::{MAX_ENTITY_CLUSTERS, Visibility, has as row_has};
@@ -78,6 +79,9 @@ pub struct Bsp {
     pub cubemaps: Vec<Cubemap>,
     /// The `info_overlay`s, drawn over the faces they name ([`mesh`]).
     pub overlays: Vec<Overlay>,
+    /// The areas of the world and the portals between them ([`Visibility`]).
+    pub areas: Vec<Area>,
+    pub area_portals: Vec<AreaPortal>,
     pub game_lumps: Vec<GameLump>,
     pub static_props: StaticProps,
     bytes: Arc<[u8]>,
@@ -156,6 +160,10 @@ impl Bsp {
         let cubemaps = records(&lump(index::CUBEMAPS, "cubemaps")?, Cubemap::SIZE, "cubemaps", Cubemap::parse)?;
         // overlays only paint: a lump that does not add up costs them, not the map
         let overlays = records(&lump(index::OVERLAYS, "overlays")?, Overlay::SIZE, "overlays", Overlay::parse).unwrap_or_default();
+        // as overlays: areas only cull what is sent, a map whose do not add up keeps them all open
+        let areas = records(&lump(index::AREAS, "areas")?, Area::SIZE, "areas", Area::parse).unwrap_or_default();
+        let area_portals =
+            records(&lump(index::AREA_PORTALS, "area portals")?, AreaPortal::SIZE, "area portals", AreaPortal::parse).unwrap_or_default();
         let lighting = lump(index::LIGHTING, "lighting")?.into_owned();
         let lighting_hdr = lump(index::LIGHTING_HDR, "HDR lighting")?.into_owned();
 
@@ -207,6 +215,8 @@ impl Bsp {
             disp_verts,
             cubemaps,
             overlays,
+            areas,
+            area_portals,
             game_lumps,
             static_props,
             bytes,

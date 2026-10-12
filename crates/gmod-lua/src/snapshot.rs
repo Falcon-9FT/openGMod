@@ -125,7 +125,8 @@ fn lerp_angle(a: Angle, b: Angle, t: f32) -> Angle {
 }
 
 /// Classes only the server has: the engine sends clients nothing of them.
-const SERVER_ONLY: &[&str] = &["info_", "logic_", "filter_", "ai_", "path_", "trigger_", "game_", "math_", "lua_run", "point_template"];
+const SERVER_ONLY: &[&str] =
+    &["info_", "logic_", "filter_", "ai_", "path_", "trigger_", "game_", "math_", "lua_run", "point_template", "func_areaportal"];
 
 pub(crate) fn server_only(class: &str) -> bool {
     let class = class.to_ascii_lowercase();

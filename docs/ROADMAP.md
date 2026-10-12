@@ -334,7 +334,9 @@
   (`TRANSMIT_ALWAYS`/`NEVER`/`PVS`, `EFL_FORCE_CHECK_TRANSMIT`), `SetPreventTransmit`;
   view-модели — владельцу, прикреплённое — с родителем, игроки — всем. Невидимое клиент держит
   «спящим» (`IsDormant`, `NotifyShouldTransmit`, не рисуется и не думает). `AddPVS`/`AddPAS`,
-  `net.SendPVS`/`SendPAS` и звуки — по видимости и слышимости.
+  `net.SendPVS`/`SendPAS` и звуки — по видимости и слышимости. Порталы областей ✅: закрытый
+  `func_areaportal` (входы `Open`/`Close`/`Toggle`, или вслед за дверью из `target`) прячет
+  то, что за ним.
 * Загрузка контента ✅: `resource.AddFile` (с файлами модели и текстурой материала),
   `AddSingleFile`, карта сервера — то, чего у клиента нет, скачивается в `~/.opengmod/download`
   и монтируется за файлами игры. `resource.AddWorkshop` запоминается, но без Steam не
@@ -349,7 +351,7 @@
   экран загрузки GMod (`GetLoadPanel`, `OnActivate`/`OnDeactivate`, `GameDetails` с
   `sv_loadingurl`, `GetLoadStatus` — «Downloading …», «Loading …», `GetDownloadables`);
   Lua игры стартует в главном потоке, когда всё готово.
-* Дальше: мастер-сервер для интернет-вкладки; порталы областей в PVS; предсказание оружия; шифрование и проверка игроков (без
+* Дальше: мастер-сервер для интернет-вкладки; предсказание оружия; шифрование и проверка игроков (без
   Steam — свои ключи).
 
 ## Этап 7 и дальше

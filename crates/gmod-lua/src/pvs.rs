@@ -12,13 +12,19 @@
 //! again when it is flagged `EFL_FORCE_CHECK_TRANSMIT`; and `SetPreventTransmit` keeps an entity
 //! from players. A map compiled without visibility sends everything to everyone.
 //!
+//! What is behind a shut area portal is not sent either, whatever the PVS says: an entity goes
+//! to a player when one of the areas its box touches is joined to the player's through the
+//! portals open. A `func_areaportal` opens and shuts its portal (`portalnumber`) by its inputs
+//! (`Open`, `Close`, `Toggle`; open at first unless `StartOpen` is 0), or with the door it names
+//! (`target`): open while the door is not shut. A `func_areaportalwindow` is always open.
+//!
 //! A client keeps what it was sent and is out of sight now, dormant ([`crate::snapshot`]):
 //! `IsDormant`, not drawn, not thinking; `NotifyShouldTransmit` tells it when one goes and comes.
 //! The same sets say where what is heard is heard: `RecipientFilter:AddPVS`, `AddPAS`,
 //! `net.SendPVS`, `net.SendPAS` ([`players_seeing`], [`players_hearing`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gmod_bsp::{Visibility, row_has};
@@ -33,8 +39,16 @@ const TRANSMIT_NEVER: i64 = 1;
 /// `EFL_FORCE_CHECK_TRANSMIT`: the SENT is asked again how it is sent.
 pub(crate) const EFL_FORCE_CHECK_TRANSMIT: i64 = 128;
 
-/// Where an entity's box was, the clusters it touched, and whether that is all of them.
-type Placed = ((Vector, Vector), Vec<usize>, bool);
+/// Where an entity's box was, the clusters it touched and whether that is all of them, and
+/// the areas it touched.
+type Placed = ((Vector, Vector), Vec<usize>, bool, Vec<u16>);
+
+/// What a player sees: the clusters (`None`: all) and the areas joined to its own (`None`: all).
+#[derive(Debug, Clone, Default)]
+struct Sight {
+    clusters: Option<Vec<u8>>,
+    areas: Option<Vec<bool>>,
+}
 
 /// What the server keeps to tell what each player is sent.
 #[derive(Default)]
@@ -48,9 +62,10 @@ pub(crate) struct Transmit {
     /// The clusters of each entity's box, as it was when they were found: the box, the
     /// clusters, and whether that is all of them.
     clusters: RefCell<HashMap<EntityHandle, Placed>>,
-    /// The set of clusters a player sees, while `SetupPlayerVisibility` adds to it; `Some(None)`
-    /// when it is everything.
-    adding: RefCell<Option<Option<Vec<u8>>>>,
+    /// What a player sees, while `SetupPlayerVisibility` adds to it.
+    adding: RefCell<Option<Sight>>,
+    /// Whether each `func_areaportal` was opened or shut by its inputs.
+    portals: RefCell<HashMap<EntityHandle, bool>>,
 }
 
 /// How an entity is sent.
@@ -60,8 +75,8 @@ enum Rule {
     Never,
     /// To this player alone.
     Owner(EntityHandle),
-    /// Where these clusters are in sight.
-    Seen(Vec<usize>),
+    /// Where these clusters are in sight and one of these areas is joined to the player's.
+    Seen(Vec<usize>, Vec<u16>),
     /// As its parent is.
     With(EntityHandle),
 }
@@ -70,6 +85,8 @@ enum Rule {
 #[derive(Debug, Clone, Default)]
 pub struct Transmission {
     entries: Vec<(EntityHandle, Rule)>,
+    /// The keys of the area portals open.
+    open: HashSet<u16>,
 }
 
 /// What a player is sent of a [`Transmission`]: the entities by index, and the others that are
@@ -97,18 +114,80 @@ fn world_box(lua: &Lua, handle: EntityHandle) -> Option<(Vector, Vector)> {
     Some((pos + lo, pos + hi))
 }
 
-/// The clusters an entity's box touches, and whether that is all of them.
-fn clusters_of(lua: &Lua, vis: &Visibility, handle: EntityHandle) -> (Vec<usize>, bool) {
-    let Some(bounds) = world_box(lua, handle) else { return (Vec::new(), true) };
-    if let Some((was, clusters, all)) = host(lua).transmit.clusters.borrow().get(&handle)
+/// The clusters an entity's box touches and whether that is all of them, and its areas.
+fn clusters_of(lua: &Lua, vis: &Visibility, handle: EntityHandle) -> (Vec<usize>, bool, Vec<u16>) {
+    let Some(bounds) = world_box(lua, handle) else { return (Vec::new(), true, Vec::new()) };
+    if let Some((was, clusters, all, areas)) = host(lua).transmit.clusters.borrow().get(&handle)
         && *was == bounds
     {
-        return (clusters.clone(), *all);
+        return (clusters.clone(), *all, areas.clone());
     }
     let mut clusters = Vec::new();
     let all = vis.clusters_in_box(array(bounds.0), array(bounds.1), &mut clusters);
-    host(lua).transmit.clusters.borrow_mut().insert(handle, (bounds, clusters.clone(), all));
-    (clusters, all)
+    let mut areas = Vec::new();
+    vis.areas_in_box(array(bounds.0), array(bounds.1), &mut areas);
+    host(lua).transmit.clusters.borrow_mut().insert(handle, (bounds, clusters.clone(), all, areas.clone()));
+    (clusters, all, areas)
+}
+
+/// The keys of the area portals open now.
+fn open_portals(lua: &Lua) -> HashSet<u16> {
+    let portals: Vec<(EntityHandle, String, Option<u16>, String, bool)> = {
+        let entities = &host(lua).entities;
+        entities
+            .handles()
+            .into_iter()
+            .filter_map(|h| {
+                let ent = entities.get(h)?;
+                let class = ent.class.to_ascii_lowercase();
+                if !class.starts_with("func_areaportal") || ent.removed {
+                    return None;
+                }
+                let key = ent.keyvalue("portalnumber").and_then(|k| k.trim().parse::<u16>().ok());
+                let target = ent.keyvalue("target").unwrap_or_default().to_string();
+                let start_open = ent.keyvalue("StartOpen").is_none_or(|v| v.trim() != "0");
+                Some((h, class, key, target, start_open))
+            })
+            .collect()
+    };
+    let states = host(lua).transmit.portals.borrow().clone();
+    let mut open = HashSet::new();
+    for (handle, class, key, target, start_open) in portals {
+        let Some(key) = key else { continue };
+        let door = (!target.is_empty()).then(|| crate::ents::named(lua, &target)).flatten();
+        let is_open = match door.and_then(|d| crate::movers::openness(lua, d)) {
+            // a door's portal opens as the door does, and shuts once it is shut
+            Some(openness) => openness > 0.0,
+            None => class == "func_areaportalwindow" || states.get(&handle).copied().unwrap_or(start_open),
+        };
+        if is_open {
+            open.insert(key);
+        }
+    }
+    open
+}
+
+/// An input of a `func_areaportal`: `Open`, `Close`, `Toggle`. Whether it took it.
+pub(crate) fn input(lua: &Lua, target: EntityHandle, input: &str) -> bool {
+    let Some((class, start_open)) =
+        host(lua).entities.get(target).map(|e| (e.class.to_ascii_lowercase(), e.keyvalue("StartOpen").is_none_or(|v| v.trim() != "0")))
+    else {
+        return false;
+    };
+    if class != "func_areaportal" {
+        return false;
+    }
+    let host = host(lua);
+    let mut portals = host.transmit.portals.borrow_mut();
+    let now = portals.get(&target).copied().unwrap_or(start_open);
+    let next = match input.to_ascii_lowercase().as_str() {
+        "open" => true,
+        "close" => false,
+        "toggle" => !now,
+        _ => return false,
+    };
+    portals.insert(target, next);
+    true
 }
 
 /// What a SENT's `UpdateTransmitState` says, asked once.
@@ -145,6 +224,7 @@ pub(crate) fn transmission(lua: &Lua) -> Transmission {
         transmit.prevented.borrow_mut().retain(|h, _| host.entities.is_valid(*h));
         transmit.states.borrow_mut().retain(|h, _| host.entities.is_valid(*h));
         transmit.clusters.borrow_mut().retain(|h, _| host.entities.is_valid(*h));
+        transmit.portals.borrow_mut().retain(|h, _| host.entities.is_valid(*h));
     }
     let mut entries = Vec::with_capacity(handles.len());
     for handle in handles {
@@ -169,7 +249,7 @@ pub(crate) fn transmission(lua: &Lua) -> Transmission {
         } else {
             match &vis {
                 Some(vis) => match clusters_of(lua, vis, handle) {
-                    (clusters, true) if !clusters.is_empty() => Rule::Seen(clusters),
+                    (clusters, true, areas) if !clusters.is_empty() => Rule::Seen(clusters, areas),
                     _ => Rule::Always,
                 },
                 None => Rule::Always,
@@ -177,46 +257,67 @@ pub(crate) fn transmission(lua: &Lua) -> Transmission {
         };
         entries.push((handle, rule));
     }
-    Transmission { entries }
+    let open = if vis.is_some() { open_portals(lua) } else { HashSet::new() };
+    Transmission { entries, open }
 }
 
-/// The clusters a player sees: from its view entity or its eyes, with what
-/// `SetupPlayerVisibility` adds; `None` for all of them.
-fn player_set(lua: &Lua, vis: &Visibility, player: EntityHandle) -> Option<Vec<u8>> {
+/// What is seen from a point: the clusters, and the areas joined to its own by the portals
+/// open.
+fn sight_from(vis: &Visibility, point: Vector, open: &HashSet<u16>) -> Sight {
+    Sight {
+        clusters: vis.cluster_at(array(point)).map(|c| vis.pvs(c).to_vec()),
+        areas: vis.area_at(array(point)).map(|a| vis.connected_areas(a, &|key| open.contains(&key))),
+    }
+}
+
+/// What a player sees: from its view entity or its eyes, with what `SetupPlayerVisibility` adds.
+fn player_sight(lua: &Lua, vis: &Visibility, player: EntityHandle, open: &HashSet<u16>) -> Sight {
     let view = crate::player::state(lua, player, |_, p| p.view_entity).filter(|&v| host(lua).entities.is_valid(v));
     let from = match view {
         Some(v) => host(lua).entities.transform(v).map(|(p, _)| p),
         None => crate::player::eye(lua, player).map(|(e, _)| e),
-    }?;
-    let set = vis.cluster_at(array(from)).map(|c| vis.pvs(c).to_vec());
-    *host(lua).transmit.adding.borrow_mut() = Some(set);
+    };
+    let Some(from) = from else { return Sight::default() };
+    *host(lua).transmit.adding.borrow_mut() = Some(sight_from(vis, from, open));
     let args = [entity::push(lua, player), entity::push(lua, view.unwrap_or(EntityHandle::NULL))];
     crate::call_hook(lua, "SetupPlayerVisibility", args.into_iter().flatten().collect());
-    host(lua).transmit.adding.borrow_mut().take().flatten()
+    host(lua).transmit.adding.borrow_mut().take().unwrap_or_default()
 }
 
 /// `AddOriginToPVS`, in `SetupPlayerVisibility`: what is seen from there is seen too.
 fn add_origin(lua: &Lua, origin: Vector) {
     let Some(vis) = visibility(lua) else { return };
+    // from there, through the portals open as they are now
+    let open = open_portals(lua);
+    let more = sight_from(&vis, origin, &open);
     let host = host(lua);
     let mut adding = host.transmit.adding.borrow_mut();
-    let Some(set) = adding.as_mut() else { return };
-    match (set.as_mut(), vis.cluster_at(array(origin))) {
-        (Some(row), Some(cluster)) => {
-            for (a, b) in row.iter_mut().zip(vis.pvs(cluster)) {
+    let Some(sight) = adding.as_mut() else { return };
+    sight.clusters = match (sight.clusters.take(), more.clusters) {
+        (Some(mut row), Some(other)) => {
+            for (a, b) in row.iter_mut().zip(&other) {
                 *a |= b;
             }
+            Some(row)
         }
         // from no cluster, everything is seen
-        (Some(_), None) => *set = None,
-        (None, _) => {}
-    }
+        _ => None,
+    };
+    sight.areas = match (sight.areas.take(), more.areas) {
+        (Some(mut joined), Some(other)) => {
+            for (a, b) in joined.iter_mut().zip(&other) {
+                *a |= b;
+            }
+            Some(joined)
+        }
+        _ => None,
+    };
 }
 
 impl Transmission {
     /// What a player is sent.
     pub(crate) fn for_player(&self, lua: &Lua, player: EntityHandle) -> Sent {
-        let set = visibility(lua).and_then(|vis| player_set(lua, &vis, player));
+        let sight = visibility(lua).map(|vis| player_sight(lua, &vis, player, &self.open)).unwrap_or_default();
         let view = crate::player::state(lua, player, |_, p| p.view_entity).unwrap_or(EntityHandle::NULL);
         let prevented = host(lua).transmit.prevented.borrow().clone();
         let mut decided: HashMap<EntityHandle, bool> = HashMap::with_capacity(self.entries.len());
@@ -227,7 +328,14 @@ impl Transmission {
                     Rule::Always => true,
                     Rule::Never => false,
                     Rule::Owner(owner) => *owner == player,
-                    Rule::Seen(clusters) => set.as_ref().is_none_or(|row| clusters.iter().any(|&c| row_has(row, c))),
+                    Rule::Seen(clusters, areas) => {
+                        sight.clusters.as_ref().is_none_or(|row| clusters.iter().any(|&c| row_has(row, c)))
+                            && (areas.is_empty()
+                                || sight
+                                    .areas
+                                    .as_ref()
+                                    .is_none_or(|joined| areas.iter().any(|&a| joined.get(usize::from(a)) == Some(&true))))
+                    }
                     Rule::With(_) => return None,
                 } || handle == view,
             )
