@@ -7,22 +7,27 @@
 //! ConVar `sk_<npc>_health` when one is set, else HL2's default), its hull - a solid box,
 //! human-sized for people and zombies, smaller for headcrabs and birds - and it moves by steps
 //! on the ground (scanners and manhacks fly, turrets and barnacles stay put), dropped onto the
-//! floor below. It plays its idle (`ACT_IDLE`) and takes the weapon of `additionalequipment`,
-//! held in its hand as a player's is (bone-merged, drawn). Without an enemy, one that hates a
-//! player it can see within its look distance takes the nearest (it looks five times a
-//! second), and it turns to face its enemy every tick (`ai_disabled`, `ai_ignoreplayers` and
-//! `FL_NOTARGET` as in GMod).
+//! floor below; one without a box (`npc_enemyfinder`) is a point nothing runs into. A side
+//! given before `Spawn` (`SetNPCClass`) is kept. It plays its idle (`ACT_IDLE`) and takes the
+//! weapon of `additionalequipment`, held in its hand as a player's is (bone-merged, drawn). A
+//! map's template NPCs (`SF_NPC_TEMPLATE`) go as the map loads. Without an enemy, one that
+//! hates a player it can see within its look distance takes the nearest (it looks five times
+//! a second), and it turns to face its enemy every tick. As in GMod, `ai_disabled` stops that,
+//! and players with `FL_NOTARGET`, or all of them with `ai_ignoreplayers`, are not taken as
+//! enemies - when seen or when they shoot - and one that was is let go.
 //!
-//! Damage ([`crate::damage`]) hurts it: what bullets do goes through `ScaleNPCDamage` first,
-//! then `OnDamaged` (and `OnDamagedByPlayer`) fire, `OnHalfHealth` once it is down to half, and
-//! it takes a hated attacker as its enemy. At no health it dies: `OnNPCKilled`, `OnDeath`, its
+//! Damage ([`crate::damage`]) hurts it: `OnDamaged` (and `OnDamagedByPlayer`) fire,
+//! `OnHalfHealth` once it is down to half, and it takes a hated attacker as its enemy
+//! (`ScaleNPCDamage` waits for bullets that fly). At no health it dies: `OnNPCKilled`, `OnDeath`, its
 //! weapon falls (unless `SF_NPC_NO_WEAPON_DROP`), a health vial with `SF_NPC_DROP_HEALTHKIT`,
 //! and the NPC goes, leaving a corpse: a ragdoll of its model posed as it was drawn and pushed
 //! by the killing blow ([`crate::ragdoll`]). As in GMod the corpse is the client's by default -
 //! it lies on the world and what does not move, nothing traces or walks into it - and a
 //! `prop_ragdoll` of the server's with `ai_serverragdolls 1` (and `CreateEntityRagdoll`). A
 //! model that cannot be a ragdoll leaves none; with `SF_NPC_FADE_CORPSE`, which sandbox
-//! always sets, the corpse fades a while later.
+//! always sets, the corpse fades a while later, and of the client's there are 32 at most, the
+//! oldest going first. A removed NPC takes the weapon in its hand with it - on the server: a
+//! client has what the server sends.
 //!
 //! The `NPC` methods keep what they are told - enemies and what it remembers of them,
 //! relationships (`AddRelationship`, `AddEntityRelationship`, `Disposition`, by default those
@@ -33,15 +38,16 @@
 
 use std::cell::RefCell;
 
-use mlua::{AnyUserData, Lua, MultiValue, Table, Value};
+use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::args::Args;
-use crate::damage::{DamageInfo, dmg};
+use crate::damage::DamageInfo;
 use crate::entity::{self, Def, Ent, EntityHandle, Kind};
 use crate::meta::{self, type_id};
 use crate::vector::{Angle, Vector};
 use crate::{host, timer};
 
+const SOLID_NONE: i64 = 0;
 const SOLID_BBOX: i64 = 2;
 const MOVETYPE_NONE: i64 = 0;
 const MOVETYPE_STEP: i64 = 3;
@@ -57,13 +63,14 @@ const ACT_INVALID: i64 = -1;
 const SCHED_NONE: i64 = 0;
 const SCHED_IDLE_STAND: i64 = 1;
 const NPC_STATE_IDLE: i64 = 1;
+const NPC_STATE_ALERT: i64 = 2;
 const NPC_STATE_COMBAT: i64 = 3;
 const NPC_STATE_DEAD: i64 = 7;
 const WEAPON_PROFICIENCY_AVERAGE: i64 = 1;
-const HITGROUP_GENERIC: i64 = 0;
 
 const SF_NPC_DROP_HEALTHKIT: i64 = 8;
 const SF_NPC_FADE_CORPSE: i64 = 512;
+const SF_NPC_TEMPLATE: i64 = 2048;
 const SF_NPC_NO_WEAPON_DROP: i64 = 8192;
 const SF_FLOOR_TURRET_CITIZEN: i64 = 512;
 const SF_CITIZEN_MEDIC: i64 = 131072;
@@ -117,6 +124,9 @@ const CAPS_GROUND: i64 = 1;
 /// How long a fading corpse lies before it goes, and how long it takes to fade.
 const CORPSE_TIME: f64 = 15.0;
 const CORPSE_FADE: f64 = 1.0;
+/// How many of the client's corpses there are at most, as GMod keeps (`g_ragdoll_maxcount`):
+/// past it the oldest goes.
+const CORPSE_CAP: usize = 32;
 /// How far an NPC sees, by default, and how often it looks for enemies.
 const LOOK_DISTANCE: f32 = 2048.0;
 const LOOK_INTERVAL: f64 = 0.2;
@@ -272,6 +282,8 @@ struct Memory {
 pub struct Npc {
     /// Its side (`Classify`).
     class: i64,
+    /// The side was given (`SetNPCClass`): spawning keeps it.
+    class_set: bool,
     hull: i64,
     weapon: EntityHandle,
     proficiency: i64,
@@ -301,6 +313,7 @@ impl Npc {
         let info = class_of(&ent.class);
         Npc {
             class: classify(ent),
+            class_set: false,
             hull: info.hull.unwrap_or(0),
             weapon: EntityHandle::NULL,
             proficiency: WEAPON_PROFICIENCY_AVERAGE,
@@ -326,10 +339,17 @@ impl Npc {
     }
 }
 
-/// The corpses that fade, and when each goes.
+/// A corpse the engine looks after: when it goes, if it fades, and whether it is the client's.
+struct Corpse {
+    body: EntityHandle,
+    fades_at: Option<f64>,
+    client: bool,
+}
+
+/// The corpses that fade and those of the client, oldest first.
 #[derive(Default)]
 pub(crate) struct Npcs {
-    corpses: RefCell<Vec<(EntityHandle, f64)>>,
+    corpses: RefCell<Vec<Corpse>>,
 }
 
 /// The side of an NPC of a class, as its spawn flags change it.
@@ -449,6 +469,13 @@ fn living(lua: &Lua, target: EntityHandle) -> bool {
     }
 }
 
+/// Whether an NPC may take a target as its enemy: not one with `FL_NOTARGET`, nor any player
+/// while `ai_ignoreplayers` is on - seen or shot by, alike.
+fn targetable(lua: &Lua, target: EntityHandle) -> bool {
+    let Some((player, flags)) = host(lua).entities.get(target).map(|e| (e.player.is_some(), e.flags)) else { return false };
+    flags & FL_NOTARGET == 0 && !(player && number(lua, "ai_ignoreplayers").is_some_and(|n| n != 0.0))
+}
+
 /// How an NPC feels about a target, and how much: what it was told of that entity, else of its
 /// class or name, else what its side feels.
 pub(crate) fn disposition(lua: &Lua, handle: EntityHandle, target: EntityHandle) -> (i64, i64) {
@@ -514,9 +541,16 @@ fn citizen_model(lua: &Lua, ent: &Ent) -> String {
 }
 
 /// An engine NPC has spawned ([`crate::ents::spawn`]): it takes its class's model, health,
-/// hull and way of moving, stands on the floor, idles, and takes its weapon.
+/// hull and way of moving, stands on the floor, idles, and takes its weapon. One of a map
+/// that is a template (`SF_NPC_TEMPLATE`) is not there to live but for an `npc_template_maker`
+/// to make others by, and goes as the map loads.
 pub(crate) fn spawned(lua: &Lua, handle: EntityHandle) {
     if handle.kind != Kind::Npc {
+        return;
+    }
+    let template = host(lua).entities.get(handle).is_some_and(|e| e.spawn_flags & SF_NPC_TEMPLATE != 0 && e.map_creation_id.is_some());
+    if template {
+        crate::ents::remove(lua, handle);
         return;
     }
     let Some(model) = host(lua).entities.get(handle).filter(|e| !e.scripted).map(|e| {
@@ -538,14 +572,20 @@ pub(crate) fn spawned(lua: &Lua, handle: EntityHandle) {
         ("", default) => default,
         (convar, default) => number(lua, convar).map_or(default, |n| n as i64),
     };
-    with_npc(lua, handle, |ent, npc| {
+    let point = with_npc(lua, handle, |ent, npc| {
         if ent.health <= 0 {
             ent.health = health.max(1);
         }
         if ent.max_health <= 0 {
             ent.max_health = ent.health;
         }
-        ent.solid = SOLID_BBOX;
+        if let Some((mins, maxs)) = info.hull.and_then(hull_box) {
+            ent.mins = mins;
+            ent.maxs = maxs;
+        }
+        // one with no box (`npc_enemyfinder`, `npc_bullseye`) is a point nothing runs into
+        let point = ent.mins == Vector::default() && ent.maxs == Vector::default();
+        ent.solid = if point { SOLID_NONE } else { SOLID_BBOX };
         ent.move_type = match info.place {
             Place::Ground => MOVETYPE_STEP,
             Place::Air => MOVETYPE_FLY,
@@ -553,18 +593,17 @@ pub(crate) fn spawned(lua: &Lua, handle: EntityHandle) {
         };
         ent.collision_group = crate::trace::group::NPC;
         ent.flags |= FL_NPC;
-        if let Some((mins, maxs)) = info.hull.and_then(hull_box) {
-            ent.mins = mins;
-            ent.maxs = maxs;
+        if !npc.class_set {
+            npc.class = classify(ent);
         }
-        npc.class = classify(ent);
         npc.capabilities |= info.caps;
         npc.schedule = SCHED_IDLE_STAND;
         if let Some(squad) = ent.keyvalue("squadname") {
             npc.squad = squad.to_string();
         }
+        point
     });
-    if info.place == Place::Ground {
+    if info.place == Place::Ground && point == Some(false) {
         drop_to_floor(lua, handle);
     }
     play_activity(lua, handle, ACT_IDLE);
@@ -694,20 +733,16 @@ fn remember(npc: &mut Npc, enemy: EntityHandle, position: Vector, now: f64) {
 }
 
 /// Damage to an engine NPC, after the `EntityTakeDamage` hook let it through
-/// ([`crate::damage::take`]).
-pub(crate) fn hurt(lua: &Lua, handle: EntityHandle, info: DamageInfo, userdata: &AnyUserData) {
+/// ([`crate::damage::take`]). `ScaleNPCDamage` is not for it: GMod asks that hook where a
+/// bullet's trace hits a hit group, before the damage is taken, and never for damage given
+/// directly (`TakeDamageInfo`) - here bullets do not fly yet.
+pub(crate) fn hurt(lua: &Lua, handle: EntityHandle, info: DamageInfo) {
     if handle.kind != Kind::Npc {
         return;
     }
     let alive = host(lua).entities.get(handle).is_some_and(|e| !e.removed && e.spawned && !e.npc.as_ref().is_some_and(|n| n.dead));
     if !alive {
         return;
-    }
-    let mut info = info;
-    // a bullet's hit is scaled by where it hit; there are no hit boxes yet, so anywhere
-    if info.kind & (dmg::BULLET | dmg::BUCKSHOT | dmg::SNIPER) != 0 {
-        hook(lua, "ScaleNPCDamage", [value(lua, handle), Value::Integer(HITGROUP_GENERIC), Value::UserData(userdata.clone())]);
-        info = userdata.borrow::<DamageInfo>().map(|i| *i).unwrap_or(info);
     }
     let attacker = info.attacker.filter(|&a| host(lua).entities.is_valid(a)).unwrap_or(EntityHandle::NULL);
     let Some((health, half)) = with_npc(lua, handle, |ent, npc| {
@@ -725,9 +760,10 @@ pub(crate) fn hurt(lua: &Lua, handle: EntityHandle, info: DamageInfo, userdata: 
     if half {
         crate::outputs::fire(lua, handle, "OnHalfHealth", attacker, handle, None);
     }
-    // it turns on whoever hurt it, if it hates or fears them and has no other enemy
+    // it turns on whoever hurt it, if it hates or fears them, may target them and has no
+    // other enemy
     let enemy = with_npc(lua, handle, |_, npc| npc.enemy).unwrap_or(EntityHandle::NULL);
-    if !living(lua, enemy) && attacker != handle && attacker.index.is_some_and(|i| i != 0) {
+    if !living(lua, enemy) && attacker != handle && attacker.index.is_some_and(|i| i != 0) && targetable(lua, attacker) {
         let (feeling, _) = disposition(lua, handle, attacker);
         if feeling == D_HT || feeling == D_FR {
             set_enemy(lua, handle, attacker);
@@ -828,11 +864,38 @@ fn corpse(lua: &Lua, handle: EntityHandle, info: &DamageInfo, fades: bool) -> ml
     if server {
         hook(lua, "CreateEntityRagdoll", [value(lua, handle), value(lua, body)]);
     }
-    if fades {
-        let now = host(lua).clock.cur_time.get();
-        host(lua).npcs.corpses.borrow_mut().push((body, now + CORPSE_TIME));
+    // the server's ragdolls stay till they fade, however many; the client's go oldest first
+    if fades || !server {
+        let fades_at = fades.then(|| host(lua).clock.cur_time.get() + CORPSE_TIME);
+        host(lua).npcs.corpses.borrow_mut().push(Corpse { body, fades_at, client: !server });
+    }
+    if !server {
+        retire_corpses(lua);
     }
     Ok(())
+}
+
+/// The oldest of the client's corpses go while there are more than [`CORPSE_CAP`].
+fn retire_corpses(lua: &Lua) {
+    let retired: Vec<EntityHandle> = {
+        let host = host(lua);
+        let mut list = host.npcs.corpses.borrow_mut();
+        list.retain(|c| host.entities.get(c.body).is_some_and(|e| !e.removed));
+        let mut over = list.iter().filter(|c| c.client).count().saturating_sub(CORPSE_CAP);
+        let mut retired = Vec::new();
+        list.retain(|c| {
+            let keep = over == 0 || !c.client;
+            if !keep {
+                over -= 1;
+                retired.push(c.body);
+            }
+            keep
+        });
+        retired
+    };
+    for body in retired {
+        crate::ents::remove(lua, body);
+    }
 }
 
 /// The force of the killing blow pushes the part nearest where it hit (the first part when it
@@ -862,9 +925,11 @@ fn push(lua: &Lua, body: EntityHandle, info: &DamageInfo) {
     }
 }
 
-/// An entity is going ([`crate::ents::remove`]): the weapon in an NPC's hand goes with it.
+/// An entity is going ([`crate::ents::remove`]): the weapon in an NPC's hand goes with it. Only
+/// on the server: a client removes what left the server's snapshot while it still has the old
+/// state, where the NPC holds a weapon the server dropped and still sends.
 pub(crate) fn removed(lua: &Lua, handle: EntityHandle) {
-    if handle.kind != Kind::Npc {
+    if handle.kind != Kind::Npc || host(lua).realm != crate::Realm::Server {
         return;
     }
     let item = host(lua).entities.get(handle).and_then(|e| e.npc.as_ref().map(|n| n.weapon)).unwrap_or(EntityHandle::NULL);
@@ -879,8 +944,8 @@ pub(crate) fn tick(lua: &Lua) {
     let corpses: Vec<(EntityHandle, f64)> = {
         let host = host(lua);
         let mut list = host.npcs.corpses.borrow_mut();
-        list.retain(|(h, _)| host.entities.is_valid(*h));
-        list.clone()
+        list.retain(|c| host.entities.is_valid(c.body));
+        list.iter().filter_map(|c| c.fades_at.map(|at| (c.body, at))).collect()
     };
     for (corpse, at) in corpses {
         if now >= at {
@@ -913,8 +978,14 @@ pub(crate) fn tick(lua: &Lua) {
 fn think(lua: &Lua, handle: EntityHandle, now: f64) {
     let Some((enemy, look)) = with_npc(lua, handle, |_, npc| (npc.enemy, npc.next_look <= now)) else { return };
     let mut enemy = enemy;
-    if enemy.index.is_some() && !living(lua, enemy) {
-        with_npc(lua, handle, |_, npc| npc.enemy = EntityHandle::NULL);
+    // one dead or gone, or that it may no longer target, it lets go of, still alert
+    if enemy.index.is_some() && !(living(lua, enemy) && targetable(lua, enemy)) {
+        with_npc(lua, handle, |_, npc| {
+            npc.enemy = EntityHandle::NULL;
+            if npc.state == NPC_STATE_COMBAT {
+                npc.state = NPC_STATE_ALERT;
+            }
+        });
         enemy = EntityHandle::NULL;
     }
     if enemy.index.is_none() && look {
@@ -939,15 +1010,11 @@ fn eyes(lua: &Lua, handle: EntityHandle) -> Option<Vector> {
 
 /// The nearest living player the NPC hates and can see within its look distance.
 fn nearest_hated_player(lua: &Lua, handle: EntityHandle) -> Option<EntityHandle> {
-    if number(lua, "ai_ignoreplayers").is_some_and(|n| n != 0.0) {
-        return None;
-    }
     let from = eyes(lua, handle)?;
     let range = with_npc(lua, handle, |_, npc| npc.look_distance)?;
     let mut best: Option<(EntityHandle, f32)> = None;
     for player in crate::player::all(lua) {
-        let hidden = host(lua).entities.get(player).is_none_or(|e| e.flags & FL_NOTARGET != 0);
-        if hidden || !crate::player::alive(lua, player) || disposition(lua, handle, player).0 != D_HT {
+        if !targetable(lua, player) || !crate::player::alive(lua, player) || disposition(lua, handle, player).0 != D_HT {
             continue;
         }
         let Some((to, _)) = crate::player::eye(lua, player) else { continue };
@@ -1290,7 +1357,10 @@ fn install_relationships(def: &Def) -> mlua::Result<()> {
     def("Classify", |a| integer(read(a, |_, npc| npc.class)?))?;
     def("SetNPCClass", |a| {
         let n = a.number(2)? as i64;
-        write(a, |_, npc| npc.class = n)
+        write(a, |_, npc| {
+            npc.class = n;
+            npc.class_set = true;
+        })
     })?;
     def("SetSquad", |a| {
         let name = a.opt_string(2)?.unwrap_or_default();

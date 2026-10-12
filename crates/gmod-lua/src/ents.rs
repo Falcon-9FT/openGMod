@@ -197,10 +197,24 @@ const ENGINE_CLASSES: &[&str] = &[
     "weapon_slam", "weapon_smg1", "weapon_stunstick",
 ];
 
-/// The kind of an engine class: its prefix says it.
+/// The kind of an engine class: its prefix says it, but for the makers, thrown things and the
+/// helicopter's markers, which are named `npc_` and are no NPCs.
 fn engine_kind(class: &str) -> Kind {
     let class = class.to_ascii_lowercase();
-    if class.starts_with("npc_") && !matches!(class.as_str(), "npc_maker" | "npc_template_maker" | "npc_antlion_template_maker") {
+    let not_npc = matches!(
+        class.as_str(),
+        "npc_maker"
+            | "npc_template_maker"
+            | "npc_antlion_template_maker"
+            | "npc_grenade_frag"
+            | "npc_grenade_bugbait"
+            | "npc_satchel"
+            | "npc_tripmine"
+            | "npc_heli_avoidsphere"
+            | "npc_heli_avoidbox"
+            | "npc_heli_nobomb"
+    );
+    if class.starts_with("npc_") && !not_npc {
         Kind::Npc
     } else if class.starts_with("weapon_") {
         Kind::Weapon

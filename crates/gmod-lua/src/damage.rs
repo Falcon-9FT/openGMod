@@ -117,7 +117,7 @@ pub(crate) fn take(lua: &Lua, target: EntityHandle, info: DamageInfo) {
             let _ = files::call_reporting(lua, f, MultiValue::from_iter([Value::UserData(ent), Value::UserData(ud)]));
         }
     } else if target.kind == entity::Kind::Npc {
-        crate::npc::hurt(lua, target, info, &ud);
+        crate::npc::hurt(lua, target, info);
     } else {
         crate::breakable::damaged(lua, target, &info);
     }
