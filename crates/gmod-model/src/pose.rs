@@ -228,7 +228,9 @@ impl Rig {
         }
         let part = self.parts.len();
         for (s, sequence) in model.sequences.iter().enumerate() {
-            let same = self.sequences.iter().position(|&(p, t)| self.parts[p].mdl.sequences[t].label.eq_ignore_ascii_case(&sequence.label));
+            // the model's own sequences already in the rig are not in its parts yet
+            let label = |p: usize, t: usize| if p == part { &model.sequences[t].label } else { &self.parts[p].mdl.sequences[t].label };
+            let same = self.sequences.iter().position(|&(p, t)| label(p, t).eq_ignore_ascii_case(&sequence.label));
             match same {
                 None => self.sequences.push((part, s)),
                 Some(i) if sequence.flags & flags::OVERRIDE != 0 => self.sequences[i] = (part, s),

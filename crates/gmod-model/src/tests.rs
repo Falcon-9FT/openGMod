@@ -641,7 +641,8 @@ fn sequences_blend_and_layer() {
 #[test]
 fn included_models_play_on_the_bones_of_the_same_names() {
     // the included model has the bones in another order, one the rig does not have, and
-    // a sequence of the same name as the rig's (left out) and one that overrides one
+    // a sequence of the same name as the rig's (left out), two of the same name as each
+    // other (the second left out) and one that overrides one
     let mut wave = TestAnimation::turning("@wave", 2, 3, 0.0, 0.6);
     wave.frames.iter_mut().flatten().for_each(|(bone, ..)| *bone = 2);
     let mut raw = TestSequence::new("raw64", "", 0);
@@ -655,7 +656,7 @@ fn included_models_play_on_the_bones_of_the_same_names() {
             bone("tail", 1, [0.0; 3]),
         ],
         animations: vec![wave],
-        sequences: vec![TestSequence::new("wave", "ACT_WAVE", 0), TestSequence::new("idle", "", 0), raw],
+        sequences: vec![TestSequence::new("wave", "ACT_WAVE", 0), TestSequence::new("idle", "", 0), TestSequence::new("WAVE", "", 0), raw],
         pose_parameters: vec![
             PoseParameter { name: "AIM_YAW".into(), flags: 0, start: -45.0, end: 45.0, wrap: 0.0 },
             PoseParameter { name: "lean".into(), flags: 0, start: -1.0, end: 1.0, wrap: 0.0 },
@@ -679,6 +680,7 @@ fn included_models_play_on_the_bones_of_the_same_names() {
     assert_eq!(rig.sequence_count(), 10);
     assert_eq!(rig.sequence(0).map(|s| s.animations[0]), Some(0));
     assert_eq!(rig.sequence(1).map(|s| s.flags), Some(flags::OVERRIDE));
+    assert_eq!(rig.find_sequence("wave").and_then(|s| rig.sequence(s)).map(|s| s.label.as_str()), Some("wave"));
     assert_eq!(rig.pose_parameters().iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["aim_yaw", "lean"]);
     let wave = rig.find_sequence("wave").unwrap();
     let pose = rig.pose(wave, 1.0, &rig.default_pose_parameters(), &[]);
