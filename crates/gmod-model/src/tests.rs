@@ -539,6 +539,16 @@ fn hitboxes_are_read_by_set() {
     let lower = &set.hitboxes[1];
     assert_eq!((lower.bone, lower.group, lower.name.as_str()), (2, 5, "box1"));
     assert_eq!((lower.mins, lower.maxs), ([0.0, -1.5, -1.5], [10.0, 1.5, 1.5]));
+    // a hitbox's name past the end of the file, as models of Half-Life 2 have them: no name
+    let (mut broken, _) = arm().files();
+    let field = |bytes: &[u8], at: usize| i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let set_at = field(&broken, 176);
+    let name_at = set_at + field(&broken, set_at + 8) + 32;
+    let past_end = broken.len() as i32 + 100;
+    broken[name_at..name_at + 4].copy_from_slice(&past_end.to_le_bytes());
+    let broken = Mdl::parse(&broken).unwrap();
+    assert_eq!(broken.hitbox_sets[0].hitboxes[0].name, "");
+    assert_eq!(broken.hitbox_sets[0].hitboxes[1].name, "box1");
     // a model without any
     let (still, _) = TestRig { hitboxes: Vec::new(), ..arm() }.files();
     assert!(Mdl::parse(&still).unwrap().hitbox_sets.is_empty());

@@ -64,6 +64,12 @@ impl Install {
     /// The installation at `path`, which may name the installation folder, its `garrysmod`
     /// folder, or a file in the installation folder (`gmod.exe`).
     pub fn at(path: &Path) -> Result<Install, LocateError> {
+        Install::at_among(path, &steam_roots())
+    }
+
+    /// [`Install::at`], with the Steam installations to look for its library in when the
+    /// folder is not where Steam puts games (`<library>/steamapps/common/<folder>`).
+    fn at_among(path: &Path, steams: &[PathBuf]) -> Result<Install, LocateError> {
         let mut candidates = Vec::new();
         if path.is_file() {
             candidates.extend(path.parent().map(Path::to_path_buf));
@@ -77,7 +83,7 @@ impl Install {
         for candidate in candidates {
             let missing = missing(&candidate);
             if missing.is_empty() {
-                let library = library_of(&candidate);
+                let library = library_of(&candidate).or_else(|| library_for(&candidate, steams));
                 return Ok(Install { root: candidate, library });
             }
             error.tried.push((candidate, missing));
@@ -127,6 +133,19 @@ fn library_of(root: &Path) -> Option<PathBuf> {
     let steamapps = common.parent()?;
     let fits = common.file_name()?.eq_ignore_ascii_case("common") && steamapps.file_name()?.eq_ignore_ascii_case("steamapps");
     if fits { steamapps.parent().map(Path::to_path_buf) } else { None }
+}
+
+/// The library of a game folder that is not where Steam puts games - one reached by a link,
+/// or a copy: the library Steam installed it into, else the first with subscribed workshop
+/// items of Garry's Mod, as those are what the library is needed for.
+fn library_for(root: &Path, steams: &[PathBuf]) -> Option<PathBuf> {
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let libraries: Vec<PathBuf> = steams.iter().flat_map(|steam| libraries(steam)).collect();
+    let workshop = |library: &PathBuf| library.join("steamapps/workshop/content").join(APP_ID.to_string()).is_dir();
+    libraries.iter().find(|library| same(&app_dir(library), root)).or_else(|| libraries.iter().find(|l| workshop(l))).cloned()
 }
 
 pub(crate) fn home() -> Option<PathBuf> {
@@ -252,7 +271,13 @@ mod tests {
 
         let elsewhere = tmp.path().join("Games/GMod");
         fake_install(&elsewhere);
-        assert_eq!(Install::at(&elsewhere).unwrap().library, None);
+        assert_eq!(Install::at_among(&elsewhere, &[]).unwrap().library, None);
+        // a folder elsewhere still finds the subscribed items of the Steam on the computer
+        let steam = tmp.path().join("Steam");
+        std::fs::create_dir_all(steam.join("steamapps")).unwrap();
+        assert_eq!(Install::at_among(&elsewhere, std::slice::from_ref(&steam)).unwrap().library, None);
+        std::fs::create_dir_all(steam.join("steamapps/workshop/content/4000")).unwrap();
+        assert_eq!(Install::at_among(&elsewhere, std::slice::from_ref(&steam)).unwrap().library, Some(steam));
 
         let err = Install::at(&tmp.path().join("Games")).unwrap_err();
         assert_eq!(err.tried[0].1, ESSENTIALS);

@@ -5,11 +5,14 @@
 //! Steam keeps each subscribed item in `steamapps/workshop/content/4000/<id>/`: a `.gma`, or
 //! for items published before the current workshop a `<name>_legacy.bin` - an LZMA stream
 //! around a GMA. Those are unpacked once into a folder of openGMOD's own and read from
-//! there; the downloads themselves are not touched.
+//! there; the downloads themselves are not touched. Steam's list of the items it installed
+//! (`appworkshop_4000.acf`) leaves out the folders of items no longer subscribed to; it is
+//! written late, so a folder that changed since it was written is kept all the same.
 
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use gmod_kv::Options;
 
@@ -58,13 +61,39 @@ fn files_with(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     out
 }
 
-/// The IDs Steam lists as installed in `appworkshop_4000.acf`, if it has that file.
-fn installed_ids(library: &Path) -> Option<HashSet<u64>> {
+/// The addon files of a subscribed item's folder: `.gma` files, old compressed downloads
+/// (`.bin`), and files of another name that are GMA files all the same.
+fn item_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let is_gma = |path: &Path| {
+        let mut magic = [0u8; 4];
+        std::fs::File::open(path).and_then(|mut f| io::Read::read_exact(&mut f, &mut magic)).is_ok() && &magic == b"GMAD"
+    };
+    let mut out: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && (has_extension(p, "gma") || has_extension(p, "bin") || is_gma(p)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The IDs Steam lists as installed in `appworkshop_4000.acf`, if it has that file, and when
+/// it was written.
+fn installed_ids(library: &Path) -> Option<(HashSet<u64>, SystemTime)> {
     let manifest = library.join(format!("steamapps/workshop/appworkshop_{}.acf", crate::install::APP_ID));
+    let written = std::fs::metadata(&manifest).and_then(|m| m.modified()).ok()?;
     let bytes = std::fs::read(manifest).ok()?;
     let (doc, _) = gmod_kv::parse_lenient(&gmod_kv::decode_text(&bytes), Options { escapes: true });
     let installed = doc.root.block("AppWorkshop")?.block("WorkshopItemsInstalled")?;
-    Some(installed.iter().filter_map(|pair| pair.key.parse().ok()).collect())
+    Some((installed.iter().filter_map(|pair| pair.key.parse().ok()).collect(), written))
+}
+
+/// When a folder or a file in it last changed.
+fn last_change(dir: &Path) -> Option<SystemTime> {
+    let own = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    let files = std::fs::read_dir(dir).into_iter().flatten().filter_map(Result::ok).filter_map(|e| e.metadata().ok()?.modified().ok());
+    own.into_iter().chain(files).max()
 }
 
 /// Every addon file of an installation: subscribed items first (by ID), then the ones in
@@ -80,11 +109,16 @@ pub fn addon_files(install: &Install) -> Vec<AddonFile> {
             .flatten()
             .filter_map(Result::ok)
             .filter_map(|e| Some((e.file_name().to_str()?.parse::<u64>().ok()?, e.path())))
-            .filter(|(id, path)| path.is_dir() && listed.as_ref().is_none_or(|l| l.contains(id)))
+            .filter(|(id, path)| {
+                // Steam writes its list when it likes, so an item it downloaded since is not
+                // in it yet: only one it left out when it last wrote the list is gone
+                path.is_dir()
+                    && listed.as_ref().is_none_or(|(ids, written)| ids.contains(id) || last_change(path).is_none_or(|t| t >= *written))
+            })
             .collect();
         items.sort();
         for (id, item) in items {
-            for path in files_with(&item, &["gma", "bin"]) {
+            for path in item_files(&item) {
                 let packed = has_extension(&path, "bin");
                 out.push(AddonFile { path, origin: Origin::Subscribed, workshop_id: Some(id), packed });
                 ids.insert(id);
@@ -171,6 +205,8 @@ pub fn unpack_legacy(packed: &Path, workshop_id: Option<u64>, cache_dir: &Path) 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::gma::{self, GmaArchive, GmaInfo};
     use crate::testutil::{TempDir, fake_install};
@@ -190,6 +226,9 @@ mod tests {
         gma::write(&workshop.join("111/item.gma"), &info, &[]).unwrap();
         std::fs::write(workshop.join("222/old_legacy.bin"), b"").unwrap();
         gma::write(&workshop.join("333/gone.gma"), &info, &[]).unwrap();
+        // a GMA by another name, and a file that is no addon
+        gma::write(&workshop.join("111/temp"), &info, &[]).unwrap();
+        std::fs::write(workshop.join("111/notes.txt"), b"not an addon").unwrap();
         std::fs::create_dir_all(install.game_dir().join("addons")).unwrap();
         gma::write(&install.game_dir().join("addons/by_hand.gma"), &info, &[]).unwrap();
         std::fs::create_dir_all(install.game_dir().join("cache/workshop")).unwrap();
@@ -204,6 +243,7 @@ mod tests {
         };
         let all = [
             ("item.gma".to_string(), Origin::Subscribed, Some(111), false),
+            ("temp".to_string(), Origin::Subscribed, Some(111), false),
             ("old_legacy.bin".to_string(), Origin::Subscribed, Some(222), true),
             ("gone.gma".to_string(), Origin::Subscribed, Some(333), false),
             ("by_hand.gma".to_string(), Origin::AddonsFolder, None, false),
@@ -213,14 +253,21 @@ mod tests {
 
         // with Steam's list, items no longer subscribed (333) are left out
         let acf = "\"AppWorkshop\"\n{\n\t\"appid\" \"4000\"\n\t\"WorkshopItemsInstalled\"\n\t{\n\t\t\"111\" { \"size\" \"1\" }\n\t\t\"222\" { \"size\" \"1\" }\n\t}\n}\n";
-        std::fs::write(library.join("steamapps/workshop/appworkshop_4000.acf"), acf).unwrap();
+        let manifest = library.join("steamapps/workshop/appworkshop_4000.acf");
+        std::fs::write(&manifest, acf).unwrap();
+        let written_at = |time: SystemTime| std::fs::File::options().write(true).open(&manifest).unwrap().set_modified(time).unwrap();
+        written_at(SystemTime::now() + Duration::from_secs(3600));
         let mut expected = all.to_vec();
-        expected.remove(2);
+        expected.remove(3);
         assert_eq!(summary(addon_files(&install)), expected);
+        // ...but not an item downloaded after Steam last wrote its list
+        written_at(SystemTime::now() - Duration::from_secs(3600));
+        assert_eq!(summary(addon_files(&install)), all);
+        written_at(SystemTime::now() + Duration::from_secs(3600));
 
         // what each is switched off by: the item, or the file's name
         let keys: Vec<String> = addon_files(&install).iter().map(addon_key).collect();
-        assert_eq!(keys, ["111", "222", "by_hand.gma", "444"]);
+        assert_eq!(keys, ["111", "111", "222", "by_hand.gma", "444"]);
         let file = tmp.path().join("settings/disabled.txt");
         let disabled: HashSet<String> = ["111".to_string(), "by_hand.gma".to_string()].into_iter().collect();
         write_disabled(&file, &disabled).unwrap();
