@@ -217,6 +217,26 @@ fn the_face_nearest_the_weight_is_drawn() {
 }
 
 #[test]
+fn a_font_of_the_game_is_found_by_its_files_name() {
+    // HL2MP.ttf is Half-Life 2's font with weapons' icons where the digits were, and goes by
+    // its name; the engine finds HALFLIFE2.ttf for "HalfLife2" all the same
+    let mut fonts = Fonts::new();
+    fonts.add_game_font(plain("HalfLife2", 100, &['x']), "HL2MP.ttf");
+    fonts.add_game_font(plain("HalfLife2", 500, &['1']), "HALFLIFE2.ttf");
+    let numbers = fonts.font(&FontSpec { weight: 0, ..spec("HalfLife2", 20) });
+    assert!(fonts.glyph(numbers, '1').width > 0);
+    assert_eq!(fonts.glyph(numbers, 'x').width, 0);
+    // and HL2MP.ttf by its file's name, which is not among its own
+    let icons = fonts.font(&spec("HL2MP", 20));
+    assert!(fonts.glyph(icons, 'x').width > 0);
+    // weight 0 is the regular face, not the thinnest
+    fonts.add_font(plain("Duo", 100, &['a']));
+    fonts.add_font(plain("Duo", 400, &['b']));
+    let regular = fonts.font(&FontSpec { weight: 0, ..spec("Duo", 20) });
+    assert!(fonts.glyph(regular, 'b').width > 0);
+}
+
+#[test]
 fn missing_families_and_characters_come_from_the_fallbacks() {
     let mut fonts = Fonts::new();
     fonts.add_font(plain("Only Latin", 400, &['a']));

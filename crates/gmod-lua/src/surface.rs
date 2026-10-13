@@ -330,7 +330,7 @@ pub(crate) fn load_fonts(lua: &Lua) {
         let folder = pattern.rsplit_once('/').map_or("", |(f, _)| f);
         for file in vfs.find(pattern, "GAME").files {
             if let Ok(data) = vfs.read(&format!("{folder}/{file}"), "GAME") {
-                fonts.add_font(data);
+                fonts.add_game_font(data, &file);
             }
         }
     }
