@@ -158,6 +158,14 @@ pub(crate) fn command(lua: &Lua, player: EntityHandle, weapon: EntityHandle, cmd
             }
         }
     }
+    // the beam, for the clients to draw: to what it holds, else where it aims while the key is
+    // down (`NULL`: the client follows the aim itself)
+    let beam = match held(lua, player) {
+        Some(h) => Some((h.entity, h.point)),
+        None if cmd.buttons & IN_ATTACK != 0 => Some((EntityHandle::NULL, Vector::default())),
+        None => None,
+    };
+    host(lua).entities.with_mut(weapon, |ent| ent.beam = beam);
 }
 
 /// Takes what the player aims at, if it can be taken.

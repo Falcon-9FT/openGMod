@@ -99,10 +99,12 @@ pub mod nav;
 pub mod net;
 pub mod npc;
 pub mod outputs;
+pub mod physcannon;
 pub mod physgun;
 pub mod physics;
 pub mod pickup;
 pub mod player;
+pub mod projectiles;
 pub mod pvs;
 pub mod ragdoll;
 pub mod recipients;
@@ -292,6 +294,8 @@ pub(crate) struct Host {
     pub physgun: physgun::Guns,
     /// What players carry with the use key.
     pub(crate) hands: pickup::Hands,
+    /// What the engine's weapons fired that is still in flight.
+    pub(crate) projectiles: projectiles::Projectiles,
     pub inputs: inputs::Queue,
     /// The 2D frame `surface` draws, and its fonts; the client and the menu have one.
     pub screen: surface::Screen,
@@ -410,6 +414,7 @@ impl Runtime {
             physics: physics::World::default(),
             physgun: physgun::Guns::default(),
             hands: pickup::Hands::default(),
+            projectiles: projectiles::Projectiles::default(),
             inputs: inputs::Queue::default(),
             screen: surface::Screen::default(),
             client: client::Client::default(),
@@ -585,6 +590,7 @@ impl Runtime {
                 physgun::think(&self.lua);
                 pickup::think(&self.lua);
                 physics::simulate(&self.lua);
+                projectiles::think(&self.lua);
                 triggers::tick(&self.lua);
                 inputs::service(&self.lua);
                 logic::tick(&self.lua);

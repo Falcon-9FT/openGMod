@@ -979,7 +979,8 @@ fn tick(lua: &Lua, handle: EntityHandle) {
     let (mut buttons, mut pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
     // carrying something, the attack key throws it and the weapon is still
     if crate::pickup::carrying(lua, handle).is_some() {
-        if pressed & IN_ATTACK != 0 {
+        // what the gravity gun holds it launches or lets go; what the hands hold is thrown
+        if !crate::physcannon::holding(lua, handle, active, pressed) && pressed & IN_ATTACK != 0 {
             crate::pickup::drop(lua, handle, true);
         }
         buttons &= !(IN_ATTACK | IN_ATTACK2);

@@ -476,10 +476,14 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
-/// The physics gun's beams, as the engine draws them: from the gun to the point held, bending
-/// from where the gun points, in the player's weapon colour.
+/// The physics guns' beams, as GMod draws them: from the gun's muzzle - the view model's for
+/// the one who looks through it, where it shows - bending from where the gun aims to what it
+/// holds, or straight to where it aims while nothing is held; the texture runs along it, a
+/// glow at either end, in the colour of the player's weapon (`GetWeaponColor`). Only a gun in
+/// its owner's hands draws one.
 pub(crate) fn physgun_beams(lua: &Lua, viewer: crate::entity::EntityHandle) {
-    let guns: Vec<(crate::entity::EntityHandle, crate::entity::EntityHandle, crate::entity::EntityHandle, Vector)> = {
+    use crate::entity::EntityHandle;
+    let guns: Vec<(EntityHandle, EntityHandle, EntityHandle, Vector)> = {
         let entities = &host(lua).entities;
         entities
             .handles()
@@ -487,30 +491,64 @@ pub(crate) fn physgun_beams(lua: &Lua, viewer: crate::entity::EntityHandle) {
             .filter_map(|h| {
                 let ent = entities.get(h)?;
                 let (target, point) = ent.beam?;
-                (!ent.removed && !ent.dormant && entities.is_valid(target)).then_some((h, ent.owner, target, point))
+                (!ent.removed && !ent.dormant).then_some((h, ent.owner, target, point))
             })
             .collect()
     };
-    for (_, owner, target, point) in guns {
-        let Some((eye, forward)) = crate::player::eye(lua, owner) else { continue };
-        let Some((pos, angles)) = host(lua).entities.transform(target) else { continue };
-        let end = pos + point.rotated(angles);
-        let (_, right, up) = crate::player::eye_angles(lua, owner).unwrap_or_default().vectors();
-        // the muzzle: before the eyes, to the right and down a little for whoever looks through them
-        let start = if owner == viewer { eye + forward * 24.0 + right * 6.0 - up * 7.0 } else { eye + forward * 28.0 - up * 12.0 };
+    let time = host(lua).started.elapsed().as_secs_f32();
+    for (gun, owner, target, point) in guns {
+        if crate::player::active_weapon(lua, owner) != Some(gun) {
+            continue;
+        }
+        // the eyes and the aim: the view's for the viewer, which moves smoothly between ticks
+        let (eye, aim) = if owner == viewer {
+            let view = host(lua).client.view.get();
+            (view.origin, view.angles.vectors().0)
+        } else {
+            let Some(found) = crate::player::eye(lua, owner) else { continue };
+            found
+        };
+        let start = if owner == viewer {
+            crate::anim::view_model_attachment(lua, owner, &["muzzle", "core"])
+        } else {
+            crate::anim::named_attachment(lua, gun, &["muzzle", "core"])
+        };
+        let start = start.unwrap_or_else(|| {
+            let (_, right, up) = aim.angle().vectors();
+            eye + aim * 24.0 + right * 6.0 - up * 7.0
+        });
+        let held = host(lua).entities.is_valid(target) && target.index.is_some_and(|i| i != 0);
+        let end = if held {
+            let Some((pos, angles)) = host(lua).entities.transform(target) else { continue };
+            pos + point.rotated(angles)
+        } else {
+            let range = crate::convar::value(lua, "physgun_maxrange").and_then(|v| v.trim().parse().ok()).unwrap_or(4096.0f32);
+            let sweep = crate::trace::Sweep {
+                mask: gmod_bsp::mask::SHOT,
+                ..crate::trace::Sweep::line(eye, eye + aim * range, crate::trace::Filter::Entities(vec![owner]))
+            };
+            crate::trace::trace(lua, &sweep).end
+        };
         let colour = crate::player::state(lua, owner, |_, p| p.weapon_color).unwrap_or(Vector::new(0.3, 1.8, 2.1));
-        let rgb = [colour.x, colour.y, colour.z].map(|c| (c / 2.1).clamp(0.0, 1.0));
-        let control = start + forward * ((end - start).length() * 0.5);
-        const STEPS: usize = 16;
+        let rgb = [colour.x, colour.y, colour.z].map(|c| c.clamp(0.0, 1.0));
+        let color = [rgb[0], rgb[1], rgb[2], 1.0];
+        // bending: it leaves the gun along the aim and comes round to what it holds
+        let length = (end - start).length();
+        let control = start + aim * (length * 0.5);
+        const STEPS: usize = 24;
+        let scroll = (time * 2.0).fract();
         let points = (0..=STEPS)
             .map(|i| {
                 let t = i as f32 / STEPS as f32;
                 let pos = start * ((1.0 - t) * (1.0 - t)) + control * (2.0 * t * (1.0 - t)) + end * (t * t);
-                BeamPoint { pos, width: 3.0 + 2.0 * (1.0 - t), v: t * 4.0, color: [rgb[0], rgb[1], rgb[2], 1.0] }
+                BeamPoint { pos, width: 3.0, v: t * (length / 128.0).max(1.0) - scroll, color }
             })
             .collect();
-        let material = Material3d { name: "sprites/physbeam".into(), texture: None, additive: Some(true) };
-        push_with(lua, material, Shape::Beam(points));
+        let additive = |name: &str| Material3d { name: name.into(), texture: None, additive: Some(true) };
+        push_with(lua, additive("sprites/physbeama"), Shape::Beam(points));
+        push_with(lua, additive("sprites/physg_glow1"), Shape::Sprite { pos: start, width: 6.0, height: 6.0, color });
+        let size = if held { 16.0 } else { 10.0 };
+        push_with(lua, additive("sprites/physg_glow2"), Shape::Sprite { pos: end, width: size, height: size, color });
     }
 }
 

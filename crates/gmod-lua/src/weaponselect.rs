@@ -223,19 +223,24 @@ fn draw_weapon(lua: &Lua, weapon: EntityHandle, rect: [f32; 4], picked: bool, co
         return;
     }
     let Some(data) = crate::weapon::data(lua, weapon) else { return };
-    let icon = if picked { data.icons[1].clone().or_else(|| data.icons[0].clone()) } else { data.icons[0].clone() };
     let screen = &host(lua).screen;
-    match icon.and_then(|(font, character)| Some((screen.proportional_font(&font)?, character))) {
-        Some((font, character)) => {
-            let (tw, th) = screen.fonts.borrow_mut().text_size(font, &character);
-            screen.text(font, x + (w - tw as f32) / 2.0, y + (h - th as f32) / 2.0, &character, color);
-        }
-        // no icon: its name
-        None => {
-            let Some(font) = screen.proportional_font("HudSelectionText") else { return };
-            let name = host(lua).client.phrase(&data.print_name);
-            let (tw, th) = screen.fonts.borrow_mut().text_size(font, &name);
-            screen.text(font, x + (w - tw as f32) / 2.0, y + (h - th as f32) / 2.0, &name, color);
-        }
+    // the icon, and over it when chosen its glow (`WeaponIconsSelected`: blurred, added), as
+    // Half-Life 2 draws them; above the name, when chosen
+    let area = if picked { h - h * 0.25 } else { h };
+    let wanted: Vec<(String, String)> =
+        if picked { data.icons.iter().flatten().cloned().collect() } else { data.icons[0].iter().cloned().collect() };
+    let icons: Vec<(gmod_ui::FontId, String)> =
+        wanted.into_iter().filter_map(|(font, character)| Some((screen.proportional_font(&font)?, character))).collect();
+    for (font, character) in &icons {
+        let (tw, th) = screen.fonts.borrow_mut().text_size(*font, character);
+        screen.text(*font, x + (w - tw as f32) / 2.0, y + (area - th as f32) / 2.0, character, color);
+    }
+    // no icon: its name
+    if icons.is_empty()
+        && let Some(font) = screen.proportional_font("HudSelectionText")
+    {
+        let name = host(lua).client.phrase(&data.print_name);
+        let (tw, th) = screen.fonts.borrow_mut().text_size(font, &name);
+        screen.text(font, x + (w - tw as f32) / 2.0, y + (h - th as f32) / 2.0, &name, color);
     }
 }

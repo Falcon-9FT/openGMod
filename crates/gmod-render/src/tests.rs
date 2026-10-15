@@ -445,7 +445,8 @@ fn draws_a_model_alone_for_its_icon() {
     let above = Camera::looking_at([32.0, 32.0, 200.0], [32.0, 32.1, 0.0], 30.0);
     let pixels = read_back(&device, &queue, |encoder, view| renderer.render_model(&device, &queue, encoder, view, (64, 64), &above, model));
     let middle = at(&pixels, 32, 32);
-    assert!(middle[3] == 255 && (middle[0] > 120 || middle[0] < 40), "{middle:?}");
+    // the missing texture's purple or black, however a GPU lights it (WARP: darker)
+    assert!(middle[3] == 255 && middle[1] < 40 && middle[0].abs_diff(middle[2]) < 40, "{middle:?}");
     assert_eq!(at(&pixels, 0, 0)[3], 0, "nothing where the model is not");
     assert!((0..64 * 64).all(|i| !red(at(&pixels, i % 64, i / 64))), "none of the map's red floor");
 }

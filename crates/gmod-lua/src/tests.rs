@@ -1562,21 +1562,25 @@ fn what_is_drawn_of_the_entities() {
 /// a box 16 units wide and high: `models/crate.mdl`, a prop of 25 kg of wood, and
 /// `models/doll.mdl`, a ragdoll of two such boxes.
 fn physics_game(entities: &[&[(&str, &str)]]) -> Game {
+    physics_game_with(entities, &[])
+}
+
+/// The same, with more files in the game.
+fn physics_game_with(entities: &[&[(&str, &str)]], files: &[(&str, &[u8])]) -> Game {
     use gmod_model::testmodel::{self, TestConvex};
     let mdl = testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
     let part = || vec![TestConvex::cuboid([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0])];
     let crate_phy = testmodel::phy(1, &[part()], false, "solid { \"index\" \"0\" \"mass\" \"25\" \"surfaceprop\" \"wood\" }");
     let doll_phy = testmodel::phy(1, &[part(), part()], false, "");
-    let g = game_with(
-        Realm::Server,
-        &[
-            ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
-            ("models/crate.mdl", &mdl),
-            ("models/crate.phy", &crate_phy),
-            ("models/doll.mdl", &mdl),
-            ("models/doll.phy", &doll_phy),
-        ],
-    );
+    let mut all: Vec<(&str, &[u8])> = vec![
+        ("lua/includes/init.lua", ENTITY_LUA.as_bytes()),
+        ("models/crate.mdl", &mdl),
+        ("models/crate.phy", &crate_phy),
+        ("models/doll.mdl", &mdl),
+        ("models/doll.phy", &doll_phy),
+    ];
+    all.extend_from_slice(files);
+    let g = game_with(Realm::Server, &all);
     g.runtime.init();
     let mut map = player_map();
     map.entities.extend(entities.iter().map(|list| list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()));
@@ -1781,11 +1785,12 @@ fn the_physics_gun() {
     g.runtime.think(0.5);
     assert_eq!(g.printed(), "picked\tcrate\nfroze\tweapon_physgun\tcrate\ndropped\tcrate\n");
     assert!(!g.runtime.view(alice).unwrap().holding);
-    assert_eq!(beam(&g), Some(None), "let go, no beam");
+    assert_eq!(beam(&g), Some(Some(EntityHandle::NULL)), "let go, the beam goes where it aims while the key is down");
     assert!(g.eval::<bool>("return not CRATE:GetPhysicsObject():IsMotionEnabled() and CRATE:GetPos().z > 40"));
     // R asks the gamemode to unfreeze; what the hook will not let go is not taken
     g.runtime.set_input(alice, aiming(0.0, 180.0, RELOAD));
     g.runtime.think(0.02);
+    assert_eq!(beam(&g), Some(None), "the key up, no beam");
     let heavy_down = (56.0f32 / 92.0).atan().to_degrees();
     g.runtime.set_input(alice, aiming(heavy_down, 0.0, ATTACK));
     g.runtime.think(0.02);
@@ -3562,4 +3567,155 @@ fn models_without_spawn_icons_are_pictured_by_the_program() {
     let picture = gmod_material::png::Rgba { width: 1, height: 1, pixels: vec![255; 4] };
     g.runtime.give_picture(asked[0].0, picture);
     assert_eq!(g.runtime.take_page_pictures().iter().map(|(id, _)| *id).collect::<Vec<_>>(), [asked[0].0]);
+}
+
+/// A game of physics with a player in it.
+fn armed_game() -> (Game, EntityHandle) {
+    let g = physics_game(&[]);
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    let player = g.runtime.join(alice()).expect("a free slot");
+    g.runtime.think(0.1);
+    (g, player)
+}
+
+#[test]
+fn the_gravity_gun_punts_takes_and_launches() {
+    let (g, alice) = armed_game();
+    g.runtime
+        .run_string(
+            "P = Entity(1) P:Give('weapon_physcannon') P:SelectWeapon('weapon_physcannon')
+             C = ents.Create('prop_physics') C:SetModel('models/crate.mdl') C:SetPos(P:EyePos() + Vector(80, 0, -8)) C:Spawn()
+             LOG = {}
+             HOOKS.GravGunOnPickedUp = function(p, e) LOG[#LOG + 1] = 'up' end
+             HOOKS.GravGunOnDropped = function(p, e) LOG[#LOG + 1] = 'down' end
+             HOOKS.GravGunPunt = function(p, e) LOG[#LOG + 1] = 'punt' end",
+            "gun",
+        )
+        .unwrap();
+    let press = |buttons: u32| {
+        g.runtime.set_input(alice, UserCmd { buttons, ..UserCmd::default() });
+        g.runtime.think(0.03);
+        g.runtime.set_input(alice, UserCmd::default());
+        g.runtime.think(0.6);
+    };
+    assert!(g.eval::<bool>("return P:GetActiveWeapon():GetClass() == 'weapon_physcannon'"));
+    // the second key takes it, the first launches it along the aim
+    press(player::key::ATTACK2);
+    assert!(g.eval::<bool>("return C:IsPlayerHolding() and LOG[1] == 'up'"), "{}", g.eval::<String>("return table.concat(LOG, ',')"));
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::ATTACK, ..UserCmd::default() });
+    g.runtime.think(0.03);
+    assert!(g.eval::<bool>("return not C:IsPlayerHolding() and LOG[2] == 'down' and C:GetPhysicsObject():GetVelocity().x > 500"));
+    // what it does not hold, the first key punts: into the wall a little way off
+    g.runtime.set_input(alice, UserCmd::default());
+    g.runtime.think(1.5);
+    // back before the gun, upright (thrown, it turned over: its origin is at its bottom)
+    g.runtime
+        .run_string(
+            "C:SetPos(P:EyePos() + Vector(80, 0, -8)) C:SetAngles(Angle(0, 0, 0)) C:GetPhysicsObject():SetVelocity(Vector(0, 0, 0))",
+            "back",
+        )
+        .unwrap();
+    g.runtime.set_input(alice, UserCmd { buttons: player::key::ATTACK, ..UserCmd::default() });
+    g.runtime.think(0.016);
+    assert!(
+        g.eval::<bool>("return LOG[3] == 'punt' and C:GetPos().x > 90"),
+        "{}",
+        g.eval::<String>("return table.concat(LOG, ',') .. tostring(C:GetPos())")
+    );
+}
+
+#[test]
+fn the_engines_weapons_fire_what_flies() {
+    let script = |ammo: &str, ammo2: &str, clip: i64| {
+        format!(
+            "WeaponData {{ \"clip_size\" \"{clip}\" \"default_clip\" \"{clip}\" \"primary_ammo\" \"{ammo}\" \"secondary_ammo\" \"{ammo2}\" }}"
+        )
+    };
+    let (rpg, frag, smg, bow) =
+        (script("RPG_Round", "None", -1), script("Grenade", "None", -1), script("SMG1", "SMG1_Grenade", 45), script("XBowBolt", "None", 1));
+    let models = gmod_model::testmodel::mdl(1, ([-2.0, -2.0, -2.0], [2.0, 2.0, 2.0]));
+    let files: Vec<(&str, &[u8])> = vec![
+        ("scripts/weapons/weapon_rpg.txt", rpg.as_bytes()),
+        ("scripts/weapons/weapon_frag.txt", frag.as_bytes()),
+        ("scripts/weapons/weapon_smg1.txt", smg.as_bytes()),
+        ("scripts/weapons/weapon_crossbow.txt", bow.as_bytes()),
+        ("models/weapons/w_missile_launch.mdl", &models),
+        ("models/items/ar2_grenade.mdl", &models),
+        ("models/crossbow_bolt.mdl", &models),
+    ];
+    let g = physics_game_with(&[], &files);
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    let alice = g.runtime.join(alice()).expect("a free slot");
+    g.runtime.think(0.1);
+    g.runtime
+        .run_string(
+            "P = Entity(1) P:SetHealth(10000) P:SetMaxHealth(10000)
+             for _, class in ipairs({ 'weapon_rpg', 'weapon_frag', 'weapon_smg1', 'weapon_crossbow' }) do P:Give(class) end
+             P:GiveAmmo(3, 'RPG_Round') P:GiveAmmo(2, 'Grenade') P:GiveAmmo(2, 'SMG1_Grenade') P:GiveAmmo(5, 'XBowBolt')",
+            "arm",
+        )
+        .unwrap();
+    // aimed down at the floor before the player
+    let fire = |class: &str, buttons: u32| {
+        g.runtime.run_string(&format!("P:SelectWeapon('{class}')"), "select").unwrap();
+        g.runtime.think(1.0);
+        let aim = vector::Angle::new(45.0, 0.0, 0.0);
+        g.runtime.set_input(alice, UserCmd { buttons, view_angles: aim, ..UserCmd::default() });
+        g.runtime.think(0.016);
+        g.runtime.set_input(alice, UserCmd { view_angles: aim, ..UserCmd::default() });
+    };
+    let count = |class: &str| g.eval::<i64>(&format!("return #ents.FindByClass('{class}')"));
+    // a rocket, which goes off at the floor
+    fire("weapon_rpg", player::key::ATTACK);
+    assert_eq!(count("rpg_missile"), 1);
+    assert!(g.eval::<bool>("return P:GetAmmoCount('RPG_Round') == 2"));
+    g.runtime.think(2.0);
+    assert_eq!(count("rpg_missile"), 0, "it went off");
+    // a grenade, thrown, which goes off when its fuse has burnt
+    fire("weapon_frag", player::key::ATTACK);
+    assert_eq!(count("npc_grenade_frag"), 1);
+    g.runtime.think(3.5);
+    assert_eq!(count("npc_grenade_frag"), 0, "its fuse burnt");
+    // the SMG's grenade, with the second key
+    fire("weapon_smg1", player::key::ATTACK2);
+    assert_eq!(count("grenade_ar2"), 1);
+    assert!(g.eval::<bool>("return P:GetAmmoCount('SMG1_Grenade') == 1"));
+    g.runtime.think(2.0);
+    assert_eq!(count("grenade_ar2"), 0);
+    // a bolt, which sticks in the floor
+    fire("weapon_crossbow", player::key::ATTACK);
+    g.runtime.think(0.5);
+    assert_eq!(count("crossbow_bolt"), 1);
+    assert!(g.eval::<bool>("local b = ents.FindByClass('crossbow_bolt')[1] return b:GetVelocity():Length() == 0"));
+}
+
+#[test]
+fn the_physics_guns_beam_shows_while_its_key_is_down() {
+    use crate::render3d::Shape;
+    let server = player_game();
+    let alice = server.runtime.join(alice()).unwrap();
+    server.runtime.run_string("Entity(1):Give('weapon_physgun') Entity(1):SelectWeapon('weapon_physgun')", "gun").unwrap();
+    server.runtime.think(0.1);
+    server.runtime.set_input(alice, UserCmd { buttons: player::key::ATTACK, ..UserCmd::default() });
+    server.runtime.think(0.05);
+    let client = client_game(&[]);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.set_local_player(alice);
+    let eye = client.runtime.view(alice).unwrap().eye;
+    client.runtime.set_view(crate::client::View { origin: eye, ..Default::default() });
+    client.runtime.drawn(alice);
+    let drawn = client.runtime.take_primitives();
+    // nothing held: a beam from before the eyes to where they look, a glow at either end
+    let beams: Vec<_> = drawn.iter().filter(|p| p.material.name == "sprites/physbeama").collect();
+    assert_eq!(beams.len(), 1, "{drawn:?}");
+    let Shape::Beam(points) = &beams[0].shape else { panic!("{beams:?}") };
+    let (start, end) = (points[0].pos, points[points.len() - 1].pos);
+    assert!(end.x > start.x + 10.0 && (end.y - eye.y).abs() < 1.0, "{start:?} {end:?}");
+    assert_eq!(drawn.iter().filter(|p| matches!(p.shape, Shape::Sprite { .. })).count(), 2);
+    // the key up: none
+    server.runtime.set_input(alice, UserCmd::default());
+    server.runtime.think(0.05);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.drawn(alice);
+    assert!(client.runtime.take_primitives().iter().all(|p| p.material.name != "sprites/physbeama"));
 }

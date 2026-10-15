@@ -701,6 +701,36 @@ fn view_model_fov(lua: &Lua, viewer: EntityHandle) -> f32 {
     own.or_else(|| crate::convar::value(lua, "viewmodel_fov").and_then(|v| v.parse().ok())).unwrap_or(54.0)
 }
 
+/// Where an attachment of the local player's view model (`muzzle`) is seen in the world: on the
+/// model where the view puts it (`CalcViewModelView`), then as the world's wider field of view
+/// shows the point the view model's narrower one does (Source's `FormatViewModelAttachment`):
+/// what is drawn in the world from there starts where the view model shows it.
+pub(crate) fn view_model_attachment(lua: &Lua, owner: EntityHandle, names: &[&str]) -> Option<Vector> {
+    let vm = view_model(lua, owner, 0);
+    let (rig, bones) = model_bones(lua, vm)?;
+    let index = names.iter().find_map(|name| rig.attachments().iter().position(|a| a.name.eq_ignore_ascii_case(name)))?;
+    let local = rig.attachment(index, &bones)?;
+    let view = host(lua).client.view.get();
+    let (origin, angles) = view_model_view(lua, view.origin, view.angles);
+    let m = Matrix::from_angle(angles).m;
+    let place: BoneMatrix = std::array::from_fn(|r| [m[r][0], m[r][1], m[r][2], [origin.x, origin.y, origin.z][r]]);
+    let world = rig_pose::multiply(&place, &local);
+    let point = Vector::new(world[0][3], world[1][3], world[2][3]);
+    let half = |fov: f32| (fov.clamp(1.0, 170.0) / 2.0).to_radians().tan();
+    let factor = half(view.fov) / half(view_model_fov(lua, owner));
+    let (forward, right, up) = view.angles.vectors();
+    let d = point - view.origin;
+    Some(view.origin + right * (d.dot(right) * factor) + up * (d.dot(up) * factor) + forward * d.dot(forward))
+}
+
+/// Where an attachment of an entity's model is in the world, by name: the first of `names`
+/// it has.
+pub(crate) fn named_attachment(lua: &Lua, handle: EntityHandle, names: &[&str]) -> Option<Vector> {
+    let (rig, _) = animated(lua, handle)?;
+    let index = names.iter().find_map(|name| rig.attachments().iter().position(|a| a.name.eq_ignore_ascii_case(name)))?;
+    attachment_world(lua, handle, index).map(|(pos, _)| pos)
+}
+
 /// A player's view models that are there.
 pub(crate) fn view_models_of(lua: &Lua, owner: EntityHandle) -> Vec<EntityHandle> {
     let all = player::state(lua, owner, |_, p| p.view_models).unwrap_or([EntityHandle::NULL; 3]);

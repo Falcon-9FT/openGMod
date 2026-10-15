@@ -39,6 +39,8 @@ struct Carried {
     middle: Vector,
     /// Whether its body fell before it was taken.
     gravity: bool,
+    /// Held with the gravity gun ([`crate::physcannon`]) rather than by hand.
+    gun: bool,
 }
 
 /// What each player carries.
@@ -79,15 +81,26 @@ pub(crate) fn can_carry(lua: &Lua, target: EntityHandle) -> bool {
 /// A player picks an entity up, if it can be carried and is light enough (unless `forced`) and
 /// `AllowPlayerPickup` lets them. Whether they did.
 pub(crate) fn pick_up(lua: &Lua, player: EntityHandle, target: EntityHandle, forced: bool) -> bool {
+    take(lua, player, target, (!forced).then_some(MAX_MASS), false)
+}
+
+/// The gravity gun takes an entity, up to `max_mass` kilograms, if `GravGunPickupAllowed`
+/// lets it (`GravGunOnPickedUp`). Whether it did.
+pub(crate) fn pick_up_by_gun(lua: &Lua, player: EntityHandle, target: EntityHandle, max_mass: f32) -> bool {
+    take(lua, player, target, Some(max_mass), true)
+}
+
+fn take(lua: &Lua, player: EntityHandle, target: EntityHandle, max_mass: Option<f32>, gun: bool) -> bool {
     if carrying(lua, player).is_some() || !can_carry(lua, target) {
         return false;
     }
     let Some(body) = crate::physics::body(lua, target) else { return false };
     let mass = host(lua).physics.physics.borrow().mass(body);
-    if !forced && mass > MAX_MASS {
+    if max_mass.is_some_and(|most| mass > most) {
         return false;
     }
-    let allowed = hook(lua, "AllowPlayerPickup", [value(lua, player), value(lua, target)]);
+    let asked = if gun { "GravGunPickupAllowed" } else { "AllowPlayerPickup" };
+    let allowed = hook(lua, asked, [value(lua, player), value(lua, target)]);
     if matches!(allowed.front(), Some(Value::Boolean(false))) {
         return false;
     }
@@ -106,22 +119,36 @@ pub(crate) fn pick_up(lua: &Lua, player: EntityHandle, target: EntityHandle, for
     };
     let yaw = crate::player::eye_angles(lua, player).map_or(0.0, |a| a.y);
     let size = (maxs - mins).length() * 0.5;
-    let carried = Carried { entity: target, angles, yaw, distance: size + GAP, middle: (mins + maxs) * 0.5, gravity };
+    let carried = Carried { entity: target, angles, yaw, distance: size + GAP, middle: (mins + maxs) * 0.5, gravity, gun };
     host(lua).hands.carried.borrow_mut().push((player, carried));
-    hook(lua, "OnPlayerPhysicsPickup", [value(lua, player), value(lua, target)]);
+    let told = if gun { "GravGunOnPickedUp" } else { "OnPlayerPhysicsPickup" };
+    hook(lua, told, [value(lua, player), value(lua, target)]);
     true
+}
+
+/// Whether what a player carries the gravity gun holds.
+pub(crate) fn carried_by_gun(lua: &Lua, player: EntityHandle) -> bool {
+    carried(lua, player).is_some_and(|c| c.gun)
 }
 
 /// A player lets go of what they carry: it falls, or flies where they look if `thrown`.
 pub(crate) fn drop(lua: &Lua, player: EntityHandle, thrown: bool) {
+    let_go(lua, player, thrown.then_some(|mass: f32| (THROW / mass.max(1.0)).min(MAX_THROW)));
+}
+
+/// A player lets go of what they carry, thrown at the speed `throw` gives for its mass.
+pub(crate) fn let_go(lua: &Lua, player: EntityHandle, throw: Option<impl Fn(f32) -> f32>) {
     let Some(c) = carried(lua, player) else { return };
+    let thrown = throw.is_some();
     host(lua).hands.carried.borrow_mut().retain(|(p, _)| *p != player);
     if let Some(body) = crate::physics::body(lua, c.entity) {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
         physics.set_gravity_enabled(body, c.gravity);
-        if thrown && let Some((_, aim)) = crate::player::eye(lua, player) {
-            let speed = (THROW / physics.mass(body).max(1.0)).min(MAX_THROW);
+        if let Some(throw) = throw
+            && let Some((_, aim)) = crate::player::eye(lua, player)
+        {
+            let speed = throw(physics.mass(body));
             let own = host.entities.get(player).map(|ent| ent.velocity).unwrap_or_default();
             let v = own + aim * speed;
             physics.set_velocity(body, [v.x, v.y, v.z]);
@@ -129,7 +156,11 @@ pub(crate) fn drop(lua: &Lua, player: EntityHandle, thrown: bool) {
         }
     }
     if host(lua).entities.is_valid(c.entity) {
-        hook(lua, "OnPlayerPhysicsDrop", [value(lua, player), value(lua, c.entity), Value::Boolean(thrown)]);
+        if c.gun {
+            hook(lua, "GravGunOnDropped", [value(lua, player), value(lua, c.entity)]);
+        } else {
+            hook(lua, "OnPlayerPhysicsDrop", [value(lua, player), value(lua, c.entity), Value::Boolean(thrown)]);
+        }
     }
 }
 
