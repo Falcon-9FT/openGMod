@@ -156,6 +156,27 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(Value::UserData(lua.create_userdata(origin + direction * t)?))
         })?,
     )?;
+    // LZMA, as GMod's: the "alone" container, its size in its header
+    util.raw_set(
+        "Compress",
+        lua.create_function(|lua, data: mlua::LuaString| {
+            let data = data.as_bytes();
+            if data.is_empty() {
+                return Ok(Value::Nil);
+            }
+            Ok(Value::String(lua.create_string(gmod_fs::lzma::compress_alone(&data))?))
+        })?,
+    )?;
+    util.raw_set(
+        "Decompress",
+        lua.create_function(|lua, (data, most): (mlua::LuaString, Option<f64>)| {
+            let limit = most.filter(|m| *m > 0.0).map_or(1 << 28, |m| m as u64);
+            match gmod_fs::lzma::decompress_alone(&data.as_bytes(), limit) {
+                Ok(out) => Ok(Value::String(lua.create_string(out)?)),
+                Err(_) => Ok(Value::Nil),
+            }
+        })?,
+    )?;
     crate::surfaceprops::install(lua, &util)?;
     lua.globals().raw_set("util", util)?;
     lua.globals().raw_set("PrecacheParticleSystem", lua.create_function(|_, _: MultiValue| Ok(()))?)?;

@@ -18,6 +18,7 @@ use std::sync::{Mutex, OnceLock};
 
 use gmod_fs::Vfs;
 use gmod_lua::player::{IMPULSE_FLASHLIGHT, key};
+use gmod_lua::snapshot::Snapshot;
 use gmod_lua::vector::{Angle, Vector};
 use gmod_lua::{Drawn, EntityHandle, Map, PlayerView, Realm, Runtime, UserCmd};
 use gmod_movement::FULL_MOVE;
@@ -108,6 +109,8 @@ pub struct Game {
     sounds: Vec<gmod_lua::sound::SoundEvent>,
     /// Console lines typed for the next frame.
     typed: Vec<String>,
+    /// A game here: the server's last two ticks, which the client is shown between.
+    ticks: Option<(Snapshot, Snapshot)>,
 }
 
 /// The player's client, on the game's files with the map, for `max_players`.
@@ -153,8 +156,16 @@ impl Game {
             "Lua: {} files, {errors} errors; type commands here (give weapon_crowbar, gm_spawn <model>)",
             server.runtime().files_loaded() + client.files_loaded()
         );
-        let mut game =
-            Game { link: Link::Local(Box::new(server)), client, player, impulse: 0, turned: None, sounds: Vec::new(), typed: Vec::new() };
+        let mut game = Game {
+            link: Link::Local(Box::new(server)),
+            client,
+            player,
+            impulse: 0,
+            turned: None,
+            sounds: Vec::new(),
+            typed: Vec::new(),
+            ticks: None,
+        };
         game.send_client_commands();
         Ok(game)
     }
@@ -175,6 +186,7 @@ impl Game {
             turned: None,
             sounds: Vec::new(),
             typed: Vec::new(),
+            ticks: None,
         };
         game.send_client_commands();
         Ok(game)
@@ -357,9 +369,11 @@ impl Game {
         let eye = match &mut self.link {
             Link::Local(server) => {
                 let host = server.frame(seconds);
-                // the client has what the server has now - its entities, what is said to its
-                // player - and thinks
-                self.client.apply_snapshot(&server.runtime().snapshot());
+                // the client has what the server has - its entities, between its last two
+                // ticks as this frame falls, so that what moves moves smoothly; what is said to
+                // its player - and thinks
+                let shown = between_ticks(&mut self.ticks, server.runtime().snapshot(), server.runtime().tick_fraction(), self.player);
+                self.client.apply_snapshot(&shown);
                 deliver(&self.client, host, &mut self.sounds);
                 let view = self.client.view(self.player)?;
                 between(view.previous_eye, view.eye, server.runtime().tick_fraction())
@@ -433,6 +447,25 @@ impl Game {
         }
         (models, fov)
     }
+}
+
+/// The entities as the client is shown them in a game here: between the server's last two
+/// ticks (`ticks`, moved on when `latest` is of a new one) by `fraction`, as a client over the
+/// network sees them; but the player as they are now, whose eyes go between the ticks of
+/// themselves, and whose angles are the mouse's.
+fn between_ticks(ticks: &mut Option<(Snapshot, Snapshot)>, latest: Snapshot, fraction: f32, player: EntityHandle) -> Snapshot {
+    match ticks {
+        Some((_, now)) if now.time == latest.time => {}
+        Some((before, now)) => *before = std::mem::replace(now, latest),
+        None => *ticks = Some((latest.clone(), latest)),
+    }
+    let (before, now) = ticks.as_ref().expect("set above");
+    let mut shown = Snapshot::between(before, now, fraction);
+    let own = |e: &&gmod_lua::snapshot::EntityState| Some(e.index) == player.index && e.serial == player.serial;
+    if let (Some(state), Some(slot)) = (now.entities.iter().find(own), shown.entities.iter_mut().find(|e| own(&&**e))) {
+        *slot = state.clone();
+    }
+    shown
 }
 
 /// What the server's frame left for the host's client, handed to it.
@@ -927,6 +960,30 @@ mod tests {
         assert_eq!((cmd.mouse_wheel, cmd.mouse_x, cmd.mouse_y), (-1, 3, -4));
         assert_eq!((cmd.forward_move, cmd.side_move), (FULL_MOVE, -FULL_MOVE));
         assert_eq!(cmd.buttons, key::FORWARD | key::MOVELEFT | key::SPEED | key::ATTACK | key::USE);
+    }
+
+    #[test]
+    fn a_game_here_is_shown_between_its_last_two_ticks() {
+        use gmod_lua::entity::{Ent, Kind};
+        use gmod_lua::snapshot::EntityState;
+        let at = |time: f64, x: f32| {
+            let state = |index: u32| {
+                let mut ent = Ent::new("prop_physics", Kind::Entity, index, 0.0);
+                ent.local_pos = Vector::new(x, 0.0, 0.0);
+                EntityState { index, serial: 1, ent, vars: Default::default() }
+            };
+            Snapshot { time, entities: vec![state(1), state(5)], dormant: Vec::new() }
+        };
+        let player = EntityHandle { index: Some(1), serial: 1, ..EntityHandle::NULL };
+        let mut ticks = None;
+        between_ticks(&mut ticks, at(1.0, 0.0), 0.5, player);
+        // a tick later, half way between the two: the prop half way, the player where they are
+        let shown = between_ticks(&mut ticks, at(1.015, 10.0), 0.5, player);
+        assert_eq!(shown.entities[1].ent.local_pos.x, 5.0);
+        assert_eq!(shown.entities[0].ent.local_pos.x, 10.0);
+        // the same tick again, later in it: further on, from the same two
+        let shown = between_ticks(&mut ticks, at(1.015, 10.0), 0.75, player);
+        assert_eq!(shown.entities[1].ent.local_pos.x, 7.5);
     }
 
     #[test]

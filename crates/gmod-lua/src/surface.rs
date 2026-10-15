@@ -700,11 +700,15 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         Ok(Value::Table(t))
     })?;
     def(lua, &s, "SetTextPosition", nothing)?;
+    // whether drawing is cut, and to what: the scissor and the clip of the panel that paints
+    // (`DModelPanel` cuts its model to it), else the whole screen
     def_many(lua, &s, "GetScissorRect", |a| {
         let screen = &host(a.lua).screen;
         let (w, h) = screen.size.get();
-        let clip = screen.scissor.get().unwrap_or(Clip::new(0, 0, w as i32, h as i32));
-        Ok(MultiValue::from_iter([clip.left, clip.top, clip.right, clip.bottom].map(|v| Value::Integer(v.into()))))
+        let cut = screen.canvas.borrow().clip;
+        let clip = cut.unwrap_or(Clip::new(0, 0, w as i32, h as i32));
+        let rect = [clip.left, clip.top, clip.right, clip.bottom].map(|v| Value::Integer(v.into()));
+        Ok(MultiValue::from_iter(std::iter::once(Value::Boolean(cut.is_some())).chain(rect)))
     })?;
     globals.raw_set("surface", s)?;
     Ok(())

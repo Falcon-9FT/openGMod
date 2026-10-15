@@ -111,6 +111,10 @@ pub struct Ent {
     pub vehicle_class: String,
     pub use_type: i64,
     pub trigger: bool,
+    /// Lua asked to be asked whether it collides (`SetCustomCollisionCheck`): kept, though the
+    /// `ShouldCollide` hook is not asked yet.
+    #[serde(default)]
+    pub custom_collision_check: bool,
     pub custom_collisions: bool,
     /// Kept across map loads by sandbox (`SetPersistent`).
     pub persistent: bool,
@@ -255,6 +259,7 @@ impl Ent {
             vehicle_class: String::new(),
             use_type: 0,
             trigger: false,
+            custom_collision_check: false,
             custom_collisions: false,
             persistent: false,
             transmit_with_parent: false,
@@ -1462,6 +1467,13 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         write(a, |ent| ent.transmit_with_parent = with_parent)
     })?;
     def("GetTrigger", |a| Ok(Value::Boolean(read(a, |ent| ent.trigger)?)))?;
+    def("SetCustomCollisionCheck", |a| {
+        let on = a.boolean(2);
+        write(a, |ent| ent.custom_collision_check = on)
+    })?;
+    def("GetCustomCollisionCheck", |a| Ok(Value::Boolean(read(a, |ent| ent.custom_collision_check)?)))?;
+    // the rules are read at every sweep and step: nothing to tell
+    def("CollisionRulesChanged", |a| this(a, 1).map(|_| Value::Nil))?;
     def("IsOnGround", |a| Ok(Value::Boolean(read(a, |ent| ent.flags & 1 != 0)?)))?;
     def("OnGround", |a| Ok(Value::Boolean(read(a, |ent| ent.flags & 1 != 0)?)))?;
     def("WaterLevel", |a| {

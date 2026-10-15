@@ -596,6 +596,9 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     def(lua, &globals, "EyePos", |a| userdata(a.lua, host(a.lua).client.view.get().origin))?;
     def(lua, &globals, "EyeAngles", |a| userdata(a.lua, host(a.lua).client.view.get().angles))?;
     def(lua, &globals, "EyeVector", |a| userdata(a.lua, host(a.lua).client.view.get().angles.vectors().0))?;
+    // the main view's: the same here, which draws no other views (`render.RenderView`) yet
+    def(lua, &globals, "MainEyePos", |a| userdata(a.lua, host(a.lua).client.view.get().origin))?;
+    def(lua, &globals, "MainEyeAngles", |a| userdata(a.lua, host(a.lua).client.view.get().angles))?;
     def(lua, &globals, "RenderAngles", |a| userdata(a.lua, host(a.lua).client.view.get().angles))?;
     def(lua, &globals, "RealFrameTime", |a| Ok(Value::Number(host(a.lua).client.real_frame_time.get())))?;
     def(lua, &globals, "FrameNumber", |a| Ok(Value::Integer(host(a.lua).client.frame.get() as i64)))?;

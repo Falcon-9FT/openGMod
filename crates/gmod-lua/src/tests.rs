@@ -3396,6 +3396,28 @@ fn the_sender_of_messages_is_the_same_key_every_time() {
 }
 
 #[test]
+fn compressed_strings_come_back() {
+    let g = game(Realm::Server, &[]);
+    assert!(g.eval::<bool>(
+        "local text = string.rep('trolleybus informator \\0\\255 ', 200)
+         local packed = util.Compress(text)
+         return #packed < #text / 4 and util.Decompress(packed) == text and util.Decompress('not lzma') == nil
+             and util.Decompress(packed, 100) == nil and util.Compress('') == nil"
+    ));
+}
+
+#[test]
+fn custom_collision_checks_are_kept() {
+    let g = player_game();
+    assert!(g.eval::<bool>(
+        "local e = ents.Create('prop_physics') e:SetModel('models/box.mdl') e:Spawn()
+         local before = e:GetCustomCollisionCheck()
+         e:SetCustomCollisionCheck(true) e:CollisionRulesChanged()
+         return before == false and e:GetCustomCollisionCheck() == true"
+    ));
+}
+
+#[test]
 fn distance_to_line() {
     let g = game(Realm::Server, &[]);
     assert!(g.eval::<bool>(
@@ -3718,4 +3740,15 @@ fn the_physics_guns_beam_shows_while_its_key_is_down() {
     client.runtime.apply_snapshot(&server.runtime.snapshot());
     client.runtime.drawn(alice);
     assert!(client.runtime.take_primitives().iter().all(|p| p.material.name != "sprites/physbeama"));
+}
+
+#[test]
+fn the_scissor_and_the_main_view() {
+    let g = client_game(&[]);
+    assert!(g.eval::<bool>(
+        "local on, l, t, r, b = surface.GetScissorRect()
+         -- nothing cuts: off, the whole screen
+         local off = on == false and l == 0 and t == 0 and r == 640 and b == 480
+         return off and MainEyePos() == EyePos() and MainEyeAngles() == EyeAngles()"
+    ));
 }
