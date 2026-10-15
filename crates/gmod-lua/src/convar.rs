@@ -41,6 +41,8 @@ const ENGINE_CONVARS: &[(&str, &str, &str)] = &[
     ("deathmatch", "1", "Running a deathmatch server."),
     ("coop", "0", "Cooperative play."),
     ("crosshair", "1", ""),
+    // the map's sky, from its `worldspawn` ([`set_value`] when the map spawns)
+    ("sv_skyname", "sky_day01_01", "Current name of the skybox texture"),
     // the NPC menu of the spawn menu's bar
     ("ai_disabled", "0", "Disables all NPC thinking"),
     ("ai_ignoreplayers", "0", "NPCs ignore players"),
@@ -64,6 +66,8 @@ const CLIENT_CONVARS: &[(&str, &str, &str)] = &[
     ("name", "Player", "Current user name"),
     ("hud_saytext_time", "12", "How long lines of chat show"),
     ("cl_chatfilters", "63", "What the chat shows"),
+    // addons read it for their own translations (`GetConVar("gmod_language"):GetString()`)
+    ("gmod_language", "en", "Changes language of the game"),
 ];
 
 /// A ConVar of a client the server is told of (`GetInfo`).
@@ -243,6 +247,13 @@ fn set(lua: &Lua, handle: ConVarHandle, value: &str) {
     }
 }
 
+/// Sets a ConVar of that name, if there is one.
+pub(crate) fn set_value(lua: &Lua, name: &str, value: &str) {
+    if let Some(handle) = find(lua, name) {
+        set(lua, handle, value);
+    }
+}
+
 /// The value of a ConVar, if there is one of that name.
 pub(crate) fn value(lua: &Lua, name: &str) -> Option<String> {
     find(lua, name).map(|handle| with(lua, handle, |c| c.value.clone()))
@@ -252,9 +263,11 @@ fn with<R>(lua: &Lua, handle: ConVarHandle, f: impl FnOnce(&ConVar) -> R) -> R {
     f(&host(lua).console.convars.borrow()[handle.0])
 }
 
-/// FCVAR flags: a number, or a table of numbers to combine.
+/// FCVAR flags: a number, or a table of numbers to combine; a boolean, which some addons give,
+/// is none, as GMod takes it.
 fn flags_arg(args: &Args, position: usize) -> mlua::Result<i64> {
     match args.get(position) {
+        Some(Value::Boolean(_)) => Ok(0),
         Some(Value::Table(t)) => {
             let mut flags = 0i64;
             for flag in t.sequence_values::<f64>() {

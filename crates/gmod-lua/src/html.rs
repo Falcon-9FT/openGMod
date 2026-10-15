@@ -117,7 +117,7 @@ pub(crate) struct Pages {
     pub web: RefCell<Option<WebPages>>,
     slots: RefCell<HashMap<PanelHandle, Slot>>,
     /// The newest pictures, by image number, until the program takes them.
-    pictures: RefCell<HashMap<u32, Rgba>>,
+    pub(crate) pictures: RefCell<HashMap<u32, Rgba>>,
 }
 
 /// Does something with a panel's page, making it first if the panel has none yet.

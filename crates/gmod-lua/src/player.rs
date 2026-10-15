@@ -255,6 +255,11 @@ pub struct PlayerState {
     /// What the use key works while it is held (a scripted entity used continuously or on and
     /// off).
     pub using: EntityHandle,
+    /// The vehicle the player sits in ([`crate::vehicle`]); how it was turned at the last tick,
+    /// to turn the view with it; the collision group the player had before it.
+    pub vehicle: EntityHandle,
+    pub vehicle_angles: Angle,
+    pub vehicle_group: i64,
     /// What the player stands on (`GetGroundEntity`): the world, an entity, or nothing in the
     /// air; and where that entity was, to carry the player along when it moves.
     pub ground: EntityHandle,
@@ -354,6 +359,9 @@ impl PlayerState {
             hovered_widget: EntityHandle::NULL,
             pressed_widget: EntityHandle::NULL,
             using: EntityHandle::NULL,
+            vehicle: EntityHandle::NULL,
+            vehicle_angles: Angle::default(),
+            vehicle_group: 0,
             ground: EntityHandle::NULL,
             ground_at: None,
             suit: true,
@@ -601,6 +609,12 @@ pub(crate) fn set_last_hit_group(lua: &Lua, handle: EntityHandle, group: i64) {
 
 /// The eyes of a player and where they aim.
 pub(crate) fn eye(lua: &Lua, handle: EntityHandle) -> Option<(Vector, Vector)> {
+    let vehicle = crate::vehicle::of(lua, handle);
+    if vehicle.index.is_some()
+        && let Some((eyes, _)) = crate::vehicle::eyes(lua, vehicle)
+    {
+        return state(lua, handle, |_, p| (eyes, p.eye_angles.vectors().0));
+    }
     let (pos, _) = host(lua).entities.transform(handle)?;
     state(lua, handle, |_, p| (pos + Vector::new(0.0, 0.0, p.moving.view_height), p.eye_angles.vectors().0))
 }
@@ -923,6 +937,16 @@ fn tick(lua: &Lua, handle: EntityHandle) {
         }
     }
 
+    // in a vehicle: its seat, not walking, and no weapon
+    if state(lua, handle, |_, p| p.vehicle.index.is_some()).unwrap_or(false) {
+        let mv = movedata(lua, handle, &cmd, false).and_then(|mv| lua.create_userdata(mv).ok());
+        if crate::vehicle::tick(lua, handle, &ply, mv, pressed) {
+            crate::anim::animate_player(lua, handle);
+            hook(lua, "PlayerPostThink", [Value::UserData(ply)]);
+            return;
+        }
+    }
+
     // movement
     let Some(mut mv) = movedata(lua, handle, &cmd, frozen) else { return };
     let Ok(mv_ud) = lua.create_userdata(mv) else { return };
@@ -955,7 +979,8 @@ fn tick(lua: &Lua, handle: EntityHandle) {
     let (mut buttons, mut pressed) = state(lua, handle, |_, p| (p.buttons, p.buttons & !p.old_buttons)).unwrap_or_default();
     // carrying something, the attack key throws it and the weapon is still
     if crate::pickup::carrying(lua, handle).is_some() {
-        if pressed & IN_ATTACK != 0 {
+        // what the gravity gun holds it launches or lets go; what the hands hold is thrown
+        if !crate::physcannon::holding(lua, handle, active, pressed) && pressed & IN_ATTACK != 0 {
             crate::pickup::drop(lua, handle, true);
         }
         buttons &= !(IN_ATTACK | IN_ATTACK2);
@@ -1662,7 +1687,7 @@ pub(crate) fn bump_weapon(lua: &Lua, handle: EntityHandle, item: EntityHandle) {
 
 /// How far the use key reaches, from the eyes.
 const USE_REACH: f32 = 80.0;
-const IN_USE: u32 = 32;
+pub(crate) const IN_USE: u32 = 32;
 const IN_ATTACK: u32 = 1;
 const IN_ATTACK2: u32 = 2048;
 /// `SetUseType`'s kinds, and the kinds of use `ENT:Use` is given.
@@ -1731,6 +1756,13 @@ fn use_key(lua: &Lua, handle: EntityHandle, buttons: u32, pressed: u32) {
     }
     let allowed = hook(lua, "PlayerUse", [ent_value(lua, handle), ent_value(lua, target)]);
     if matches!(allowed.front(), Some(Value::Boolean(false))) {
+        return;
+    }
+    // a vehicle is sat in
+    if crate::vehicle::is_vehicle(lua, target) {
+        if !crate::vehicle::enter(lua, handle, target, false) {
+            crate::sound::emit_scaled(lua, "HL2Player.UseDeny", handle, 1.0);
+        }
         return;
     }
     let scripted = host(lua).entities.get(target).is_some_and(|ent| ent.scripted);
@@ -2185,7 +2217,8 @@ pub(crate) fn install(lua: &Lua, realm: crate::Realm) -> mlua::Result<()> {
         let (mins, maxs) = read(a, |_, p| p.duck_hull)?;
         Ok(MultiValue::from_iter([entity::vector(a.lua, mins)?, entity::vector(a.lua, maxs)?]))
     })?;
-    Ok(())
+    // sitting in vehicles
+    crate::vehicle::install(lua)
 }
 
 /// Who the player is.
@@ -2757,6 +2790,13 @@ fn install_view(def: &entity::Def) -> mlua::Result<()> {
         let vm = read(a, |_, p| p.view_models.get(index).copied().unwrap_or(EntityHandle::NULL))?;
         entity::push(a.lua, vm)
     })?;
+    // whether the player is drawn as others see them: what the gamemode's
+    // `ShouldDrawLocalPlayer` says; openGMOD draws the view from the eyes, so not otherwise
+    def("ShouldDrawLocalPlayer", |a| {
+        let ply = a.get(1).cloned().unwrap_or(Value::Nil);
+        let said = crate::call_hook(a.lua, "ShouldDrawLocalPlayer", MultiValue::from_iter([ply]));
+        Ok(Value::Boolean(matches!(said.front(), Some(Value::Boolean(true)))))
+    })?;
     entity_field!(def, "GetHands", "SetHands", hands);
     entity_field!(def, "GetHoveredWidget", "SetHoveredWidget", hovered_widget);
     entity_field!(def, "GetPressedWidget", "SetPressedWidget", pressed_widget);
@@ -2869,10 +2909,5 @@ fn install_rest(def: &entity::Def) -> mlua::Result<()> {
         entity::push(a.lua, crate::pickup::carrying(a.lua, handle).unwrap_or(EntityHandle::NULL))
     })?;
     def("GetUseEntity", null)?;
-    def("GetVehicle", null)?;
-    def("InVehicle", no)?;
-    for name in ["EnterVehicle", "ExitVehicle"] {
-        def(name, nothing)?;
-    }
     Ok(())
 }

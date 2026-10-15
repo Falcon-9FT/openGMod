@@ -64,6 +64,7 @@ use mlua::Lua;
 pub mod ai;
 pub mod anim;
 mod args;
+pub mod bass;
 pub mod breakable;
 pub mod bullets;
 pub mod chat;
@@ -98,13 +99,16 @@ pub mod nav;
 pub mod net;
 pub mod npc;
 pub mod outputs;
+pub mod physcannon;
 pub mod physgun;
 pub mod physics;
 pub mod pickup;
 pub mod player;
+pub mod projectiles;
 pub mod pvs;
 pub mod ragdoll;
 pub mod recipients;
+pub mod render3d;
 pub mod resource;
 pub mod sandbox;
 pub mod serverlist;
@@ -112,6 +116,7 @@ pub mod snapshot;
 pub mod sound;
 pub mod sql;
 mod startup;
+pub mod steam;
 pub mod surface;
 mod surfaceprops;
 pub mod timer;
@@ -119,8 +124,10 @@ pub mod trace;
 pub mod triggers;
 pub mod util;
 pub mod vector;
+pub mod vehicle;
 pub mod vgui;
 pub mod weapon;
+pub mod weaponselect;
 pub mod world;
 
 #[cfg(test)]
@@ -287,6 +294,8 @@ pub(crate) struct Host {
     pub physgun: physgun::Guns,
     /// What players carry with the use key.
     pub(crate) hands: pickup::Hands,
+    /// What the engine's weapons fired that is still in flight.
+    pub(crate) projectiles: projectiles::Projectiles,
     pub inputs: inputs::Queue,
     /// The 2D frame `surface` draws, and its fonts; the client and the menu have one.
     pub screen: surface::Screen,
@@ -298,8 +307,14 @@ pub(crate) struct Host {
     pub pages: html::Pages,
     /// The addons and games, and what the main menu tells the program.
     pub menu: menu::Menu,
+    /// The channels of `sound.PlayFile`; the client's.
+    pub channels: bass::Channels,
+    /// What the client's Lua draws in the world this frame.
+    pub render3d: render3d::Frame,
     /// The engine's HUD: where its elements go, its colours.
     pub hud: RefCell<hud::Hud>,
+    /// The row of weapon slots the HUD chooses a weapon in.
+    pub(crate) selection: weaponselect::Selection,
     /// The sounds Lua played, for the program.
     pub sounds: sound::Sounds,
     /// What surfaces are made of.
@@ -399,13 +414,17 @@ impl Runtime {
             physics: physics::World::default(),
             physgun: physgun::Guns::default(),
             hands: pickup::Hands::default(),
+            projectiles: projectiles::Projectiles::default(),
             inputs: inputs::Queue::default(),
             screen: surface::Screen::default(),
             client: client::Client::default(),
             panels: vgui::Panels::default(),
             pages: html::Pages::default(),
             menu: menu::Menu::default(),
+            channels: bass::Channels::default(),
+            render3d: render3d::Frame::default(),
             hud: RefCell::new(hud::Hud::default()),
+            selection: weaponselect::Selection::default(),
             sounds: sound::Sounds::new(realm),
             surfaces: surfaceprops::Surfaces::default(),
             chat: chat::Chat::default(),
@@ -437,6 +456,9 @@ impl Runtime {
         effect::install(&lua)?;
         constraint::install(&lua)?;
         sound::install(&lua)?;
+        if realm != Realm::Server {
+            bass::install(&lua)?;
+        }
         material::install(&lua)?;
         world::install(&lua)?;
         ents::install(&lua, realm)?;
@@ -549,13 +571,15 @@ impl Runtime {
             let before = (clock.cur_time.get() / timer::TICK_INTERVAL).floor();
             let end = clock.cur_time.get() + seconds;
             clock.cur_time.set(end);
-            clock.frame_time.set(seconds);
+            // a server's frame is a tick, as in GMod; a client's is what was drawn
+            clock.frame_time.set(if self.realm() == Realm::Server { timer::TICK_INTERVAL } else { seconds });
             let ticks = ((end / timer::TICK_INTERVAL).floor() - before).max(0.0) as u64;
             clock.ticks.set(clock.ticks.get() + ticks);
             (before, end, ticks)
         };
         convar::run_buffer(&self.lua);
         http::deliver(&self.lua);
+        bass::deliver(&self.lua);
         timer::run_timers(&self.lua);
         // a client does not simulate: what moves comes from the server
         let server = self.realm() == Realm::Server;
@@ -566,21 +590,30 @@ impl Runtime {
                 physgun::think(&self.lua);
                 pickup::think(&self.lua);
                 physics::simulate(&self.lua);
+                projectiles::think(&self.lua);
                 triggers::tick(&self.lua);
                 inputs::service(&self.lua);
                 logic::tick(&self.lua);
                 movers::tick(&self.lua);
                 npc::tick(&self.lua);
             }
-            ents::think(&self.lua);
             if server {
+                ents::think(&self.lua);
                 anim::advance(&self.lua);
                 lagcomp::record(&self.lua);
             }
             self.call_hook("Tick", mlua::MultiValue::new());
+            // the server's frame is the tick: its `Think` runs with each
+            if server {
+                self.call_hook("Think", mlua::MultiValue::new());
+            }
         }
         host(&self.lua).clock.cur_time.set(end);
-        self.call_hook("Think", mlua::MultiValue::new());
+        // a client thinks every frame, its scripted entities too
+        if !server {
+            ents::think(&self.lua);
+            self.call_hook("Think", mlua::MultiValue::new());
+        }
         ents::collect(&self.lua);
     }
 

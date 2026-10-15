@@ -804,13 +804,13 @@ fn weights(vertex: &gmod_model::Vertex) -> Weights {
     out
 }
 
-/// A model on its own, to draw wherever an entity has it: one piece in the model's space (its
-/// first body group, in the pose it was made in, with the bones of every vertex to pose it),
-/// with its materials and textures. The light comes from where it is drawn, so the vertices
-/// have none of their own.
-pub fn model(vfs: &Vfs, name: &str, skin: usize) -> io::Result<World> {
+/// A model on its own, to draw wherever an entity has it: one piece in the model's space (the
+/// body groups of body number `body`, in the pose it was made in, with the bones of every
+/// vertex to pose it), with its materials and textures. The light comes from where it is
+/// drawn, so the vertices have none of their own.
+pub fn model(vfs: &Vfs, name: &str, skin: usize, body: usize) -> io::Result<World> {
     let model = gmod_model::load(vfs, name)?;
-    let mesh = model.mesh(0, skin)?;
+    let mesh = model.mesh(body, skin)?;
     let mut gather = Gather::new(vfs);
     let vertices = mesh
         .vertices

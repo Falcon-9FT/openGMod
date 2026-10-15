@@ -6,8 +6,8 @@
 //!
 //! Lua decides what shows: every element asks `HUDShouldDraw` (`CHudHealth`, `CHudBattery`,
 //! `CHudAmmo`, `CHudSecondaryAmmo`, `CHudCrosshair`, `CHudChat` - the chat box of
-//! [`crate::chat`] - and `CHudGMod` for Lua's own HUD), a
-//! weapon can hide its ammo (`SWEP.DrawAmmo`, `CustomAmmoDisplay`) and its crosshair
+//! [`crate::chat`] - `CHudWeaponSelection` - the row of [`crate::weaponselect`] - and
+//! `CHudGMod` for Lua's own HUD), a weapon can hide its ammo (`SWEP.DrawAmmo`, `CustomAmmoDisplay`) and its crosshair
 //! (`SWEP.DrawCrosshair`, `DoDrawCrosshair`). Around the engine's elements Lua draws its own:
 //! `PreDrawHUD`, `HUDPaintBackground`, then the elements, `HUDPaint`, the weapon's `DrawHUD`,
 //! `HUDDrawScoreBoard`, the chat, `PostDrawHUD`.
@@ -243,8 +243,15 @@ fn label(lua: &Lua, token: &str, english: &str) -> String {
     if phrase == token { english.to_string() } else { phrase }
 }
 
+/// The HUD's colours: of what it shows, and of the boxes behind.
+pub(crate) fn colors(lua: &Lua) -> ([u8; 4], [u8; 4]) {
+    let host = host(lua);
+    let hud = host.hud.borrow();
+    (hud.fg, hud.bg)
+}
+
 /// A box with round corners, as the HUD's backgrounds are.
-fn rounded_box(lua: &Lua, rect: [f32; 4], radius: f32, color: [u8; 4]) {
+pub(crate) fn rounded_box(lua: &Lua, rect: [f32; 4], radius: f32, color: [u8; 4]) {
     let [x, y, w, h] = rect;
     let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
     let mut points = Vec::with_capacity(4 * 5);
@@ -364,6 +371,7 @@ pub(crate) fn paint(lua: &Lua) {
             }
         }
         crosshair(lua, weapon);
+        crate::weaponselect::paint(lua);
     }
     if should_draw(lua, "CHudGMod") {
         call_hook(lua, "HUDPaint", MultiValue::new());

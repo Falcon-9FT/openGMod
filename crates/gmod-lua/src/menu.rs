@@ -62,6 +62,8 @@ pub(crate) struct Menu {
     pub no_addons: Cell<bool>,
     /// The server browser's questions and favourites.
     pub servers: crate::serverlist::Servers,
+    /// Steam, when the program signed in to it, and what was asked of it.
+    pub steam: crate::steam::SteamState,
 }
 
 fn def(lua: &Lua, table: &Table, name: &'static str, f: fn(&Args) -> mlua::Result<Value>) -> mlua::Result<()> {
@@ -108,10 +110,23 @@ function GetAPIManifest( callback )
 	timer.Simple( 0, function() callback( "{}" ) end )
 end
 
+local previews, steam = ...
+
+-- the details of a workshop item: from Steam when the program signed in to it, else from its
+-- public web API
 local details = {}
 function steamworks.FileInfo( id, callback )
 	id = tostring( id )
 	if ( details[ id ] ) then return callback( details[ id ] ) end
+	local function got( info )
+		if ( info.error ) then return callback( info ) end
+		info.installed = steamworks.IsSubscribed( id )
+		info.disabled = !steamworks.ShouldMountAddon( id )
+		info.children = {}
+		details[ id ] = info
+		callback( info )
+	end
+	if ( steam.FileInfo( id, got ) ) then return end
 	HTTP( {
 		url = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
 		method = "POST",
@@ -122,27 +137,113 @@ function steamworks.FileInfo( id, callback )
 			if ( !item or tonumber( item.result ) != 1 ) then return callback( { error = item and item.result or code } ) end
 			local tags = {}
 			for _, tag in ipairs( item.tags or {} ) do tags[ #tags + 1 ] = tag.tag end
-			local info = {
+			got( {
 				id = id, title = item.title or "", description = item.description or "",
 				owner = item.creator or "", ownername = "", previewid = item.preview_url, previewurl = item.preview_url,
 				size = tonumber( item.file_size ) or 0, created = tonumber( item.time_created ) or 0,
 				updated = tonumber( item.time_updated ) or 0, tags = table.concat( tags, "," ),
-				banned = tonumber( item.banned ) == 1, installed = steamworks.IsSubscribed( id ), disabled = !steamworks.ShouldMountAddon( id ),
-				children = {}
-			}
-			details[ id ] = info
-			callback( info )
+				banned = tonumber( item.banned ) == 1
+			} )
 		end,
 		failed = function( reason ) callback( { error = reason } ) end
 	} )
 end
 
--- the details give the address of the preview: it is its own download
+-- the details give the address of the preview: it is its own download, kept in openGMOD's
+-- cache; the menu shows it by the path it gets back (`../<path>` from its page), as GMod's
 function steamworks.Download( id, uncompress, callback )
-	if ( isstring( id ) and id:find( "^https?://" ) ) then return callback( id ) end
-	if ( callback ) then callback( nil ) end
+	if ( !callback ) then return end
+	if ( !isstring( id ) or !id:find( "^https://" ) ) then return callback( nil ) end
+	local kept = previews.find( id )
+	if ( kept ) then return callback( kept ) end
+	HTTP( {
+		url = id,
+		method = "GET",
+		success = function( code, body ) callback( code == 200 and previews.save( id, body ) or nil ) end,
+		failed = function() callback( nil ) end
+	} )
+end
+
+-- the names of workshop authors: from Steam, else their public Steam profiles, asked one at
+-- a time - Steam
+-- turns away many at once (429), and those are asked again a little later
+local names, waiting, queue, busy = {}, {}, {}, false
+local function AskNextName( tries )
+	local steamid = queue[ 1 ]
+	if ( !steamid ) then busy = false return end
+	busy = true
+	local function answer( name )
+		table.remove( queue, 1 )
+		if ( name != "" ) then names[ steamid ] = name end
+		for _, callback in ipairs( waiting[ steamid ] or {} ) do callback( name ) end
+		waiting[ steamid ] = nil
+		timer.Simple( 0.1, function() AskNextName( 0 ) end )
+	end
+	HTTP( {
+		url = "https://steamcommunity.com/profiles/" .. steamid .. "/?xml=1",
+		method = "GET",
+		success = function( code, body )
+			if ( code == 429 and tries < 5 ) then
+				return timer.Simple( 2 ^ tries, function() AskNextName( tries + 1 ) end )
+			end
+			answer( code == 200 and body and body:match( "<steamID><!%[CDATA%[(.-)%]%]></steamID>" ) or "" )
+		end,
+		failed = function() answer( "" ) end
+	} )
+end
+function steamworks.RequestPlayerInfo( steamid, callback )
+	steamid = tostring( steamid )
+	if ( steam.PlayerName( steamid, callback ) ) then return end
+	if ( names[ steamid ] ) then return callback( names[ steamid ] ) end
+	if ( !steamid:find( "^%d+$" ) ) then return callback( "" ) end
+	if ( waiting[ steamid ] ) then return table.insert( waiting[ steamid ], callback ) end
+	waiting[ steamid ] = { callback }
+	queue[ #queue + 1 ] = steamid
+	if ( !busy ) then AskNextName( 0 ) end
 end
 "#;
+
+/// Where the previews of workshop items are kept, in openGMOD's folder: the menu's page
+/// asks for them by this path (`asset://garrysmod/cache/previews/...`).
+pub const PREVIEWS: &str = "cache/previews";
+
+/// The file a preview at `url` is kept in, without its extension: a hash of the address.
+fn preview_stem(url: &str) -> String {
+    // FNV-1a
+    let hash = url.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{PREVIEWS}/{hash:016x}")
+}
+
+/// The picture types a preview may be, by their first bytes.
+const PICTURES: [(&[u8], &str); 3] = [(b"\xff\xd8\xff", "jpg"), (b"\x89PNG", "png"), (b"GIF8", "gif")];
+
+/// The table the menu's Lua keeps previews with: `find(url)` the path of one kept already,
+/// `save(url, body)` keeps one downloaded (a picture only) and gives its path.
+pub(crate) fn previews(lua: &Lua) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.raw_set(
+        "find",
+        lua.create_function(|lua, url: String| {
+            let stem = preview_stem(&url);
+            let host = host(lua);
+            let dir = host.data_dir.borrow();
+            let Some(dir) = dir.as_ref() else { return Ok(None) };
+            Ok(PICTURES.iter().map(|(_, ext)| format!("{stem}.{ext}")).find(|path| dir.path(path).is_ok_and(|p| p.is_file())))
+        })?,
+    )?;
+    table.raw_set(
+        "save",
+        lua.create_function(|lua, (url, body): (String, mlua::LuaString)| {
+            let body = body.as_bytes();
+            let Some((_, ext)) = PICTURES.iter().find(|(magic, _)| body.starts_with(magic)) else { return Ok(None) };
+            let path = format!("{}.{ext}", preview_stem(&url));
+            let host = host(lua);
+            let dir = host.data_dir.borrow();
+            Ok(dir.as_ref().and_then(|dir| dir.write(&path, &body).ok()).map(|_| path))
+        })?,
+    )?;
+    Ok(table)
+}
 
 pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     let engine = library(lua, "engine")?;
@@ -272,12 +373,6 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         }
         Ok(Value::Nil)
     })?;
-    def(lua, &steamworks, "RequestPlayerInfo", |a| {
-        if let Some(Value::Function(f)) = a.values.get(1) {
-            call_back(a.lua, f.clone(), "");
-        }
-        Ok(Value::Nil)
-    })?;
     def(lua, &steamworks, "GetPlayerName", |a| Ok(Value::String(a.lua.create_string("")?)))?;
     def(lua, &steamworks, "ViewFile", |a| {
         let id = a.string(1)?;
@@ -302,12 +397,13 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     ] {
         def(lua, &steamworks, name, nothing)?;
     }
+    crate::steam::install(lua, &steamworks)?;
 
     let serverlist = library(lua, "serverlist")?;
     crate::serverlist::install(lua, &serverlist)?;
 
     let chunk = lua.load(MENU_LUA).set_name("=[openGMOD menu]");
-    chunk.exec()
+    chunk.call((previews(lua)?, crate::steam::natives(lua)?))
 }
 
 /// The program's side of the menu.
@@ -315,6 +411,13 @@ impl crate::Runtime {
     /// The addons there are, mounted or not: `engine.GetAddons`, and what the menu switches.
     pub fn set_addons(&self, addons: Vec<Addon>) {
         *host(&self.lua).menu.addons.borrow_mut() = addons;
+    }
+
+    /// The addons there are changed (subscribed to or left on Steam): the menu lists them
+    /// anew (`WorkshopSubscriptionsChanged`).
+    pub fn addons_changed(&self, addons: Vec<Addon>) {
+        self.set_addons(addons);
+        crate::call_hook(&self.lua, "WorkshopSubscriptionsChanged", MultiValue::new());
     }
 
     /// The addons as the menu left them, when it applied a change since the last call

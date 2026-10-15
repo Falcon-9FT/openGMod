@@ -40,11 +40,21 @@ pub struct MountOptions {
     pub unpack_dir: Option<PathBuf>,
     /// Addons switched off, by [`workshop::addon_key`]: not mounted.
     pub disabled: HashSet<String>,
+    /// The workshop items the player is subscribed to, as Steam lists them; the others of
+    /// Steam's workshop folder are server downloads ([`workshop::addon_files`]). None: all.
+    pub subscribed: Option<HashSet<u64>>,
 }
 
 impl Default for MountOptions {
     fn default() -> MountOptions {
-        MountOptions { addons: true, server_downloads: false, mount_cfg: true, unpack_dir: None, disabled: HashSet::new() }
+        MountOptions {
+            addons: true,
+            server_downloads: false,
+            mount_cfg: true,
+            unpack_dir: None,
+            disabled: HashSet::new(),
+            subscribed: None,
+        }
     }
 }
 
@@ -122,7 +132,7 @@ pub fn mount_install(install: &Install, options: &MountOptions) -> (Vfs, Vec<Str
             !inside
         });
         let mut slot = addon_slot.unwrap_or(vfs.mounts().len());
-        for addon in workshop::addon_files(install) {
+        for addon in workshop::addon_files(install, options.subscribed.as_ref()) {
             let wanted = match addon.origin {
                 Origin::Subscribed | Origin::AddonsFolder => options.addons,
                 Origin::ServerDownload => options.server_downloads,

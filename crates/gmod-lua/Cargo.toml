@@ -17,6 +17,7 @@ gmod-physics.workspace = true
 gmod-glua.workspace = true
 gmod-ui.workspace = true
 gmod-audio.workspace = true
+gmod-steam.workspace = true
 mlua.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

@@ -24,7 +24,7 @@ fn breakable_map(entities: Vec<Vec<(String, String)>>) -> Map {
         vec![TestBrush::cuboid([-112.0, -8.0, 48.0], [-104.0, 8.0, 64.0])],
     ];
     let mut all = vec![
-        pairs(&[("classname", "worldspawn")]),
+        pairs(&[("classname", "worldspawn"), ("skyname", "sky_test")]),
         pairs(&[("classname", "info_player_start"), ("origin", "0 0 0"), ("angles", "0 0 0")]),
         pairs(&[("classname", "info_target"), ("targetname", "rec")]),
     ];
@@ -84,6 +84,12 @@ fn items_game(map: Map) -> (Game, EntityHandle) {
         "item_ammo_smg1_grenade",
         "item_box_buckshot",
         "item_ammo_ar2_altfire",
+        "item_suit",
+        "combine_mine",
+        "grenade_helicopter",
+        "npc_grenade_frag",
+        "weapon_striderbuster",
+        "prop_thumper",
     ];
     let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
     for class in classes {
@@ -231,6 +237,55 @@ fn items_are_taken_when_they_are_of_use() {
         .unwrap();
     g.runtime.think(0.1);
     assert!(g.eval::<bool>("return not IsValid(KIT) and Entity(1):Health() == 50"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn the_things_of_the_entities_tab_have_their_models() {
+    let (g, _) = items_game(breakable_map(Vec::new()));
+    // what the spawn menu's Entities tab puts down besides the items: a model, and a body
+    // that falls - but the thumper, which stands
+    for class in ["item_suit", "combine_mine", "grenade_helicopter", "npc_grenade_frag", "weapon_striderbuster"] {
+        let model = crate::items::model_of(class).unwrap();
+        assert!(
+            g.eval::<bool>(&format!(
+                "THING = spawn('{class}', -300, 0, 100)
+                 return THING:GetModel() == '{model}' and THING:GetPhysicsObject():IsValid() and not THING:IsWeapon()"
+            )),
+            "{class}"
+        );
+        g.runtime.think(0.5);
+        assert!(g.eval::<bool>("local fell = THING:GetPos().z < 50 THING:Remove() return fell"), "{class} falls");
+    }
+    assert!(g.eval::<bool>(
+        "local t = spawn('prop_thumper', -300, 0, 100)
+         return t:GetModel() == 'models/props_combine/combinethumper002.mdl' and not t:GetPhysicsObject():IsValid()"
+    ));
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>("return ents.FindByClass('prop_thumper')[1]:GetPos().z == 100"), "the thumper stands");
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn the_map_gives_its_sky_and_addons_their_convars() {
+    let (g, _) = items_game(breakable_map(Vec::new()));
+    // `sv_skyname` is the sky of the map's worldspawn; flags given as a boolean are none
+    assert!(g.eval::<bool>(
+        "local made = CreateConVar('addon_setting', 200, false)
+         return GetConVar_Internal('sv_skyname'):GetString() == 'sky_test' and made:GetInt() == 200 and GetConVar_Internal('addon_setting') ~= nil"
+    ));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn seats_have_the_body_of_their_model() {
+    let (g, _) = items_game(breakable_map(Vec::new()));
+    // a seat is a vehicle with a body, for addons to weld; no one sits in it yet
+    assert!(g.eval::<bool>(
+        "local seat = spawn('prop_vehicle_prisoner_pod', -300, 0, 100, 'models/crate.mdl')
+         return seat:IsVehicle() and seat:GetPhysicsObject():IsValid() and seat:GetDriver() == NULL
+             and seat:TestPVS(Vector(0, 0, 0)) and seat:TestPVS(Entity(1))"
+    ));
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
 

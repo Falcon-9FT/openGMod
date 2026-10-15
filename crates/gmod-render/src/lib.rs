@@ -33,7 +33,10 @@ use gmod_world::gpu::{self, Camera, Draw, PixelFormat, TextureData};
 use gmod_world::sky::SkyCamera;
 use gmod_world::{Piece, Surface, Texture, World};
 
+mod effects;
 mod ui;
+
+pub use effects::{EffectBatch, EffectVertex};
 
 pub use ui::Overlay;
 
@@ -290,6 +293,8 @@ pub struct Renderer {
     time: f32,
     /// Textures that could not be uploaded and are drawn as missing.
     pub failed_textures: Vec<String>,
+    /// What the game draws in the world this frame: beams, sprites, quads.
+    effects: effects::Effects,
 }
 
 fn buffer(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, usage: wgpu::BufferUsages, data: &[u8]) -> wgpu::Buffer {
@@ -849,6 +854,7 @@ impl Renderer {
         let camera_buffer = camera_buffer(device, camera_slots);
         let camera_group = camera_group(device, &layouts.camera, &camera_buffer);
 
+        let effects = effects::Effects::new(device, queue, &layouts.camera, format);
         let shared = Shared {
             samplers: (0..4).map(|i| sampler(device, i & 1 != 0, i & 2 != 0, true)).collect(),
             missing: views(device, queue, "missing", &gpu::missing_texture()),
@@ -929,7 +935,32 @@ impl Renderer {
             depth: None,
             time: 0.0,
             failed_textures,
+            effects,
         }
+    }
+
+    /// Whether a texture of that name was uploaded already (or failed to be).
+    pub fn has_texture(&self, name: &str) -> bool {
+        self.textures.contains_key(name)
+    }
+
+    /// Uploads a texture for effects to be drawn with, by its name ([`EffectBatch::texture`]);
+    /// one known already is not uploaded again.
+    pub fn add_effect_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &Texture) {
+        if self.textures.contains_key(&texture.name) {
+            return;
+        }
+        let uploaded = self.shared.texture(device, queue, texture);
+        if uploaded.is_none() {
+            self.failed_textures.push(texture.name.clone());
+        }
+        self.textures.insert(texture.name.clone(), uploaded);
+    }
+
+    /// What the game draws in the world from now on ([`EffectBatch`]), over the world and the
+    /// entities.
+    pub fn set_effects(&mut self, batches: Vec<EffectBatch>) {
+        self.effects.batches = batches;
     }
 
     /// The time from now on, in seconds into the map: what materials that change with time
@@ -998,6 +1029,69 @@ impl Renderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.depth = Some((view.clone(), size));
         view
+    }
+
+    /// Draws one model alone into `target`, `size` pixels cleared to nothing first: a spawn
+    /// icon. Lit evenly, as it was made (its bones at rest), at the origin unturned, seen
+    /// through `camera`; with buffers of its own, so the frame's are as they were.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_model(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        size: (u32, u32),
+        camera: &Camera,
+        model: ModelId,
+    ) {
+        let Some(mesh) = self.models.get(model.0) else { return };
+        let depth = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("model depth"),
+                size: wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let aspect = size.0.max(1) as f32 / size.1.max(1) as f32;
+        let (matrix, _) = gpu::placement([0.0; 3], [0.0; 3]);
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        // light from everywhere, more from above and the front, as a studio's
+        let side = [0.55; 3];
+        let light = gmod_world::light::ModelLight { ambient: [[0.8; 3], side, side, side, [0.95; 3], [0.3; 3]], lights: Vec::new() };
+        let moment = lights_bytes(&[], None, true, [0.0; 3], identity, 1.0);
+        let needed = mesh.skin.as_ref().map_or(0, |(_, needed)| *needed);
+        let first_bone = (needed > 0).then_some(0);
+        let [x, y, z] = camera.eye;
+        let bytes = camera_bytes(
+            gpu::multiply(&camera.view_projection(aspect), &matrix),
+            [x, y, z, 1.0],
+            Some(&light),
+            &moment,
+            first_bone,
+            &[0.0; 8],
+        );
+        let buffer = camera_buffer(device, 1);
+        queue.write_buffer(&buffer, 0, &bytes);
+        let group = camera_group(device, &self.shared.layouts.camera, &buffer);
+        // every bone where it was made
+        let (bones, bones_group) = bones_buffer(device, &self.shared.layouts.bones, needed.max(1));
+        let rest: Vec<u8> = (0..needed.max(1))
+            .flat_map(|_| [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        queue.write_buffer(&bones, 0, &rest);
+        let clear = wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 });
+        let mut pass = begin_pass(encoder, "model", target, &depth, clear);
+        let draw = Drawing { pipelines: &self.pipelines, camera: &group, bones: &bones_group };
+        let mut current = None;
+        draw.mesh(&mut pass, &mut current, 0, mesh, (0..mesh.draws.len()).filter(|&i| !mesh.draws[i].1.translucent()));
+        draw.mesh(&mut pass, &mut current, 0, mesh, (0..mesh.draws.len()).filter(|&i| mesh.draws[i].1.translucent()));
     }
 
     /// Draws a frame into `target`, a view of `size` pixels.
@@ -1098,6 +1192,7 @@ impl Renderer {
 
         // the world, its depth cleared: all of the sky is behind it, however near the 3D sky
         // box was drawn
+        let effects = self.effects.prepare(device, queue, &self.textures, &self.shared.samplers);
         let mut pass = begin_pass(encoder, "world", target, &depth, wgpu::LoadOp::Load);
         let (first, translucent) = order(&self.world.draws, camera.eye);
         let draw = Drawing { pipelines: &self.pipelines, camera: &self.camera_group, bones: &self.bones_group };
@@ -1113,6 +1208,8 @@ impl Renderer {
             let mesh = &self.models[placed.model.0];
             draw.mesh(&mut pass, &mut current, slot(1 + i), mesh, (0..mesh.draws.len()).filter(|&i| mesh.draws[i].1.translucent()));
         }
+        // what the game draws by itself, over all that, behind what is in front of it
+        self.effects.draw(&mut pass, &self.camera_group, &effects);
         drop(pass);
         if self.view_models.is_empty() {
             return;

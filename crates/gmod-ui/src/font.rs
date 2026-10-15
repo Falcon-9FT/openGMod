@@ -320,12 +320,15 @@ impl Fonts {
             self.read_system_fonts();
         }
         let candidates = self.by_family.get(&key)?;
-        // a full name ("Roboto Bold") is that face
-        if let Some(&exact) = candidates.iter().find(|&&i| self.faces[i].full_name == key && self.faces[i].names[0] != key) {
+        // the file of the game of that name, over the others that go by it - even one whose
+        // full name it is (HL2MP.ttf's is "HalfLife2" too)
+        let by_file: Vec<usize> = candidates.iter().copied().filter(|&i| self.faces[i].file.as_deref() == Some(key.as_str())).collect();
+        // else a full name ("Roboto Bold") is that face
+        if by_file.is_empty()
+            && let Some(&exact) = candidates.iter().find(|&&i| self.faces[i].full_name == key && self.faces[i].names[0] != key)
+        {
             return Some(exact);
         }
-        // the file of the game of that name, over the others that go by it
-        let by_file: Vec<usize> = candidates.iter().copied().filter(|&i| self.faces[i].file.as_deref() == Some(key.as_str())).collect();
         let candidates = if by_file.is_empty() { candidates.clone() } else { by_file };
         candidates.into_iter().min_by_key(|&i| {
             let face = &self.faces[i];

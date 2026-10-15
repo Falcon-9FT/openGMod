@@ -2401,9 +2401,16 @@ fn image_if_there(lua: &Lua, path: &str) -> Option<u32> {
     host.vfs.exists(&format!("materials/{path}"), "GAME").then(|| host.screen.image_id(path, false))
 }
 
-/// The spawn icon the game has of a model: `spawnicons/models/....png`.
+/// The spawn icon the game has of a model (`spawnicons/models/....png`), else a picture of it
+/// the program makes.
 fn spawn_icon(lua: &Lua, model: &str) -> Option<u32> {
     let stem = model.to_lowercase();
     let stem = stem.strip_suffix(".mdl").unwrap_or(&stem);
-    image_if_there(lua, &format!("spawnicons/{stem}.png"))
+    if stem.is_empty() {
+        return None;
+    }
+    image_if_there(lua, &format!("spawnicons/{stem}.png")).or_else(|| {
+        let host = host(lua);
+        host.vfs.exists(&format!("{stem}.mdl"), "GAME").then(|| host.screen.model_icon(&format!("{stem}.mdl")))
+    })
 }

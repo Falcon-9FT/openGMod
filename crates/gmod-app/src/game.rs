@@ -81,6 +81,9 @@ pub struct Shown {
     /// The game turned the player itself (a spawn, `SetEyeAngles`): the camera's pitch and
     /// yaw from now on.
     pub turned: Option<(f32, f32)>,
+    /// The client's Lua looks elsewhere than the player does (`CalcView`): the pitch and yaw
+    /// to draw with, this frame only.
+    pub look: Option<(f32, f32)>,
     pub view: PlayerView,
 }
 
@@ -301,6 +304,21 @@ impl Game {
 
     /// Runs a console command as the player: on the server in this program, or through the
     /// client's console, which sends the server what it does not know itself.
+    /// A key of choosing a weapon: the client's row of slots, or the key's command to the
+    /// server when its HUD does not choose.
+    pub fn choose_weapon(&self, choose: gmod_lua::weaponselect::Choose) {
+        if let Some(line) = self.client.choose_weapon(choose) {
+            self.command(&line);
+        }
+    }
+
+    /// The weapon chosen in the row of slots, taken.
+    pub fn take_chosen_weapon(&self) {
+        if let Some(line) = self.client.take_chosen_weapon() {
+            self.command(&line);
+        }
+    }
+
     pub fn command(&self, line: &str) {
         match &self.link {
             Link::Local(server) => server.runtime().run_player_command(self.player, line),
@@ -381,7 +399,12 @@ impl Game {
         // over the network the player's angles come back late: the eyes look where the mouse
         // says now
         let angles = if local { view.angles } else { Angle::new(pitch, yaw, 0.0) };
-        self.client.set_view(gmod_lua::client::View { origin: Vector::new(eye[0], eye[1], eye[2]), angles, fov: view.fov });
+        // as the client's Lua makes the view of it (a vehicle's, from behind)
+        let eyes = gmod_lua::client::View { origin: Vector::new(eye[0], eye[1], eye[2]), angles, fov: view.fov };
+        let seen = self.client.calc_view(self.player, eyes);
+        self.client.set_view(seen);
+        let eye = [seen.origin.x, seen.origin.y, seen.origin.z];
+        let look = (angle_apart(seen.angles.p, angles.p) || angle_apart(seen.angles.y, angles.y)).then_some((seen.angles.p, seen.angles.y));
         self.client.think(seconds);
         // the camera takes the angles the game gave the player (a spawn, `SetEyeAngles`); in
         // this program also whatever else turned them, which comes at once
@@ -389,7 +412,7 @@ impl Game {
         self.turned = Some(view.turned);
         let apart = local && (angle_apart(view.angles.p, pitch) || angle_apart(view.angles.y, yaw));
         let turned = (given || apart).then_some((view.angles.p, view.angles.y));
-        Some(Shown { eye, turned, view })
+        Some(Shown { eye, turned, look, view })
     }
 
     /// The models of the entities the player sees.
@@ -430,15 +453,17 @@ fn deliver(client: &Runtime, host: ForHost, sounds: &mut Vec<gmod_lua::sound::So
 /// has it, and given to the renderer.
 pub struct Models {
     vfs: Arc<Vfs>,
-    /// By name and skin; none for those that could not be read.
-    loaded: HashMap<(String, i64), Option<ModelId>>,
+    /// By name, skin and body number; none for those that could not be read.
+    loaded: HashMap<(String, i64, usize), Option<ModelId>>,
     /// The map's brush models that move (`*3`), ready to upload when first drawn.
     brushes: HashMap<usize, World>,
+    /// The materials of what the game draws by itself (beams, sprites).
+    pub materials: crate::effects::Materials,
 }
 
 impl Models {
     pub fn new(vfs: Arc<Vfs>) -> Models {
-        Models { vfs, loaded: HashMap::new(), brushes: HashMap::new() }
+        Models { materials: crate::effects::Materials::new(vfs.clone()), vfs, loaded: HashMap::new(), brushes: HashMap::new() }
     }
 
     /// With the brush models of the map that are drawn where their entities are: doors,
@@ -448,19 +473,38 @@ impl Models {
         self
     }
 
+    /// A model to picture alone (a spawn icon), as it is made - skin 0, its first body - read
+    /// and handed to `upload` the first time; and its bounds, its vertices' box.
+    pub fn icon_model(&mut self, name: &str, mut upload: impl FnMut(&World) -> ModelId) -> Option<(ModelId, [f32; 3], [f32; 3])> {
+        let name = name.to_ascii_lowercase().replace('\\', "/");
+        let model = gmod_world::model(&self.vfs, &name, 0, 0).ok()?;
+        let mut bounds = ([f32::MAX; 3], [f32::MIN; 3]);
+        for vertex in model.pieces.iter().flat_map(|p| &p.vertices) {
+            for i in 0..3 {
+                bounds.0[i] = bounds.0[i].min(vertex.position[i]);
+                bounds.1[i] = bounds.1[i].max(vertex.position[i]);
+            }
+        }
+        if bounds.0[0] > bounds.1[0] {
+            return None;
+        }
+        let id = *self.loaded.entry((name, 0, 0)).or_insert_with(|| Some(upload(&model)));
+        Some((id?, bounds.0, bounds.1))
+    }
+
     /// Where to draw the models of `drawn`. Those not seen before are read and handed to
     /// `upload`; one that cannot be read is told once and not drawn.
     pub fn place(&mut self, drawn: &[Drawn], mut upload: impl FnMut(&World) -> ModelId) -> Vec<Placed> {
         drawn
             .iter()
             .filter_map(|d| {
-                let key = (d.model.to_ascii_lowercase().replace('\\', "/"), d.skin);
+                let key = (d.model.to_ascii_lowercase().replace('\\', "/"), d.skin, d.body);
                 let brushes = &self.brushes;
-                let model = *self.loaded.entry(key).or_insert_with_key(|(name, skin)| {
+                let model = *self.loaded.entry(key).or_insert_with_key(|(name, skin, body)| {
                     if let Some(index) = name.strip_prefix('*').and_then(|n| n.parse::<usize>().ok()) {
                         return brushes.get(&index).filter(|w| !w.pieces.is_empty()).map(&mut upload);
                     }
-                    match gmod_world::model(&self.vfs, name, usize::try_from(*skin).unwrap_or(0)) {
+                    match gmod_world::model(&self.vfs, name, usize::try_from(*skin).unwrap_or(0), *body) {
                         Ok(model) => Some(upload(&model)),
                         Err(e) => {
                             println!("{name}: {e}");
@@ -862,6 +906,7 @@ mod tests {
             entity: EntityHandle::NULL,
             model: "models/props_c17/oildrum001.mdl".into(),
             skin: 0,
+            body: 0,
             origin: Vector::new(1.0, 2.0, 3.0),
             angles: Angle::new(0.0, 90.0, 0.0),
             scale: 1.0,
@@ -870,7 +915,7 @@ mod tests {
         // not in the game's files: not drawn, and not looked for again
         assert!(models.place(&[drawn.clone(), drawn.clone()], |_| unreachable!("nothing to upload")).is_empty());
         assert_eq!(models.loaded.len(), 1);
-        assert_eq!(models.loaded.get(&(drawn.model.clone(), 0)), Some(&None));
+        assert_eq!(models.loaded.get(&(drawn.model.clone(), 0, 0)), Some(&None));
     }
 
     #[test]

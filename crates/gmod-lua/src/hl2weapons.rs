@@ -11,9 +11,13 @@
 //! line and then a box: what it hits takes club damage (`ACT_VM_HITCENTER`, `melee_hit`),
 //! a miss plays `ACT_VM_MISSCENTER` and `single_shot`.
 //!
+//! The second attack key: the shotgun fires both barrels, the SMG its grenade, the AR2 its
+//! ball. The frag grenade is thrown (or, with the second key, lobbed), the RPG fires a rocket
+//! at a time, the crossbow a bolt; what they fire flies in [`crate::projectiles`]. The gravity
+//! gun is [`crate::physcannon`].
+//!
 //! How often each fires, how far its bullets spread and how hard it kicks are our own
-//! choices, near what the game does. The secondary fire of the SMG, the AR2 and the shotgun,
-//! the crossbow, the RPG, grenades and the gravity gun are not here yet.
+//! choices, near what the game does.
 
 use mlua::{Lua, Value};
 
@@ -25,6 +29,7 @@ use crate::trace::{self, Filter, Sweep};
 use crate::vector::{Angle, Vector};
 
 const IN_ATTACK: u32 = 1;
+const IN_ATTACK2: u32 = 2048;
 const IN_RELOAD: u32 = 8192;
 const DMG_CLUB: i64 = 128;
 
@@ -124,13 +129,55 @@ pub(crate) fn frame(lua: &Lua, weapon: EntityHandle, buttons: u32, pressed: u32)
     if !host(lua).entities.is_valid(owner) {
         return;
     }
+    let ready = |slot: usize| state(lua, weapon).is_some_and(|s| s.next_fire[slot] <= now(lua) && s.reload.is_none());
+    match class.as_str() {
+        crate::physcannon::CLASS => return crate::physcannon::frame(lua, owner, weapon, buttons, pressed),
+        "weapon_frag" => {
+            for (key, lob) in [(IN_ATTACK, false), (IN_ATTACK2, true)] {
+                if pressed & key != 0 && ready(0) {
+                    throw_grenade(lua, owner, weapon, lob);
+                }
+            }
+            return;
+        }
+        "weapon_rpg" => {
+            if pressed & IN_ATTACK != 0 && ready(0) && !crate::projectiles::rocket_flying(lua, owner) {
+                fire_projectile(lua, owner, weapon, crate::projectiles::Kind::Rocket, 0, 600.0, "single_shot", "ACT_VM_PRIMARYATTACK", 0.5);
+            }
+            return;
+        }
+        "weapon_crossbow" => {
+            if buttons & IN_RELOAD != 0 || state(lua, weapon).is_some_and(|s| s.clip[0] == 0 && s.next_fire[0] <= now(lua)) {
+                crate::weapon::default_reload(lua, weapon, act(lua, "ACT_VM_RELOAD"));
+            }
+            if pressed & IN_ATTACK != 0 && ready(0) {
+                fire_projectile(lua, owner, weapon, crate::projectiles::Kind::Bolt, 0, 3500.0, "single_shot", "ACT_VM_PRIMARYATTACK", 0.75);
+            }
+            return;
+        }
+        _ => {}
+    }
     if let Some(gun) = GUNS.iter().find(|g| g.class == class) {
         if buttons & IN_RELOAD != 0 {
             crate::weapon::default_reload(lua, weapon, act(lua, "ACT_VM_RELOAD"));
         }
         let wants = if gun.automatic { buttons & IN_ATTACK != 0 } else { pressed & IN_ATTACK != 0 };
-        if wants && state(lua, weapon).is_some_and(|s| s.next_fire[0] <= now(lua) && s.reload.is_none()) {
+        if wants && ready(0) {
             crate::lagcomp::compensated_shot(lua, owner, || fire(lua, owner, weapon, gun));
+        }
+        if pressed & IN_ATTACK2 != 0 && ready(1) && ready(0) {
+            match gun.class {
+                "weapon_shotgun" => crate::lagcomp::compensated_shot(lua, owner, || both_barrels(lua, owner, weapon, gun)),
+                "weapon_smg1" => {
+                    let kind = crate::projectiles::Kind::SmgGrenade;
+                    fire_projectile(lua, owner, weapon, kind, 1, 1000.0, "double_shot", "ACT_VM_SECONDARYATTACK", 1.0);
+                }
+                "weapon_ar2" => {
+                    let kind = crate::projectiles::Kind::Ball;
+                    fire_projectile(lua, owner, weapon, kind, 1, 1000.0, "double_shot", "ACT_VM_SECONDARYATTACK", 1.0);
+                }
+                _ => {}
+            }
         }
     } else if let Some(melee) = MELEE.iter().find(|m| m.class == class)
         && buttons & IN_ATTACK != 0
@@ -178,6 +225,116 @@ fn fire(lua: &Lua, owner: EntityHandle, weapon: EntityHandle, gun: &Gun) {
     }
     kick(lua, owner, gun.kick.0 * (0.5 + 0.5 * roll(lua).abs()), gun.kick.1 * roll(lua));
     set_next_fire(lua, weapon, now(lua) + gun.interval);
+}
+
+/// Takes a round of a weapon's primary (`slot` 0) or secondary ammo: from its clip if it has
+/// one, else from what its owner carries. Whether there was one.
+fn take_round(lua: &Lua, owner: EntityHandle, weapon: EntityHandle, slot: usize) -> bool {
+    let Some(data) = crate::weapon::data(lua, weapon) else { return false };
+    if data.clip_size[slot] >= 0 {
+        let has = state(lua, weapon).is_some_and(|s| s.clip[slot] > 0);
+        if has {
+            host(lua).entities.with_mut(weapon, |ent| {
+                if let Some(w) = ent.weapon.as_mut() {
+                    w.clip[slot] -= 1;
+                }
+            });
+        }
+        return has;
+    }
+    let ammo = crate::weapon::ammo_id(lua, &data.ammo[slot]);
+    if crate::player::ammo_count(lua, owner, ammo) <= 0 {
+        return false;
+    }
+    crate::player::remove_ammo(lua, owner, ammo, 1);
+    true
+}
+
+fn set_next(lua: &Lua, weapon: EntityHandle, slot: usize, at: f64) {
+    host(lua).entities.with_mut(weapon, |ent| {
+        if let Some(w) = ent.weapon.as_mut() {
+            w.next_fire[slot] = at;
+        }
+    });
+}
+
+/// Where what a weapon fires leaves it: before the eyes, a little to the right and down.
+fn muzzle(lua: &Lua, owner: EntityHandle) -> Option<(Vector, Vector)> {
+    let (eye, aim) = crate::player::eye(lua, owner)?;
+    let (_, right, up) = aim.angle().vectors();
+    Some((eye + aim * 16.0 + right * 6.0 - up * 4.0, aim))
+}
+
+/// A weapon fires something that flies, with a round of `slot`'s ammo: at `speed` along the
+/// aim, its sound and its view model's activity, the next shot of both keys `interval` on.
+#[allow(clippy::too_many_arguments)]
+fn fire_projectile(
+    lua: &Lua,
+    owner: EntityHandle,
+    weapon: EntityHandle,
+    kind: crate::projectiles::Kind,
+    slot: usize,
+    speed: f32,
+    sound_of: &str,
+    activity: &str,
+    interval: f64,
+) {
+    let Some(data) = crate::weapon::data(lua, weapon) else { return };
+    if !take_round(lua, owner, weapon, slot) {
+        sound(lua, weapon, &data, "empty");
+        set_next(lua, weapon, slot, now(lua) + 0.3);
+        return;
+    }
+    let Some((from, aim)) = muzzle(lua, owner) else { return };
+    crate::projectiles::launch(lua, kind, owner, weapon, from, aim * speed);
+    crate::anim::send_weapon_anim(lua, weapon, act(lua, activity));
+    crate::anim::animation_event(lua, owner, crate::anim::EVENT_ATTACK_PRIMARY, 0);
+    sound(lua, weapon, &data, sound_of);
+    kick(lua, owner, 2.0, roll(lua));
+    set_next(lua, weapon, 0, now(lua) + interval);
+    set_next(lua, weapon, 1, now(lua) + interval);
+}
+
+/// A frag grenade thrown overhand, or lobbed underhand with the second key.
+fn throw_grenade(lua: &Lua, owner: EntityHandle, weapon: EntityHandle, lob: bool) {
+    if !take_round(lua, owner, weapon, 0) {
+        return;
+    }
+    let Some((from, aim)) = muzzle(lua, owner) else { return };
+    let own = host(lua).entities.get(owner).map(|e| e.velocity).unwrap_or_default();
+    let velocity = if lob { aim * 350.0 + Vector::new(0.0, 0.0, 50.0) } else { (aim + Vector::new(0.0, 0.0, 0.1)) * 1200.0 } + own;
+    crate::projectiles::launch(lua, crate::projectiles::Kind::Frag, owner, weapon, from, velocity);
+    crate::anim::send_weapon_anim(lua, weapon, act(lua, if lob { "ACT_VM_HAULBACK" } else { "ACT_VM_THROW" }));
+    crate::anim::animation_event(lua, owner, crate::anim::EVENT_ATTACK_PRIMARY, 0);
+    crate::sound::emit_scaled(lua, if lob { "WeaponFrag.Roll" } else { "WeaponFrag.Throw" }, weapon, 1.0);
+    set_next(lua, weapon, 0, now(lua) + 1.0);
+}
+
+/// The shotgun's second key: both barrels, two shells, twice the pellets.
+fn both_barrels(lua: &Lua, owner: EntityHandle, weapon: EntityHandle, gun: &Gun) {
+    let Some(data) = crate::weapon::data(lua, weapon) else { return };
+    if !state(lua, weapon).is_some_and(|s| s.clip[0] >= 2) {
+        return fire(lua, owner, weapon, gun);
+    }
+    host(lua).entities.with_mut(weapon, |ent| {
+        if let Some(w) = ent.weapon.as_mut() {
+            w.clip[0] -= 2;
+        }
+    });
+    crate::anim::send_weapon_anim(lua, weapon, act(lua, "ACT_VM_SECONDARYATTACK"));
+    crate::anim::animation_event(lua, owner, crate::anim::EVENT_ATTACK_PRIMARY, 0);
+    sound(lua, weapon, &data, "double_shot");
+    if let Some(mut b) = bullets::from_eyes(lua, owner) {
+        let spread = (gun.cone.to_radians() * 0.5).sin();
+        b.spread = Vector::new(spread, spread, 0.0);
+        b.num = gun.pellets * 2;
+        b.ammo_type = data.ammo[0].clone();
+        b.tracer = gun.tracer;
+        bullets::fire(lua, owner, b);
+    }
+    kick(lua, owner, gun.kick.0 * 2.0, gun.kick.1 * roll(lua));
+    set_next(lua, weapon, 0, now(lua) + gun.interval * 2.0);
+    set_next(lua, weapon, 1, now(lua) + gun.interval * 2.0);
 }
 
 /// A melee weapon swings at what is before the eyes.

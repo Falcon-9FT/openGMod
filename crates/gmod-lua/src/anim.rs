@@ -166,6 +166,9 @@ pub(crate) struct Anims {
     private: RefCell<Vec<String>>,
     /// For choosing among sequences of an activity.
     random: Cell<u64>,
+    /// The bones of entities whose `BuildBonePositions` callbacks run now, in their models'
+    /// space: what `GetBoneMatrix` reads and `SetBoneMatrix` changes while they do.
+    building: RefCell<HashMap<EntityHandle, Vec<BoneMatrix>>>,
 }
 
 /// The rig of a studio model (with the models it includes and its `.ani`), read once.
@@ -495,6 +498,10 @@ pub(crate) fn model_bones(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Rig>, 
 
 fn model_bones_at(lua: &Lua, handle: EntityHandle, depth: u32) -> Option<(Arc<Rig>, Vec<BoneMatrix>)> {
     let (rig, anim) = animated(lua, handle)?;
+    // while its `BuildBonePositions` runs, the bones are those it works on
+    if let Some(bones) = host(lua).anims.building.borrow().get(&handle) {
+        return Some((rig, bones.clone()));
+    }
     let (manipulations, effects, parent) = host(lua).entities.get(handle).map(|e| (e.bone_manipulations.clone(), e.effects, e.parent))?;
     let parameters = anim.parameters(&rig);
     let layers: Vec<Layer> = anim
@@ -544,7 +551,51 @@ fn model_bones_at(lua: &Lua, handle: EntityHandle, depth: u32) -> Option<(Arc<Ri
             }
         }
     }
+    if depth == 0 {
+        bones = build_bone_positions(lua, handle, bones);
+    }
     Some((rig, bones))
+}
+
+/// The client's `BuildBonePositions` callbacks of an entity (`AddCallback`), if it has any.
+fn bone_callbacks(lua: &Lua, handle: EntityHandle) -> Vec<mlua::Function> {
+    if host(lua).realm == crate::Realm::Server {
+        return Vec::new();
+    }
+    let Ok(Value::UserData(ud)) = entity::push(lua, handle) else { return Vec::new() };
+    let Ok(Some(list)) = entity::store_of(lua, &ud, "callbacks").and_then(|c| c.raw_get::<Option<mlua::Table>>("BuildBonePositions"))
+    else {
+        return Vec::new();
+    };
+    list.sequence_values::<mlua::Function>().filter_map(Result::ok).collect()
+}
+
+/// The bones as the entity's `BuildBonePositions` callbacks leave them: each is called with
+/// the entity and how many bones it has, and may read the bones (`GetBoneMatrix`) and set them
+/// (`SetBoneMatrix`), in the world, as GMod has it.
+fn build_bone_positions(lua: &Lua, handle: EntityHandle, bones: Vec<BoneMatrix>) -> Vec<BoneMatrix> {
+    let callbacks = bone_callbacks(lua, handle);
+    if callbacks.is_empty() {
+        return bones;
+    }
+    let count = bones.len();
+    host(lua).anims.building.borrow_mut().insert(handle, bones);
+    if let Ok(ent) = entity::push(lua, handle) {
+        for callback in callbacks {
+            let _ = crate::files::call_reporting(lua, callback, MultiValue::from_iter([ent.clone(), Value::Integer(count as i64)]));
+        }
+    }
+    host(lua).anims.building.borrow_mut().remove(&handle).unwrap_or_default()
+}
+
+/// `SetBoneMatrix`: a bone set in the world while the entity's bones are built; at other times
+/// it changes nothing.
+fn set_bone_matrix(lua: &Lua, handle: EntityHandle, bone: usize, world: &Matrix) {
+    let Some(place) = placement(lua, handle) else { return };
+    let local = rig_pose::multiply(&rig_pose::invert(&place), &[world.m[0], world.m[1], world.m[2]]);
+    if let Some(slot) = host(lua).anims.building.borrow_mut().get_mut(&handle).and_then(|bones| bones.get_mut(bone)) {
+        *slot = local;
+    }
 }
 
 /// Where a bone of an entity is in the world, as a matrix.
@@ -563,7 +614,7 @@ fn to_vmatrix(m: &BoneMatrix) -> Matrix {
 pub(crate) fn skinning(lua: &Lua, handle: EntityHandle) -> Vec<[[f32; 4]; 3]> {
     let still = animated(lua, handle).is_none_or(|(rig, _)| rig.bones().len() <= 1 && rig.sequence_count() <= 1);
     let manipulated = host(lua).entities.get(handle).is_some_and(|e| !e.bone_manipulations.is_empty() || e.effects & EF_BONEMERGE != 0);
-    if still && !manipulated {
+    if still && !manipulated && bone_callbacks(lua, handle).is_empty() {
         return Vec::new();
     }
     model_bones(lua, handle).map(|(rig, bones)| rig.skinning(&bones)).unwrap_or_default()
@@ -581,15 +632,20 @@ pub(crate) fn view_models(lua: &Lua, viewer: EntityHandle) -> (Vec<crate::Drawn>
     };
     let Some((eye, _)) = player::eye(lua, viewer) else { return (Vec::new(), fov) };
     let angles = player::eye_angles(lua, viewer).unwrap_or_default();
-    if !show || !host(lua).entities.is_valid(active) {
+    // none from behind (`drawviewer`), nor in a vehicle that does not let weapons in
+    let seated =
+        crate::vehicle::of(lua, viewer).index.is_some() && !player::state(lua, viewer, |_, p| p.allow_weapons_in_vehicle).unwrap_or(false);
+    if !show || seated || host(lua).client.draw_viewer.get() || !host(lua).entities.is_valid(active) {
         return (Vec::new(), fov);
     }
     let drawn = |handle: EntityHandle| -> Option<crate::Drawn> {
-        let (model, skin, hidden) = host(lua).entities.get(handle).map(|e| (e.model.clone(), e.skin, e.no_draw || e.effects & 32 != 0))?;
+        let (model, skin, groups, hidden) =
+            host(lua).entities.get(handle).map(|e| (e.model.clone(), e.skin, e.body_groups.clone(), e.no_draw || e.effects & 32 != 0))?;
         if hidden || model.is_empty() {
             return None;
         }
-        Some(crate::Drawn { entity: handle, model, skin, origin: eye, angles, scale: 1.0, bones: skinning(lua, handle) })
+        let body = crate::ents::body_number(lua, &model, &groups);
+        Some(crate::Drawn { entity: handle, model, skin, body, origin: eye, angles, scale: 1.0, bones: skinning(lua, handle) })
     };
     let mut out: Vec<crate::Drawn> = view_models.iter().filter_map(|&vm| drawn(vm)).collect();
     // the hands go on the first view model, when the weapon wants them (`SWEP.UseHands`, and
@@ -645,6 +701,36 @@ fn view_model_fov(lua: &Lua, viewer: EntityHandle) -> f32 {
     own.or_else(|| crate::convar::value(lua, "viewmodel_fov").and_then(|v| v.parse().ok())).unwrap_or(54.0)
 }
 
+/// Where an attachment of the local player's view model (`muzzle`) is seen in the world: on the
+/// model where the view puts it (`CalcViewModelView`), then as the world's wider field of view
+/// shows the point the view model's narrower one does (Source's `FormatViewModelAttachment`):
+/// what is drawn in the world from there starts where the view model shows it.
+pub(crate) fn view_model_attachment(lua: &Lua, owner: EntityHandle, names: &[&str]) -> Option<Vector> {
+    let vm = view_model(lua, owner, 0);
+    let (rig, bones) = model_bones(lua, vm)?;
+    let index = names.iter().find_map(|name| rig.attachments().iter().position(|a| a.name.eq_ignore_ascii_case(name)))?;
+    let local = rig.attachment(index, &bones)?;
+    let view = host(lua).client.view.get();
+    let (origin, angles) = view_model_view(lua, view.origin, view.angles);
+    let m = Matrix::from_angle(angles).m;
+    let place: BoneMatrix = std::array::from_fn(|r| [m[r][0], m[r][1], m[r][2], [origin.x, origin.y, origin.z][r]]);
+    let world = rig_pose::multiply(&place, &local);
+    let point = Vector::new(world[0][3], world[1][3], world[2][3]);
+    let half = |fov: f32| (fov.clamp(1.0, 170.0) / 2.0).to_radians().tan();
+    let factor = half(view.fov) / half(view_model_fov(lua, owner));
+    let (forward, right, up) = view.angles.vectors();
+    let d = point - view.origin;
+    Some(view.origin + right * (d.dot(right) * factor) + up * (d.dot(up) * factor) + forward * d.dot(forward))
+}
+
+/// Where an attachment of an entity's model is in the world, by name: the first of `names`
+/// it has.
+pub(crate) fn named_attachment(lua: &Lua, handle: EntityHandle, names: &[&str]) -> Option<Vector> {
+    let (rig, _) = animated(lua, handle)?;
+    let index = names.iter().find_map(|name| rig.attachments().iter().position(|a| a.name.eq_ignore_ascii_case(name)))?;
+    attachment_world(lua, handle, index).map(|(pos, _)| pos)
+}
+
 /// A player's view models that are there.
 pub(crate) fn view_models_of(lua: &Lua, owner: EntityHandle) -> Vec<EntityHandle> {
     let all = player::state(lua, owner, |_, p| p.view_models).unwrap_or([EntityHandle::NULL; 3]);
@@ -669,6 +755,19 @@ pub(crate) fn set_weapon_model(lua: &Lua, vm: EntityHandle, model: &str, weapon:
         let (Ok(v), Ok(o), Ok(n)) = (entity::push(lua, vm), lua.create_string(&old), lua.create_string(model)) else { return };
         crate::call_hook(lua, "OnViewModelChanged", MultiValue::from_iter([v, Value::String(o), Value::String(n)]));
     }
+}
+
+/// A player's view model's pose parameter moves towards `target` (as the parameter counts),
+/// `rate` of its range a second, a tick's worth: the physics gun's claws opening.
+pub(crate) fn approach_view_model_pose(lua: &Lua, owner: EntityHandle, name: &str, target: f32, rate: f32) {
+    let vm = view_model(lua, owner, 0);
+    let Some((rig, anim)) = animated(lua, vm) else { return };
+    let Some(index) = rig.pose_parameters().iter().position(|p| p.name.eq_ignore_ascii_case(name)) else { return };
+    let goal = rig.pose_parameters()[index].normalize(target);
+    let now = anim.parameters(&rig).get(index).copied().unwrap_or(goal);
+    let step = rate * crate::timer::TICK_INTERVAL as f32;
+    let next = if (goal - now).abs() <= step { goal } else { now + step * (goal - now).signum() };
+    change(lua, vm, |anim| anim.set_pose(index, next));
 }
 
 /// A weapon comes out: its owner's view model shows it and plays drawing it.
@@ -1293,6 +1392,15 @@ pub(crate) fn install_methods(def: &Def) -> mlua::Result<()> {
         number(f64::from(duration.unwrap_or(0.0)))
     })?;
 
+    def("SetBoneMatrix", |a| {
+        let handle = this(a)?;
+        let bone = a.number(2)? as i64;
+        let matrix = a.userdata::<Matrix>(3, "VMatrix")?;
+        if let Ok(bone) = usize::try_from(bone) {
+            set_bone_matrix(a.lua, handle, bone, &matrix);
+        }
+        Ok(Value::Nil)
+    })?;
     // bones and attachments where they are now
     def("GetBoneMatrix", |a| {
         let handle = this(a)?;

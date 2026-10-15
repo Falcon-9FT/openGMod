@@ -457,6 +457,32 @@ pub(crate) fn install_methods(def: &entity::Def) -> mlua::Result<()> {
         }
         Ok(Value::Nil)
     })?;
+    // whether a point or an entity is in what this entity sees: a player from their eyes,
+    // anything else from where it is; everything on a map without visibility
+    def("TestPVS", |a| {
+        let handle = entity::this(a, 1)?;
+        let Some(vis) = visibility(a.lua) else { return Ok(Value::Boolean(true)) };
+        let from = match crate::player::eye(a.lua, handle) {
+            Some((eye, _)) => Some(eye),
+            None => host(a.lua).entities.transform(handle).map(|(pos, _)| pos),
+        };
+        let Some(cluster) = from.and_then(|from| vis.cluster_at(array(from))) else { return Ok(Value::Boolean(true)) };
+        let row = vis.pvs(cluster).to_vec();
+        let seen = match a.get(2) {
+            Some(Value::UserData(ud)) if ud.is::<Vector>() => {
+                let point = *ud.borrow::<Vector>()?;
+                vis.cluster_at(array(point)).is_none_or(|c| row_has(&row, c))
+            }
+            other => match entity::handle_of(other) {
+                Some(target) => {
+                    let (clusters, all, _) = clusters_of(a.lua, &vis, target);
+                    all || clusters.iter().any(|&c| row_has(&row, c))
+                }
+                None => false,
+            },
+        };
+        Ok(Value::Boolean(seen))
+    })?;
     def("IsDormant", |a| {
         let handle = entity::this(a, 1)?;
         Ok(Value::Boolean(host(a.lua).entities.get(handle).is_some_and(|e| e.dormant)))

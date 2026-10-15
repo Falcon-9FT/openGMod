@@ -293,11 +293,16 @@ fn run(args: &Args, out: &mut Out) -> ExitCode {
         }
     };
     let unpack_dir = if args.unpack { UserDir::default_root().map(|root| root.join("cache").join("workshop")) } else { None };
+    // the addons the player switched off in the game's menu are left out, as the game does
+    let disabled = UserDir::default_root()
+        .map(|root| gmod_fs::workshop::read_disabled(&root.join("settings").join("addons_disabled.txt")))
+        .unwrap_or_default();
     let options = MountOptions {
         addons: args.addons,
         server_downloads: args.server_downloads,
         mount_cfg: true,
         unpack_dir,
+        disabled,
         ..MountOptions::default()
     };
     let (mut vfs, warnings) = mount_install(&install, &options);

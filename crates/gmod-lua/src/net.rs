@@ -348,7 +348,8 @@ pub(crate) fn receive(lua: &Lua, name: &str, data: &Bits, from: EntityHandle) ->
     *host(lua).net.incoming.borrow_mut() = Some(Reader { bits, at: 0 });
     let incoming = lua.globals().get::<Table>("net")?.get::<Option<mlua::Function>>("Incoming")?;
     if let Some(incoming) = incoming {
-        let args = mlua::IntoLuaMulti::into_lua_multi((length, from), lua)?;
+        // the sender as Lua knows it: the same object every time, the key of its tables
+        let args = MultiValue::from_iter([Value::Integer(length as i64), crate::entity::push(lua, from)?]);
         let _ = crate::files::call_reporting(lua, incoming, args);
     }
     host(lua).net.incoming.borrow_mut().take();

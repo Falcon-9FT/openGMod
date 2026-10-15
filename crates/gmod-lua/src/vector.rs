@@ -131,7 +131,7 @@ impl std::ops::Neg for Vector {
 }
 
 /// An angle component brought into [-180, 180], as Source's `AngleNormalize`.
-fn normalize_degrees(angle: f32) -> f32 {
+pub(crate) fn normalize_degrees(angle: f32) -> f32 {
     let mut angle = angle % 360.0;
     if angle > 180.0 {
         angle -= 360.0;

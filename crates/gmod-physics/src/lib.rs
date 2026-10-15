@@ -235,6 +235,20 @@ pub struct Impact {
     pub normal: Vec3,
 }
 
+/// A body touching something now (`GetFrictionSnapshot`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Contact {
+    /// What it touches: another body; `None` for the world.
+    pub other: Option<BodyId>,
+    /// Where, in the world.
+    pub point: Vec3,
+    /// From the body towards what it touches.
+    pub normal: Vec3,
+    /// How hard they press on each other in the last step, in the engine's units of force
+    /// (kg units/s²).
+    pub force: f32,
+}
+
 impl Default for Physics {
     fn default() -> Physics {
         Physics::new()
@@ -839,6 +853,35 @@ impl Physics {
     /// The joints that broke since this was last asked.
     pub fn broken(&mut self) -> Vec<JointId> {
         std::mem::take(&mut self.broken)
+    }
+
+    /// What a body touches now: one contact for each thing, where they touch deepest.
+    pub fn contacts(&self, id: BodyId) -> Vec<Contact> {
+        let world = &self.world;
+        let Some(body) = world.bodies.get(id.0) else { return Vec::new() };
+        let mut out = Vec::new();
+        for &collider in body.colliders() {
+            for pair in world.narrow_phase.contact_pairs_with(collider) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let ours = pair.collider1 == collider;
+                let other_collider = if ours { pair.collider2 } else { pair.collider1 };
+                let other = world.colliders.get(other_collider).and_then(|c| c.parent()).filter(|&h| h != self.ground);
+                let Some((manifold, contact)) = pair.find_deepest_contact() else { continue };
+                let point = world.colliders.get(pair.collider1).map(|c| units(c.position() * contact.local_p1));
+                let normal = if ours { manifold.data.normal } else { -manifold.data.normal };
+                let impulse: f32 = pair.manifolds().iter().flat_map(|m| m.points.iter()).map(|p| p.data.impulse).sum();
+                let step = self.world.integration_parameters.dt.max(1e-6);
+                out.push(Contact {
+                    other: other.map(BodyId),
+                    point: point.unwrap_or_else(|| units(body.translation())),
+                    normal: normal.to_array(),
+                    force: impulse / step / METRES_PER_UNIT,
+                });
+            }
+        }
+        out
     }
 
     /// The impacts since this was last asked, oldest first.

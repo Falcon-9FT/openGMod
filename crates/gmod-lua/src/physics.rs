@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gmod_physics::{Body, BodyId, Physics, Shape};
-use mlua::{Lua, MultiValue, Table, Value};
+use mlua::{Lua, MultiValue, ObjectLike, Table, Value};
 
 use crate::args::{self, Args};
 use crate::entity::{self, EntityHandle, PhysObjHandle};
@@ -341,6 +341,7 @@ struct Collision {
 /// Lua.
 pub(crate) fn simulate(lua: &Lua) {
     let gravity = crate::convar::value(lua, "sv_gravity").and_then(|g| g.trim().parse::<f32>().ok()).unwrap_or(600.0);
+    motion_controllers(lua);
     let (broken, collisions) = {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
@@ -384,10 +385,132 @@ pub(crate) fn simulate(lua: &Lua) {
         (physics.broken(), collisions)
     };
     crate::ragdoll::moved_on(lua);
+    physics_updates(lua);
     crate::constraint::broken(lua, &broken);
     for collision in &collisions {
         if host(lua).entities.is_valid(collision.entity) {
             collided(lua, collision);
+        }
+    }
+}
+
+// how `PhysicsSimulate` says to push: nothing, or accelerations or forces about the body's own
+// axes or the world's
+const SIM_LOCAL_ACCELERATION: i64 = 1;
+const SIM_LOCAL_FORCE: i64 = 2;
+// SIM_GLOBAL_ACCELERATION is 3: neither local nor a force
+const SIM_GLOBAL_FORCE: i64 = 4;
+
+/// A vector about the axes of something turned by `angles`, about the world's.
+fn to_world(angles: [f32; 3], v: Vector) -> Vector {
+    let [f, l, u] = gmod_physics::axes(angles);
+    Vector::new(f[0] * v.x + l[0] * v.y + u[0] * v.z, f[1] * v.x + l[1] * v.y + u[1] * v.z, f[2] * v.x + l[2] * v.y + u[2] * v.z)
+}
+
+/// A vector about the world's axes, about those of something turned by `angles`.
+fn to_local(angles: [f32; 3], v: Vector) -> Vector {
+    let [f, l, u] = gmod_physics::axes(angles);
+    let dot = |a: [f32; 3]| a[0] * v.x + a[1] * v.y + a[2] * v.z;
+    Vector::new(dot(f), dot(l), dot(u))
+}
+
+/// The motion controllers, before the bodies move: each entity that started one
+/// (`StartMotionController`) has its `PhysicsSimulate(phys, dt)` asked, for each of its bodies
+/// awake and those added to it, how to push it - an angular and a linear push, and whether
+/// they are accelerations or forces, about the body's axes or the world's (`SIM_`) - and it is
+/// pushed so for the tick.
+fn motion_controllers(lua: &Lua) {
+    let controllers: Vec<(EntityHandle, Vec<PhysObjHandle>)> = {
+        let entities = &host(lua).entities;
+        entities
+            .handles()
+            .into_iter()
+            .filter_map(|h| {
+                let ent = entities.get(h)?;
+                if !ent.motion_controller || ent.removed {
+                    return None;
+                }
+                let mut objects = ent.motion_objects.clone();
+                if !objects.iter().any(|p| p.0 == h) {
+                    objects.insert(0, PhysObjHandle(h, 0));
+                }
+                Some((h, objects))
+            })
+            .collect()
+    };
+    let dt = timer::TICK_INTERVAL as f32;
+    for (handle, objects) in controllers {
+        let Ok(Value::UserData(ud)) = entity::push(lua, handle) else { continue };
+        let Ok(Value::Function(simulate)) = ud.get::<Value>("PhysicsSimulate") else { continue };
+        for phys in objects {
+            if !valid(lua, phys) {
+                continue;
+            }
+            let Some(id) = part_body(lua, phys.0, phys.1) else { continue };
+            let awake = {
+                let host = host(lua);
+                let physics = host.physics.physics.borrow();
+                physics.motion(id) && !physics.asleep(id)
+            };
+            if !awake {
+                continue;
+            }
+            let Ok(phys_value) = lua.create_userdata(phys) else { continue };
+            let args = MultiValue::from_iter([Value::UserData(ud.clone()), Value::UserData(phys_value), Value::Number(f64::from(dt))]);
+            let Ok(result) = crate::files::call_reporting(lua, simulate.clone(), args) else { continue };
+            let mut result = result.into_iter();
+            let (angular, linear, mode) = (result.next(), result.next(), result.next());
+            let vector_of = |v: Option<Value>| match v {
+                Some(Value::UserData(ud)) => ud.borrow::<Vector>().map(|v| *v).ok(),
+                _ => None,
+            };
+            let mode = match mode {
+                Some(Value::Integer(n)) => n,
+                Some(Value::Number(n)) => n as i64,
+                _ => 0,
+            };
+            let (angular, linear) = (vector_of(angular).unwrap_or_default(), vector_of(linear).unwrap_or_default());
+            if !(SIM_LOCAL_ACCELERATION..=SIM_GLOBAL_FORCE).contains(&mode) {
+                continue;
+            }
+            let host = host(lua);
+            let mut physics = host.physics.physics.borrow_mut();
+            let Some((_, angles)) = physics.pose(id) else { continue };
+            // a force moves a body less the more it weighs
+            let per = if mode == SIM_LOCAL_FORCE || mode == SIM_GLOBAL_FORCE { 1.0 / physics.mass(id).max(1e-3) } else { 1.0 };
+            let local = mode == SIM_LOCAL_ACCELERATION || mode == SIM_LOCAL_FORCE;
+            let linear = if local { to_world(angles, linear) } else { linear };
+            let angular = if local { angular } else { to_local(angles, angular) };
+            let velocity = vector(physics.velocity(id)) + linear * (per * dt);
+            physics.set_velocity(id, array(velocity));
+            let spin = vector(physics.angular_velocity(id)) + angular * (per * dt);
+            physics.set_angular_velocity(id, array(spin));
+        }
+    }
+}
+
+/// After the bodies moved: the scripted entities whose bodies are awake hear of it
+/// (`ENT:PhysicsUpdate(phys)`).
+fn physics_updates(lua: &Lua) {
+    let awake: Vec<EntityHandle> = {
+        let host = host(lua);
+        let physics = host.physics.physics.borrow();
+        let bodies = host.physics.bodies.borrow();
+        let mut list: Vec<EntityHandle> = physics
+            .awake()
+            .into_iter()
+            .filter_map(|id| bodies.get(&id).filter(|k| k.part == 0).map(|k| k.entity))
+            .filter(|&h| host.entities.get(h).is_some_and(|e| e.scripted && !e.removed))
+            .collect();
+        list.dedup();
+        list
+    };
+    for handle in awake {
+        let Ok(Value::UserData(ud)) = entity::push(lua, handle) else { continue };
+        if let Ok(Value::Function(update)) = ud.get::<Value>("PhysicsUpdate")
+            && let Ok(phys) = push(lua, handle)
+        {
+            let _ = crate::files::call_reporting(lua, update, MultiValue::from_iter([Value::UserData(ud), phys]));
         }
     }
 }
@@ -686,7 +809,41 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         Ok(Value::Boolean(kept(a, |k| k.game_flags & flags != 0)?))
     })?;
     def("GetStress", |a| this(a).map(|_| Value::Number(0.0)))?;
-    def("GetFrictionSnapshot", |a| this(a).and_then(|_| a.lua.create_table().map(Value::Table)))?;
+    // what it touches now, and what both are made of: the world's surface where they touch
+    def("GetFrictionSnapshot", |a| {
+        let (handle, id) = this(a)?;
+        let lua = a.lua;
+        let contacts = host(lua).physics.physics.borrow().contacts(id);
+        let own = material_of(lua, handle).unwrap_or_else(|| "default".to_string());
+        let (own_index, _) = crate::surfaceprops::named(lua, &own);
+        let list = lua.create_table()?;
+        for contact in contacts {
+            let point = vector(contact.point);
+            let normal = vector(contact.normal);
+            let (other, other_index) = match contact
+                .other
+                .and_then(|o| host(lua).physics.bodies.borrow().get(&o).map(|k| (k.entity, k.part, k.material.clone())))
+            {
+                Some((entity, part, material)) => (push_part(lua, entity, part)?, crate::surfaceprops::named(lua, &material).0),
+                None => {
+                    // the world: its surface under the contact
+                    let sweep =
+                        crate::trace::Sweep::line(point - normal * 4.0, point + normal * 4.0, crate::trace::Filter::Entities(vec![handle]));
+                    let hit = crate::trace::trace(lua, &sweep);
+                    (push(lua, EntityHandle::WORLD)?, crate::trace::surface_of(lua, &hit).0)
+                }
+            };
+            let entry = lua.create_table()?;
+            entry.raw_set("Other", other)?;
+            entry.raw_set("Material", own_index as i64)?;
+            entry.raw_set("MaterialOther", other_index as i64)?;
+            entry.raw_set("ContactPoint", vector_value(lua, point)?)?;
+            entry.raw_set("Normal", vector_value(lua, normal)?)?;
+            entry.raw_set("NormalForce", f64::from(contact.force))?;
+            list.raw_push(entry)?;
+        }
+        Ok(Value::Table(list))
+    })?;
     def("OutputDebugInfo", |a| {
         let (handle, _) = this(a)?;
         let mass = with(a, |p, id| p.mass(id))?;

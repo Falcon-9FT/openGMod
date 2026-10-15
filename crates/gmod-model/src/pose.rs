@@ -404,6 +404,13 @@ impl Rig {
                 self.accumulate(&mut pose, part, s, layer.cycle, layer.weight, parameters, 0);
             }
         }
+        // the sequences played always, over all of it, at their start: those are poses held
+        // by pose parameters
+        for &(part, s) in &self.sequences {
+            if self.parts[part].mdl.sequences.get(s).is_some_and(|seq| seq.flags & flags::AUTOPLAY != 0) {
+                self.accumulate(&mut pose, part, s, 0.0, 1.0, parameters, 0);
+            }
+        }
         pose
     }
 

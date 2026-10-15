@@ -104,6 +104,11 @@ pub struct Ent {
     pub solid: i64,
     pub solid_flags: i64,
     pub collision_group: i64,
+    /// A vehicle's view from behind (`SetThirdPersonMode`), and how far (`SetCameraDistance`).
+    pub third_person: bool,
+    pub camera_distance: f32,
+    /// A vehicle's name in the list of vehicles (`SetVehicleClass`).
+    pub vehicle_class: String,
     pub use_type: i64,
     pub trigger: bool,
     pub custom_collisions: bool,
@@ -113,6 +118,22 @@ pub struct Ent {
     pub mins: Vector,
     pub maxs: Vector,
     pub no_draw: bool,
+    /// The box it is drawn within, in its own space (`SetRenderBounds`); none: its model's.
+    #[serde(skip)]
+    pub render_bounds: Option<(Vector, Vector)>,
+    /// Its `PhysicsSimulate` runs every tick (`StartMotionController`), for its own bodies and
+    /// those added to it (`AddToMotionController`): [`crate::physics::simulate`].
+    #[serde(skip)]
+    pub motion_controller: bool,
+    #[serde(skip)]
+    pub motion_objects: Vec<PhysObjHandle>,
+    /// Where a physics gun's beam goes: what it holds, and the point it holds it by, in its own
+    /// space ([`crate::render3d::physgun_beams`]).
+    #[serde(default)]
+    pub beam: Option<(EntityHandle, Vector)>,
+    /// Its model was drawn by Lua this frame (`DrawModel`), the client's ([`crate::ents::drawn`]).
+    #[serde(skip)]
+    pub lua_drawn: bool,
     pub draw_shadow: bool,
     pub model_scale: f32,
     /// Body groups set: number and value.
@@ -229,6 +250,9 @@ impl Ent {
             solid: 0,
             solid_flags: 0,
             collision_group: 0,
+            third_person: false,
+            camera_distance: 0.0,
+            vehicle_class: String::new(),
             use_type: 0,
             trigger: false,
             custom_collisions: false,
@@ -237,6 +261,11 @@ impl Ent {
             mins: Vector::default(),
             maxs: Vector::default(),
             no_draw: false,
+            beam: None,
+            render_bounds: None,
+            motion_controller: false,
+            motion_objects: Vec::new(),
+            lua_drawn: false,
             draw_shadow: true,
             model_scale: 1.0,
             body_groups: Vec::new(),
@@ -335,6 +364,20 @@ impl Entities {
         let mut slots = self.slots.borrow_mut();
         let kind = ent.kind;
         let index = (first as usize..MAX_EDICTS as usize).find(|&i| slots.get(i).is_none_or(|slot| slot.ent.is_none()))?;
+        while slots.len() <= index {
+            slots.push(Slot { serial: 0, ent: None });
+        }
+        let slot = &mut slots[index];
+        slot.ent = Some(ent);
+        Some(EntityHandle { index: Some(index as u32), serial: slot.serial, kind })
+    }
+
+    /// Puts an entity of the client's own (`ClientsideModel`) at an index above the edicts,
+    /// where the server's never are; none when every one is used.
+    pub(crate) fn insert_client(&self, ent: Ent) -> Option<EntityHandle> {
+        let mut slots = self.slots.borrow_mut();
+        let kind = ent.kind;
+        let index = (MAX_EDICTS as usize..2 * MAX_EDICTS as usize).find(|&i| slots.get(i).is_none_or(|slot| slot.ent.is_none()))?;
         while slots.len() <= index {
             slots.push(Slot { serial: 0, ent: None });
         }
@@ -781,6 +824,14 @@ pub(crate) type Def<'a> = dyn Fn(&'static str, fn(&Args) -> mlua::Result<Value>)
 /// Defines a method that gives more than one value.
 pub(crate) type DefMany<'a> = dyn Fn(&'static str, fn(&Args) -> mlua::Result<MultiValue>) -> mlua::Result<()> + 'a;
 
+/// A vector argument that may be left out: zero then.
+fn optional_vector(a: &Args, position: usize) -> Vector {
+    match a.get(position) {
+        Some(Value::UserData(ud)) => ud.borrow::<Vector>().map(|v| *v).unwrap_or_default(),
+        _ => Vector::default(),
+    }
+}
+
 /// The methods that give more than one value.
 fn install_many(def: &DefMany) -> mlua::Result<()> {
     def("GetCollisionBounds", |a| {
@@ -790,6 +841,10 @@ fn install_many(def: &DefMany) -> mlua::Result<()> {
     def("GetModelBounds", |a| {
         let model = read(a, |ent| ent.model.clone())?;
         let (mins, maxs) = crate::ents::model_bounds(a.lua, &model).unwrap_or_default();
+        Ok(MultiValue::from_iter([vector(a.lua, mins)?, vector(a.lua, maxs)?]))
+    })?;
+    def("GetRenderBounds", |a| {
+        let (mins, maxs) = read(a, |ent| ent.render_bounds.unwrap_or((ent.mins, ent.maxs)))?;
         Ok(MultiValue::from_iter([vector(a.lua, mins)?, vector(a.lua, maxs)?]))
     })?;
     def("GetColor4Part", |a| {
@@ -803,14 +858,16 @@ fn install_many(def: &DefMany) -> mlua::Result<()> {
 
 fn install_methods(def: &Def) -> mlua::Result<()> {
     // what it is
+    // the world is no valid entity to Lua, as in GMod: scripts check `IsWorld` for it
     def("IsValid", |a| {
-        let valid = handle_of(a.get(1)).is_some_and(|h| host(a.lua).entities.is_valid(h));
+        let valid = handle_of(a.get(1)).is_some_and(|h| h != EntityHandle::WORLD && host(a.lua).entities.is_valid(h));
         Ok(Value::Boolean(valid))
     })?;
+    // an entity of the client's own has none: -1, as in GMod
     def("EntIndex", |a| {
         let handle = a.userdata::<EntityHandle>(1, "Entity")?;
         let index = if host(a.lua).entities.is_valid(handle) { handle.index.unwrap_or(0) } else { 0 };
-        integer(index.into())
+        integer(if index >= MAX_EDICTS { -1 } else { index.into() })
     })?;
     def("IsWorld", |a| {
         let handle = a.userdata::<EntityHandle>(1, "Entity")?;
@@ -1026,6 +1083,15 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             }
         })
     })?;
+    // the materials of the model's texture slots, in order (`SetSubMaterial` numbers them from 0)
+    def("GetMaterials", |a| {
+        let model = read(a, |ent| ent.model.clone())?;
+        let list = a.lua.create_table()?;
+        for material in crate::ents::studio(a.lua, &model).map(|studio| studio.materials).unwrap_or_default() {
+            list.raw_push(material)?;
+        }
+        Ok(Value::Table(list))
+    })?;
     def("GetSubMaterial", |a| {
         let slot = a.number(2)? as i64;
         let material = read(a, |ent| ent.sub_materials.iter().find(|(s, _)| *s == slot).map(|(_, m)| m.clone()))?;
@@ -1083,6 +1149,24 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         let draw = a.boolean(2);
         write(a, |ent| ent.draw_shadow = draw)
     })?;
+    // the model is drawn this frame, where the entity is now (also one hidden with `SetNoDraw`)
+    def("DrawModel", |a| write(a, |ent| ent.lua_drawn = true))?;
+    // the box it is drawn within: kept for scripts to read back (nothing is culled by it yet)
+    def("SetRenderBounds", |a| {
+        let (mins, maxs) = (a.userdata::<Vector>(2, "Vector")?, a.userdata::<Vector>(3, "Vector")?);
+        let add = optional_vector(a, 4);
+        write(a, |ent| ent.render_bounds = Some((mins - add, maxs + add)))
+    })?;
+    def("SetRenderBoundsWS", |a| {
+        let handle = this(a, 1)?;
+        let (mins, maxs) = (a.userdata::<Vector>(2, "Vector")?, a.userdata::<Vector>(3, "Vector")?);
+        let add = optional_vector(a, 4);
+        let pos = host(a.lua).entities.transform(handle).map_or_else(Vector::default, |(p, _)| p);
+        write(a, |ent| ent.render_bounds = Some((mins - add - pos, maxs + add - pos)))
+    })?;
+    // the renderer draws no shadows yet: there is none to make or take away
+    def("CreateShadow", |_| Ok(Value::Nil))?;
+    def("DestroyShadow", |_| Ok(Value::Nil))?;
     def("GetBodygroup", |a| {
         let id = a.number(2)? as i64;
         integer(read(a, |ent| ent.body_groups.iter().find(|(i, _)| *i == id).map_or(0, |(_, v)| *v))?)
@@ -1458,9 +1542,26 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         crate::physics::wake(a.lua, this(a, 1)?);
         Ok(Value::Nil)
     })?;
-    // motion controllers are not simulated yet
-    def("StartMotionController", |a| write(a, |_| ()))?;
-    def("StopMotionController", |a| write(a, |_| ()))?;
+    // `PhysicsSimulate` runs every tick from now on, until it stops
+    def("StartMotionController", |a| write(a, |ent| ent.motion_controller = true))?;
+    def("StopMotionController", |a| {
+        write(a, |ent| {
+            ent.motion_controller = false;
+            ent.motion_objects.clear();
+        })
+    })?;
+    def("AddToMotionController", |a| {
+        let phys = a.userdata::<PhysObjHandle>(2, "PhysObj")?;
+        write(a, |ent| {
+            if !ent.motion_objects.contains(&phys) {
+                ent.motion_objects.push(phys);
+            }
+        })
+    })?;
+    def("RemoveFromMotionController", |a| {
+        let phys = a.userdata::<PhysObjHandle>(2, "PhysObj")?;
+        write(a, |ent| ent.motion_objects.retain(|p| *p != phys))
+    })?;
     def("GetPhysicsObject", |a| crate::physics::push(a.lua, this(a, 1)?))?;
     def("GetPhysicsObjectNum", |a| {
         let handle = this(a, 1)?;
@@ -1592,6 +1693,11 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         Ok(Value::Nil)
     })?;
     def("NextThink", |a| {
+        let time = a.number(2)?;
+        write(a, |ent| ent.think_request = Some(time))
+    })?;
+    // the client's `NextThink`: its scripted entities think as the server's do
+    def("SetNextClientThink", |a| {
         let time = a.number(2)?;
         write(a, |ent| ent.think_request = Some(time))
     })?;

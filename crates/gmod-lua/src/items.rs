@@ -18,10 +18,14 @@
 //!   `OutRemainingHealth` / `OutRemainingCharge` with what is left (0 to 1), `OnEmpty` when
 //!   nothing is; a player it cannot help, or an empty charger, hears the denial. `Recharge`
 //!   fills it again.
+//! * The rest of HL2's things in the Entities tab - the suit, the Combine mine, the
+//!   helicopter's bomb, the grenade, the Magnusson device (Episode 2's model) - take their
+//!   model and a body that falls; the thumper stands where it is put.
 //!
 //! Not done: the client's notices of what was picked up (`HUDItemPickedUp`,
 //! `HUDAmmoPickedUp`), the crates of ammo and items, chargers filling again by themselves,
-//! the Citadel's suit charger, the charging loop sound.
+//! the Citadel's suit charger, the charging loop sound; what the suit, the mine, the bomb and
+//! the grenade do (they lie there).
 
 use mlua::{Lua, MultiValue, Value};
 
@@ -68,6 +72,21 @@ const ITEMS: &[(&str, &str, Gives, &str)] = &[
 
 const AMMO: &str = "BaseCombatCharacter.AmmoPickup";
 
+/// The other things of HL2 the spawn menu's Entities tab puts down: class, model, and whether
+/// it has a body that falls (the thumper stands where it is put).
+const THINGS: &[(&str, &str, bool)] = &[
+    ("item_suit", "models/items/hevsuit.mdl", true),
+    ("combine_mine", "models/props_combine/combine_mine01.mdl", true),
+    ("grenade_helicopter", "models/combine_helicopter/helicopter_bomb01.mdl", true),
+    ("npc_grenade_frag", "models/weapons/w_grenade.mdl", true),
+    ("weapon_striderbuster", "models/magnusson_device.mdl", true),
+    ("prop_thumper", "models/props_combine/combinethumper002.mdl", false),
+];
+
+fn thing(class: &str) -> Option<(&'static str, bool)> {
+    THINGS.iter().find(|(c, ..)| c.eq_ignore_ascii_case(class)).map(|&(_, model, body)| (model, body))
+}
+
 /// How near a player's box must come to an item's to take it.
 const REACH: f32 = 8.0;
 
@@ -82,16 +101,33 @@ fn item(class: &str) -> Option<(&'static str, Gives, &'static str)> {
 /// The model an item has when nothing gives it another.
 #[cfg(test)]
 pub(crate) fn model_of(class: &str) -> Option<&'static str> {
-    item(class).map(|(model, ..)| model).or_else(|| charger_kind(class).map(|k| k.model()))
+    item(class).map(|(model, ..)| model).or_else(|| charger_kind(class).map(|k| k.model())).or_else(|| thing(class).map(|(model, _)| model))
 }
 
 fn class_of(lua: &Lua, handle: EntityHandle) -> String {
     host(lua).entities.get(handle).filter(|ent| !ent.scripted).map(|ent| ent.class.clone()).unwrap_or_default()
 }
 
-/// A spawned item takes its model and its body; a charger its model and what it holds.
+/// A spawned item takes its model and its body; a charger its model and what it holds; the
+/// other things of HL2 their model, and their body if they have one.
 pub(crate) fn spawned(lua: &Lua, handle: EntityHandle) {
     let class = class_of(lua, handle);
+    if let Some((model, body)) = thing(&class) {
+        if host(lua).entities.get(handle).is_some_and(|ent| ent.model.is_empty()) {
+            entity::set_model(lua, handle, model);
+        }
+        host(lua).entities.with_mut(handle, |ent| ent.solid = SOLID_BBOX);
+        if body {
+            host(lua).entities.with_mut(handle, |ent| {
+                ent.solid = SOLID_VPHYSICS;
+                ent.move_type = MOVETYPE_VPHYSICS;
+            });
+            if !crate::physics::init_model(lua, handle) {
+                host(lua).entities.with_mut(handle, |ent| ent.solid = SOLID_BBOX);
+            }
+        }
+        return;
+    }
     let (model, charger) = match (item(&class), charger_kind(&class)) {
         (Some((model, ..)), _) => (model, None),
         (None, Some(kind)) => (kind.model(), Some(kind)),
