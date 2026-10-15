@@ -49,6 +49,11 @@ pub(crate) struct Clock {
     /// prediction has gone: a tick ending there or before has been predicted.
     pub predicted_until: Cell<f64>,
     pub ticks: Cell<u64>,
+    /// A client was given the server's time since its last frame ([`crate::Runtime::apply_snapshot`]):
+    /// its frame ends there rather than a frame's time later.
+    pub given: Cell<bool>,
+    /// Where a client's last frame ended.
+    pub thought: Cell<f64>,
     timers: RefCell<Vec<Timer>>,
     next_simple: Cell<u64>,
 }

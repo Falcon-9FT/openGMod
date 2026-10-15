@@ -180,6 +180,26 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     crate::surfaceprops::install(lua, &util)?;
     lua.globals().raw_set("util", util)?;
     lua.globals().raw_set("PrecacheParticleSystem", lua.create_function(|_, _: MultiValue| Ok(()))?)?;
+    // `debugoverlay`: what it draws GMod shows only with `developer 1`, and this game not at all
+    let debugoverlay = lua.create_table()?;
+    let nothing = lua.create_function(|_, _: MultiValue| Ok(()))?;
+    for name in [
+        "Axis",
+        "Box",
+        "BoxAngles",
+        "Cross",
+        "EntityTextAtPosition",
+        "Grid",
+        "Line",
+        "ScreenText",
+        "Sphere",
+        "SweptBox",
+        "Text",
+        "Triangle",
+    ] {
+        debugoverlay.raw_set(name, &nothing)?;
+    }
+    lua.globals().raw_set("debugoverlay", debugoverlay)?;
     let globals = lua.globals();
     let def = |name: &'static str, f: fn(&Args) -> mlua::Result<MultiValue>| -> mlua::Result<()> {
         globals.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)

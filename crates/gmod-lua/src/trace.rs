@@ -1,9 +1,10 @@
 //! Traces as `util.TraceLine` and `util.TraceHull` make them: through the world of the map -
 //! what [`gmod_bsp::Collision`] has, brushes, displacements, the brush entities where the map
 //! put them and the static props - and through the solid entities: one with a body of its
-//! model's physics shape through that shape where it stands (a barrel on its side is round to
-//! a bullet and to a player's feet), another's box turned with it for a ray, the box around it
-//! for a hull. A ray hits a ragdoll's parts
+//! model's physics shape, or solid by it without a body (`SOLID_VPHYSICS`, as a client's copy
+//! is), through that shape where it stands (a barrel on its side is round to a bullet and to a
+//! player's feet; a bus is hollow inside), another's box turned with it for a ray, the box
+//! around it for a hull. A ray hits a ragdoll's parts
 //! themselves, and says which (`PhysicsBone`); a hull the box around them. Players and NPCs are
 //! `CONTENTS_MONSTER`, everything else `CONTENTS_SOLID`. A trace has a collision group
 //! (`collisiongroup`, a player's movement `COLLISION_GROUP_PLAYER_MOVEMENT`), and the
@@ -383,7 +384,7 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
                     BoxHit { fraction: (fraction - back).max(0.0), normal, start_solid, left: if start_solid { 1.0 } else { 0.0 } }
                 })
             }
-        } else if let Some((hulls, lo, hi)) = crate::physics::shape(lua, handle) {
+        } else if let Some((hulls, lo, hi)) = crate::physics::shape(lua, handle).or_else(|| crate::physics::model_shape(lua, handle)) {
             // the shape of its model where it stands, past the box around it
             let (lo, hi) = entity::rotated_bounds(lo, hi, angles);
             if through_box(sweep.start, sweep.end, pos + lo - sweep.maxs, pos + hi - sweep.mins).is_none() {

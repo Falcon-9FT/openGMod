@@ -2273,6 +2273,44 @@ fn sounds_are_what_lua_asks_for() {
 }
 
 #[test]
+fn a_client_traces_a_model_by_its_collision_model() {
+    use gmod_model::testmodel::{self, TestConvex};
+    // a shed: a floor and a roof, nothing between
+    let mdl = testmodel::mdl(1, ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]));
+    let floor = TestConvex::cuboid([-50.0, -50.0, 0.0], [50.0, 50.0, 10.0]);
+    let roof = TestConvex::cuboid([-50.0, -50.0, 90.0], [50.0, 50.0, 100.0]);
+    let phy = testmodel::phy(1, &[vec![floor, roof]], false, "solid { \"index\" \"0\" \"mass\" \"100\" }");
+    let client_init = format!(
+        "{ENTITY_LUA}
+{CLIENT_LUA}"
+    );
+    let server =
+        game_with(Realm::Server, &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/shed.mdl", &mdl), ("models/shed.phy", &phy)]);
+    server.runtime.init();
+    server
+        .runtime
+        .run_string(
+            "SHED = ents.Create('prop_physics') SHED:SetModel('models/shed.mdl') SHED:Spawn()
+             SHED:GetPhysicsObject():EnableMotion(false)",
+            "shed",
+        )
+        .unwrap();
+    server.runtime.think(0.02);
+    let inside = "return util.TraceLine({ start = Vector(0, 0, 50), endpos = Vector(0, 0, 50) }).Hit";
+    let up = "return util.TraceLine({ start = Vector(0, 0, 50), endpos = Vector(0, 0, 200) }).HitPos.z";
+    assert!(!server.eval::<bool>(inside));
+    // the client has no body of it, but traces it as the server does: not by the box around it
+    let client = game_with(
+        Realm::Client,
+        &[("lua/includes/init.lua", client_init.as_bytes()), ("models/shed.mdl", &mdl), ("models/shed.phy", &phy)],
+    );
+    client.runtime.init();
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    assert!(!client.eval::<bool>(inside));
+    assert!((client.eval::<f64>(up) - 90.0).abs() < 1.0, "{}", client.eval::<f64>(up));
+}
+
+#[test]
 fn footsteps_and_impacts_sound_their_surfaces() {
     use crate::sound::SoundEvent;
     use gmod_model::testmodel::{self, TestConvex};
@@ -2946,6 +2984,29 @@ fn weapons_translate_the_activities_of_their_holders() {
 }
 
 #[test]
+fn the_menu_keeps_what_servers_were_let_do() {
+    let menu = game(Realm::Menu, &[]);
+    menu.runtime
+        .run_string(
+            "BEFORE = permissions.IsGranted('connect')
+             permissions.Grant('connect', true)
+             permissions.Grant('openurl')
+             permissions.Grant('connect')
+             local all = permissions.GetAll()
+             GOT = all.temporary.loopback .. ' / ' .. all.permanent.loopback
+             AFTER = permissions.IsGranted('connect')
+             permissions.Revoke('connect', 'loopback')
+             GONE = permissions.IsGranted('connect') or permissions.GetAll().permanent.loopback",
+            "permissions",
+        )
+        .unwrap();
+    assert!(!menu.eval::<bool>("return BEFORE"));
+    assert_eq!(menu.eval::<String>("return GOT"), "connect / connect,openurl");
+    assert!(menu.eval::<bool>("return AFTER"));
+    assert_eq!(menu.eval::<String>("return GONE"), "openurl");
+}
+
+#[test]
 fn the_server_browser_asks_the_program() {
     use crate::{ServerEntry, ServerPlayer, ServerQuery};
     let menu = game(Realm::Menu, &[]);
@@ -3533,6 +3594,42 @@ fn players_sit_in_vehicles_and_get_out() {
 }
 
 #[test]
+fn the_keys_of_the_game_go_to_the_server() {
+    const KEY_V: i32 = 32;
+    let server = player_game();
+    let alice = server.runtime.join(alice()).unwrap();
+    server.runtime.think(0.02);
+    server
+        .runtime
+        .run_string(
+            "GOT = {}
+             HOOKS.PlayerButtonDown = function(ply, key) table.insert(GOT, ply:Nick() .. ' down ' .. key) end
+             HOOKS.PlayerButtonUp = function(ply, key) table.insert(GOT, ply:Nick() .. ' up ' .. key) end",
+            "keys",
+        )
+        .unwrap();
+    let client = client_game(&[]);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.set_local_player(alice);
+    client.runtime.run_string("DOWN = 0 HOOKS.PlayerButtonDown = function(ply, key) DOWN = key end", "keys").unwrap();
+    client.runtime.button(KEY_V, true);
+    // held, the key repeats: once down for the game
+    client.runtime.button(KEY_V, true);
+    client.runtime.button(KEY_V, false);
+    assert_eq!(client.eval::<i64>("return DOWN"), i64::from(KEY_V));
+    let keys = client.runtime.take_buttons();
+    assert_eq!(keys, [(KEY_V, true), (KEY_V, false)]);
+    for (code, down) in keys {
+        server.runtime.player_button_of(alice, code, down);
+    }
+    assert_eq!(server.eval::<String>("return table.concat(GOT, ', ')"), "Alice down 32, Alice up 32");
+    // a key the chat box takes is not the game's
+    client.runtime.run_string("chat.Open(1)", "chat").unwrap();
+    client.runtime.button(KEY_V, true);
+    assert!(client.runtime.take_buttons().is_empty());
+}
+
+#[test]
 fn weapons_are_chosen_in_the_row_of_slots() {
     use crate::weaponselect::Choose;
     let server = player_game();
@@ -3820,6 +3917,38 @@ fn a_still_model_is_drawn_where_its_bones_rest() {
     let m = turned[0];
     assert!((m[0][0]).abs() < 1e-4 && (m[1][0] - 1.0).abs() < 1e-4 && (m[0][1] + 1.0).abs() < 1e-4, "{m:?}");
     assert!(bones("models/plain.mdl").is_empty(), "drawn as it was made");
+}
+
+#[test]
+fn a_picture_drawn_on_a_plane_is_the_programs_image() {
+    use crate::render3d::{IMAGES, Shape};
+    let init = format!(
+        "{ENTITY_LUA}
+{CLIENT_LUA}"
+    );
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes()), ("materials/displays/screen.png", b"PNG")]);
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "local screen = Material('displays/screen.png')
+             HOOKS.PostDrawOpaqueRenderables = function()
+                 cam.Start3D2D(Vector(0, 0, 100), Angle(0, 0, 0), 0.01)
+                     surface.SetDrawColor(0, 0, 0) surface.DrawRect(0, 0, 600, 400)
+                     surface.SetDrawColor(255, 255, 255) surface.SetMaterial(screen) surface.DrawTexturedRect(0, 0, 600, 400)
+                 cam.End3D2D()
+             end",
+            "screen",
+        )
+        .unwrap();
+    g.runtime.drawn(EntityHandle::NULL);
+    let drawn = g.runtime.take_primitives();
+    // the black behind, then the picture over it: by the number of its image, 6 units across
+    assert_eq!(drawn.len(), 2, "{drawn:?}");
+    assert_eq!(drawn[0].material.name, "color");
+    let id: u32 = drawn[1].material.name.strip_prefix(IMAGES).and_then(|id| id.parse().ok()).expect("a picture");
+    assert!(g.runtime.image(id).is_some_and(|(image, _)| image.name.ends_with("screen.png")));
+    let Shape::Triangles(corners) = &drawn[1].shape else { panic!("{drawn:?}") };
+    assert!(corners.iter().all(|c| c.pos.z == 100.0) && corners.iter().any(|c| (c.pos.x - 6.0).abs() < 1e-3));
 }
 
 #[test]

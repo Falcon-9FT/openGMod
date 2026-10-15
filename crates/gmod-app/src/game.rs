@@ -226,10 +226,11 @@ impl Game {
         }
     }
 
-    /// What the client asked of the server since the last time: its user info, its commands,
-    /// its `net` messages.
+    /// What the client asked of the server since the last time: its user info, its keys
+    /// that went down and up, its commands, its `net` messages.
     fn send_client_commands(&mut self) {
         let info = self.client.take_user_info();
+        let buttons = self.client.take_buttons();
         let commands = self.client.take_server_commands();
         let messages = self.client.take_net_messages();
         match &mut self.link {
@@ -237,6 +238,9 @@ impl Game {
                 let runtime = server.runtime();
                 for (name, value) in info {
                     runtime.set_user_info(self.player, &name, &value);
+                }
+                for (code, down) in buttons {
+                    runtime.player_button_of(self.player, code, down);
                 }
                 for line in commands {
                     runtime.run_player_command(self.player, &line);
@@ -248,6 +252,9 @@ impl Game {
             Link::Remote(connection) => {
                 for (name, value) in info {
                     connection.send(&ToServer::UserInfo(name, value), true);
+                }
+                for (code, down) in buttons {
+                    connection.send(&ToServer::Button(code, down), true);
                 }
                 for line in commands {
                     connection.send(&ToServer::Command(line), true);
@@ -454,13 +461,18 @@ impl Game {
 /// network sees them; but the player as they are now, whose eyes go between the ticks of
 /// themselves, and whose angles are the mouse's.
 fn between_ticks(ticks: &mut Option<(Snapshot, Snapshot)>, latest: Snapshot, fraction: f32, player: EntityHandle) -> Snapshot {
+    // the server's time goes on between its ticks: what it has is of its last tick
+    let tick = |time: f64| (time / gmod_lua::timer::TICK_INTERVAL + 1e-6).floor();
+    let time = latest.time;
     match ticks {
-        Some((_, now)) if now.time == latest.time => {}
+        Some((_, now)) if tick(now.time) == tick(latest.time) => *now = latest,
         Some((before, now)) => *before = std::mem::replace(now, latest),
         None => *ticks = Some((latest.clone(), latest)),
     }
     let (before, now) = ticks.as_ref().expect("set above");
     let mut shown = Snapshot::between(before, now, fraction);
+    // a tick ago, as what is shown is
+    shown.time = time - gmod_lua::timer::TICK_INTERVAL;
     let own = |e: &&gmod_lua::snapshot::EntityState| Some(e.index) == player.index && e.serial == player.serial;
     if let (Some(state), Some(slot)) = (now.entities.iter().find(own), shown.entities.iter_mut().find(|e| own(&&**e))) {
         *slot = state.clone();

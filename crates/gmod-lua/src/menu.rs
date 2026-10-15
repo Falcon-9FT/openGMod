@@ -201,6 +201,56 @@ function steamworks.RequestPlayerInfo( steamid, callback )
 	queue[ #queue + 1 ] = steamid
 	if ( !busy ) then AskNextName( 0 ) end
 end
+
+-- what servers were let do (`connect` elsewhere): for this run of the program, those given
+-- for good too; by the address of the server played on
+local granted = { temporary = {}, permanent = {} }
+local function ServerAddress()
+	local address = engine.CurrentServerAddress and engine.CurrentServerAddress() or ""
+	return address != "" and address or "loopback"
+end
+local function Changed()
+	if ( hook ) then hook.Run( "OnPermissionsChanged" ) end
+end
+permissions = {}
+function permissions.GetAll()
+	local all = { temporary = {}, permanent = {} }
+	for kind, servers in pairs( granted ) do
+		for address, perms in pairs( servers ) do
+			local names = {}
+			for name in pairs( perms ) do names[ #names + 1 ] = name end
+			table.sort( names )
+			if ( #names > 0 ) then all[ kind ][ address ] = table.concat( names, "," ) end
+		end
+	end
+	return all
+end
+function permissions.IsGranted( perm )
+	local address = ServerAddress()
+	for _, servers in pairs( granted ) do
+		if ( servers[ address ] and servers[ address ][ perm ] ) then return true end
+	end
+	return false
+end
+function permissions.Grant( perm, temporary )
+	local servers = granted[ temporary and "temporary" or "permanent" ]
+	local address = ServerAddress()
+	servers[ address ] = servers[ address ] or {}
+	servers[ address ][ perm ] = true
+	Changed()
+end
+function permissions.Revoke( perm, address )
+	for _, servers in pairs( granted ) do
+		if ( servers[ address ] ) then servers[ address ][ perm ] = nil end
+	end
+	Changed()
+end
+function permissions.Connect( address )
+	RunConsoleCommand( "connect", address )
+end
+function permissions.AskToConnect( address )
+	if ( RequestConnectToServer ) then RequestConnectToServer( address ) end
+end
 "#;
 
 /// Where the previews of workshop items are kept, in openGMOD's folder: the menu's page

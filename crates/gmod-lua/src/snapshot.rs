@@ -219,10 +219,11 @@ impl crate::Runtime {
     /// A client takes what the server sent: entities gone from the server go (`OnRemove`,
     /// `EntityRemoved`), those out of sight are kept dormant, the others are as the server has
     /// them, and those new to the client come into being (`OnEntityCreated`, `Initialize`).
-    /// `CurTime` is the server's.
+    /// `CurTime` is the server's, the client's next frame ending there.
     pub fn apply_snapshot(&self, snapshot: &Snapshot) {
         let lua = &self.lua;
         host(lua).clock.cur_time.set(snapshot.time);
+        host(lua).clock.given.set(true);
         let wanted: std::collections::HashMap<u32, u32> =
             snapshot.entities.iter().map(|e| (e.index, e.serial)).chain(snapshot.dormant.iter().copied()).collect();
         let gone: Vec<EntityHandle> = host(lua)

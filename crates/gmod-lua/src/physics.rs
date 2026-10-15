@@ -194,6 +194,7 @@ pub(crate) fn keep(lua: &Lua, id: BodyId, entity: EntityHandle, part: usize, sha
     let (mins, maxs) = bounds(shape);
     let kept = Kept { entity, part, material: material.to_string(), mins, maxs, game_flags: 0, contents: 0, drag: true, hulls: None };
     host(lua).physics.bodies.borrow_mut().insert(id, kept);
+    set_material(lua, id, material);
 }
 
 /// Takes a body away, with what Lua keeps with it.
@@ -228,7 +229,7 @@ pub(crate) fn body(lua: &Lua, handle: EntityHandle) -> Option<BodyId> {
 
 /// Gives an entity a body of `shape` where it stands, in place of the one it had. Whether it
 /// got one.
-fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>) -> bool {
+fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>, material: Option<&str>) -> bool {
     destroy(lua, handle);
     let host = host(lua);
     let Some((pos, angles)) = host.entities.transform(handle) else { return false };
@@ -240,11 +241,12 @@ fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>
         ..Body::new(shape, array(pos), turn(angles))
     };
     let Some(id) = host.physics.physics.borrow_mut().add(&body) else { return false };
-    let material = model.map_or("default", |m| &m.material).to_string();
+    let material = material.or(model.map(|m| m.material.as_str())).unwrap_or("default").to_string();
     let hulls = model.map(|m| m.hulls.clone()).filter(|h| !h.is_empty());
-    let kept = Kept { entity: handle, part: 0, material, mins, maxs, game_flags: 0, contents: 0, drag: true, hulls };
+    let kept = Kept { entity: handle, part: 0, material: material.clone(), mins, maxs, game_flags: 0, contents: 0, drag: true, hulls };
     host.physics.bodies.borrow_mut().insert(id, kept);
     host.entities.with_mut(handle, |ent| ent.physics = Some(id));
+    set_material(lua, id, &material);
     true
 }
 
@@ -258,11 +260,21 @@ pub(crate) fn shape(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Vec<gmod_bsp
     Some((kept.hulls.clone()?, kept.mins, kept.maxs))
 }
 
+/// The shape of an entity's model for traces when it has no body of it - a client's copy of
+/// the server's entity, one whose body was taken away - but is solid by it
+/// (`SOLID_VPHYSICS`), as the engine traces the model's collision model where it stands.
+pub(crate) fn model_shape(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Vec<gmod_bsp::collision::Hull>>, Vector, Vector)> {
+    let model = host(lua).entities.get(handle).filter(|ent| ent.solid == crate::entity::SOLID_VPHYSICS).map(|ent| ent.model.clone())?;
+    let found = phys_model(lua, &model).filter(|m| !m.hulls.is_empty())?;
+    let (mins, maxs) = bounds(&found.shape);
+    Some((found.hulls, mins, maxs))
+}
+
 /// `PhysicsInit(SOLID_VPHYSICS)`: a body of the entity's model. Whether it got one.
 pub(crate) fn init_model(lua: &Lua, handle: EntityHandle) -> bool {
     let model = host(lua).entities.get(handle).map(|ent| ent.model.clone()).unwrap_or_default();
     match phys_model(lua, &model) {
-        Some(found) => init(lua, handle, found.shape.clone(), Some(&found)),
+        Some(found) => init(lua, handle, found.shape.clone(), Some(&found), None),
         None => {
             destroy(lua, handle);
             false
@@ -270,9 +282,21 @@ pub(crate) fn init_model(lua: &Lua, handle: EntityHandle) -> bool {
     }
 }
 
-/// A body of a box, a ball or convex hulls by their corners.
-pub(crate) fn init_shape(lua: &Lua, handle: EntityHandle, shape: Shape) -> bool {
-    init(lua, handle, shape, None)
+/// A body of a box, a ball or convex hulls by their corners, of a surface property (`default`
+/// when none is given).
+pub(crate) fn init_shape(lua: &Lua, handle: EntityHandle, shape: Shape, material: Option<&str>) -> bool {
+    init(lua, handle, shape, None, material)
+}
+
+/// A body is of a surface property from now on (`PhysObj:SetMaterial`): it holds back what
+/// slides along it as that does (`friction_00` not at all).
+pub(crate) fn set_material(lua: &Lua, id: BodyId, material: &str) {
+    let friction = crate::surfaceprops::with(lua, |props| props.get(material).map(|p| p.friction));
+    let host = host(lua);
+    if let Some(kept) = host.physics.bodies.borrow_mut().get_mut(&id) {
+        kept.material = material.to_string();
+    }
+    host.physics.physics.borrow_mut().set_friction(id, friction.unwrap_or(gmod_physics::DEFAULT_FRICTION));
 }
 
 /// Takes an entity's bodies away: its own, a ragdoll's parts. The world keeps its own.
@@ -789,7 +813,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     def("GetMaterial", |a| Ok(Value::String(a.lua.create_string(kept(a, |k| k.material.clone())?)?)))?;
     def("SetMaterial", |a| {
         let material = a.string(2)?;
-        kept(a, |k| k.material = material).map(|_| Value::Nil)
+        set_material(a.lua, this(a)?.1, &material);
+        Ok(Value::Nil)
     })?;
     def("GetContents", |a| Ok(Value::Integer(kept(a, |k| k.contents)?)))?;
     def("SetContents", |a| {

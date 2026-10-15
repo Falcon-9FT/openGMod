@@ -562,14 +562,23 @@ impl Runtime {
 
     /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
     /// answers to `HTTP` requests that came in, the timers that are due, for every tick that
-    /// passed the players' commands and movement, the bodies of physics, the inputs fired, the
-    /// scripted entities that think and the `Tick` hook, each at its own `CurTime`; the `Think` hook; then the
-    /// entities removed in the frame go.
+    /// passed the players' commands and movement, the `Tick` and `Think` hooks (the server's
+    /// frame is a tick: the gamemode thinks at its start, as in Source), the bodies of physics,
+    /// the inputs fired, the scripted entities that think, each at its own `CurTime`; the
+    /// entities removed go when the players' commands have run and at the end of the tick (a
+    /// client's at the end of its frame).
     pub fn think(&self, seconds: f64) {
         let (before, end, ticks) = {
             let clock = &host(&self.lua).clock;
-            let before = (clock.cur_time.get() / timer::TICK_INTERVAL).floor();
-            let end = clock.cur_time.get() + seconds;
+            // a client given the server's time this frame is at it, from where its last frame
+            // ended: the server's frames are not quite its own
+            let given = self.realm() != Realm::Server && clock.given.replace(false);
+            let (now, last) = (clock.cur_time.get(), clock.thought.get());
+            // the first frame, or one long after the last: from the server's time
+            let start = if given && last > 0.0 && (now - last).abs() < 1.0 { last } else { now };
+            let before = (start / timer::TICK_INTERVAL).floor();
+            let end = if given { now.max(start) } else { now + seconds };
+            clock.thought.set(end);
             clock.cur_time.set(end);
             // a server's frame is a tick, as in GMod; a client's is what was drawn
             clock.frame_time.set(if self.realm() == Realm::Server { timer::TICK_INTERVAL } else { seconds });
@@ -587,6 +596,13 @@ impl Runtime {
             host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::TICK_INTERVAL).min(end));
             if server {
                 player::tick_all(&self.lua);
+                // what the players' commands removed goes before the frame, as in Source
+                ents::collect(&self.lua);
+            }
+            // the gamemode thinks first in a frame of the server's, before the entities do
+            self.call_hook("Tick", mlua::MultiValue::new());
+            if server {
+                self.call_hook("Think", mlua::MultiValue::new());
                 physgun::think(&self.lua);
                 pickup::think(&self.lua);
                 physics::simulate(&self.lua);
@@ -596,16 +612,11 @@ impl Runtime {
                 logic::tick(&self.lua);
                 movers::tick(&self.lua);
                 npc::tick(&self.lua);
-            }
-            if server {
                 ents::think(&self.lua);
                 anim::advance(&self.lua);
                 lagcomp::record(&self.lua);
-            }
-            self.call_hook("Tick", mlua::MultiValue::new());
-            // the server's frame is the tick: its `Think` runs with each
-            if server {
-                self.call_hook("Think", mlua::MultiValue::new());
+                // the server's frame ends: what was removed in it is gone before the next
+                ents::collect(&self.lua);
             }
         }
         host(&self.lua).clock.cur_time.set(end);
@@ -654,6 +665,28 @@ impl Runtime {
     /// player slot is taken ([`set_max_players`](Self::set_max_players)).
     pub fn join(&self, info: PlayerInfo) -> Option<EntityHandle> {
         player::join(&self.lua, info)
+    }
+
+    /// A key or button of a player's (`KEY_*`, `MOUSE_*`) went down or up, one the game had
+    /// rather than a menu or the chat: `PlayerButtonDown` or `PlayerButtonUp`, with the
+    /// player. On a client, the local player's, and the server is told
+    /// ([`take_buttons`](Self::take_buttons)).
+    pub fn player_button(&self, code: i32, down: bool) {
+        let player = host(&self.lua).client.local_player.get();
+        if self.realm() != Realm::Server {
+            host(&self.lua).client.buttons.borrow_mut().push((code, down));
+        }
+        self.player_button_of(player, code, down);
+    }
+
+    /// [`player_button`](Self::player_button) on the server: the player whose it was.
+    pub fn player_button_of(&self, player: EntityHandle, code: i32, down: bool) {
+        if !host(&self.lua).entities.is_valid(player) {
+            return;
+        }
+        let Ok(ply) = entity::push(&self.lua, player) else { return };
+        let hook = if down { "PlayerButtonDown" } else { "PlayerButtonUp" };
+        self.call_hook(hook, mlua::MultiValue::from_iter([ply, mlua::Value::Integer(code.into())]));
     }
 
     /// Runs console commands typed by a player, as a client's console sends them: the

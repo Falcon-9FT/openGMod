@@ -95,6 +95,10 @@ struct Plane {
 /// glyphs ([`gmod_ui::Fonts::pages`]) it is cut from, which the program gives the renderer.
 pub const GLYPHS: &str = "!glyphs/";
 
+/// The material of a picture (`Material("x.png")`) drawn in the world: this, and the number of
+/// its image ([`crate::Runtime::image`]), whose pixels the program gives the renderer.
+pub const IMAGES: &str = "!image/";
+
 // The canvas drawn on a plane: so big, and `(0, 0)` so far in, that nothing drawn is cut off at
 // its edges, as drawing on a plane may go any way from its origin.
 const PLANE_SIZE: u32 = 1 << 18;
@@ -157,7 +161,13 @@ fn plane_triangles(
             gmod_ui::Texture::White => Material3d { name: "color".into(), texture: None, additive: Some(batch.additive) },
             gmod_ui::Texture::Image(id) => {
                 let Some(found) = image(id) else { continue };
-                Material3d { name: found.name, texture: None, additive: Some(batch.additive || found.additive) }
+                let additive = Some(batch.additive || found.additive);
+                // a picture (`Material("x.png")`) is no material of the game's: the program has
+                // its pixels by its number
+                let lower = found.name.to_ascii_lowercase();
+                let picture = [".png", ".jpg", ".jpeg"].iter().any(|e| lower.ends_with(e));
+                let name = if picture { format!("{IMAGES}{id}") } else { found.name };
+                Material3d { name, texture: None, additive }
             }
             gmod_ui::Texture::Glyphs(page) => Material3d { name: format!("{GLYPHS}{page}"), texture: None, additive: Some(batch.additive) },
         };

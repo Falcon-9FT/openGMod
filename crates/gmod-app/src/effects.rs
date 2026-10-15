@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gmod_fs::Vfs;
-use gmod_lua::render3d::{GLYPHS, Material3d, Primitive, Shape};
+use gmod_lua::render3d::{GLYPHS, IMAGES, Material3d, Primitive, Shape};
 use gmod_lua::vector::Vector;
 use gmod_render::{EffectBatch, EffectVertex};
 use gmod_world::gpu::Camera;
@@ -31,8 +31,8 @@ impl Materials {
     /// The texture a material shows (none for a plain colour, or one that is not there) and
     /// whether it adds to what is behind it.
     fn look(&mut self, material: &Material3d) -> Look {
-        // text: a page of the fonts' glyphs, which the program hands the renderer itself
-        if material.name.starts_with(GLYPHS) {
+        // text, a picture: pixels the program hands the renderer itself
+        if given(&material.name) {
             return (None, material.additive.unwrap_or(false));
         }
         let key = (material.name.to_ascii_lowercase(), material.texture.clone(), material.additive);
@@ -52,6 +52,11 @@ impl Materials {
         self.looks.insert(key, look.clone());
         look
     }
+}
+
+/// A texture the program makes from pixels of its own: a page of the fonts' glyphs, a picture.
+pub fn given(name: &str) -> bool {
+    name.starts_with(GLYPHS) || name.starts_with(IMAGES)
 }
 
 fn v3(v: Vector) -> [f32; 3] {
@@ -83,8 +88,8 @@ fn quad(out: &mut Vec<EffectVertex>, corners: [[f32; 3]; 4], uvs: [[f32; 2]; 4],
 }
 
 /// The triangles of the primitives, as seen from `camera`, in batches of one texture each, in
-/// the order they were drawn; the textures they need are handed to `upload` once. Text whose
-/// page of glyphs the renderer does not have yet (`has`) is left out.
+/// the order they were drawn; the textures they need are handed to `upload` once. Text and
+/// pictures whose pixels the renderer does not have yet (`has`) are left out.
 pub fn batches(
     primitives: &[Primitive],
     camera: &Camera,
@@ -97,7 +102,7 @@ pub fn batches(
     let up = cross(right, forward);
     let mut out: Vec<EffectBatch> = Vec::new();
     for primitive in primitives {
-        let glyphs = primitive.material.name.starts_with(GLYPHS);
+        let glyphs = given(&primitive.material.name);
         if glyphs && !has(&primitive.material.name) {
             continue;
         }

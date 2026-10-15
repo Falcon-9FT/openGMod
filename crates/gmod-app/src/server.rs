@@ -416,6 +416,11 @@ impl Server {
                     self.runtime.receive_net_message(&name, &data, player);
                 }
             }
+            ToServer::Button(code, down) => {
+                if let Some(player) = player {
+                    self.runtime.player_button_of(player, code, down);
+                }
+            }
         }
     }
 

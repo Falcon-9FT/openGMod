@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The version of these messages: a client and a server of different ones do not play.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The port servers listen on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 27015;
@@ -126,6 +126,8 @@ pub enum ToServer {
     UserInfo(String, String),
     /// A `net` message.
     Net { name: String, data: Bits },
+    /// A key or button of the game's went down (true) or up (`PlayerButtonDown`).
+    Button(i32, bool),
 }
 
 /// What a server sends a client.

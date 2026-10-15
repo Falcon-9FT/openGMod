@@ -1550,11 +1550,26 @@ impl App {
         let mut view_models = models.place(&held, |model| renderer.add_model(&gpu.device, &gpu.queue, model));
         // what the game drew in the world by itself this frame: beams, sprites, quads
         let primitives = game.client().take_primitives();
-        // the pages of glyphs the renderer has, which text in the world is cut from
+        // the pictures drawn in the world, given the renderer the first time
+        for name in primitives.iter().map(|p| &p.material.name) {
+            let Some(id) = name.strip_prefix(gmod_lua::render3d::IMAGES).and_then(|id| id.parse().ok()) else { continue };
+            if renderer.has_texture(name) {
+                continue;
+            }
+            let limit = gpu.device.limits().max_texture_dimension_2d;
+            // one that could not be read is plain
+            let (width, height, pixels) = match game.client().image(id).and_then(|(_, pixels)| pixels) {
+                Some(p) if p.width > 0 && p.height > 0 && p.width <= limit && p.height <= limit => (p.width, p.height, p.pixels),
+                _ => (1, 1, vec![255; 4]),
+            };
+            renderer.set_effect_pixels(&gpu.device, &gpu.queue, name, width, height, pixels);
+        }
+        // the pages of glyphs and the pictures the renderer has, which text and pictures in
+        // the world are cut from
         let pages: HashSet<String> = primitives
             .iter()
             .map(|p| &p.material.name)
-            .filter(|name| name.starts_with(gmod_lua::render3d::GLYPHS) && renderer.has_texture(name))
+            .filter(|name| effects::given(name) && renderer.has_texture(name))
             .cloned()
             .collect();
         let batches = effects::batches(

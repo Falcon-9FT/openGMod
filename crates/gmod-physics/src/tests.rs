@@ -59,6 +59,24 @@ fn a_crate_falls_and_comes_to_rest_on_the_floor() {
 }
 
 #[test]
+fn a_body_of_no_friction_slides_on() {
+    let mut physics = floor();
+    let gripping = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    let sliding = physics.add(&crate_body([0.0, 200.0, 16.0])).unwrap();
+    physics.set_friction(sliding, 0.0);
+    assert_eq!(physics.friction(sliding), 0.0);
+    run(&mut physics, 0.5);
+    for body in [gripping, sliding] {
+        physics.set_velocity(body, [300.0, 0.0, 0.0]);
+    }
+    run(&mut physics, 1.0);
+    // the floor holds the one back, and not the other: the less of the two goes
+    let (held, _) = physics.pose(gripping).unwrap();
+    let (slid, _) = physics.pose(sliding).unwrap();
+    assert!(held[0] < 150.0 && slid[0] > 250.0, "{held:?} {slid:?}");
+}
+
+#[test]
 fn bodies_hit_each_other() {
     let mut physics = floor();
     let below = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();

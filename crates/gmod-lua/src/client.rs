@@ -57,6 +57,10 @@ pub(crate) struct Client {
     pub to_server: RefCell<Vec<String>>,
     /// User info (ConVars with `FCVAR_USERINFO`) the server has not been told of.
     pub user_info: RefCell<Vec<(String, String)>>,
+    /// Keys and buttons of the game's that went down (true) or up since the server was told,
+    /// for its `PlayerButtonDown` and `PlayerButtonUp`; and those down, as it was told.
+    pub(crate) buttons: RefCell<Vec<(i32, bool)>>,
+    buttons_down: RefCell<HashSet<i32>>,
     pub frame: Cell<u64>,
     pub real_frame_time: Cell<f64>,
     /// The view is from outside the local player, who is drawn then (`CalcView`'s
@@ -76,6 +80,8 @@ impl Default for Client {
             phrases: RefCell::new(HashMap::new()),
             to_server: RefCell::new(Vec::new()),
             user_info: RefCell::new(Vec::new()),
+            buttons: RefCell::new(Vec::new()),
+            buttons_down: RefCell::new(HashSet::new()),
             frame: Cell::new(0),
             draw_viewer: Cell::new(false),
             real_frame_time: Cell::new(0.0),
@@ -1063,6 +1069,10 @@ impl crate::Runtime {
         // a key held down repeats: for the text entries, not the binds
         let repeat = down && host(lua).client.is_down(code);
         host(lua).client.set_key(code, down);
+        // a key the game had going down goes up for it whoever takes it now
+        if !down && host(lua).client.buttons_down.borrow_mut().remove(&code) {
+            self.player_button(code, false);
+        }
         if down {
             crate::chat::key_down(lua);
             if let Some(taken) = crate::chat::key(lua, code) {
@@ -1081,6 +1091,9 @@ impl crate::Runtime {
         }
         if repeat {
             return false;
+        }
+        if down && host(lua).client.buttons_down.borrow_mut().insert(code) {
+            self.player_button(code, true);
         }
         let Some(command) = host(lua).client.binding(code) else { return false };
         if down {
@@ -1205,6 +1218,13 @@ impl crate::Runtime {
     /// oldest first.
     pub fn take_server_commands(&self) -> Vec<String> {
         std::mem::take(&mut *host(&self.lua).client.to_server.borrow_mut())
+    }
+
+    /// The keys and buttons of the game's (`KEY_*`, `MOUSE_*`) that went down (true) or up
+    /// since the last time, in order: the server's `PlayerButtonDown` and `PlayerButtonUp`
+    /// ([`player_button`](Self::player_button)).
+    pub fn take_buttons(&self) -> Vec<(i32, bool)> {
+        std::mem::take(&mut *host(&self.lua).client.buttons.borrow_mut())
     }
 
     /// The user info the client tells the server (`gmod_toolmode`, `cl_playermodel`): all of

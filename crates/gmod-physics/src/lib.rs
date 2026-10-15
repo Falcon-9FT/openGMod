@@ -23,9 +23,9 @@ use std::collections::{HashMap, HashSet};
 
 use rapier3d::math::{Mat3, Pose, Rotation, Vector};
 use rapier3d::prelude::{
-    ActiveHooks, Collider, ColliderBuilder, ColliderHandle, GenericJoint, GenericJointBuilder, ImpulseJointHandle, InteractionGroups,
-    JointAxesMask, JointAxis, MassProperties, PairFilterContext, PhysicsHooks, PhysicsWorld, QueryFilter, Ray, RigidBodyBuilder,
-    RigidBodyHandle, RigidBodyType, SharedShape, SolverFlags, SpringJointBuilder,
+    ActiveHooks, CoefficientCombineRule, Collider, ColliderBuilder, ColliderHandle, GenericJoint, GenericJointBuilder, ImpulseJointHandle,
+    InteractionGroups, JointAxesMask, JointAxis, MassProperties, PairFilterContext, PhysicsHooks, PhysicsWorld, QueryFilter, Ray,
+    RigidBodyBuilder, RigidBodyHandle, RigidBodyType, SharedShape, SolverFlags, SpringJointBuilder,
 };
 
 pub type Vec3 = [f32; 3];
@@ -36,7 +36,9 @@ pub const METRES_PER_UNIT: f32 = 0.0254;
 pub const DEFAULT_GRAVITY: f32 = 600.0;
 /// Kilograms in a cubic metre of what has no mass of its own: the `default` surface property.
 pub const DEFAULT_DENSITY: f32 = 2000.0;
-/// How much what slides along something holds back, when nothing says otherwise.
+/// How much what slides along something holds back, when nothing says otherwise. Two things
+/// sliding along each other hold back as the one that holds back less does: a body of
+/// `friction_00` slides on anything.
 pub const DEFAULT_FRICTION: f32 = 0.8;
 /// The least change of speed a contact makes to count as an [`Impact`], in units/s: less is
 /// a body at rest, or one sliding along.
@@ -293,14 +295,14 @@ impl Physics {
         for corners in hulls {
             let points: Vec<Vector> = corners.iter().map(|&p| metres(p)).collect();
             if let Some(collider) = ColliderBuilder::convex_hull(&points) {
-                self.world.colliders.insert(collider.friction(DEFAULT_FRICTION));
+                self.world.colliders.insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min));
                 added += 1;
             }
         }
         if !triangles.is_empty()
             && let Ok(collider) = ColliderBuilder::trimesh(vertices.iter().map(|&p| metres(p)).collect(), triangles.to_vec())
         {
-            self.world.colliders.insert(collider.friction(DEFAULT_FRICTION));
+            self.world.colliders.insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min));
         }
         added
     }
@@ -324,7 +326,8 @@ impl Physics {
             .user_data(u128::from(body.user));
         let handle = self.world.insert_body(rigid);
         for (shape, _) in shapes {
-            let collider = ColliderBuilder::new(shape).density(density).friction(DEFAULT_FRICTION);
+            let collider =
+                ColliderBuilder::new(shape).density(density).friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min);
             self.world.insert_collider(collider, Some(handle));
         }
         if body.inertia > 0.0 && body.inertia != 1.0 {
@@ -332,6 +335,22 @@ impl Physics {
         }
         self.weigh(handle);
         Some(BodyId(handle))
+    }
+
+    /// How much a body holds back what slides along it: its material's friction.
+    pub fn set_friction(&mut self, id: BodyId, friction: f32) {
+        let Some(body) = self.world.bodies.get(id.0) else { return };
+        for &collider in body.colliders() {
+            if let Some(collider) = self.world.colliders.get_mut(collider) {
+                collider.set_friction(friction.max(0.0));
+            }
+        }
+    }
+
+    /// The friction of a body ([`Physics::set_friction`]).
+    pub fn friction(&self, id: BodyId) -> f32 {
+        let body = self.world.bodies.get(id.0);
+        body.and_then(|b| b.colliders().first()).and_then(|&c| self.world.colliders.get(c)).map_or(DEFAULT_FRICTION, |c| c.friction())
     }
 
     /// Works out a body's mass and inertia from its colliders, and turns it as hard as it
@@ -365,7 +384,8 @@ impl Physics {
             .user_data(u128::from(user));
         let handle = self.world.insert_body(rigid);
         for collider in colliders {
-            self.world.insert_collider(collider.friction(DEFAULT_FRICTION), Some(handle));
+            self.world
+                .insert_collider(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min), Some(handle));
         }
         Some(BodyId(handle))
     }

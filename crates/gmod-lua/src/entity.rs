@@ -494,7 +494,7 @@ pub fn rotated_bounds(mins: Vector, maxs: Vector, angles: Angle) -> (Vector, Vec
 
 const CACHE: &str = "gmod-lua.entities";
 /// `SOLID_VPHYSICS`: the entity collides as its physics body.
-const SOLID_VPHYSICS: i64 = 6;
+pub(crate) const SOLID_VPHYSICS: i64 = 6;
 const NULL_ENTITY: &str = "gmod-lua.null-entity";
 
 /// The engine's types that are not entities: name, type ID, and whether only clients have it.
@@ -1519,7 +1519,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             ent.move_type = 6;
         })?;
         let shape = gmod_physics::Shape::cuboid([mins.x, mins.y, mins.z], [maxs.x, maxs.y, maxs.z]);
-        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, shape)))
+        let material = a.opt_string(4)?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, shape, material.as_deref())))
     })?;
     def("PhysicsInitSphere", |a| {
         let radius = a.number(2)? as f32;
@@ -1528,7 +1529,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             ent.solid = SOLID_VPHYSICS;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Sphere(radius))))
+        let material = a.opt_string(3)?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Sphere(radius), material.as_deref())))
     })?;
     def("PhysicsInitConvex", |a| {
         let points = convex(&a.table(2)?)?;
@@ -1536,7 +1538,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             ent.solid = SOLID_VPHYSICS;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(vec![points]))))
+        let material = a.opt_string(3)?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(vec![points]), material.as_deref())))
     })?;
     def("PhysicsInitMultiConvex", |a| {
         let hulls = a.table(2)?.sequence_values::<Table>().map(|t| convex(&t?)).collect::<mlua::Result<Vec<_>>>()?;
@@ -1544,7 +1547,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             ent.solid = SOLID_VPHYSICS;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(hulls))))
+        let material = a.opt_string(3)?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(hulls), material.as_deref())))
     })?;
     def("PhysicsDestroy", |a| {
         crate::physics::destroy(a.lua, this(a, 1)?);
