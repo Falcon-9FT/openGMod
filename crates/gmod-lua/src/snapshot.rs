@@ -261,9 +261,18 @@ impl crate::Runtime {
                 if entities.get(handle).is_some_and(|e| e.dormant) {
                     woke.push(handle);
                 }
-                entities.with_mut(handle, |ent| *ent = state.ent.clone());
+                entities.with_mut(handle, |ent| {
+                    // what is the client's own stays: when its `Think` runs (every frame here,
+                    // or as `SetNextClientThink` asks - not as the server's ticks do), the
+                    // bounds it is drawn in, whether Lua drew it
+                    let own = (ent.next_think, ent.think_request, ent.render_bounds, ent.lua_drawn);
+                    *ent = state.ent.clone();
+                    (ent.next_think, ent.think_request, ent.render_bounds, ent.lua_drawn) = own;
+                });
             } else {
-                entities.put(state.index, state.serial, state.ent.clone());
+                let mut ent = state.ent.clone();
+                (ent.next_think, ent.think_request) = (0.0, None);
+                entities.put(state.index, state.serial, ent);
                 new.push(handle);
             }
             handles.push(handle);

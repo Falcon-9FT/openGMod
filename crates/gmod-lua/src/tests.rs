@@ -3752,3 +3752,32 @@ fn the_scissor_and_the_main_view() {
          return off and MainEyePos() == EyePos() and MainEyeAngles() == EyeAngles()"
     ));
 }
+
+#[test]
+fn a_client_thinks_every_frame_whatever_the_server_ticks() {
+    const SENT: &str = "scripted_ents.Register({ Type = 'anim', Think = function(self) THINKS = (THINKS or 0) + 1 end }, 'sent_thinker')";
+    let server = player_game();
+    server.runtime.run_string(SENT, "sent").unwrap();
+    let alice = server.runtime.join(alice()).unwrap();
+    server.runtime.run_string("S = ents.Create('sent_thinker') S:Spawn()", "spawn").unwrap();
+    server.runtime.think(0.02);
+    let client = client_game(&[]);
+    client.runtime.run_string(SENT, "sent").unwrap();
+    client.runtime.set_local_player(alice);
+    // the server's own Think every 0.2 seconds; the client's every frame, as GMod's
+    for _ in 0..30 {
+        server.runtime.think(1.0 / 60.0);
+        client.runtime.apply_snapshot(&server.runtime.snapshot());
+        client.runtime.think(1.0 / 60.0);
+    }
+    let thinks = client.eval::<i64>("return THINKS or 0");
+    assert!(thinks >= 29, "{thinks} of 30 frames");
+    // and the bounds it is drawn in, the client's, stay
+    client
+        .runtime
+        .run_string("local e = ents.FindByClass('sent_thinker')[1] e:SetRenderBounds(Vector(-50, -50, -50), Vector(50, 50, 50))", "bounds")
+        .unwrap();
+    server.runtime.think(0.02);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    assert!(client.eval::<bool>("local lo = ents.FindByClass('sent_thinker')[1]:GetRenderBounds() return lo == Vector(-50, -50, -50)"));
+}
