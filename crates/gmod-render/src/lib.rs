@@ -957,6 +957,14 @@ impl Renderer {
         self.textures.insert(texture.name.clone(), uploaded);
     }
 
+    /// A texture for effects from RGBA pixels, `width` by `height`, made again each time it is
+    /// given: a page of the fonts' glyphs, which text drawn in the world is cut from.
+    pub fn set_effect_pixels(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, name: &str, width: u32, height: u32, rgba: Vec<u8>) {
+        let data = TextureData { width, height, format: PixelFormat::Rgba8, frames: 1, levels: vec![rgba], clamp_s: true, clamp_t: true };
+        self.textures.insert(name.to_string(), Some(views(device, queue, name, &data)));
+        self.effects.forget(name);
+    }
+
     /// What the game draws in the world from now on ([`EffectBatch`]), over the world and the
     /// entities.
     pub fn set_effects(&mut self, batches: Vec<EffectBatch>) {

@@ -169,6 +169,9 @@ pub(crate) struct Anims {
     /// The bones of entities whose `BuildBonePositions` callbacks run now, in their models'
     /// space: what `GetBoneMatrix` reads and `SetBoneMatrix` changes while they do.
     building: RefCell<HashMap<EntityHandle, Vec<BoneMatrix>>>,
+    /// What moves the vertices of models that do not move to where their bones rest, by
+    /// model; empty for those whose bones rest where the vertices were made with them.
+    still: RefCell<HashMap<String, Vec<BoneMatrix>>>,
 }
 
 /// The rig of a studio model (with the models it includes and its `.ani`), read once.
@@ -609,13 +612,28 @@ fn to_vmatrix(m: &BoneMatrix) -> Matrix {
     Matrix { m: [m[0], m[1], m[2], [0.0, 0.0, 0.0, 1.0]] }
 }
 
+/// A model that does not move, as Source draws it: through its bones, where they rest - which
+/// is not always where its vertices were made with them (a root bone the model's compile
+/// turned): worked out once for each model; none when it changes nothing.
+fn still_skinning(lua: &Lua, handle: EntityHandle) -> Vec<BoneMatrix> {
+    let Some(model) = host(lua).entities.get(handle).map(|e| e.model.to_ascii_lowercase()) else { return Vec::new() };
+    if let Some(known) = host(lua).anims.still.borrow().get(&model) {
+        return known.clone();
+    }
+    let skinning = model_bones(lua, handle).map(|(rig, bones)| rig.skinning(&bones)).unwrap_or_default();
+    let identity = |m: &BoneMatrix| (0..3).all(|r| (0..4).all(|c| (m[r][c] - if r == c { 1.0 } else { 0.0 }).abs() < 1e-4));
+    let skinning = if skinning.iter().all(identity) { Vec::new() } else { skinning };
+    host(lua).anims.still.borrow_mut().insert(model, skinning.clone());
+    skinning
+}
+
 /// What moves the vertices of an entity's model to where it is posed: none for a model that
 /// does not move (one bone, no sequences, nothing moved by Lua).
 pub(crate) fn skinning(lua: &Lua, handle: EntityHandle) -> Vec<[[f32; 4]; 3]> {
     let still = animated(lua, handle).is_none_or(|(rig, _)| rig.bones().len() <= 1 && rig.sequence_count() <= 1);
     let manipulated = host(lua).entities.get(handle).is_some_and(|e| !e.bone_manipulations.is_empty() || e.effects & EF_BONEMERGE != 0);
     if still && !manipulated && bone_callbacks(lua, handle).is_empty() {
-        return Vec::new();
+        return still_skinning(lua, handle);
     }
     model_bones(lua, handle).map(|(rig, bones)| rig.skinning(&bones)).unwrap_or_default()
 }

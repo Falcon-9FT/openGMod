@@ -3781,3 +3781,78 @@ fn a_client_thinks_every_frame_whatever_the_server_ticks() {
     client.runtime.apply_snapshot(&server.runtime.snapshot());
     assert!(client.eval::<bool>("local lo = ents.FindByClass('sent_thinker')[1]:GetRenderBounds() return lo == Vector(-50, -50, -50)"));
 }
+
+#[test]
+fn a_still_model_is_drawn_where_its_bones_rest() {
+    use gmod_model::testmodel::{TestBone, TestRig};
+    // one bone, which rests turned a quarter about z from where the vertices were made with it
+    // (a root bone the model's compile turned), and one that rests where they were made
+    let rig = TestRig {
+        name: "still.mdl".into(),
+        bones: vec![TestBone { name: "root".into(), parent: -1, position: [0.0; 3], euler: [0.0; 3] }],
+        ..TestRig::default()
+    };
+    let (plain, _) = rig.files();
+    let mut turned = plain.clone();
+    let bone_at = i32::from_le_bytes(turned[160..164].try_into().unwrap()) as usize;
+    let q = gmod_model::anim::euler_quaternion([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
+    for (i, v) in q.iter().chain(&[0.0, 0.0, std::f32::consts::FRAC_PI_2]).enumerate() {
+        turned[bone_at + 44 + i * 4..bone_at + 48 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let g = game_with(
+        Realm::Server,
+        &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/turned.mdl", &turned), ("models/plain.mdl", &plain)],
+    );
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "for _, m in ipairs({ 'models/turned.mdl', 'models/plain.mdl' }) do
+                 local e = ents.Create('prop_dynamic') e:SetModel(m) e:Spawn()
+             end",
+            "props",
+        )
+        .unwrap();
+    let drawn = g.runtime.drawn(EntityHandle::NULL);
+    let bones = |model: &str| drawn.iter().find(|d| d.model == model).map(|d| d.bones.clone()).expect("drawn");
+    let turned = bones("models/turned.mdl");
+    assert_eq!(turned.len(), 1);
+    // x goes to y: a quarter turn about z
+    let m = turned[0];
+    assert!((m[0][0]).abs() < 1e-4 && (m[1][0] - 1.0).abs() < 1e-4 && (m[0][1] + 1.0).abs() < 1e-4, "{m:?}");
+    assert!(bones("models/plain.mdl").is_empty(), "drawn as it was made");
+}
+
+#[test]
+fn text_drawn_on_a_plane_is_cut_from_the_pages_of_glyphs() {
+    use crate::render3d::{GLYPHS, Shape};
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes())]);
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "surface.CreateFont('Plate', { font = 'Tahoma', size = 20 })
+             HOOKS.PostDrawOpaqueRenderables = function()
+                 cam.Start3D2D(Vector(0, 0, 100), Angle(0, 0, 0), 0.25)
+                     surface.SetFont('Plate') surface.SetTextColor(255, 200, 0, 255) surface.SetTextPos(0, 0)
+                     surface.DrawText('42')
+                 cam.End3D2D()
+             end",
+            "plate",
+        )
+        .unwrap();
+    g.runtime.drawn(EntityHandle::NULL);
+    let drawn = g.runtime.take_primitives();
+    // where the machine has a font at all, its glyphs: triangles of a page, in the text's colour
+    let has_font = g.runtime.with_canvas(|_, fonts| {
+        let font = fonts.font(&gmod_ui::FontSpec { family: "Tahoma".into(), size: 20, ..gmod_ui::FontSpec::default() });
+        fonts.face_name(font).is_some()
+    });
+    let text: Vec<_> = drawn.iter().filter(|p| p.material.name.starts_with(GLYPHS)).collect();
+    assert_eq!(!text.is_empty(), has_font, "{drawn:?}");
+    if let Some(Shape::Triangles(corners)) = text.first().map(|p| &p.shape) {
+        assert!(corners.iter().all(|c| c.pos.z == 100.0 && (c.color[1] - 200.0 / 255.0).abs() < 1e-3));
+        // two glyphs, two quads at least, a quarter of a unit a pixel: well under 20 units across
+        let xs: Vec<f32> = corners.iter().map(|c| c.pos.x).collect();
+        assert!(corners.len() >= 12 && xs.iter().cloned().fold(f32::MIN, f32::max) < 20.0, "{corners:?}");
+    }
+}

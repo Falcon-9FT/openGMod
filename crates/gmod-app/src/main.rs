@@ -665,7 +665,20 @@ impl Gpu {
         menu: Option<&gmod_lua::Runtime>,
     ) {
         if let Some(client) = client {
-            draw_2d(&self.device, &self.queue, &mut self.overlay, encoder, view, size, client);
+            let changed = draw_2d(&self.device, &self.queue, &mut self.overlay, encoder, view, size, client);
+            // the pages of glyphs that text drawn in the world is cut from: the renderer's too,
+            // when they change and the first time
+            if let Some(renderer) = &mut self.renderer {
+                client.with_canvas(|_, fonts| {
+                    for (page, glyphs) in fonts.pages().iter().enumerate() {
+                        let name = format!("{}{page}", gmod_lua::render3d::GLYPHS);
+                        if changed.contains(&(page as u32)) || !renderer.has_texture(&name) {
+                            let side = gmod_ui::font::PAGE_SIZE;
+                            renderer.set_effect_pixels(&self.device, &self.queue, &name, side, side, glyphs.pixels.clone());
+                        }
+                    }
+                });
+            }
         }
         if let Some(menu) = menu {
             draw_2d(&self.device, &self.queue, &mut self.menu_overlay, encoder, view, size, menu);
@@ -827,7 +840,7 @@ impl Gpu {
 }
 
 /// Draws what a realm painted in 2D: the pages' new pictures, the atlas's new glyphs and the
-/// new images go to the GPU first.
+/// new images go to the GPU first. The pages of glyphs that changed.
 fn draw_2d(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -836,19 +849,18 @@ fn draw_2d(
     view: &wgpu::TextureView,
     size: (u32, u32),
     runtime: &gmod_lua::Runtime,
-) {
+) -> Vec<u32> {
     for (id, picture) in runtime.take_page_pictures() {
         overlay.update_image(device, queue, id, picture.width, picture.height, &picture.pixels);
     }
-    let missing = runtime.with_canvas(|canvas, fonts| {
-        overlay.update_glyphs(device, queue, fonts);
-        overlay.missing_images(canvas)
-    });
+    let (changed, missing) =
+        runtime.with_canvas(|canvas, fonts| (overlay.update_glyphs(device, queue, fonts), overlay.missing_images(canvas)));
     for id in missing {
         let pixels = runtime.image(id).and_then(|(_, pixels)| pixels);
         overlay.set_image(device, queue, id, pixels.as_ref().map(|p| (p.width, p.height, p.pixels.as_slice())));
     }
     runtime.with_canvas(|canvas, _| overlay.render(device, queue, encoder, view, size, canvas));
+    changed
 }
 
 struct App {
@@ -1538,9 +1550,20 @@ impl App {
         let mut view_models = models.place(&held, |model| renderer.add_model(&gpu.device, &gpu.queue, model));
         // what the game drew in the world by itself this frame: beams, sprites, quads
         let primitives = game.client().take_primitives();
-        let batches = effects::batches(&primitives, &camera, &mut models.materials, |texture| {
-            renderer.add_effect_texture(&gpu.device, &gpu.queue, texture)
-        });
+        // the pages of glyphs the renderer has, which text in the world is cut from
+        let pages: HashSet<String> = primitives
+            .iter()
+            .map(|p| &p.material.name)
+            .filter(|name| name.starts_with(gmod_lua::render3d::GLYPHS) && renderer.has_texture(name))
+            .cloned()
+            .collect();
+        let batches = effects::batches(
+            &primitives,
+            &camera,
+            &mut models.materials,
+            |texture| renderer.add_effect_texture(&gpu.device, &gpu.queue, texture),
+            |name| pages.contains(name),
+        );
         renderer.set_effects(batches);
         let (Some(light), Some(collision)) = (&self.light, &self.collision) else { return };
         for p in placed.iter_mut().chain(&mut view_models) {

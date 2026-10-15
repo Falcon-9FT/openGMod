@@ -141,6 +141,11 @@ impl Effects {
 
     /// The vertices of the frame on the GPU, and a bind group for each texture used; then the
     /// batches, each a range of the vertices.
+    /// A texture made again: what was bound of it before goes.
+    pub(crate) fn forget(&mut self, name: &str) {
+        self.groups.remove(&Some(name.to_string()));
+    }
+
     pub(crate) fn prepare(
         &mut self,
         device: &wgpu::Device,

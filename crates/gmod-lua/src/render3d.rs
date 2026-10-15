@@ -91,6 +91,10 @@ struct Plane {
     y: Vector,
 }
 
+/// The material of text drawn in the world: this, and the number of the page of the fonts'
+/// glyphs ([`gmod_ui::Fonts::pages`]) it is cut from, which the program gives the renderer.
+pub const GLYPHS: &str = "!glyphs/";
+
 // The canvas drawn on a plane: so big, and `(0, 0)` so far in, that nothing drawn is cut off at
 // its edges, as drawing on a plane may go any way from its origin.
 const PLANE_SIZE: u32 = 1 << 18;
@@ -129,7 +133,8 @@ fn start_3d2d(lua: &Lua, pos: Vector, angles: Angle, scale: f32) {
 }
 
 /// `cam.End3D2D`: what was drawn on the plane put in the world, as triangles of the materials
-/// it was drawn with; the screen is drawn on again. Text is not put there yet.
+/// it was drawn with - text of the page of the fonts' glyphs it was cut from
+/// ([`GLYPHS`]) - and the screen is drawn on again.
 fn end_3d2d(lua: &Lua) {
     let Some((plane, taken)) = host(lua).render3d.planes.borrow_mut().pop() else { return };
     let screen = &host(lua).screen;
@@ -154,7 +159,7 @@ fn plane_triangles(
                 let Some(found) = image(id) else { continue };
                 Material3d { name: found.name, texture: None, additive: Some(batch.additive || found.additive) }
             }
-            gmod_ui::Texture::Glyphs(_) => continue,
+            gmod_ui::Texture::Glyphs(page) => Material3d { name: format!("{GLYPHS}{page}"), texture: None, additive: Some(batch.additive) },
         };
         let range = batch.start as usize..(batch.start + batch.count) as usize;
         let triangles = vertices[range]
