@@ -40,6 +40,12 @@ pub const DEFAULT_DENSITY: f32 = 2000.0;
 /// sliding along each other hold back as the one that holds back less does: a body of
 /// `friction_00` slides on anything.
 pub const DEFAULT_FRICTION: f32 = 0.8;
+
+/// How hard a rigid rope holds its length against being pushed shorter: a spring of this
+/// stiffness and damping per kilogram (1/s², 1/s), critically damped and far quicker than a
+/// tick.
+const ROD_STIFFNESS: f32 = 1.0e5;
+const ROD_DAMPING: f32 = 632.0;
 /// The least change of speed a contact makes to count as an [`Impact`], in units/s: less is
 /// a body at rest, or one sliding along.
 pub const MIN_IMPACT_SPEED: f32 = 50.0;
@@ -178,8 +184,10 @@ pub enum Joint {
     /// `length` units; no nearer either when `rigid`.
     Rope { start: Vec3, end: Vec3, length: f32, rigid: bool },
     /// A point of each pulled towards `length` units apart, with `stiffness` (kilograms per
-    /// second squared) and `damping` (kilograms per second).
-    Spring { start: Vec3, end: Vec3, length: f32, stiffness: f32, damping: f32 },
+    /// second squared) and `damping` (kilograms per second) along the line between them; and
+    /// `relative_damping` (kilograms per second) against their moving apart any way at all,
+    /// as VPhysics' springs have it (measured in GMod).
+    Spring { start: Vec3, end: Vec3, length: f32, stiffness: f32, damping: f32, relative_damping: f32 },
     /// Nothing held: the two only go through each other.
     NoCollide,
     /// Turning about `point`, the second no farther from how it is now to the first than
@@ -212,6 +220,9 @@ pub struct Physics {
     last_impact: HashMap<RigidBodyHandle, f32>,
     /// The ragdoll joints and their limits.
     limits: Vec<Limit>,
+    /// The springs that hold back their two points moving apart any way, and how much:
+    /// kilograms per second ([`Joint::Spring`]'s `relative_damping`).
+    dampers: HashMap<JointId, f32>,
     /// The bodies harder to turn than their shapes ([`Body::inertia`]), and how much.
     inertia: HashMap<RigidBodyHandle, f32>,
     /// Seconds stepped.
@@ -267,6 +278,7 @@ impl Physics {
             world,
             ground,
             strengths: HashMap::new(),
+            dampers: HashMap::new(),
             broken: Vec::new(),
             apart: HashSet::new(),
             aloof: HashSet::new(),
@@ -776,14 +788,23 @@ impl Physics {
                 if length <= 0.0 {
                     return None;
                 }
-                GenericJointBuilder::new(JointAxesMask::empty())
+                let builder = GenericJointBuilder::new(JointAxesMask::empty())
                     .coupled_axes(JointAxesMask::LIN_AXES)
                     .limits(JointAxis::LinX, [if rigid { length } else { 0.0 }, length])
                     .local_anchor1(first.inverse_transform_point(metres(start)))
-                    .local_anchor2(second.inverse_transform_point(metres(end)))
-                    .build()
+                    .local_anchor2(second.inverse_transform_point(metres(end)));
+                // the solver keeps coupled axes from going past their greatest length only: a
+                // rod also holds them apart, by a motor as stiff as a joint can be
+                let builder = if rigid {
+                    builder
+                        .motor_position(JointAxis::LinX, length, ROD_STIFFNESS, ROD_DAMPING)
+                        .motor_model(JointAxis::LinX, rapier3d::prelude::MotorModel::AccelerationBased)
+                } else {
+                    builder
+                };
+                builder.build()
             }
-            Joint::Spring { start, end, length, stiffness, damping } => {
+            Joint::Spring { start, end, length, stiffness, damping, .. } => {
                 SpringJointBuilder::new((length * METRES_PER_UNIT).max(0.0), stiffness.max(0.0), damping.max(0.0))
                     .local_anchor1(first.inverse_transform_point(metres(start)))
                     .local_anchor2(second.inverse_transform_point(metres(end)))
@@ -818,6 +839,11 @@ impl Physics {
         if let Some(ranges) = held {
             self.limits.push(Limit { joint: id, frame: data.local_frame1, ranges });
         }
+        if let Joint::Spring { relative_damping, .. } = joint
+            && relative_damping > 0.0
+        {
+            self.dampers.insert(id, relative_damping);
+        }
         // the weight of a kilogram as the game falls, on a lever of a unit
         let weight = DEFAULT_GRAVITY * METRES_PER_UNIT;
         let [force, torque] = strength;
@@ -831,7 +857,44 @@ impl Physics {
     pub fn unjoin(&mut self, id: JointId) {
         self.world.remove_impulse_joint(id.0);
         self.strengths.remove(&id);
+        self.dampers.remove(&id);
         self.limits.retain(|limit| limit.joint != id);
+    }
+
+    /// Before a step: each spring's relative damping takes from how fast its two points move
+    /// apart, any way, what `seconds` of it would - all of it, however strong, never more.
+    fn damp_springs(&mut self, seconds: f32) {
+        let joints = &self.world.impulse_joints;
+        self.dampers.retain(|id, _| joints.get(id.0).is_some());
+        for (id, &damping) in &self.dampers {
+            let Some(joint) = self.world.impulse_joints.get(id.0) else { continue };
+            let (one, two) = (joint.body1(), joint.body2());
+            let (frame1, frame2) = (joint.data.local_frame1, joint.data.local_frame2);
+            let (Some(a), Some(b)) = (self.world.bodies.get(one), self.world.bodies.get(two)) else { continue };
+            if a.is_sleeping() && b.is_sleeping() {
+                continue;
+            }
+            let (pa, pb) = (*a.position() * frame1.translation, *b.position() * frame2.translation);
+            let relative = b.velocity_at_point(pb) - a.velocity_at_point(pa);
+            // what moves: a fixed body or one moved by the game takes nothing
+            let inverse = |body: &rapier3d::prelude::RigidBody| if body.is_dynamic() { 1.0 / body.mass().max(1e-6) } else { 0.0 };
+            let inverse_mass = inverse(a) + inverse(b);
+            if inverse_mass <= 0.0 || relative.length_squared() < 1e-12 {
+                continue;
+            }
+            let taken = 1.0 - (-damping * seconds * inverse_mass).exp();
+            let impulse = relative * (taken / inverse_mass);
+            if let Some(a) = self.world.bodies.get_mut(one)
+                && a.is_dynamic()
+            {
+                a.apply_impulse_at_point(impulse, pa, true);
+            }
+            if let Some(b) = self.world.bodies.get_mut(two)
+                && b.is_dynamic()
+            {
+                b.apply_impulse_at_point(-impulse, pb, true);
+            }
+        }
     }
 
     /// Sets the limits of the ragdoll joints for the step to come ([`Joint::Ragdoll`]). A turn
@@ -963,6 +1026,7 @@ impl Physics {
         }
         self.world.integration_parameters.dt = seconds;
         self.aim_limits();
+        self.damp_springs(seconds);
         self.world.step_with_events(&Apart { pairs: &self.apart, aloof: &self.aloof }, &());
         self.clock += seconds;
         self.find_impacts();

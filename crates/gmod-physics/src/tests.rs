@@ -252,7 +252,7 @@ fn ropes_hinges_springs_and_sliders() {
         .join(
             spring,
             ground,
-            Joint::Spring { start: [0.0, 500.0, 16.0], end: [0.0, 500.0, 100.0], length: 50.0, stiffness, damping },
+            Joint::Spring { start: [0.0, 500.0, 16.0], end: [0.0, 500.0, 100.0], length: 50.0, stiffness, damping, relative_damping: 0.0 },
             true,
             [0.0; 2],
         )
@@ -536,4 +536,48 @@ fn movers_carry_and_push_what_they_meet() {
     }
     let (pushed, _) = physics.pose(beside).unwrap();
     assert!(pushed[0] > 320.0, "pushed along: {pushed:?}");
+}
+
+/// A trolleybus's wheel: a heavy ball held to a heavier body by two rigid ropes across it and
+/// springs to where it hangs. The body spun hard, the wheel goes round with it.
+#[test]
+fn a_wheel_on_rigid_ropes_goes_round_with_its_body() {
+    let mut physics = Physics::new();
+    physics.set_gravity(0.0);
+    let body = physics
+        .add(&Body {
+            mass: Some(7466.0),
+            ..Body::new(Shape::cuboid([-230.0, -48.0, -49.0], [216.0, 48.0, 74.0]), [0.0, 0.0, 100.0], [0.0; 3])
+        })
+        .unwrap();
+    let wheel_at = [112.0, 40.0, 100.0 - 45.0];
+    let wheel = physics.add(&Body { mass: Some(933.0), ..Body::new(Shape::Sphere(20.0), wheel_at, [0.0; 3]) }).unwrap();
+    let distance = |a: Vec3, b: Vec3| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+    for (dx, rigid) in [(-40.0, true), (40.0, true), (0.0, false)] {
+        // across the body, level with the wheel, as Trolleybus System ties them
+        let end = [112.0 + dx, -40.0, 100.0 - 45.0];
+        let joint = Joint::Rope { start: wheel_at, end, length: distance(wheel_at, end), rigid };
+        physics.join(wheel, body, joint, false, [0.0; 2]).unwrap();
+    }
+    for _ in 0..6 {
+        let spring =
+            Joint::Spring { start: wheel_at, end: wheel_at, length: 0.0, stiffness: 50000.0, damping: 1300.0, relative_damping: 1300.0 };
+        physics.join(wheel, body, spring, false, [0.0; 2]).unwrap();
+    }
+    let local = |physics: &Physics| {
+        let (origin, angles) = physics.pose(body).unwrap();
+        let (point, _) = physics.pose(wheel).unwrap();
+        let d = Vector::from(point) - Vector::from(origin);
+        (rotation(angles).inverse() * d).to_array()
+    };
+    run(&mut physics, 0.3);
+    let rest = local(&physics);
+    let mut worst: f32 = 0.0;
+    for tick in 0..100 {
+        physics.set_angular_velocity(body, if tick < 4 { [0.0, 0.0, 600.0] } else { [0.0; 3] });
+        physics.step(TICK);
+        worst = worst.max(distance(local(&physics), rest));
+    }
+    // GMod, measured: 4 units at most (rigid ropes are rods there)
+    assert!(worst < 5.0, "the wheel went {worst} units from its place");
 }

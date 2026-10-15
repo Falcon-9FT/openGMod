@@ -75,6 +75,31 @@ pub fn command(keys: &Keys, buttons: &Buttons, pitch: f32, yaw: f32) -> UserCmd 
     }
 }
 
+/// A console command that holds a key: `+attack` (down) or `-attack` (up), and the key.
+fn console_key(line: &str) -> Option<(u32, bool)> {
+    let (down, name) = match line.as_bytes().first()? {
+        b'+' => (true, &line[1..]),
+        b'-' => (false, &line[1..]),
+        _ => return None,
+    };
+    let bit = match name.to_ascii_lowercase().as_str() {
+        "attack" => key::ATTACK,
+        "attack2" => key::ATTACK2,
+        "use" => key::USE,
+        "reload" => key::RELOAD,
+        "jump" => key::JUMP,
+        "duck" => key::DUCK,
+        "forward" => key::FORWARD,
+        "back" => key::BACK,
+        "moveleft" => key::MOVELEFT,
+        "moveright" => key::MOVERIGHT,
+        "speed" => key::SPEED,
+        "walk" => key::WALK,
+        _ => return None,
+    };
+    Some((bit, down))
+}
+
 /// What a frame shows.
 pub struct Shown {
     /// Where to see from: between where the eyes were at the last two ticks.
@@ -109,6 +134,8 @@ pub struct Game {
     sounds: Vec<gmod_lua::sound::SoundEvent>,
     /// Console lines typed for the next frame.
     typed: Vec<String>,
+    /// The keys held by the console (`+attack` until `-attack`), as by the keyboard.
+    console_keys: u32,
     /// A game here: the server's last two ticks, which the client is shown between.
     ticks: Option<(Snapshot, Snapshot)>,
 }
@@ -164,6 +191,7 @@ impl Game {
             turned: None,
             sounds: Vec::new(),
             typed: Vec::new(),
+            console_keys: 0,
             ticks: None,
         };
         game.send_client_commands();
@@ -186,6 +214,7 @@ impl Game {
             turned: None,
             sounds: Vec::new(),
             typed: Vec::new(),
+            console_keys: 0,
             ticks: None,
         };
         game.send_client_commands();
@@ -360,9 +389,25 @@ impl Game {
     /// ticks of the game - here, or on the server, whose entities come as they come - and
     /// the client's frame.
     pub fn frame(&mut self, keys: &Keys, buttons: &Buttons, pitch: f32, yaw: f32, seconds: f64) -> Option<Shown> {
+        let mut lines = std::mem::take(&mut self.typed);
+        // `+attack` and the like hold a key until their `-` comes, as the engine's console does
+        lines.retain(|line| match console_key(line.trim()) {
+            Some((bit, down)) => {
+                self.console_keys = if down { self.console_keys | bit } else { self.console_keys & !bit };
+                false
+            }
+            None => true,
+        });
         let mut cmd = command(keys, buttons, pitch, yaw);
+        cmd.buttons |= self.console_keys;
+        let held = |bit: u32| self.console_keys & bit != 0;
+        if cmd.forward_move == 0.0 {
+            cmd.forward_move = (f32::from(held(key::FORWARD)) - f32::from(held(key::BACK))) * FULL_MOVE;
+        }
+        if cmd.side_move == 0.0 {
+            cmd.side_move = (f32::from(held(key::MOVERIGHT)) - f32::from(held(key::MOVELEFT))) * FULL_MOVE;
+        }
         cmd.impulse = std::mem::take(&mut self.impulse);
-        let lines = std::mem::take(&mut self.typed);
         match &mut self.link {
             Link::Local(server) => {
                 server.runtime().set_input(self.player, cmd);

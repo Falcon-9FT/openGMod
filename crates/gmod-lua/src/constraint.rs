@@ -160,7 +160,14 @@ fn make(lua: &Lua, handle: EntityHandle) {
                     _ => (Vector::new(end[0], end[1], end[2]) - pos).length(),
                 };
                 collide = true;
-                Joint::Spring { start: at, end, length, stiffness: number("constant"), damping: number("damping") }
+                Joint::Spring {
+                    start: at,
+                    end,
+                    length,
+                    stiffness: number("constant"),
+                    damping: number("damping"),
+                    relative_damping: number("relativedamping"),
+                }
             }
             COLLISION_PAIR => {
                 collide = false;
