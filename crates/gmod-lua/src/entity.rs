@@ -778,8 +778,10 @@ pub(crate) fn set_model(lua: &Lua, handle: EntityHandle, model: &str) {
 }
 
 /// `IsPlayer` and the like: whether an entity is of a kind.
+/// `IsPlayer` and the like: false for NULL, as in GMod, rather than an error.
 fn is_kind(a: &Args, kind: Kind) -> mlua::Result<Value> {
-    Ok(Value::Boolean(read(a, |ent| ent.kind == kind)?))
+    let handle = a.userdata::<EntityHandle>(1, "Entity")?;
+    Ok(Value::Boolean(host(a.lua).entities.get(handle).is_some_and(|ent| ent.kind == kind)))
 }
 
 fn color_part(a: &Args, position: usize) -> mlua::Result<u8> {
@@ -905,7 +907,10 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("IsWeapon", |a| is_kind(a, Kind::Weapon))?;
     def("IsVehicle", |a| is_kind(a, Kind::Vehicle))?;
     def("IsNextBot", |a| is_kind(a, Kind::NextBot))?;
-    def("IsRagdoll", |a| Ok(Value::Boolean(read(a, |ent| ent.class.eq_ignore_ascii_case("prop_ragdoll"))?)))?;
+    def("IsRagdoll", |a| {
+        let handle = a.userdata::<EntityHandle>(1, "Entity")?;
+        Ok(Value::Boolean(host(a.lua).entities.get(handle).is_some_and(|ent| ent.class.eq_ignore_ascii_case("prop_ragdoll"))))
+    })?;
     def("IsScripted", |a| Ok(Value::Boolean(read(a, |ent| ent.scripted)?)))?;
     def("CreatedByMap", |a| Ok(Value::Boolean(read(a, |ent| ent.map_creation_id.is_some())?)))?;
     def("MapCreationID", |a| integer(read(a, |ent| ent.map_creation_id.unwrap_or(-1))?.into()))?;

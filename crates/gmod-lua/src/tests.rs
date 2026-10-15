@@ -3594,6 +3594,20 @@ fn players_sit_in_vehicles_and_get_out() {
 }
 
 #[test]
+fn what_null_is_can_be_asked() {
+    let g = game(Realm::Server, &[]);
+    // as GMod answers, measured in it: no error for these
+    let answer = g.eval::<String>(
+        "local t = {} for _, k in ipairs({ 'IsPlayer', 'IsNPC', 'IsNextBot', 'IsRagdoll', 'IsVehicle', 'IsWeapon', 'IsWorld', 'IsValid' }) do
+             t[#t + 1] = tostring(NULL[k](NULL))
+         end
+         return table.concat(t, ' ') .. ' ' .. NULL:EntIndex()",
+    );
+    assert_eq!(answer, "false false false false false false false false 0");
+    assert!(g.runtime.lua().load("NULL:GetPos()").exec().is_err());
+}
+
+#[test]
 fn the_keys_of_the_game_go_to_the_server() {
     const KEY_V: i32 = 32;
     let server = player_game();
@@ -3848,6 +3862,42 @@ fn the_scissor_and_the_main_view() {
          local off = on == false and l == 0 and t == 0 and r == 640 and b == 480
          return off and MainEyePos() == EyePos() and MainEyeAngles() == EyeAngles()"
     ));
+}
+
+#[test]
+fn the_gamemode_thinks_before_the_entities_and_what_was_removed_goes() {
+    let g = player_game();
+    g.runtime
+        .run_string(
+            "ORDER = {}
+             scripted_ents.Register({ Type = 'anim', Think = function(self)
+                 table.insert(ORDER, 'ent') self:NextThink(CurTime()) return true end }, 'sent_order')
+             S = ents.Create('sent_order') S:Spawn()",
+            "order",
+        )
+        .unwrap();
+    g.runtime.think(0.015);
+    g.runtime
+        .run_string(
+            "ORDER = {}
+             HOOKS.Think = function() table.insert(ORDER, 'Think') end
+             HOOKS.Tick = function() table.insert(ORDER, 'Tick') end",
+            "hooks",
+        )
+        .unwrap();
+    g.runtime.think(0.03);
+    // as measured in GMod: Think, Tick, then the entities, each tick
+    assert_eq!(g.eval::<String>("return table.concat(ORDER, ' ')"), "Think Tick ent Think Tick ent");
+    // removed in a tick: still valid in it, gone by the gamemode's Think of the next
+    g.runtime
+        .run_string(
+            "HOOKS.Think = function() SEEN = S:IsValid() end
+             S.Think = function(self) self:Remove() STILL = self:IsValid() end",
+            "remove",
+        )
+        .unwrap();
+    g.runtime.think(0.03);
+    assert_eq!(g.eval::<String>("return tostring(STILL) .. ' ' .. tostring(SEEN)"), "true false");
 }
 
 #[test]

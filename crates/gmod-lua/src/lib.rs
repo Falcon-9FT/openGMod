@@ -599,10 +599,13 @@ impl Runtime {
                 // what the players' commands removed goes before the frame, as in Source
                 ents::collect(&self.lua);
             }
-            // the gamemode thinks first in a frame of the server's, before the entities do
-            self.call_hook("Tick", mlua::MultiValue::new());
+            // the gamemode thinks first in a frame of the server's, before the entities do:
+            // `Think`, then `Tick` (as measured in GMod)
             if server {
                 self.call_hook("Think", mlua::MultiValue::new());
+            }
+            self.call_hook("Tick", mlua::MultiValue::new());
+            if server {
                 physgun::think(&self.lua);
                 pickup::think(&self.lua);
                 physics::simulate(&self.lua);
