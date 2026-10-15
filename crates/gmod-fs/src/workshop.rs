@@ -98,7 +98,12 @@ fn last_change(dir: &Path) -> Option<SystemTime> {
 
 /// Every addon file of an installation: subscribed items first (by ID), then the ones in
 /// `garrysmod/addons`, then server downloads that are not subscribed too.
-pub fn addon_files(install: &Install) -> Vec<AddonFile> {
+///
+/// `subscribed` is Steam's own list of the items the player subscribed to, when Steam can be
+/// asked: the other items in Steam's workshop folder were downloaded for servers played on
+/// (`resource.AddWorkshop`) and are server downloads, which GMod mounts only on that server.
+/// Without the list every item there is taken as subscribed.
+pub fn addon_files(install: &Install, subscribed: Option<&HashSet<u64>>) -> Vec<AddonFile> {
     let mut out = Vec::new();
     let mut ids = HashSet::new();
 
@@ -118,9 +123,10 @@ pub fn addon_files(install: &Install) -> Vec<AddonFile> {
             .collect();
         items.sort();
         for (id, item) in items {
+            let origin = if subscribed.is_none_or(|ids| ids.contains(&id)) { Origin::Subscribed } else { Origin::ServerDownload };
             for path in item_files(&item) {
                 let packed = has_extension(&path, "bin");
-                out.push(AddonFile { path, origin: Origin::Subscribed, workshop_id: Some(id), packed });
+                out.push(AddonFile { path, origin, workshop_id: Some(id), packed });
                 ids.insert(id);
             }
         }
@@ -249,7 +255,7 @@ mod tests {
             ("by_hand.gma".to_string(), Origin::AddonsFolder, None, false),
             ("444.gma".to_string(), Origin::ServerDownload, Some(444), false),
         ];
-        assert_eq!(summary(addon_files(&install)), all);
+        assert_eq!(summary(addon_files(&install, None)), all);
 
         // with Steam's list, items no longer subscribed (333) are left out
         let acf = "\"AppWorkshop\"\n{\n\t\"appid\" \"4000\"\n\t\"WorkshopItemsInstalled\"\n\t{\n\t\t\"111\" { \"size\" \"1\" }\n\t\t\"222\" { \"size\" \"1\" }\n\t}\n}\n";
@@ -259,14 +265,29 @@ mod tests {
         written_at(SystemTime::now() + Duration::from_secs(3600));
         let mut expected = all.to_vec();
         expected.remove(3);
-        assert_eq!(summary(addon_files(&install)), expected);
+        assert_eq!(summary(addon_files(&install, None)), expected);
         // ...but not an item downloaded after Steam last wrote its list
         written_at(SystemTime::now() - Duration::from_secs(3600));
-        assert_eq!(summary(addon_files(&install)), all);
+        assert_eq!(summary(addon_files(&install, None)), all);
         written_at(SystemTime::now() + Duration::from_secs(3600));
 
+        // with Steam's subscriptions, an item not among them was downloaded for a server
+        let subscribed: HashSet<u64> = [111].into_iter().collect();
+        let origins: Vec<(Option<u64>, Origin)> =
+            addon_files(&install, Some(&subscribed)).iter().map(|f| (f.workshop_id, f.origin)).collect();
+        assert_eq!(
+            origins,
+            [
+                (Some(111), Origin::Subscribed),
+                (Some(111), Origin::Subscribed),
+                (Some(222), Origin::ServerDownload),
+                (None, Origin::AddonsFolder),
+                (Some(444), Origin::ServerDownload),
+            ]
+        );
+
         // what each is switched off by: the item, or the file's name
-        let keys: Vec<String> = addon_files(&install).iter().map(addon_key).collect();
+        let keys: Vec<String> = addon_files(&install, None).iter().map(addon_key).collect();
         assert_eq!(keys, ["111", "111", "222", "by_hand.gma", "444"]);
         let file = tmp.path().join("settings/disabled.txt");
         let disabled: HashSet<String> = ["111".to_string(), "by_hand.gma".to_string()].into_iter().collect();

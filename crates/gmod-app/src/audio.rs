@@ -105,7 +105,7 @@ impl Audio {
                     if source != 0 {
                         self.sources.insert(source, play.entity.expect("a source is an entity"));
                     }
-                    let looping = clip.loop_start.is_some();
+                    let looping = play.looping.unwrap_or(clip.loop_start.is_some());
                     let sound = Sound {
                         clip,
                         volume: play.volume,
@@ -116,6 +116,7 @@ impl Audio {
                         source,
                         channel: play.channel,
                         name: play.name,
+                        start: f64::from(play.start),
                     };
                     let voice = self.mixer.lock().expect("the mixer").play(sound);
                     if let Some(patch) = play.patch {
@@ -128,6 +129,11 @@ impl Audio {
                 SoundEvent::StopPatch(patch) => {
                     if let Some(voice) = self.patches.remove(&patch) {
                         self.mixer.lock().expect("the mixer").stop(voice);
+                    }
+                }
+                SoundEvent::MovePatch { patch, position } => {
+                    if let Some(&voice) = self.patches.get(&patch) {
+                        self.mixer.lock().expect("the mixer").move_voice(voice, array(position));
                     }
                 }
                 SoundEvent::ChangePatch { patch, volume, pitch } => {

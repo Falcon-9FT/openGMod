@@ -11,6 +11,7 @@ members = [
     "crates/gmod-world",
     "crates/gmod-movement",
     "crates/gmod-net",
+    "crates/gmod-steam",
     "crates/gmod-physics",
     "crates/gmod-ui",
     "crates/gmod-audio",
@@ -21,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"
@@ -38,6 +39,7 @@ gmod-model = { path = "crates/gmod-model" }
 gmod-world = { path = "crates/gmod-world" }
 gmod-movement = { path = "crates/gmod-movement" }
 gmod-net = { path = "crates/gmod-net" }
+gmod-steam = { path = "crates/gmod-steam" }
 gmod-physics = { path = "crates/gmod-physics" }
 gmod-ui = { path = "crates/gmod-ui" }
 gmod-audio = { path = "crates/gmod-audio" }

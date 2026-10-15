@@ -9,6 +9,8 @@ struct TestFont<'a> {
     chars: &'a [char],
     /// Characters where a symbol font keeps them (U+F000 on), in a symbol cmap.
     symbol: bool,
+    /// Its full name, if not its family and style.
+    full: Option<&'a str>,
 }
 
 impl TestFont<'_> {
@@ -106,7 +108,7 @@ impl TestFont<'_> {
         cmap.extend(sub);
         tables.push((b"cmap", cmap));
 
-        let full = format!("{} {}", self.family, self.style);
+        let full = self.full.map_or_else(|| format!("{} {}", self.family, self.style), str::to_string);
         let strings = [(1u16, self.family), (2, self.style), (4, full.as_str())];
         let mut records = Vec::new();
         let mut text = Vec::new();
@@ -157,7 +159,7 @@ impl TestFont<'_> {
 
 fn plain(family: &str, weight: u16, chars: &[char]) -> Vec<u8> {
     let style = if weight >= 600 { "Bold" } else { "Regular" };
-    TestFont { family, style, weight, chars, symbol: false }.build()
+    TestFont { family, style, weight, chars, symbol: false, full: None }.build()
 }
 
 fn spec(family: &str, size: u32) -> FontSpec {
@@ -218,10 +220,12 @@ fn the_face_nearest_the_weight_is_drawn() {
 
 #[test]
 fn a_font_of_the_game_is_found_by_its_files_name() {
-    // HL2MP.ttf is Half-Life 2's font with weapons' icons where the digits were, and goes by
-    // its name; the engine finds HALFLIFE2.ttf for "HalfLife2" all the same
+    // HL2MP.ttf is Half-Life 2's font with weapons' icons where the digits were: its family is
+    // "HL2MP", but one of its full names "HalfLife2"; the engine finds HALFLIFE2.ttf for
+    // "HalfLife2" all the same
     let mut fonts = Fonts::new();
-    fonts.add_game_font(plain("HalfLife2", 100, &['x']), "HL2MP.ttf");
+    let hl2mp = TestFont { family: "HL2MP", style: "Regular", weight: 400, chars: &['x'], symbol: false, full: Some("HalfLife2") };
+    fonts.add_game_font(hl2mp.build(), "HL2MP.ttf");
     fonts.add_game_font(plain("HalfLife2", 500, &['1']), "HALFLIFE2.ttf");
     let numbers = fonts.font(&FontSpec { weight: 0, ..spec("HalfLife2", 20) });
     assert!(fonts.glyph(numbers, '1').width > 0);
@@ -258,7 +262,7 @@ fn missing_families_and_characters_come_from_the_fallbacks() {
 #[test]
 fn symbol_fonts_answer_for_their_characters() {
     let mut fonts = Fonts::new();
-    fonts.add_font(TestFont { family: "Marlett", style: "Regular", weight: 400, chars: &['r', '0'], symbol: true }.build());
+    fonts.add_font(TestFont { family: "Marlett", style: "Regular", weight: 400, chars: &['r', '0'], symbol: true, full: None }.build());
     let marlett = fonts.font(&FontSpec { symbol: true, ..spec("Marlett", 20) });
     assert_eq!(fonts.glyph(marlett, 'r').width, 10);
     assert_eq!(fonts.glyph(marlett, '0').width, 10);

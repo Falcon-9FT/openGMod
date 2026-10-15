@@ -52,6 +52,12 @@ pub struct SoundPlay {
     /// The player whose client made it itself, predicting: it is not sent to them.
     #[serde(default)]
     pub unheard_by: Option<EntityHandle>,
+    /// Whether it plays again from its start when it ends; none: as the file says (its loop).
+    #[serde(default)]
+    pub looping: Option<bool>,
+    /// Seconds into the file it starts at.
+    #[serde(default)]
+    pub start: f32,
 }
 
 /// What Lua did with sounds, for the program to hear.
@@ -70,6 +76,11 @@ pub enum SoundEvent {
         patch: u64,
         volume: f32,
         pitch: f32,
+    },
+    /// A sound of no entity is somewhere else now (a channel of `sound.PlayFile`).
+    MovePatch {
+        patch: u64,
+        position: Vector,
     },
 }
 
@@ -106,6 +117,14 @@ impl Sounds {
             sounds.next_patch.set(1 << 63);
         }
         sounds
+    }
+
+    /// A number for a sound to change or stop it by, of no `CSoundPatch` (a channel of
+    /// [`crate::bass`]).
+    pub(crate) fn new_number(&self) -> u64 {
+        let id = self.next_patch.get() + 1;
+        self.next_patch.set(id);
+        id
     }
 
     fn new_patch(&self, entity: Option<EntityHandle>, name: String) -> u64 {
@@ -281,6 +300,8 @@ fn play(
         channel: r.channel,
         patch,
         unheard_by,
+        looping: None,
+        start: 0.0,
     }));
 }
 

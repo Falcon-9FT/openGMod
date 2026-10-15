@@ -78,6 +78,11 @@ fn held(lua: &Lua, player: EntityHandle) -> Option<Held> {
 }
 
 fn set_held(lua: &Lua, player: EntityHandle, held: Option<Held>) -> Option<Held> {
+    // the gun's beam goes to what it holds, for the clients to draw
+    let beam = held.map(|h| (h.entity, h.point));
+    if let Some(gun) = held.map(|h| h.weapon).or_else(|| self::held(lua, player).map(|h| h.weapon)) {
+        host(lua).entities.with_mut(gun, |ent| ent.beam = beam);
+    }
     let host = host(lua);
     let mut all = host.physgun.held.borrow_mut();
     let was = all.iter().position(|(p, _)| *p == player).map(|i| all.remove(i).1);
@@ -116,6 +121,9 @@ pub(crate) fn command(lua: &Lua, player: EntityHandle, weapon: EntityHandle, cmd
     if !is_gun {
         return;
     }
+    // the claws open while it holds something, and close again
+    let open = if held(lua, player).is_some() { 1.0 } else { 0.0 };
+    crate::anim::approach_view_model_pose(lua, player, "active", open, 4.0);
     if cmd.buttons & IN_ATTACK == 0 {
         host(lua).physgun.waiting.borrow_mut().retain(|&p| p != player);
     }

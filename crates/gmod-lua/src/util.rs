@@ -120,6 +120,43 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let id = a.string(1)?.trim().parse::<u64>().ok().and_then(steamid_from_64).unwrap_or_else(|| "STEAM_0:0:0".into());
         Ok(Value::String(a.lua.create_string(id)?))
     })?;
+    // the distance from a point to a segment: how far, the nearest point, and how far along
+    util.raw_set(
+        "DistanceToLine",
+        lua.create_function(|lua, values: MultiValue| {
+            let a = Args::new(lua, values, "DistanceToLine");
+            let (start, end, point) =
+                (a.userdata::<Vector>(1, "Vector")?, a.userdata::<Vector>(2, "Vector")?, a.userdata::<Vector>(3, "Vector")?);
+            let line = end - start;
+            let length = line.length();
+            let along = if length > 1e-6 { ((point - start).dot(line) / length).clamp(0.0, length) } else { 0.0 };
+            let nearest = if length > 1e-6 { start + line * (along / length) } else { start };
+            Ok(((point - nearest).length(), lua.create_userdata(nearest)?, along))
+        })?,
+    )?;
+    // where a ray meets a plane; nil when it runs along it or away from it
+    util.raw_set(
+        "IntersectRayWithPlane",
+        lua.create_function(|lua, values: MultiValue| {
+            let a = Args::new(lua, values, "IntersectRayWithPlane");
+            let (origin, direction, point, normal) = (
+                a.userdata::<Vector>(1, "Vector")?,
+                a.userdata::<Vector>(2, "Vector")?,
+                a.userdata::<Vector>(3, "Vector")?,
+                a.userdata::<Vector>(4, "Vector")?,
+            );
+            let towards = direction.dot(normal);
+            if towards.abs() < 1e-6 {
+                return Ok(Value::Nil);
+            }
+            let t = (point - origin).dot(normal) / towards;
+            if t < 0.0 {
+                return Ok(Value::Nil);
+            }
+            Ok(Value::UserData(lua.create_userdata(origin + direction * t)?))
+        })?,
+    )?;
+    crate::surfaceprops::install(lua, &util)?;
     lua.globals().raw_set("util", util)?;
     lua.globals().raw_set("PrecacheParticleSystem", lua.create_function(|_, _: MultiValue| Ok(()))?)?;
     let globals = lua.globals();

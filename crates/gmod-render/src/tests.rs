@@ -134,11 +134,8 @@ fn draws_the_test_map() {
     assert_eq!(reds, 0, "the back of the floor is drawn");
 }
 
-#[test]
-fn draws_models_where_the_entities_are() {
-    let Some((device, queue)) = device_or_skip() else { return };
-    // a model: a square of the missing texture, 64 units a side, facing up; it is lit from
-    // where it is drawn, so its purple stays purple over the red floor
+/// A model: a square of the missing texture, 64 units a side, facing up, from the origin.
+fn square_model() -> World {
     let vertices = [[0.0, 0.0], [0.0, 64.0], [64.0, 64.0], [64.0, 0.0]]
         .map(|[x, y]| gmod_world::Vertex {
             position: [x, y, 0.0],
@@ -170,7 +167,7 @@ fn draws_models_where_the_entities_are() {
         modulate: false,
         overlay: false,
     };
-    let square = World {
+    World {
         pieces: vec![gmod_world::Piece {
             vertices,
             indices: vec![0, 1, 2, 0, 2, 3],
@@ -185,7 +182,15 @@ fn draws_models_where_the_entities_are() {
         missing_materials: Vec::new(),
         missing_textures: Vec::new(),
         missing_models: Vec::new(),
-    };
+    }
+}
+
+#[test]
+fn draws_models_where_the_entities_are() {
+    let Some((device, queue)) = device_or_skip() else { return };
+    // a model: a square of the missing texture, 64 units a side, facing up; it is lit from
+    // where it is drawn, so its purple stays purple over the red floor
+    let square = square_model();
     let purple = |p: &[u8]| p[0] > 120 && p[2] > 120 && p[1] < 40;
     let above = Camera::looking_at([64.0, 64.0, 200.0], [64.0, 64.1, 0.0], 75.0);
 
@@ -429,4 +434,18 @@ fn draws_the_2d_over_the_picture() {
     assert!(blue[2] > 200 && blue[0] < 40 && blue[1] < 40, "{blue:?}");
     let added = at(&pixels, 40, 40);
     assert!(added[0] > 100 && added[0] < 255 && added[1] < 40, "{added:?}");
+}
+
+#[test]
+fn draws_a_model_alone_for_its_icon() {
+    let Some((device, queue)) = device_or_skip() else { return };
+    let mut renderer = Renderer::new(&device, &queue, FORMAT, &test_map());
+    let model = renderer.add_model(&device, &queue, &square_model());
+    // from above its middle: the square fills the middle, nothing of the map around it
+    let above = Camera::looking_at([32.0, 32.0, 200.0], [32.0, 32.1, 0.0], 30.0);
+    let pixels = read_back(&device, &queue, |encoder, view| renderer.render_model(&device, &queue, encoder, view, (64, 64), &above, model));
+    let middle = at(&pixels, 32, 32);
+    assert!(middle[3] == 255 && (middle[0] > 120 || middle[0] < 40), "{middle:?}");
+    assert_eq!(at(&pixels, 0, 0)[3], 0, "nothing where the model is not");
+    assert!((0..64 * 64).all(|i| !red(at(&pixels, i % 64, i / 64))), "none of the map's red floor");
 }

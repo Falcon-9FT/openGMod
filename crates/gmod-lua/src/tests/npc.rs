@@ -57,7 +57,7 @@ fn npc_game_on(hooks: &str, map: &Map) -> Game {
     g.runtime
         .run_string(
             "HOOKS.AcceptInput = function(ent, input, activator, caller, param)
-                 if ent:GetName() == 'rec' then print('rec', input, activator:IsValid() and activator:GetClass() or '-') end
+                 if ent:GetName() == 'rec' then print('rec', input, (activator:IsValid() or activator:IsWorld()) and activator:GetClass() or '-') end
              end",
             "rec",
         )

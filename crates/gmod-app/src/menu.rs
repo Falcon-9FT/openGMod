@@ -31,10 +31,16 @@ pub fn start_web(vfs: Arc<Vfs>) -> Result<Web, String> {
     Web::start(&root.join("cache").join("chromium"), &log, files)
 }
 
-/// What `asset://` serves: `asset://garrysmod/<path>` the game's files, `asset://mapimage/<map>`
-/// a map's picture (`maps/thumb/<map>.png`, else the game's "no picture").
+/// What `asset://` serves: `asset://garrysmod/<path>` the game's files, and the previews of
+/// workshop items the menu downloaded ([`gmod_lua::menu::PREVIEWS`], in openGMOD's folder);
+/// `asset://mapimage/<map>` a map's picture (`maps/thumb/<map>.png`, else the game's "no
+/// picture").
 fn asset(vfs: &Vfs, host: &str, path: &str) -> Option<Vec<u8>> {
     if host.eq_ignore_ascii_case("garrysmod") {
+        if path.strip_prefix(gmod_lua::menu::PREVIEWS).is_some_and(|rest| rest.starts_with('/')) {
+            let root = gmod_fs::UserDir::default_root()?;
+            return gmod_fs::UserDir::open(root, None).ok()?.read(path).ok();
+        }
         return vfs.read(path, "GAME").ok();
     }
     if host.eq_ignore_ascii_case("mapimage") {
@@ -222,9 +228,10 @@ impl Menu {
     }
 }
 
-/// The addons of the installation for the menu, those switched off (`disabled`) not mounted.
-pub fn addons(install: &Install, disabled: &HashSet<String>) -> Vec<Addon> {
-    workshop::addon_files(install)
+/// The addons of the installation for the menu, those switched off (`disabled`) not mounted;
+/// of the workshop, those Steam says the player subscribed to (`subscribed`).
+pub fn addons(install: &Install, disabled: &HashSet<String>, subscribed: Option<&HashSet<u64>>) -> Vec<Addon> {
+    workshop::addon_files(install, subscribed)
         .into_iter()
         .filter(|file| file.origin != workshop::Origin::ServerDownload)
         .map(|file| addon(install, &file, disabled))
@@ -232,8 +239,16 @@ pub fn addons(install: &Install, disabled: &HashSet<String>) -> Vec<Addon> {
 }
 
 fn addon(install: &Install, file: &AddonFile, disabled: &HashSet<String>) -> Addon {
-    let gma = (!file.packed).then(|| gmod_fs::gma::GmaArchive::open(&file.path).ok()).flatten();
-    let stem = file.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    // an old compressed download is read where it was unpacked to when it was mounted
+    let unpacked = || {
+        let root = gmod_fs::UserDir::default_root()?;
+        Some(root.join("cache").join("workshop").join(format!("{}.gma", file.workshop_id?)))
+    };
+    let readable = if file.packed { unpacked() } else { Some(file.path.clone()) };
+    let gma = readable.and_then(|path| gmod_fs::gma::GmaArchive::open(&path).ok());
+    // one never unpacked has no title here: the menu shows the workshop's
+    let stem =
+        if file.packed { String::new() } else { file.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default() };
     let title = gma.as_ref().map(|g| g.info().title.clone()).filter(|t| !t.is_empty()).unwrap_or(stem);
     let models = gma.as_ref().map_or(0, |g| g.entries().iter().filter(|e| e.path.ends_with(".mdl")).count() as u32);
     let metadata = std::fs::metadata(&file.path).ok();

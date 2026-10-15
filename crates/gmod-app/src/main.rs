@@ -7,6 +7,10 @@
 //! for those who join ([`server`]). Drawn with Direct3D 12 on Windows (Vulkan when that is
 //! missing). Without the game's Lua (`--no-lua`, or a map file without the game) the player
 //! only walks ([`gmod_movement`]).
+//!
+//! To play, the player signs in through Steam as Garry's Mod ([`gmod_steam`]): Steam must run,
+//! with an account that owns the game. Their name is their name on Steam, the workshop items
+//! mounted those they subscribed to.
 
 #![forbid(unsafe_code)]
 
@@ -37,7 +41,9 @@ use gmod_world::gpu::Camera;
 mod audio;
 mod browser;
 mod client;
+mod effects;
 mod game;
+mod icons;
 mod keys;
 mod menu;
 mod proto;
@@ -45,6 +51,7 @@ mod server;
 mod walk;
 
 use game::{Buttons, Game, Models};
+use gmod_lua::weaponselect::Choose;
 use walk::{Keys, Walker};
 
 const USAGE: &str = "\
@@ -68,7 +75,6 @@ OPTIONS:
     --maxplayers <N>     players a game started here takes; more than 1: others join it over
                          the network (a listen server)
     --port <PORT>        the UDP port a server here listens on (default: 27015)
-    --name <NAME>        the player's name (default: the user's)
     --connect <ADDRESS>  plays on a server: host or host:port
     --dedicated          a server without a window or a player of its own (16 players
                          unless --maxplayers says otherwise); lines typed are its console,
@@ -82,6 +88,9 @@ OPTIONS:
                          here, for the browsers of those who name it in their masters.txt
                          (UDP port 27011 unless --port says otherwise)
     -h, --help           this text
+
+    Playing takes Steam running, signed in to an account that owns Garry's Mod: the player's
+    name is theirs on Steam. A dedicated server and a master server need no Steam.
 
 CONTROLS:
     in a game, Esc shows the main menu and takes you back; click the window to look around
@@ -119,7 +128,6 @@ struct Args {
     gamemode: Option<String>,
     max_players: Option<u32>,
     port: Option<u16>,
-    name: Option<String>,
     connect: Option<String>,
     dedicated: bool,
     hostname: Option<String>,
@@ -138,7 +146,6 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
         gamemode: None,
         max_players: None,
         port: None,
-        name: None,
         connect: None,
         dedicated: false,
         hostname: None,
@@ -158,7 +165,6 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
                 args.max_players = Some(n.ok_or(format!("--maxplayers needs a number from 1 to {}", gmod_lua::player::MAX_PLAYERS))?);
             }
             "--port" => args.port = Some(raw.next().and_then(|p| p.parse().ok()).ok_or("--port needs a port")?),
-            "--name" => args.name = Some(raw.next().ok_or("--name needs a name")?),
             "--connect" => args.connect = Some(raw.next().ok_or("--connect needs an address")?),
             "--dedicated" => args.dedicated = true,
             "--hostname" => args.hostname = Some(raw.next().ok_or("--hostname needs a name")?),
@@ -190,13 +196,22 @@ struct Setup {
     /// The player's name, and their key: who they are on every server.
     name: String,
     identity: gmod_net::Identity,
+    /// The workshop items the player subscribed to, as Steam lists them; none without Steam
+    /// (a dedicated server), which mounts every item of the workshop folder.
+    subscribed: Option<HashSet<u64>>,
 }
 
 impl Setup {
     /// The game's files as Garry's Mod mounts them, the addons switched off left out.
     fn mount(&self, install: &Install) -> Vfs {
         let unpack_dir = UserDir::default_root().map(|root| root.join("cache").join("workshop"));
-        let options = MountOptions { addons: self.addons, unpack_dir, disabled: self.disabled.clone(), ..MountOptions::default() };
+        let options = MountOptions {
+            addons: self.addons,
+            unpack_dir,
+            disabled: self.disabled.clone(),
+            subscribed: self.subscribed.clone(),
+            ..MountOptions::default()
+        };
         mount_install(install, &options).0
     }
 }
@@ -496,15 +511,6 @@ fn server_address(address: &str) -> Result<SocketAddr, String> {
     with_port.to_socket_addrs().map_err(|e| format!("{address}: {e}"))?.next().ok_or_else(|| format!("{address}: no such host"))
 }
 
-/// The player's name when none is given: the user's.
-fn default_name() -> String {
-    ["OPENGMOD_NAME", "USERNAME", "USER"]
-        .iter()
-        .filter_map(|v| std::env::var(v).ok())
-        .find(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| "Player".to_string())
-}
-
 /// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
 /// llvmpipe), a discrete one before an integrated one, and of the same kind Direct3D 12 before
 /// Vulkan.
@@ -731,6 +737,54 @@ impl Gpu {
         Ok(file)
     }
 
+    /// A model drawn alone, `size` pixels square, as `camera` sees it (a spawn icon): its RGBA
+    /// pixels, transparent where it is not.
+    fn picture_model(&self, model: gmod_render::ModelId, camera: &Camera, size: u32) -> Option<gmod_material::png::Rgba> {
+        let renderer = self.renderer.as_ref()?;
+        let bgra = matches!(self.view_format, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm);
+        let extent = wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("model picture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.view_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("model picture") });
+        renderer.render_model(&self.device, &self.queue, &mut encoder, &view, (size, size), camera, model);
+        let row = (size * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("model picture"),
+            size: u64::from(row) * u64::from(size),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(size) },
+            },
+            extent,
+        );
+        self.queue.submit([encoder.finish()]);
+        buffer.map_async(wgpu::MapMode::Read, .., |_| ());
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        let data = buffer.slice(..).get_mapped_range().ok()?.to_vec();
+        let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let p = &data[y * row as usize + x * 4..][..4];
+                pixels.extend(if bgra { [p[2], p[1], p[0], p[3]] } else { [p[0], p[1], p[2], p[3]] });
+            }
+        }
+        Some(gmod_material::png::Rgba { width: size, height: size, pixels })
+    }
+
     fn draw(&mut self, camera: &Camera, client: Option<&gmod_lua::Runtime>, menu: Option<&gmod_lua::Runtime>) -> bool {
         // a frame that no longer fits the window as well as it could is still shown, and the
         // surface made again after it: dropping it each time would leave the window empty
@@ -820,6 +874,10 @@ struct App {
     walker: Option<Walker>,
     name: String,
     camera: Camera,
+    /// Where the game's view looks instead of where the mouse turned the camera (`CalcView`).
+    look: Option<(f32, f32)>,
+    /// Models the client asked pictures of, not made yet: the image each is for.
+    icons: std::collections::VecDeque<(u32, String)>,
     gpu: Option<Gpu>,
     error: Option<String>,
     keys: HashSet<KeyCode>,
@@ -864,6 +922,8 @@ struct App {
     menu_late: bool,
     /// Frames drawn since the start.
     frames_drawn: u64,
+    /// Steam, signed in as Garry's Mod.
+    steam: Rc<gmod_steam::Steam>,
 }
 
 impl App {
@@ -967,6 +1027,38 @@ impl App {
     /// Whether the main menu shows: while there is no map, and over the game when opened.
     fn menu_shown(&self) -> bool {
         self.menu.is_some() && (self.menu_open || self.collision.is_none())
+    }
+
+    /// The pictures of models the client asked for (spawn icons the game has none of): those
+    /// kept from before, else drawn now, a few milliseconds' worth a frame, and kept.
+    fn make_icons(&mut self) {
+        let Some(game) = &self.game else { return };
+        self.icons.extend(game.client().take_model_icons());
+        let (Some(models), Some(gpu)) = (&mut self.models, &mut self.gpu) else { return };
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(8) {
+            let Some((id, model)) = self.icons.pop_front() else { break };
+            let picture = icons::read(&model).or_else(|| {
+                let renderer = gpu.renderer.as_mut()?;
+                let (made, mins, maxs) = models.icon_model(&model, |world| renderer.add_model(&gpu.device, &gpu.queue, world))?;
+                let picture = gpu.picture_model(made, &icons::camera(mins, maxs), icons::SIZE)?;
+                icons::keep(&model, &picture);
+                Some(picture)
+            });
+            if let Some(picture) = picture {
+                game.client().give_picture(id, picture);
+            }
+        }
+    }
+
+    /// The camera the picture is drawn with: from the eyes, looking where the game's view says
+    /// (`CalcView`), else where the mouse turned it.
+    fn view_camera(&self) -> Camera {
+        let mut camera = self.camera;
+        if let Some((pitch, yaw)) = self.look {
+            (camera.pitch, camera.yaw) = (pitch, yaw);
+        }
+        camera
     }
 
     /// Shows the menu over the game (Esc), or goes back to the game.
@@ -1170,6 +1262,8 @@ impl App {
         self.light = None;
         self.lit.clear();
         self.walker = None;
+        self.look = None;
+        self.icons.clear();
         self.ui_cursor = false;
         self.name = "main menu".to_string();
         if let Some(gpu) = &mut self.gpu {
@@ -1201,6 +1295,28 @@ impl App {
                  its log is in ~/.opengmod/logs/chromium.log. opengmod --no-html goes without it.",
                 self.frames_drawn
             );
+        }
+    }
+
+    /// What Steam said this frame, to the menu; subscribing to an item or leaving one changes
+    /// the addons it lists (and mounts from the next game on).
+    fn steam_frame(&mut self) {
+        use gmod_steam::Event;
+        let events = self.steam.run_frame();
+        if let Some(menu) = &self.menu {
+            menu.runtime().steam_events(&events);
+        }
+        let changed = events.iter().any(|event| {
+            matches!(event, Event::Subscribed { result: 1, .. } | Event::Unsubscribed { result: 1, .. } | Event::Installed { .. })
+        });
+        if !changed {
+            return;
+        }
+        self.setup.subscribed = Some(self.steam.subscribed(true).into_iter().collect());
+        if let Some(menu) = &self.menu
+            && let Ok(install) = Install::locate(self.setup.gmod.as_deref())
+        {
+            menu.runtime().addons_changed(menu::addons(&install, &self.setup.disabled, self.setup.subscribed.as_ref()));
         }
     }
 
@@ -1336,6 +1452,7 @@ impl App {
         let Some(shown) = shown else { return };
         self.holding = shown.view.holding;
         self.camera.eye = shown.eye;
+        self.look = shown.look;
         if let Some((pitch, yaw)) = shown.turned {
             (self.camera.pitch, self.camera.yaw) = (pitch, yaw);
         }
@@ -1377,7 +1494,7 @@ impl App {
             .iter()
             .position(|&k| k == key);
         match (key, slot) {
-            (_, Some(slot)) => game.command(&format!("slot{}", slot + 1)),
+            (_, Some(slot)) => game.choose_weapon(Choose::Slot(slot as i64)),
             (KeyCode::KeyV, _) => game.command("noclip"),
             (KeyCode::KeyZ, _) => game.command("gmod_undo"),
             (KeyCode::KeyF, _) => game.flashlight(),
@@ -1408,6 +1525,7 @@ impl App {
 
     /// Gives the renderer the models of the game's entities and where they are now.
     fn show_entities(&mut self) {
+        let camera = self.view_camera();
         let (Some(game), Some(models), Some(gpu)) = (&self.game, &mut self.models, &mut self.gpu) else { return };
         let Some(renderer) = &mut gpu.renderer else { return };
         let mut placed = models.place(&game.drawn(), |model| renderer.add_model(&gpu.device, &gpu.queue, model));
@@ -1416,8 +1534,14 @@ impl App {
             self.lit.clear();
         }
         // what the player holds, lit as the eyes are
-        let (held, fov) = game.view_models(self.camera.eye, self.camera.pitch, self.camera.yaw);
+        let (held, fov) = game.view_models(camera.eye, camera.pitch, camera.yaw);
         let mut view_models = models.place(&held, |model| renderer.add_model(&gpu.device, &gpu.queue, model));
+        // what the game drew in the world by itself this frame: beams, sprites, quads
+        let primitives = game.client().take_primitives();
+        let batches = effects::batches(&primitives, &camera, &mut models.materials, |texture| {
+            renderer.add_effect_texture(&gpu.device, &gpu.queue, texture)
+        });
+        renderer.set_effects(batches);
         let (Some(light), Some(collision)) = (&self.light, &self.collision) else { return };
         for p in placed.iter_mut().chain(&mut view_models) {
             let key = p.origin.map(|v| (v / 8.0).round() as i32);
@@ -1520,6 +1644,13 @@ impl ApplicationHandler for App {
                     if index == 0 {
                         self.capture(true);
                     }
+                } else if let Some(game) = self.game.as_ref().filter(|g| pressed && g.client().choosing_weapon()) {
+                    // while the row of weapon slots shows, a click chooses or puts it away
+                    if index == 0 {
+                        game.take_chosen_weapon();
+                    } else {
+                        game.client().cancel_weapon_choice();
+                    }
                 } else if self.captured || !pressed {
                     self.mouse[index] = pressed;
                 }
@@ -1544,7 +1675,7 @@ impl ApplicationHandler for App {
                     if self.holding {
                         self.wheel += if up { 1 } else { -1 };
                     } else {
-                        game.command(if up { "invprev" } else { "invnext" });
+                        game.choose_weapon(if up { Choose::Previous } else { Choose::Next });
                     }
                 }
             }
@@ -1629,21 +1760,24 @@ impl ApplicationHandler for App {
                     self.advance(seconds);
                 }
                 self.show_entities();
+                self.make_icons();
                 if let (Some(game), Some(gpu)) = (&self.game, &self.gpu) {
                     game.paint(gpu.config.width, gpu.config.height, f64::from(seconds));
                 }
+                self.steam_frame();
                 self.menu_frame(seconds);
                 if !self.menu_shown() {
                     self.follow_ui_cursor();
                 }
                 let menu = self.menu.as_ref().filter(|_| self.menu_shown()).map(menu::Menu::runtime);
+                let camera = self.view_camera();
                 if let Some(gpu) = &mut self.gpu {
                     let client = self.game.as_ref().map(Game::client);
-                    if gpu.draw(&self.camera, client, menu) {
+                    if gpu.draw(&camera, client, menu) {
                         self.frames_drawn += 1;
                     }
                     if std::mem::take(&mut self.screenshot) {
-                        match gpu.screenshot(&self.camera, client, menu, &self.name) {
+                        match gpu.screenshot(&camera, client, menu, &self.name) {
                             Ok(file) => println!("Screenshot: {}", file.display()),
                             Err(e) => println!("No screenshot: {e}"),
                         }
@@ -1806,6 +1940,22 @@ fn main() -> ExitCode {
         };
     }
     let disabled = menu::disabled_file().map(|file| gmod_fs::workshop::read_disabled(&file)).unwrap_or_default();
+    // to play, Steam: an account that owns the game. A dedicated server goes without
+    let steam = if args.dedicated {
+        None
+    } else {
+        let install = match Install::locate(args.gmod.as_deref()) {
+            Ok(install) => install,
+            Err(e) => return fail(&format!("Garry's Mod was not found: {e}")),
+        };
+        match gmod_steam::Steam::start(&install.root) {
+            Ok(steam) => {
+                println!("Steam: {} ({})", steam.name(), steam.steam_id());
+                Some(Rc::new(steam))
+            }
+            Err(e) => return fail(&format!("openGMOD plays with a licensed Garry's Mod, through Steam: {e}.")),
+        }
+    };
     let setup = Setup {
         gmod: args.gmod.clone(),
         addons: args.addons,
@@ -1815,18 +1965,20 @@ fn main() -> ExitCode {
         max_players: args.max_players.unwrap_or(if args.dedicated { 16 } else { 1 }),
         port: args.port.unwrap_or(proto::DEFAULT_PORT),
         announce: args.announce.clone(),
-        name: args.name.clone().unwrap_or_else(default_name),
+        name: steam.as_ref().map(|steam| steam.name()).unwrap_or_else(|| "Player".to_string()),
         // a dedicated server has no player of its own
         identity: if args.dedicated { gmod_net::Identity::generate() } else { keys::player_identity() },
+        subscribed: steam.as_ref().map(|steam| steam.subscribed(true).into_iter().collect()),
     };
-    if args.dedicated {
+    // a dedicated server: the only way without Steam
+    let Some(steam) = steam else {
         let Some(map) = &args.map else { return fail(&format!("--dedicated needs a map\n\n{USAGE}")) };
         let hostname = args.hostname.clone().unwrap_or_else(|| "openGMOD".to_string());
         return match dedicated(&setup, map, &hostname) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e),
         };
-    }
+    };
 
     // the main menu, drawn by Chromium, on the game's files
     let (mut web, mut main_menu) = (None, None);
@@ -1837,7 +1989,7 @@ fn main() -> ExitCode {
             match menu::start_web(vfs.clone()) {
                 Ok(started) => {
                     let started = Rc::new(started);
-                    let addons = menu::addons(&install, &setup.disabled);
+                    let addons = menu::addons(&install, &setup.disabled, setup.subscribed.as_ref());
                     match menu::Menu::start(
                         vfs,
                         Some(menu::web_pages(started.clone())),
@@ -1846,7 +1998,10 @@ fn main() -> ExitCode {
                         menu::games(&install),
                         !args.addons,
                     ) {
-                        Ok(menu) => main_menu = Some(menu),
+                        Ok(menu) => {
+                            menu.runtime().set_steam(steam.clone());
+                            main_menu = Some(menu);
+                        }
                         Err(e) => println!("No main menu: {e}"),
                     }
                     web = Some(started);
@@ -1882,6 +2037,8 @@ fn main() -> ExitCode {
         settings: Settings::default(),
         spawn: None,
         walker: None,
+        look: None,
+        icons: std::collections::VecDeque::new(),
         name: "main menu".to_string(),
         camera: Camera::looking_at([0.0; 3], [1.0, 0.0, 0.0], FOV),
         gpu: None,
@@ -1912,6 +2069,7 @@ fn main() -> ExitCode {
         menu_drawn: false,
         menu_late: false,
         frames_drawn: 0,
+        steam,
     };
     if let Some(map) = map {
         app.enter_map(&map);

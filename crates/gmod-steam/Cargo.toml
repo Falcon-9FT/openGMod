@@ -1,0 +1,9 @@
+[package]
+name = "gmod-steam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Steam, as Garry's Mod talks to it: the player's account and licence, names of others, the workshop - through the steam_api64.dll of the player's installation"
+
+[dependencies]

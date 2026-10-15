@@ -443,7 +443,8 @@ fn timers_and_hooks() {
     assert!(printed.contains("simple\t0.5"), "{printed}");
     assert_eq!(printed.matches("rep\t").count(), 3, "{printed}");
     assert!(!g.eval::<bool>("return timer.Exists('rep')"));
-    assert_eq!(g.eval::<i32>("return THINKS"), 10);
+    // the server's Think runs with each tick, as in GMod: 66 in a second
+    assert_eq!(g.eval::<i32>("return THINKS"), 66);
     assert!((g.runtime.cur_time() - 1.0).abs() < 1e-9);
     assert_eq!(g.messages().len(), 1);
     assert!(g.messages()[0].ends_with("in a timer"), "{:?}", g.messages());
@@ -621,7 +622,10 @@ fn materials() {
 fn empty_world() {
     let g = game(Realm::Server, &[]);
     assert!(g.eval::<bool>("return #player.GetAll() == 0 and #ents.GetAll() == 1 and Entity(1) == NULL and not NULL:IsValid()"));
-    assert!(g.eval::<bool>("return game.GetWorld():IsValid() and game.GetWorld():IsWorld() and tostring(NULL) == '[NULL Entity]'"));
+    // the world is no valid entity to Lua, as in GMod
+    assert!(g.eval::<bool>(
+        "return not game.GetWorld():IsValid() and not Entity(0):IsValid() and game.GetWorld():IsWorld() and tostring(NULL) == '[NULL Entity]'"
+    ));
     assert!(g.eval::<bool>("return ents.GetAll()[1] == game.GetWorld() and tostring(Entity(0)) == 'Entity [0][worldspawn]'"));
     assert!(g.eval::<bool>(
         "return FindMetaTable('Player').MetaName == 'Player' and FindMetaTable('Player').MetaBaseClass == FindMetaTable('Entity')"
@@ -1740,6 +1744,15 @@ fn the_physics_gun() {
     g.runtime.think(0.02);
     assert_eq!(g.printed(), "picked\tcrate\n");
     assert!(g.runtime.view(alice).unwrap().holding);
+    // the gun's beam goes to what it holds, for the clients to draw
+    let beam = |g: &Game| {
+        let host = crate::host(g.runtime.lua());
+        let guns = host.entities.handles();
+        guns.into_iter().find_map(|h| host.entities.get(h).filter(|e| e.class == "weapon_physgun").map(|e| e.beam.map(|b| b.0)))
+    };
+    let crate_handle = g.eval::<mlua::AnyUserData>("return CRATE").borrow::<EntityHandle>().map(|h| *h).ok();
+    assert!(crate_handle.is_some());
+    assert_eq!(beam(&g).flatten(), crate_handle);
     // looking straight ahead it comes up there, by the point it was taken at
     g.runtime.set_input(alice, aiming(0.0, 90.0, ATTACK));
     g.runtime.think(1.0);
@@ -1768,6 +1781,7 @@ fn the_physics_gun() {
     g.runtime.think(0.5);
     assert_eq!(g.printed(), "picked\tcrate\nfroze\tweapon_physgun\tcrate\ndropped\tcrate\n");
     assert!(!g.runtime.view(alice).unwrap().holding);
+    assert_eq!(beam(&g), Some(None), "let go, no beam");
     assert!(g.eval::<bool>("return not CRATE:GetPhysicsObject():IsMotionEnabled() and CRATE:GetPos().z > 40"));
     // R asks the gamemode to unfreeze; what the hook will not let go is not taken
     g.runtime.set_input(alice, aiming(0.0, 180.0, RELOAD));
@@ -3036,4 +3050,516 @@ fn the_menu_shows_the_loading_screen() {
     assert!(menu.eval::<bool>("return IsHostingGame()"));
     menu.runtime.end_loading();
     assert!(menu.messages().is_empty(), "{:?}", menu.messages());
+}
+
+#[test]
+fn the_menu_keeps_workshop_previews_in_the_user_folder() {
+    let menu = game(Realm::Menu, &[]);
+    let home = TempDir::new();
+    menu.runtime.set_data_dir(gmod_fs::UserDir::open(&home.0, None).unwrap());
+    let previews = crate::menu::previews(menu.runtime.lua()).unwrap();
+    menu.runtime.lua().globals().set("PREVIEWS", previews).unwrap();
+    let url = "https://images.steamusercontent.com/ugc/1/ABC/";
+    // a picture is kept, by a path the menu's page finds it at; what is not a picture is not
+    let (before, saved, found, page): (Option<String>, String, String, Option<String>) = menu.eval(&format!(
+        "local before = PREVIEWS.find('{url}')
+         local saved = PREVIEWS.save('{url}', '\\255\\216\\255\\224 jpeg')
+         return before, saved, PREVIEWS.find('{url}'), PREVIEWS.save('https://example.com/page', '<html>')"
+    ));
+    assert_eq!((before, page), (None, None));
+    assert!(saved.starts_with(&format!("{}/", crate::menu::PREVIEWS)) && saved.ends_with(".jpg"), "{saved}");
+    assert_eq!(found, saved);
+    assert_eq!(std::fs::read(home.0.join(&saved)).unwrap(), b"\xff\xd8\xff\xe0 jpeg");
+}
+
+#[test]
+fn client_side_models_are_the_clients_own() {
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes()), ("models/box.mdl", &mdl)]);
+    g.runtime.init();
+    // an entity of the client's own, with no index; none for a model that is not there
+    assert!(g.eval::<bool>(
+        "WHEEL = ClientsideModel('models/box.mdl', 7) WHEEL:SetPos(Vector(10, 0, 0))
+         return WHEEL:IsValid() and WHEEL:EntIndex() == -1 and WHEEL:GetClass() == 'class C_BaseFlex'
+             and WHEEL:GetModel() == 'models/box.mdl' and ClientsideModel('models/none.mdl') == NULL"
+    ));
+    assert!(g.runtime.drawn(EntityHandle::NULL).iter().any(|d| d.model == "models/box.mdl"), "it is drawn");
+    // what the server sends does not take it away; the client does
+    g.runtime.apply_snapshot(&crate::Snapshot::default());
+    assert!(g.eval::<bool>("local kept = WHEEL:IsValid() WHEEL:SetNextClientThink(CurTime()) WHEEL:Remove() return kept"));
+    g.runtime.think(0.1);
+    assert!(g.eval::<bool>("return not WHEEL:IsValid()"));
+}
+
+#[test]
+fn the_lua_of_entities_draws_them() {
+    // one that draws nothing of itself, one that draws itself, a prop drawn by its override
+    const SENTS: &str = "scripted_ents.Register({ Type = 'anim', Draw = function(self) end }, 'sent_hidden')
+        scripted_ents.Register({ Type = 'anim', Draw = function(self, flags) self:DrawModel(flags) end }, 'sent_shown')
+        scripted_ents.Register({ Type = 'anim', Draw = function(self) error('no such render function') end }, 'sent_broken')";
+    let server = player_game();
+    server.runtime.run_string(SENTS, "sents").unwrap();
+    server
+        .runtime
+        .run_string(
+            "for i, class in ipairs({ 'sent_hidden', 'sent_shown', 'sent_broken', 'prop_physics' }) do
+                 local e = ents.Create(class) e:SetModel('models/box.mdl') e:SetPos(Vector(i * 40, 0, 0)) e:Spawn()
+             end",
+            "spawn",
+        )
+        .unwrap();
+    server.runtime.think(0.02);
+    let client = client_game(&[]);
+    client.runtime.run_string(SENTS, "sents").unwrap();
+    client.runtime.spawn_map(&player_map());
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    let classes = |g: &Game| -> Vec<String> {
+        let mut drawn: Vec<String> = g
+            .runtime
+            .drawn(EntityHandle::NULL)
+            .iter()
+            .filter_map(|d| {
+                g.eval::<Option<String>>(&format!("local e = Entity({}) return e:IsValid() and e:GetClass() or nil", d.entity.index?))
+            })
+            .collect();
+        drawn.sort();
+        drawn
+    };
+    // a scripted entity is drawn when its Lua draws it, or when its Lua failed
+    assert_eq!(classes(&client), ["prop_physics", "sent_broken", "sent_shown"]);
+    // an override takes the place of the engine's drawing; `DrawModel` draws even one hidden
+    client
+        .runtime
+        .run_string(
+            "local prop = ents.FindByClass('prop_physics')[1] prop.RenderOverride = function() end
+             local hidden = ents.FindByClass('sent_hidden')[1] hidden:SetNoDraw(true)
+             ents.FindByClass('sent_shown')[1].Draw = function(self) self:DrawModel() hidden:DrawModel() end",
+            "override",
+        )
+        .unwrap();
+    assert_eq!(classes(&client), ["sent_broken", "sent_hidden", "sent_shown"]);
+}
+
+/// A WAV of `seconds` of silence: 8-bit mono at 8000 frames a second.
+fn silent_wav(seconds: u32) -> Vec<u8> {
+    let frames = 8000 * seconds;
+    let mut wav = b"RIFF".to_vec();
+    wav.extend((36 + frames).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    wav.extend(16u32.to_le_bytes());
+    wav.extend(1u16.to_le_bytes()); // PCM
+    wav.extend(1u16.to_le_bytes()); // mono
+    wav.extend(8000u32.to_le_bytes());
+    wav.extend(8000u32.to_le_bytes());
+    wav.extend(1u16.to_le_bytes());
+    wav.extend(8u16.to_le_bytes());
+    wav.extend(b"data");
+    wav.extend(frames.to_le_bytes());
+    wav.extend(std::iter::repeat_n(128u8, frames as usize));
+    wav
+}
+
+#[test]
+fn sound_channels_play_files_as_bass_does() {
+    use crate::sound::SoundEvent;
+    let wav = silent_wav(2);
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes()), ("sound/engine.wav", &wav)]);
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "sound.PlayFile('sound/engine.wav', '3d noplay', function(ch, code, name) CH = ch end)
+             sound.PlayFile('sound/none.wav', '', function(ch, code, name) FAILED = { ch, code, name } end)
+             CALLED_AT_ONCE = CH ~= nil",
+            "play",
+        )
+        .unwrap();
+    // the callbacks come on the next frame
+    g.runtime.think(0.01);
+    assert!(g.eval::<bool>(
+        "return not CALLED_AT_ONCE and CH:IsValid() and CH:GetState() == 0 and CH:Is3D() and math.abs(CH:GetLength() - 2) < 0.01
+             and FAILED[1] == nil and FAILED[2] == 2 and FAILED[3] == 'BASS_ERROR_FILEOPEN'"
+    ));
+    assert!(g.runtime.take_sounds().is_empty(), "noplay: nothing yet");
+    g.runtime
+        .run_string("CH:EnableLooping(true) CH:SetPos(Vector(10, 0, 0)) CH:Play() CH:SetPos(Vector(20, 0, 0)) CH:SetTime(0.5)", "go")
+        .unwrap();
+    let events = g.runtime.take_sounds();
+    let SoundEvent::Play(first) = &events[0] else { panic!("{events:?}") };
+    let patch = first.patch.unwrap();
+    assert_eq!((first.wave.as_str(), first.looping, first.start), ("sound/engine.wav", Some(true), 0.0));
+    assert_eq!(first.position.map(|p| p.x), Some(10.0));
+    assert_eq!(events[1], SoundEvent::MovePatch { patch, position: crate::vector::Vector::new(20.0, 0.0, 0.0) });
+    // seeking starts it again from there
+    assert_eq!(events[2], SoundEvent::StopPatch(patch));
+    let SoundEvent::Play(again) = &events[3] else { panic!("{events:?}") };
+    assert_eq!((again.patch, again.start), (Some(patch), 0.5));
+    assert!(g.eval::<bool>("local t = CH:GetTime() CH:Pause() return CH:GetState() == 2 and t >= 0.5 and t < 1"));
+}
+
+#[test]
+fn motion_controllers_push_bodies_every_tick() {
+    let g = player_game();
+    g.runtime
+        .run_string(
+            "scripted_ents.Register({ Type = 'anim',
+                 Initialize = function(self) self:SetModel('models/box.mdl') self:PhysicsInitSphere(8) self:StartMotionController() end,
+                 -- no spin about its own axes, and held up against gravity
+                 PhysicsSimulate = function(self, phys, dt)
+                     return -phys:GetAngleVelocity() / dt, Vector(0, 0, 600), SIM_GLOBAL_ACCELERATION
+                 end,
+                 PhysicsUpdate = function(self, phys) UPDATES = (UPDATES or 0) + 1 end }, 'sent_hover')
+             H = ents.Create('sent_hover') H:SetPos(Vector(0, 0, 300)) H:Spawn()
+             H:GetPhysicsObject():AddAngleVelocity(Vector(0, 0, 500))",
+            "hover",
+        )
+        .unwrap();
+    g.runtime.think(1.0);
+    assert!(
+        g.eval::<bool>("return math.abs(H:GetPos().z - 300) < 5 and H:GetPhysicsObject():GetAngleVelocity():Length() < 1 and UPDATES > 30")
+    );
+    // stopped, it falls
+    g.runtime.run_string("H:StopMotionController()", "stop").unwrap();
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>("return H:GetPos().z < 250"));
+}
+
+#[test]
+fn the_frame_runs_the_hooks_of_rendering() {
+    let mdl = gmod_model::testmodel::mdl(1, ([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]));
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes()), ("models/box.mdl", &mdl)]);
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "SEEN = {}
+             for _, name in ipairs({ 'PreRender', 'RenderScene', 'PreDrawOpaqueRenderables', 'PostDrawOpaqueRenderables',
+                 'PreDrawTranslucentRenderables', 'PostDrawTranslucentRenderables', 'PostRender' }) do
+                 HOOKS[name] = function(a) table.insert(SEEN, name) if name == 'RenderScene' then EYE = a end end
+             end",
+            "hooks",
+        )
+        .unwrap();
+    g.runtime.set_view(crate::client::View { origin: crate::vector::Vector::new(1.0, 2.0, 3.0), ..Default::default() });
+    g.runtime.drawn(EntityHandle::NULL);
+    assert_eq!(
+        g.eval::<String>("return table.concat(SEEN, ' ')"),
+        "PreRender RenderScene PreDrawOpaqueRenderables PostDrawOpaqueRenderables PreDrawTranslucentRenderables PostDrawTranslucentRenderables PostRender"
+    );
+    assert!(g.eval::<bool>("return EYE == Vector(1, 2, 3)"));
+}
+
+#[test]
+fn bodies_tell_what_they_touch() {
+    let g = player_game();
+    g.runtime
+        .run_string(
+            "scripted_ents.Register({ Type = 'anim',
+                 Initialize = function(self) self:SetModel('models/box.mdl') self:PhysicsInitSphere(8) end }, 'sent_ball')
+             B = ents.Create('sent_ball') B:SetPos(Vector(200, 200, 40)) B:Spawn()",
+            "ball",
+        )
+        .unwrap();
+    g.runtime.think(1.5);
+    // resting on the floor: the world, pressed down on by its weight
+    assert!(g.eval::<bool>(
+        "local touching = B:GetPhysicsObject():GetFrictionSnapshot()
+         local c = touching[1]
+         return #touching == 1 and c.Other == Entity(0):GetPhysicsObject() and c.Normal.z < -0.9 and c.NormalForce > 0
+             and type(c.MaterialOther) == 'number' and math.abs(c.ContactPoint.z - B:GetPos().z + 8) < 1"
+    ));
+}
+
+#[test]
+fn lua_draws_beams_and_sprites_in_the_world() {
+    use crate::render3d::Shape;
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes())]);
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "HOOKS.PostDrawTranslucentRenderables = function()
+                 render.SetMaterial(Material('cable/cable2'))
+                 render.SetBlend(0.5)
+                 render.DrawBeam(Vector(0, 0, 0), Vector(0, 0, 100), 2, 0, 3, { r = 255, g = 0, b = 0, a = 255 })
+                 render.SetBlend(1)
+                 render.StartBeam(3) for i = 0, 2 do render.AddBeam(Vector(i * 10, 0, 0), 1, i) end render.EndBeam()
+                 render.DrawSprite(Vector(5, 5, 5), 8, 8)
+             end",
+            "draw",
+        )
+        .unwrap();
+    g.runtime.drawn(EntityHandle::NULL);
+    let drawn = g.runtime.take_primitives();
+    assert_eq!(drawn.len(), 3, "{drawn:?}");
+    assert!(drawn.iter().all(|p| p.material.name == "cable/cable2"));
+    let Shape::Beam(beam) = &drawn[0].shape else { panic!("{drawn:?}") };
+    assert_eq!((beam.len(), beam[1].v, beam[0].width, beam[0].color), (2, 3.0, 2.0, [1.0, 0.0, 0.0, 0.5]));
+    assert!(matches!(&drawn[1].shape, Shape::Beam(points) if points.len() == 3 && points[2].v == 2.0));
+    assert!(matches!(drawn[2].shape, Shape::Sprite { width: 8.0, .. }));
+    // the next frame starts with nothing
+    g.runtime.run_string("HOOKS.PostDrawTranslucentRenderables = nil", "stop").unwrap();
+    g.runtime.drawn(EntityHandle::NULL);
+    assert!(g.runtime.take_primitives().is_empty());
+}
+
+#[test]
+fn surfaces_by_number() {
+    let g = player_game();
+    assert!(g.eval::<bool>(
+        "local i = util.GetSurfaceIndex('default')
+         local d = util.GetSurfaceData(i)
+         return i == 0 and d.name == 'default' and math.abs(d.friction - 0.8) < 1e-4 and d.density == 2000 and d.stepLeftSound == 'Default.StepLeft'
+             and util.GetSurfacePropName(i) == 'default' and util.GetSurfaceIndex('no such surface') == -1
+             and util.GetSurfaceData(100000) == nil and util.GetSurfaceData(-1) == nil"
+    ));
+}
+
+#[test]
+fn lua_builds_the_bones_and_meshes_of_what_it_draws() {
+    use crate::render3d::Shape;
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes()), ("models/arm.mdl", &arm_model())]);
+    g.runtime.init();
+    // a bone set where Lua says, in the world, while the bones are built
+    g.runtime
+        .run_string(
+            "ARM = ClientsideModel('models/arm.mdl') ARM:SetPos(Vector(100, 0, 0))
+             ARM:AddCallback('BuildBonePositions', function(ent, count)
+                 COUNT = count
+                 local m = ent:GetBoneMatrix(2)
+                 m:SetTranslation(Vector(100, 50, 0))
+                 ent:SetBoneMatrix(2, m)
+             end)
+             ARM:SetRenderBounds(Vector(-1, -1, -1), Vector(1, 1, 1), Vector(1, 1, 1))",
+            "arm",
+        )
+        .unwrap();
+    assert!(g.eval::<bool>(
+        "local tip = ARM:GetBoneMatrix(2):GetTranslation()
+         local lo, hi = ARM:GetRenderBounds()
+         return COUNT == ARM:GetBoneCount() and tip == Vector(100, 50, 0) and lo == Vector(-2, -2, -2) and hi == Vector(2, 2, 2)"
+    ));
+    let drawn = g.runtime.drawn(EntityHandle::NULL);
+    assert!(drawn.iter().any(|d| d.model == "models/arm.mdl" && !d.bones.is_empty()), "posed as built");
+    // a mesh made corner by corner: a quad as two triangles; a polygon of five as three
+    g.runtime
+        .run_string(
+            "HOOKS.PostDrawOpaqueRenderables = function()
+                 mesh.Begin(MATERIAL_QUADS or 7, 1)
+                 for _, p in ipairs({ Vector(0, 0, 0), Vector(1, 0, 0), Vector(1, 1, 0), Vector(0, 1, 0) }) do
+                     mesh.Position(p) mesh.TexCoord(0, p.x, p.y) mesh.Color(255, 0, 0, 255) mesh.AdvanceVertex()
+                 end
+                 mesh.End()
+                 mesh.Begin(MATERIAL_POLYGON or 6, 3)
+                 for i = 1, 5 do mesh.Position(Vector(i, 0, 0)) mesh.AdvanceVertex() end
+                 mesh.End()
+             end",
+            "mesh",
+        )
+        .unwrap();
+    g.runtime.drawn(EntityHandle::NULL);
+    let made = g.runtime.take_primitives();
+    let counts: Vec<usize> = made.iter().map(|p| if let Shape::Triangles(t) = &p.shape { t.len() } else { 0 }).collect();
+    assert_eq!(counts, [6, 9]);
+    let Shape::Triangles(quad) = &made[0].shape else { unreachable!() };
+    assert_eq!((quad[2].uv, quad[0].color), ([1.0, 1.0], [1.0, 0.0, 0.0, 1.0]));
+    // in front of the eyes and in the open: seen; behind them: not
+    g.runtime.set_view(crate::client::View { origin: crate::vector::Vector::new(0.0, 0.0, 0.0), ..Default::default() });
+    assert!(g.eval::<bool>(
+        "local h = util.GetPixelVisibleHandle()
+         return util.PixelVisible(Vector(100, 0, 0), 4, h) == 1 and util.PixelVisible(Vector(-100, 0, 0), 4, h) == 0"
+    ));
+}
+
+#[test]
+fn the_sender_of_messages_is_the_same_key_every_time() {
+    let g = player_game();
+    let alice = g.runtime.join(alice()).expect("a free slot");
+    g.runtime
+        .run_string(
+            "SEEN = {}
+             function net.Incoming(len, from) SEEN[from] = (SEEN[from] or 0) + 1 end",
+            "receive",
+        )
+        .unwrap();
+    let data = net::Bits::default();
+    g.runtime.receive_net_message("a", &data, alice);
+    g.runtime.receive_net_message("b", &data, alice);
+    assert!(g.eval::<bool>("return SEEN[Entity(1)] == 2"));
+}
+
+#[test]
+fn distance_to_line() {
+    let g = game(Realm::Server, &[]);
+    assert!(g.eval::<bool>(
+        "local d, near, along = util.DistanceToLine(Vector(0, 0, 0), Vector(10, 0, 0), Vector(4, 3, 0))
+         local d2, near2 = util.DistanceToLine(Vector(0, 0, 0), Vector(10, 0, 0), Vector(-4, 3, 0))
+         return d == 3 and near == Vector(4, 0, 0) and along == 4 and d2 == 5 and near2 == Vector(0, 0, 0)"
+    ));
+    assert!(g.eval::<bool>(
+        "return util.IntersectRayWithPlane(Vector(0, 0, 10), Vector(0, 0, -1), Vector(5, 5, 0), Vector(0, 0, 1)) == Vector(0, 0, 0)
+             and util.IntersectRayWithPlane(Vector(0, 0, 10), Vector(0, 0, 1), Vector(0, 0, 0), Vector(0, 0, 1)) == nil
+             and util.IntersectRayWithPlane(Vector(0, 0, 10), Vector(1, 0, 0), Vector(0, 0, 0), Vector(0, 0, 1)) == nil"
+    ));
+}
+
+#[test]
+fn drawing_in_2d_goes_on_planes_in_the_world() {
+    use crate::render3d::Shape;
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes())]);
+    g.runtime.init();
+    let screen = g.runtime.with_canvas(|c, _| (c.width, c.height));
+    g.runtime
+        .run_string(
+            "HOOKS.PostDrawOpaqueRenderables = function()
+                 cam.Start3D2D(Vector(0, 0, 100), Angle(0, 0, 0), 0.5)
+                     surface.SetDrawColor(0, 255, 0, 255)
+                     surface.DrawRect(-10, 0, 20, 4)
+                 cam.End3D2D()
+                 surface.SetDrawColor(255, 255, 255, 255)
+                 surface.DrawRect(0, 0, 10, 10)
+                 cam.Start3D2D(Vector(0, 0, 0), Angle(0, 0, 0), 1)
+                 error('left open')
+             end",
+            "draw",
+        )
+        .unwrap();
+    g.runtime.drawn(EntityHandle::NULL);
+    let drawn = g.runtime.take_primitives();
+    assert_eq!(drawn.len(), 1, "{drawn:?}");
+    assert_eq!(drawn[0].material.name, "color");
+    let Shape::Triangles(corners) = &drawn[0].shape else { panic!("{drawn:?}") };
+    assert_eq!(corners.len(), 6);
+    // x along the forward, y along the right (-y in the world), half a unit a pixel
+    let xs: Vec<f32> = corners.iter().map(|c| c.pos.x).collect();
+    let ys: Vec<f32> = corners.iter().map(|c| c.pos.y).collect();
+    assert!(xs.iter().all(|&x| x == -5.0 || x == 5.0) && ys.iter().all(|&y| y == 0.0 || y == -2.0), "{corners:?}");
+    assert!(corners.iter().all(|c| c.pos.z == 100.0 && c.color == [0.0, 1.0, 0.0, 1.0]));
+    // the screen is drawn on again, after and between: the plane left open is closed
+    let (size, count) = g.runtime.with_canvas(|c, _| ((c.width, c.height), c.vertices().len()));
+    assert_eq!((size, count), (screen, 6));
+}
+
+#[test]
+fn a_dynamic_prop_is_not_moved_by_physics() {
+    let g = physics_game(&[]);
+    g.runtime
+        .run_string(
+            "P = ents.Create('prop_dynamic') P:SetModel('models/crate.mdl') P:SetPos(Vector(0, 0, 200))
+             MADE = P:PhysicsInit(SOLID_VPHYSICS) P:Spawn()",
+            "prop",
+        )
+        .unwrap();
+    g.runtime.think(1.0);
+    let state: String = g.eval("local phys = P:GetPhysicsObject() return tostring(MADE) .. ' ' .. tostring(phys:IsValid()) .. ' ' .. tostring(phys:IsValid() and phys:IsMotionEnabled()) .. ' ' .. tostring(P:GetPos())");
+    assert_eq!(state, "true true false 0.000000 0.000000 200.000000");
+}
+
+#[test]
+fn players_sit_in_vehicles_and_get_out() {
+    let g = physics_game(&[]);
+    g.runtime.run_string(PLAYER_LUA, "players").unwrap();
+    let alice = g.runtime.join(alice()).expect("a free slot");
+    g.runtime.think(0.1);
+    g.runtime
+        .run_string(
+            "P = Entity(1) GROUP = P:GetCollisionGroup()
+             SEAT = ents.Create('prop_vehicle_prisoner_pod') SEAT:SetModel('models/crate.mdl')
+             SEAT:SetPos(P:EyePos() + Vector(40, 0, -8)) SEAT:Spawn() SEAT:GetPhysicsObject():EnableMotion(false)
+             LOG = {}
+             HOOKS.CanPlayerEnterVehicle = function(p, v, role) LOG[#LOG + 1] = 'can ' .. role end
+             HOOKS.PlayerEnteredVehicle = function(p, v, role) LOG[#LOG + 1] = 'entered' end
+             HOOKS.CanExitVehicle = function(v, p) LOG[#LOG + 1] = 'can exit' end
+             HOOKS.PlayerLeaveVehicle = function(p, v) LOG[#LOG + 1] = 'left' end",
+            "seat",
+        )
+        .unwrap();
+    // the program sends the angles the game gave the player
+    let press = |buttons: u32, yaw: f32| {
+        g.runtime.set_input(alice, UserCmd { buttons, view_angles: vector::Angle::new(0.0, yaw, 0.0), ..UserCmd::default() });
+        g.runtime.think(0.05);
+    };
+    // the use key on the seat: in it, seeing from it, looking the way it faces, not colliding
+    press(player::key::USE, 0.0);
+    press(0, 90.0);
+    assert!(g.eval::<bool>(
+        "return table.concat(LOG, ',') == 'can 0,entered' and P:InVehicle() and P:GetVehicle() == SEAT and SEAT:GetDriver() == P
+             and SEAT:GetPassenger(0) == P and P:EyePos() == SEAT:GetPos() + Vector(0, 0, 36)
+             and math.abs(P:EyeAngles().y - 90) < 0.01 and P:GetCollisionGroup() == 10 and P:GetParent() == SEAT"
+    ));
+    // the seat turns, and the view with it
+    g.runtime.run_string("SEAT:SetAngles(Angle(0, 30, 0))", "turn").unwrap();
+    press(0, 90.0);
+    assert!(g.eval::<bool>("return math.abs(P:EyeAngles().y - 120) < 0.01"), "turned with the seat");
+    // the use key again: out of it, beside it
+    press(player::key::USE, 120.0);
+    assert!(g.eval::<bool>(
+        "return table.concat(LOG, ',') == 'can 0,entered,can exit,left' and not P:InVehicle() and SEAT:GetDriver() == NULL
+             and P:GetCollisionGroup() == GROUP and P:GetPos():Distance(SEAT:GetPos()) > 30 and P:GetParent() == NULL"
+    ));
+    // one forced in by Lua goes out when the seat goes
+    g.runtime.run_string("P:EnterVehicle(SEAT) IN = P:InVehicle() SEAT:Remove()", "force").unwrap();
+    assert!(g.eval::<bool>("return IN and not P:InVehicle() and LOG[#LOG] == 'left'"));
+}
+
+#[test]
+fn weapons_are_chosen_in_the_row_of_slots() {
+    use crate::weaponselect::Choose;
+    let server = player_game();
+    let alice = server.runtime.join(alice()).unwrap();
+    server.runtime.run_string("Entity(1):Give('weapon_crowbar')", "give").unwrap();
+    server.runtime.think(0.02);
+    let client = client_game(&[]);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.set_local_player(alice);
+    // the crowbar given is in hand; the wheel opens the row on the weapon after it, the pistol
+    assert!(client.eval::<bool>("return LocalPlayer():GetActiveWeapon():GetClass() == 'weapon_crowbar'"));
+    assert_eq!(client.runtime.choose_weapon(Choose::Next), None);
+    assert!(client.runtime.choosing_weapon());
+    client.runtime.paint(0.016);
+    assert_eq!(client.runtime.take_chosen_weapon(), Some("use weapon_pistol".to_string()));
+    assert!(!client.runtime.choosing_weapon());
+    // a number key of a slot without weapons does nothing; the second attack key puts it away
+    assert_eq!(client.runtime.choose_weapon(Choose::Slot(5)), None);
+    assert!(!client.runtime.choosing_weapon());
+    client.runtime.choose_weapon(Choose::Previous);
+    client.runtime.cancel_weapon_choice();
+    assert_eq!(client.runtime.take_chosen_weapon(), None);
+    // Lua that takes the key has it; a HUD without the row switches at once
+    client.runtime.run_string("HOOKS.PlayerBindPress = function(ply, bind) return bind == 'slot2' end", "bind").unwrap();
+    assert_eq!(client.runtime.choose_weapon(Choose::Slot(1)), None);
+    assert!(!client.runtime.choosing_weapon());
+    client.runtime.run_string("HOOKS.HUDShouldDraw = function(name) return name ~= 'CHudWeaponSelection' end", "hide").unwrap();
+    assert_eq!(client.runtime.choose_weapon(Choose::Next), Some("invnext".to_string()));
+}
+
+#[test]
+fn models_without_spawn_icons_are_pictured_by_the_program() {
+    let g = client_game(&[
+        ("models/props/crate.mdl", "MDL"),
+        ("materials/spawnicons/models/props/known.png", "PNG"),
+        ("models/props/known.mdl", "MDL"),
+    ]);
+    g.runtime
+        .run_string(
+            "local a = vgui.Create('ModelImage') a:SetModel('models/props/crate.mdl')
+             local b = vgui.Create('ModelImage') b:SetModel('models/props/known.mdl')
+             local c = vgui.Create('ModelImage') c:SetModel('models/props/crate.mdl')
+             local d = vgui.Create('ModelImage') d:SetModel('models/props/missing.mdl')",
+            "icons",
+        )
+        .unwrap();
+    // the one without an icon of the game, once, however many show it; not one the game has,
+    // nor one that is not there
+    let asked = g.runtime.take_model_icons();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].1, "models/props/crate.mdl");
+    assert!(g.runtime.take_model_icons().is_empty());
+    // its picture comes back to go to the GPU
+    let picture = gmod_material::png::Rgba { width: 1, height: 1, pixels: vec![255; 4] };
+    g.runtime.give_picture(asked[0].0, picture);
+    assert_eq!(g.runtime.take_page_pictures().iter().map(|(id, _)| *id).collect::<Vec<_>>(), [asked[0].0]);
 }

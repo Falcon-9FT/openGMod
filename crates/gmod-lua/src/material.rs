@@ -47,6 +47,15 @@ impl UserData for LuaMaterial {
     }
 }
 
+/// What `render.SetMaterial` draws with: the material's name, and the base texture and
+/// additivity Lua gave a material of its own (`CreateMaterial`).
+pub(crate) fn render_info(ud: &mlua::AnyUserData) -> Option<crate::render3d::Material3d> {
+    let m = ud.borrow::<LuaMaterial>().ok()?;
+    let texture = m.get("$basetexture");
+    let additive = m.get("$additive").map(|v| v.trim() != "0");
+    Some(crate::render3d::Material3d { name: m.name.clone(), texture, additive })
+}
+
 /// A texture by name (`ITexture`): a file of the game, or one the engine renders into
 /// (`_rt_FullFrameFB`), which is not there to read.
 #[derive(Debug, Clone)]

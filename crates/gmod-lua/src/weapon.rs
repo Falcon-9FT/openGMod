@@ -151,6 +151,9 @@ pub struct WeaponData {
     pub auto_switch_from: bool,
     /// Fires while the key is held rather than once a press (a SWEP's `Primary.Automatic`).
     pub automatic: [bool; 2],
+    /// An engine weapon's icons in the row of slots, as its script's `TextureData` has them: a
+    /// font of the scheme and the character of it, and the same when chosen.
+    pub icons: [Option<(String, String)>; 2],
     /// An engine weapon's sounds by what they are for (`single_shot`, `empty`, `reload`,
     /// `melee_hit` ...): sound scripts.
     pub sounds: Vec<(String, String)>,
@@ -179,6 +182,7 @@ impl Default for WeaponData {
             auto_switch_to: true,
             auto_switch_from: true,
             automatic: [true, true],
+            icons: [None, None],
             sounds: Vec::new(),
         }
     }
@@ -366,6 +370,10 @@ fn script(lua: &Lua, class: &str) -> Option<WeaponData> {
             auto_switch_to: number("autoswitchto", 1) != 0,
             auto_switch_from: number("autoswitchfrom", 1) != 0,
             automatic: [true, true],
+            icons: ["weapon", "weapon_s"].map(|name| {
+                let icon = block.block("TextureData")?.block(name)?;
+                Some((icon.str("font")?.to_string(), icon.str("character")?.to_string()))
+            }),
             sounds: block
                 .block("SoundData")
                 .map(|sounds| sounds.iter().filter_map(|p| Some((p.key.clone(), p.value.as_str()?.to_string()))).collect())

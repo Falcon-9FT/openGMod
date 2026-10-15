@@ -34,6 +34,9 @@ pub mod flags {
     pub const LOOPING: i32 = 0x0001;
     /// It is added to what is played under it, not played instead of it.
     pub const DELTA: i32 = 0x0004;
+    /// Played always, on top of whatever else plays (a weapon's claws held by a pose
+    /// parameter).
+    pub const AUTOPLAY: i32 = 0x0008;
     /// Added in the bone's own space rather than its parent's.
     pub const POST: i32 = 0x0010;
     /// Its cycle is a pose parameter's value ([`Sequence::cycle_pose`](super::Sequence::cycle_pose)).

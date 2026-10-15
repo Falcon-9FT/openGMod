@@ -43,6 +43,8 @@ pub struct Sound {
     pub channel: i32,
     /// What it was asked for by, to stop it by the same name.
     pub name: String,
+    /// Seconds into the clip it starts at.
+    pub start: f64,
 }
 
 /// Where the sounds are heard from.
@@ -76,6 +78,12 @@ pub struct Mixer {
     pub listener: Listener,
     /// Over every sound.
     pub master: f32,
+}
+
+/// The level in decibels of a sound heard whole up to `distance` units and fading as one over
+/// the distance beyond (as BASS fades a 3D sound past its least distance).
+pub fn level_for_distance(distance: f32) -> f32 {
+    REF_DB - 20.0 * (REF_DISTANCE / distance.max(1.0)).log10()
 }
 
 /// How loud a sound of `level` decibels is at `distance` units, as Source works it out.
@@ -114,8 +122,16 @@ impl Mixer {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.voices.push(Voice { id, sound, cursor: 0.0 });
+        let cursor = (sound.start.max(0.0) * f64::from(sound.clip.rate)).min(sound.clip.frames() as f64);
+        self.voices.push(Voice { id, sound, cursor });
         id
+    }
+
+    /// A playing sound is somewhere else now.
+    pub fn move_voice(&mut self, id: u64, position: [f32; 3]) {
+        if let Some(voice) = self.voices.iter_mut().find(|v| v.id == id) {
+            voice.sound.position = Some(position);
+        }
     }
 
     pub fn stop(&mut self, id: u64) {

@@ -59,6 +59,9 @@ pub(crate) struct Client {
     pub user_info: RefCell<Vec<(String, String)>>,
     pub frame: Cell<u64>,
     pub real_frame_time: Cell<f64>,
+    /// The view is from outside the local player, who is drawn then (`CalcView`'s
+    /// `drawviewer`).
+    pub draw_viewer: Cell<bool>,
 }
 
 impl Default for Client {
@@ -74,6 +77,7 @@ impl Default for Client {
             to_server: RefCell::new(Vec::new()),
             user_info: RefCell::new(Vec::new()),
             frame: Cell::new(0),
+            draw_viewer: Cell::new(false),
             real_frame_time: Cell::new(0.0),
         }
     }
@@ -583,6 +587,11 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         Ok(Value::Table(t))
     })?;
     def(lua, &globals, "LocalPlayer", |a| entity::push(a.lua, host(a.lua).client.local_player.get()))?;
+    // models of the client's own: wheels, doors, gauges that addons draw with their entities
+    def(lua, &globals, "ClientsideModel", |a| {
+        let model = a.string(1)?.replace('\\', "/").to_ascii_lowercase();
+        entity::push(a.lua, crate::ents::create_client_model(a.lua, &model).unwrap_or(EntityHandle::NULL))
+    })?;
     def(lua, &globals, "GetViewEntity", |a| entity::push(a.lua, host(a.lua).client.local_player.get()))?;
     def(lua, &globals, "EyePos", |a| userdata(a.lua, host(a.lua).client.view.get().origin))?;
     def(lua, &globals, "EyeAngles", |a| userdata(a.lua, host(a.lua).client.view.get().angles))?;
@@ -754,6 +763,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     globals.raw_set("language", language)?;
 
     install_render(lua, &globals)?;
+    crate::render3d::install(lua)?;
 
     crate::chat::install(lua, &globals)?;
 
@@ -975,8 +985,6 @@ fn install_render(lua: &Lua, globals: &Table) -> mlua::Result<()> {
         "End2D",
         "Start3D",
         "End3D",
-        "Start3D2D",
-        "End3D2D",
         "StartOrthoView",
         "EndOrthoView",
         "PushModelMatrix",
@@ -1020,6 +1028,13 @@ impl crate::Runtime {
     /// Where the local player sees from this frame.
     pub fn set_view(&self, view: View) {
         host(&self.lua).client.view.set(view);
+    }
+
+    /// The view as the client's Lua makes it from the player's eyes (`CalcView`, which the base
+    /// gamemode hands to `CalcVehicleView` in a vehicle, to the player's class and weapon):
+    /// where to see from, which way, how wide; and whether the player is drawn then.
+    pub fn calc_view(&self, player: EntityHandle, view: View) -> View {
+        calc_view(&self.lua, player, view)
     }
 
     /// The cursor moved, to a pixel of the screen.
@@ -1136,6 +1151,42 @@ impl crate::Runtime {
         *host(&self.lua).pages.web.borrow_mut() = Some(pages);
     }
 
+    /// A key of choosing a weapon (the mouse wheel, a number key): the row of slots opens or
+    /// its choice moves ([`crate::weaponselect`]). The command to send the server instead, when
+    /// the HUD does not choose.
+    pub fn choose_weapon(&self, choose: crate::weaponselect::Choose) -> Option<String> {
+        crate::weaponselect::key(&self.lua, choose)
+    }
+
+    /// Whether the row of weapon slots shows: the attack keys are for it then.
+    pub fn choosing_weapon(&self) -> bool {
+        crate::weaponselect::is_open(&self.lua)
+    }
+
+    /// The attack key while the row shows: the command that takes the weapon chosen, if one is
+    /// to be taken; the row goes away.
+    pub fn take_chosen_weapon(&self) -> Option<String> {
+        crate::weaponselect::take(&self.lua)
+    }
+
+    /// The second attack key while the row shows: it goes away.
+    pub fn cancel_weapon_choice(&self) {
+        crate::weaponselect::cancel(&self.lua);
+    }
+
+    /// The models to picture for spawn icons the game has none of, since the last call: the
+    /// image each becomes ([`gmod_ui::Texture::Image`]), and the model; the program hands the
+    /// pictures back with [`give_picture`](Self::give_picture).
+    pub fn take_model_icons(&self) -> Vec<(u32, String)> {
+        std::mem::take(&mut *host(&self.lua).screen.model_icons.borrow_mut())
+    }
+
+    /// A picture the program made for an image (a model's spawn icon): it comes back with
+    /// [`take_page_pictures`](Self::take_page_pictures), to go to the GPU.
+    pub fn give_picture(&self, id: u32, picture: gmod_material::png::Rgba) {
+        host(&self.lua).pages.pictures.borrow_mut().insert(id, picture);
+    }
+
     /// The pictures pages drew since the last call, by the image ([`gmod_ui::Texture::Image`])
     /// each is drawn as: to send the GPU before the frame is drawn.
     pub fn take_page_pictures(&self) -> Vec<(u32, gmod_material::png::Rgba)> {
@@ -1158,4 +1209,43 @@ impl crate::Runtime {
     pub fn take_user_info(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *host(&self.lua).client.user_info.borrow_mut())
     }
+}
+
+/// `CalcView(ply, origin, angles, fov, znear, zfar)`: the view Lua gives back in its table -
+/// `origin`, `angles`, `fov`, `drawviewer` - each where it says, else as it was.
+fn calc_view(lua: &Lua, player: EntityHandle, view: View) -> View {
+    let client = &host(lua).client;
+    client.draw_viewer.set(false);
+    let args = (|| -> mlua::Result<MultiValue> {
+        Ok(MultiValue::from_iter([
+            entity::push(lua, player)?,
+            entity::vector(lua, view.origin)?,
+            entity::angle(lua, view.angles)?,
+            Value::Number(f64::from(view.fov)),
+            Value::Number(3.0),
+            Value::Number(28377.9199),
+        ]))
+    })();
+    let Ok(args) = args else { return view };
+    let said = crate::call_hook(lua, "CalcView", args);
+    let Some(Value::Table(t)) = said.front() else { return view };
+    let mut out = view;
+    if let Ok(Value::UserData(ud)) = t.raw_get::<Value>("origin")
+        && let Ok(origin) = ud.borrow::<Vector>()
+    {
+        out.origin = *origin;
+    }
+    if let Ok(Value::UserData(ud)) = t.raw_get::<Value>("angles")
+        && let Ok(angles) = ud.borrow::<Angle>()
+    {
+        out.angles = *angles;
+    }
+    if let Ok(Some(fov)) = t.raw_get::<Option<f64>>("fov")
+        && fov.is_finite()
+        && fov > 0.0
+    {
+        out.fov = fov as f32;
+    }
+    client.draw_viewer.set(matches!(t.raw_get::<Value>("drawviewer"), Ok(Value::Boolean(true))));
+    out
 }

@@ -97,6 +97,9 @@ pub(crate) struct Screen {
     pen: RefCell<Pen>,
     images: RefCell<Vec<Image>>,
     image_ids: RefCell<HashMap<String, u32>>,
+    /// Models the program is to picture, spawn icons the game has none of: the image each
+    /// becomes, and the model.
+    pub model_icons: RefCell<Vec<(u32, String)>>,
     /// Image sizes measured, by number.
     image_sizes: RefCell<HashMap<u32, (u32, u32)>>,
     /// Pixels read for `GetColor`, by lower-case name; none for what is not there.
@@ -117,6 +120,7 @@ impl Default for Screen {
             pen: RefCell::new(Pen::default()),
             images: RefCell::new(Vec::new()),
             image_ids: RefCell::new(HashMap::new()),
+            model_icons: RefCell::new(Vec::new()),
             image_sizes: RefCell::new(HashMap::new()),
             pixels: RefCell::new(HashMap::new()),
             panel_clip: Cell::new(None),
@@ -177,6 +181,19 @@ impl Screen {
         let id = images.len() as u32 + 1;
         images.push(Image { name: name.replace('\\', "/"), additive });
         self.image_ids.borrow_mut().insert(key, id);
+        id
+    }
+
+    /// The image of a model as the program pictures it (`model-icon/<model>`), asked for the
+    /// first time it is wanted ([`crate::Runtime::take_model_icons`]).
+    pub fn model_icon(&self, model: &str) -> u32 {
+        let model = model.replace('\\', "/").to_lowercase();
+        let name = format!("model-icon/{model}");
+        let new = !self.image_ids.borrow().contains_key(&name);
+        let id = self.image_id(&name, false);
+        if new {
+            self.model_icons.borrow_mut().push((id, model));
+        }
         id
     }
 

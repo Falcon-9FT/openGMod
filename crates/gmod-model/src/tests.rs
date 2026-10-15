@@ -665,6 +665,23 @@ fn sequences_blend_and_layer() {
 }
 
 #[test]
+fn autoplay_sequences_play_over_everything() {
+    // the aim grid played always, on the root alone: whatever plays, the root is turned as
+    // aim_yaw says
+    let mut model = arm();
+    model.sequences[5].flags |= flags::AUTOPLAY;
+    model.sequences[5].weights = vec![1.0, 0.0, 0.0];
+    let (mdl, ani) = model.files();
+    let rig = Rig::new(Mdl::parse(&mdl).unwrap(), ani);
+    let aimed = [rig.pose_parameters()[0].normalize(45.0)];
+    let step = testmodel::ROTATION_SCALE;
+    let pose = rig.pose(0, 0.5, &aimed, &[]);
+    assert!(close(yaw(pose[0].rotation), 0.5, step), "{}", yaw(pose[0].rotation));
+    // and idle still plays its own bones under it
+    assert!(close(yaw(pose[1].rotation), 0.5, step), "{}", yaw(pose[1].rotation));
+}
+
+#[test]
 fn included_models_play_on_the_bones_of_the_same_names() {
     // the included model has the bones in another order, one the rig does not have, and
     // a sequence of the same name as the rig's (left out), two of the same name as each

@@ -229,7 +229,8 @@ impl crate::Runtime {
             .entities
             .handles()
             .into_iter()
-            .filter(|h| h.index.is_some_and(|i| i != 0 && wanted.get(&i) != Some(&h.serial)))
+            // the client's own entities (`ClientsideModel`) are not the server's to take away
+            .filter(|h| h.index.is_some_and(|i| i != 0 && i < crate::entity::MAX_EDICTS && wanted.get(&i) != Some(&h.serial)))
             .collect();
         for handle in gone {
             crate::ents::remove(lua, handle);

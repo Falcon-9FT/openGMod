@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn servers_are_known_by_the_key_they_first_had() {
-        let dir = std::env::temp_dir().join(format!("opengmod-known-servers-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("opengmod-keys-known-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let known = KnownServers::at(Some(dir.join("servers").join("known.txt")));
         let (one, two) = (Identity::generate().public(), Identity::generate().public());

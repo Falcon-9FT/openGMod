@@ -40,7 +40,18 @@ fn clip(samples: &[i16], cue: Option<u32>) -> Arc<crate::Clip> {
 }
 
 fn sound(clip: Arc<crate::Clip>) -> Sound {
-    Sound { clip, volume: 1.0, pitch: 1.0, level: 75.0, position: None, looping: false, source: 0, channel: CHAN_AUTO, name: "test".into() }
+    Sound {
+        clip,
+        volume: 1.0,
+        pitch: 1.0,
+        level: 75.0,
+        position: None,
+        looping: false,
+        source: 0,
+        channel: CHAN_AUTO,
+        name: "test".into(),
+        start: 0.0,
+    }
 }
 
 #[test]

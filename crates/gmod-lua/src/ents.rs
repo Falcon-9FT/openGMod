@@ -13,7 +13,7 @@
 //! later in stage 4.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mlua::{AnyUserData, Function, Lua, MultiValue, ObjectLike, Table, Value};
 
@@ -23,7 +23,7 @@ use crate::vector::{Angle, Vector};
 use crate::{Realm, ScriptError, files, host};
 
 /// How often a SENT's `Think` runs on the server when it does not ask for another time: "about
-/// 5-6 times per second", as GMod's wiki puts it.
+/// 5-6 times per second", as GMod's wiki puts it. On a client it runs every frame.
 pub const DEFAULT_THINK: f64 = 0.2;
 
 /// Map creation IDs of the map's entities: this, plus the entity's place in the entity lump.
@@ -77,6 +77,8 @@ pub(crate) struct Studio {
     pub hull: (Vector, Vector),
     /// The body groups: the name of each, and the names of its models.
     pub body_parts: Vec<(String, Vec<String>)>,
+    /// What each body group's choice is worth in the model's body number (`base`).
+    pub body_bases: Vec<usize>,
     /// How many skins it has.
     pub skins: usize,
     /// The bones: the name of each, and its parent's number (-1 for none).
@@ -87,6 +89,9 @@ pub(crate) struct Studio {
     pub flexes: Vec<String>,
     /// Its `$keyvalues` text (`prop_data` ...).
     pub key_values: String,
+    /// The material of each texture slot, under `materials/` and without `.vmt`: the name in
+    /// the first of the model's folders that has it (`GetMaterials`).
+    pub materials: Vec<String>,
 }
 
 /// A studio model, read once.
@@ -101,6 +106,21 @@ pub(crate) fn studio(lua: &Lua, model: &str) -> Option<Studio> {
     }
     let studio = host.vfs.read(&path, "GAME").ok().and_then(|bytes| gmod_model::Mdl::parse(&bytes).ok()).map(|mdl| {
         let (lo, hi) = mdl.hull;
+        let materials = mdl
+            .textures
+            .iter()
+            .map(|texture| {
+                // lower case, as the engine's materials are named
+                let in_folder =
+                    |folder: &String| format!("{folder}{texture}").replace('\\', "/").trim_start_matches('/').to_ascii_lowercase();
+                mdl.texture_folders
+                    .iter()
+                    .map(in_folder)
+                    .find(|name| host.vfs.exists(&format!("materials/{name}.vmt"), "GAME"))
+                    .or_else(|| mdl.texture_folders.first().map(in_folder))
+                    .unwrap_or_else(|| texture.replace('\\', "/").to_ascii_lowercase())
+            })
+            .collect();
         Studio {
             hull: (Vector::new(lo[0], lo[1], lo[2]), Vector::new(hi[0], hi[1], hi[2])),
             body_parts: mdl
@@ -108,11 +128,13 @@ pub(crate) fn studio(lua: &Lua, model: &str) -> Option<Studio> {
                 .iter()
                 .map(|part| (part.name.clone(), part.models.iter().map(|m| m.name.clone()).collect()))
                 .collect(),
+            body_bases: mdl.body_parts.iter().map(|part| part.base).collect(),
             skins: mdl.skins.len().max(1),
             bones: mdl.bones.iter().map(|b| (b.name.clone(), b.parent)).collect(),
             attachments: mdl.attachments.iter().map(|a| a.name.clone()).collect(),
             flexes: mdl.flexes.clone(),
             key_values: mdl.key_values.clone(),
+            materials,
         }
     });
     host.models.studio.borrow_mut().insert(path, studio.clone());
@@ -198,11 +220,12 @@ const ENGINE_CLASSES: &[&str] = &[
     "trigger_weapon_dissolve", "trigger_weapon_strip", "trigger_wind", "vgui_screen", "water_lod_control", "weapon_357",
     "weapon_alyxgun", "weapon_annabelle", "weapon_ar2", "weapon_bugbait", "weapon_crossbow", "weapon_crowbar",
     "weapon_frag", "weapon_physcannon", "weapon_physgun", "weapon_pistol", "weapon_rpg", "weapon_shotgun",
-    "weapon_slam", "weapon_smg1", "weapon_stunstick",
+    "weapon_slam", "weapon_smg1", "weapon_striderbuster", "weapon_stunstick",
 ];
 
 /// The kind of an engine class: its prefix says it, but for the makers, thrown things and the
-/// helicopter's markers, which are named `npc_` and are no NPCs.
+/// helicopter's markers, which are named `npc_` and are no NPCs, and the Magnusson device,
+/// named `weapon_` and no weapon.
 fn engine_kind(class: &str) -> Kind {
     let class = class.to_ascii_lowercase();
     let not_npc = matches!(
@@ -220,7 +243,7 @@ fn engine_kind(class: &str) -> Kind {
     );
     if class.starts_with("npc_") && !not_npc {
         Kind::Npc
-    } else if class.starts_with("weapon_") {
+    } else if class.starts_with("weapon_") && class != "weapon_striderbuster" {
         Kind::Weapon
     } else if class.starts_with("prop_vehicle") {
         Kind::Vehicle
@@ -395,6 +418,24 @@ pub(crate) fn create_engine(lua: &Lua, class: &str, kind: Kind) -> mlua::Result<
     Ok(Some(handle))
 }
 
+/// `ClientsideModel(model)`: an entity of the client's own (`class C_BaseFlex`), with a model,
+/// drawn where it is put; the server knows nothing of it. None when the model is not there
+/// (as in GMod) or there is no room.
+pub(crate) fn create_client_model(lua: &Lua, model: &str) -> Option<EntityHandle> {
+    if !model.ends_with(".mdl") || !host(lua).vfs.exists(model, "GAME") {
+        return None;
+    }
+    let handle = {
+        let host = host(lua);
+        let ent = Ent::new("class C_BaseFlex", Kind::Entity, host.entities.next_creation_id(), host.clock.cur_time.get());
+        host.entities.insert_client(ent)?
+    };
+    entity::set_model(lua, handle, model);
+    host(lua).entities.with_mut(handle, |ent| ent.spawned = true);
+    announce(lua, handle);
+    Some(handle)
+}
+
 /// Tells the game's Lua that an entity was made: `OnEntityCreated`.
 pub(crate) fn announce(lua: &Lua, handle: EntityHandle) {
     let Some(ud) = userdata(lua, handle) else { return };
@@ -406,9 +447,11 @@ const SOLID_VPHYSICS: i64 = 6;
 const MOVETYPE_VPHYSICS: i64 = 6;
 
 /// Whether an engine class is a prop of physics: `prop_physics` and its kin
-/// (`prop_physics_multiplayer`, `_override`, `_respawnable`).
+/// (`prop_physics_multiplayer`, `_override`, `_respawnable`), and the vehicles
+/// (`prop_vehicle_prisoner_pod` ...), which have the body of their model too - addons weld seats.
 fn is_physics_prop(class: &str) -> bool {
-    class.to_ascii_lowercase().starts_with("prop_physics")
+    let class = class.to_ascii_lowercase();
+    class.starts_with("prop_physics") || class.starts_with("prop_vehicle")
 }
 
 /// `ent:Spawn()`: a SENT or SWEP runs its `Initialize`; a prop of physics takes its body, a
@@ -447,6 +490,12 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         if ragdoll && flags & 4 != 0 {
             host(lua).entities.with_mut(handle, |ent| ent.collision_group = crate::trace::group::DEBRIS);
         }
+    }
+    // a dynamic prop is moved by its parent, its animation and Lua, never by physics: a body
+    // it was given before (`PhysicsInit`) becomes its shadow, as Source makes it when it spawns
+    let dynamic = !scripted && host(lua).entities.get(handle).is_some_and(|e| e.class.to_ascii_lowercase().starts_with("prop_dynamic"));
+    if dynamic && crate::physics::body(lua, handle).is_some() {
+        crate::physics::set_motion(lua, handle, false);
     }
     if !scripted {
         crate::npc::spawned(lua, handle);
@@ -493,6 +542,7 @@ pub(crate) fn remove(lua: &Lua, handle: EntityHandle) {
     invalidate_cache(lua, kind == Kind::Player);
     crate::player::forget(lua, handle);
     crate::constraint::removed(lua, handle);
+    crate::vehicle::removed(lua, handle);
     crate::physics::destroy(lua, handle);
     crate::npc::removed(lua, handle);
     if let Ok(Some(list)) = ud.named_user_value::<Option<Table>>("delete-on-remove") {
@@ -525,10 +575,12 @@ pub(crate) fn collect(lua: &Lua) {
     }
 }
 
-/// One tick: the SENTs whose time has come think. A SWEP thinks in a player's hands
-/// ([`crate::weapon::post_frame`]).
+/// One tick of the server, one frame of a client: the SENTs whose time has come think - on the
+/// server five times a second unless they ask for more, on a client every frame. A SWEP thinks
+/// in a player's hands ([`crate::weapon::post_frame`]).
 pub(crate) fn think(lua: &Lua) {
     let now = host(lua).clock.cur_time.get();
+    let every = if host(lua).realm == Realm::Server { DEFAULT_THINK } else { 0.0 };
     let due: Vec<EntityHandle> = {
         let entities = &host(lua).entities;
         entities
@@ -547,7 +599,7 @@ pub(crate) fn think(lua: &Lua) {
         let again = matches!(result.as_ref().and_then(|r| r.front()), Some(Value::Boolean(true)));
         host(lua).entities.with_mut(handle, |ent| {
             let request = ent.think_request.take();
-            ent.next_think = if again { request.unwrap_or(now) } else { now + DEFAULT_THINK };
+            ent.next_think = if again { request.unwrap_or(now) } else { now + every };
         });
     }
 }
@@ -559,6 +611,9 @@ pub struct Drawn {
     /// The model's path in the game's files: `models/props_c17/oildrum001.mdl`.
     pub model: String,
     pub skin: i64,
+    /// The body number of the model: the body groups chosen (`SetBodygroup`), as Source
+    /// counts them.
+    pub body: usize,
     pub origin: Vector,
     pub angles: Angle,
     pub scale: f32,
@@ -575,48 +630,185 @@ const EF_NODRAW: i64 = 32;
 /// The models of entities as `viewer` sees them, through its own eyes: not the viewer itself
 /// nor what it carries (its weapon, its view model and the hands on it), not what is hidden,
 /// not brush entities (the map draws those) and not a corpse that could not become a ragdoll.
+///
+/// As in GMod, the Lua of an entity draws it: a scripted entity's `Draw` and
+/// `DrawTranslucent` (a scripted weapon's `DrawWorldModel`), or any entity's
+/// `RenderOverride`, run every frame, and the models they draw (`DrawModel`, of any entity)
+/// are the ones drawn. What the engine draws by itself is drawn as it is. One whose Lua failed
+/// before it drew anything is drawn all the same, rather than lost.
 pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
-    let entities = &host(lua).entities;
     // the viewer, or what goes with its eyes, all the way up the parents
+    // the viewer is drawn when the view is from outside them (`drawviewer`)
+    let hidden_viewer = if host(lua).client.draw_viewer.get() { EntityHandle::NULL } else { viewer };
     let carried = |mut handle: EntityHandle| {
+        let entities = &host(lua).entities;
         for _ in 0..16 {
             let Some(ent) = entities.get(handle) else { return false };
-            if handle == viewer || matches!(ent.class.as_str(), "predicted_viewmodel" | "viewmodel") {
+            if (handle == hidden_viewer && handle.index.is_some()) || matches!(ent.class.as_str(), "predicted_viewmodel" | "viewmodel") {
                 return true;
             }
             handle = ent.parent;
         }
         false
     };
-    entities
-        .handles()
-        .into_iter()
-        .filter(|&handle| !carried(handle))
-        .filter_map(|handle| {
-            let (model, skin) = {
+    // the entities with a model to draw, and whether they show of themselves
+    let drawable: Vec<(EntityHandle, bool, bool)> = {
+        let entities = &host(lua).entities;
+        entities
+            .handles()
+            .into_iter()
+            .filter(|&handle| !carried(handle))
+            .filter_map(|handle| {
+                entities.with_mut(handle, |ent| ent.lua_drawn = false);
                 let ent = entities.get(handle)?;
-                let hidden = ent.removed
-                    || ent.dormant
-                    || !ent.spawned
-                    || ent.no_draw
-                    || ent.effects & EF_NODRAW != 0
-                    || ent.render_mode == RENDERMODE_NONE;
                 let studio = ent.model.len() > 4 && ent.model[ent.model.len() - 4..].eq_ignore_ascii_case(".mdl");
                 // the brushes that may move are drawn where their entities are; the others are the map's
                 let moving_brush = crate::movers::moving_brush(&ent).is_some();
-                if hidden
+                if ent.removed
+                    || ent.dormant
+                    || !ent.spawned
                     || !(studio || moving_brush)
                     || (ent.class == "hl2mp_ragdoll" && ent.physics.is_none() && ent.ragdoll_pose.is_empty())
                 {
                     return None;
                 }
-                (ent.model.clone(), ent.skin)
-            };
+                let hidden = ent.no_draw || ent.effects & EF_NODRAW != 0 || ent.render_mode == RENDERMODE_NONE;
+                Some((handle, !hidden, ent.scripted))
+            })
+            .collect()
+    };
+    // what Lua draws, in the passes and among the hooks of GMod's frame; the engine draws the rest
+    let client = host(lua).realm != Realm::Server;
+    let hook = |name: &str, args: MultiValue| {
+        if client {
+            crate::call_hook(lua, name, args);
+        }
+    };
+    let flags = || MultiValue::from_iter([Value::Boolean(false), Value::Boolean(false), Value::Boolean(false)]);
+    if client {
+        crate::render3d::begin(lua);
+    }
+    hook("PreRender", MultiValue::new());
+    if client {
+        let view = host(lua).client.view.get();
+        if let (Ok(origin), Ok(angles)) = (entity::vector(lua, view.origin), entity::angle(lua, view.angles)) {
+            hook("RenderScene", MultiValue::from_iter([origin, angles, Value::Number(f64::from(view.fov))]));
+        }
+    }
+    let mut ran: HashMap<EntityHandle, Option<bool>> = HashMap::new();
+    for (pass, before, after) in [
+        (Pass::Opaque, "PreDrawOpaqueRenderables", "PostDrawOpaqueRenderables"),
+        (Pass::Translucent, "PreDrawTranslucentRenderables", "PostDrawTranslucentRenderables"),
+    ] {
+        hook(before, flags());
+        for &(handle, visible, scripted) in &drawable {
+            if !visible {
+                continue;
+            }
+            if let Some(ok) = draw_by_lua(lua, handle, scripted, pass) {
+                let was = ran.entry(handle).or_insert(None);
+                *was = Some(was.unwrap_or(true) && ok);
+            }
+        }
+        hook(after, flags());
+    }
+    // the engine's own beams, among the effects
+    if client {
+        crate::render3d::physgun_beams(lua, viewer);
+    }
+    hook("PreDrawEffects", MultiValue::new());
+    hook("PostDrawEffects", MultiValue::new());
+    hook("RenderScreenspaceEffects", MultiValue::new());
+    hook("PostRender", MultiValue::new());
+    if client {
+        crate::render3d::close_planes(lua);
+    }
+    // no Lua of its own: the engine draws it; Lua that ran: what it drew; Lua that failed:
+    // drawn all the same
+    let shown: HashSet<EntityHandle> = drawable
+        .iter()
+        .filter(|(handle, visible, _)| *visible && !matches!(ran.get(handle), Some(Some(true))))
+        .map(|(handle, ..)| *handle)
+        .collect();
+    drawable
+        .into_iter()
+        .filter(|(handle, ..)| shown.contains(handle) || host(lua).entities.get(*handle).is_some_and(|e| e.lua_drawn))
+        .filter_map(|(handle, ..)| {
+            let (model, skin, groups) = host(lua).entities.get(handle).map(|ent| (ent.model.clone(), ent.skin, ent.body_groups.clone()))?;
+            let body = body_number(lua, &model, &groups);
             // a merged model is drawn where its parent is, a player's turned as its legs are
             let (origin, angles, scale) = crate::anim::drawn_at(lua, handle)?;
-            Some(Drawn { entity: handle, model, skin, origin, angles, scale, bones: crate::anim::skinning(lua, handle) })
+            Some(Drawn { entity: handle, model, skin, body, origin, angles, scale, bones: crate::anim::skinning(lua, handle) })
         })
         .collect()
+}
+
+/// `STUDIO_RENDER`: the flags Lua's draw functions get.
+const STUDIO_RENDER: i64 = 1;
+
+/// The passes of a frame: what is opaque, then what is seen through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Opaque,
+    Translucent,
+}
+
+/// Runs the Lua that draws an entity in a pass, by its render group: its `RenderOverride`, else
+/// a scripted entity's `Draw` (opaque) and `DrawTranslucent` (translucent), a weapon's
+/// `DrawWorldModel` and `DrawWorldModelTranslucent`. None when it has none for the pass; else
+/// whether it ran without an error.
+fn draw_by_lua(lua: &Lua, handle: EntityHandle, scripted: bool, pass: Pass) -> Option<bool> {
+    let ud = userdata(lua, handle)?;
+    let function = |name: &str| match ud.get::<Value>(name) {
+        Ok(Value::Function(f)) => Some(f),
+        _ => None,
+    };
+    let group = ud.get::<Option<i64>>("RenderGroup").ok().flatten().unwrap_or(RENDERGROUP_OPAQUE);
+    let in_pass = match pass {
+        Pass::Opaque => group != RENDERGROUP_TRANSLUCENT,
+        Pass::Translucent => group == RENDERGROUP_TRANSLUCENT || group == RENDERGROUP_BOTH,
+    };
+    let override_pass = if group == RENDERGROUP_TRANSLUCENT { Pass::Translucent } else { Pass::Opaque };
+    let draw = if let Some(f) = function("RenderOverride") {
+        if pass != override_pass {
+            return None;
+        }
+        f
+    } else if !scripted || !in_pass {
+        return None;
+    } else {
+        let name = match (handle.kind == Kind::Weapon, pass) {
+            (true, Pass::Opaque) => "DrawWorldModel",
+            (true, Pass::Translucent) => "DrawWorldModelTranslucent",
+            (false, Pass::Opaque) => "Draw",
+            (false, Pass::Translucent) => "DrawTranslucent",
+        };
+        function(name)?
+    };
+    let args = MultiValue::from_iter([Value::UserData(ud.clone()), Value::Integer(STUDIO_RENDER)]);
+    Some(files::call_reporting(lua, draw, args).is_ok())
+}
+
+const RENDERGROUP_OPAQUE: i64 = 7;
+const RENDERGROUP_TRANSLUCENT: i64 = 8;
+const RENDERGROUP_BOTH: i64 = 9;
+
+/// The body number of a model with body groups chosen: each group's choice times what it is
+/// worth, as Source counts them (`m_nBody`).
+pub(crate) fn body_number(lua: &Lua, model: &str, groups: &[(i64, i64)]) -> usize {
+    if groups.is_empty() {
+        return 0;
+    }
+    let Some(studio) = studio(lua, model) else { return 0 };
+    groups
+        .iter()
+        .filter_map(|&(group, value)| {
+            let group = usize::try_from(group).ok()?;
+            let count = studio.body_parts.get(group)?.1.len();
+            let value = usize::try_from(value).ok()?.min(count.saturating_sub(1));
+            Some(value * studio.body_bases.get(group).copied().unwrap_or(0))
+        })
+        .sum()
 }
 
 /// Parses `1 2 3` as the engine does: what is missing is 0.
@@ -709,6 +901,15 @@ fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
 /// (`parentname`), all are spawned, parents before their children, then activated, the
 /// `logic_auto`s fire, and the `InitPostEntity` hook runs.
 pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
+    // the map's sky, as `sv_skyname` (both realms have it)
+    let sky = map
+        .entities
+        .iter()
+        .filter(|pairs| pairs.iter().any(|(k, v)| k.eq_ignore_ascii_case("classname") && v.eq_ignore_ascii_case("worldspawn")))
+        .find_map(|pairs| pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case("skyname")).map(|(_, v)| v.clone()));
+    if let Some(sky) = sky {
+        crate::convar::set_value(lua, "sv_skyname", &sky);
+    }
     {
         let host = host(lua);
         *host.game.map.borrow_mut() = map.name.clone();
