@@ -2501,7 +2501,7 @@ mod tests {
             (DeviceType::IntegratedGpu, Backend::Dx12),
             (DeviceType::DiscreteGpu, Backend::Dx12),
         ];
-        adapters.sort_by_key(|&(kind, backend)| adapter_rank(kind, backend));
+        adapters.sort_by_key(|&(kind, backend)| adapter_rank(kind, backend, None));
         assert_eq!(
             adapters,
             [
@@ -2512,5 +2512,18 @@ mod tests {
                 (DeviceType::Cpu, Backend::Dx12),
             ]
         );
+    }
+
+    #[test]
+    fn the_chosen_api_first_on_any_gpu() {
+        use wgpu::{Backend, DeviceType};
+        let mut adapters = [
+            (DeviceType::DiscreteGpu, Backend::Dx12),
+            (DeviceType::IntegratedGpu, Backend::Vulkan),
+            (DeviceType::DiscreteGpu, Backend::Vulkan),
+        ];
+        adapters.sort_by_key(|&(kind, backend)| adapter_rank(kind, backend, Some(Backend::Vulkan)));
+        assert_eq!(adapters[0], (DeviceType::DiscreteGpu, Backend::Vulkan));
+        assert_eq!(adapters[2], (DeviceType::DiscreteGpu, Backend::Dx12), "and the others after, should it not be there");
     }
 }
