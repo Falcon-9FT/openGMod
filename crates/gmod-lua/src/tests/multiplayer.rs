@@ -163,6 +163,17 @@ fn between_two_snapshots_things_move_smoothly() {
     // the short way round: from 170 through 180
     assert!((prop.ent.local_angles.y - 175.0).abs() < 0.01, "{:?}", prop.ent.local_angles);
     assert!((mid.time - (a.time + 0.025)).abs() < 1e-9);
+    // what played to its end stays at its end; what went round goes on from where it was
+    let cycle_between = |from: f32, to: f32, t: f32| {
+        let (mut a, mut b) = (a.clone(), b.clone());
+        for (s, cycle) in [(&mut a, from), (&mut b, to)] {
+            s.entities.iter_mut().filter(|e| e.ent.class == "prop_physics").for_each(|e| e.ent.anim.cycle = cycle);
+        }
+        Snapshot::between(&a, &b, t).entities.iter().find(|e| e.ent.class == "prop_physics").unwrap().ent.anim.cycle
+    };
+    assert_eq!(cycle_between(1.0, 1.0, 0.5), 1.0);
+    assert!((cycle_between(0.9, 0.1, 0.25) - 0.95).abs() < 1e-5);
+    assert!((cycle_between(0.9, 0.1, 0.75) - 0.05).abs() < 1e-5);
     // a jump is not drawn out
     g.runtime.run_string("P:SetPos(Vector(5000, 0, 0))", "teleport").unwrap();
     let c = g.runtime.snapshot();

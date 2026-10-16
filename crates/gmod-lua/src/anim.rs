@@ -40,6 +40,7 @@ pub const MAX_LAYERS: usize = 15;
 const EF_BONEMERGE: i64 = 1;
 const ACT_VM_DRAW: i64 = 172;
 const ACT_VM_IDLE: i64 = 174;
+pub(crate) const ACT_VM_PRIMARYATTACK: i64 = 181;
 const ACT_MP_STAND_IDLE: i64 = 990;
 /// Player animation events (`PLAYERANIMEVENT_*`) the engine raises itself.
 pub(crate) const EVENT_ATTACK_PRIMARY: i64 = 0;

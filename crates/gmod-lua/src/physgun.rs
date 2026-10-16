@@ -127,6 +127,11 @@ pub(crate) fn command(lua: &Lua, player: EntityHandle, weapon: EntityHandle, cmd
     if cmd.buttons & IN_ATTACK == 0 {
         host(lua).physgun.waiting.borrow_mut().retain(|&p| p != player);
     }
+    // as Half-Life 2's physics gun: the key going down plays its firing, which stays at its
+    // end while the key is held; let go, it goes back to idle ([`crate::anim::weapon_idle`])
+    if pressed & IN_ATTACK != 0 {
+        crate::anim::send_weapon_anim(lua, weapon, crate::anim::ACT_VM_PRIMARYATTACK);
+    }
     match held(lua, player) {
         Some(_) if cmd.buttons & IN_ATTACK == 0 => drop(lua, player),
         Some(held) if pressed & IN_ATTACK2 != 0 => {
