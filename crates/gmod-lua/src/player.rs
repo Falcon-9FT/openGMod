@@ -154,6 +154,8 @@ pub enum ToClient {
     GameEvent(String, Vec<(String, crate::gameevent::Field)>),
     /// A user message (`umsg`): its name and what was written in it.
     UserMessage(String, Vec<crate::usermessage::Part>),
+    /// `util.ScreenShake`: how hard as it is felt there, how often, how long.
+    Shake(f32, f32, f32),
 }
 
 /// Asks a player's client something. A bot has none: the server runs its console lines

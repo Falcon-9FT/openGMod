@@ -276,6 +276,11 @@ pub(crate) struct Panels {
 }
 
 impl Panels {
+    /// Puts text on the clipboard (`SetClipboardText`), where text entries paste from.
+    pub(crate) fn set_clipboard(&self, text: String) {
+        *self.clipboard.borrow_mut() = text;
+    }
+
     fn get<R>(&self, h: PanelHandle, f: impl FnOnce(&Node) -> R) -> Option<R> {
         let slots = self.slots.borrow();
         let slot = slots.get(h.index as usize).filter(|s| s.serial == h.serial)?;
@@ -959,8 +964,10 @@ fn paint_panel(lua: &Lua, h: PanelHandle, origin: (i32, i32), clip: Clip, alpha:
     let corner = (origin.0 + x, origin.1 + y);
     let own = Clip::new(corner.0, corner.1, w, hh);
     let clip = if no_clip { screen_clip(lua) } else { clip.intersect(own) };
+    // a panel faded out all the way is still painted, unseen, as on the PC Source paints it:
+    // scripts animate in `Paint` (XGUI fades itself in so)
     let alpha = alpha * f32::from(own_alpha) / 255.0;
-    if clip.is_empty() || alpha <= 0.0 {
+    if clip.is_empty() {
         return;
     }
     enter(lua, corner, clip, alpha);

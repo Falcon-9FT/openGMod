@@ -541,6 +541,11 @@ impl Gather<'_> {
         let mut s = Surface::plain(name, first, count);
         let Some(m) = material else { return s };
         s.missing = false;
+        // `$no_draw`: there, and not drawn (models hide their parts so)
+        if m.flag("$no_draw") {
+            s.count = 0;
+            return s;
+        }
         if let Some(texture) = m.texture("$basetexture") {
             s.base = self.texture(&texture);
         }

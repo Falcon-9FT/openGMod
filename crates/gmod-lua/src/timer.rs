@@ -160,6 +160,10 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         })?;
         Ok(MultiValue::from_iter([Value::Boolean(found.is_some())]))
     })?;
+    def(&timer, "IsPaused", |a| {
+        let paused = with_timer(a, |t, _| t.paused.is_some())?;
+        Ok(MultiValue::from_iter([paused.map_or(Value::Nil, Value::Boolean)]))
+    })?;
     def(&timer, "Toggle", |a| {
         let state = with_timer(a, |t, now| match t.paused.take() {
             Some(left) => {

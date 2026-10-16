@@ -402,6 +402,13 @@ pub(crate) fn explode(lua: &Lua, center: Vector, damage: f32, radius: f32, attac
     crate::effect::dispatch(lua, "Explosion", effect);
     crate::sound::emit_at(lua, "BaseExplosionEffect.Sound", center);
     let attacker = if attacker.index.is_some() { attacker } else { inflictor };
+    radius_damage(lua, DamageInfo::new(damage, dmg::BLAST, attacker, inflictor), center, radius);
+}
+
+/// Damage felt within `radius` of `center` (`util.BlastDamage`): all of it at the middle,
+/// nothing at the edge, none through the world; it pushes away from the middle.
+pub(crate) fn radius_damage(lua: &Lua, template: DamageInfo, center: Vector, radius: f32) {
+    let (damage, inflictor) = (template.damage, template.inflictor.unwrap_or(EntityHandle::NULL));
     let collision = host(lua).world.collision.borrow().clone();
     // the world between the middle and a victim shields it; the brushes of what blows up and
     // of the victim itself do not
@@ -425,7 +432,7 @@ pub(crate) fn explode(lua: &Lua, center: Vector, damage: f32, radius: f32, attac
         let amount = damage * (1.0 - distance / radius);
         let away = target - center;
         let direction = if away.length() > 0.001 { away.normalized() } else { Vector::new(0.0, 0.0, 1.0) };
-        let mut info = DamageInfo::new(amount, dmg::BLAST, attacker, inflictor);
+        let mut info = DamageInfo { damage: amount, ..template };
         info.force = direction * (amount * PUSH);
         info.position = center;
         info.reported_position = center;

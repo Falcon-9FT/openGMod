@@ -1288,6 +1288,8 @@ impl crate::Runtime {
 /// `CalcView(ply, origin, angles, fov, znear, zfar)`: the view Lua gives back in its table -
 /// `origin`, `angles`, `fov`, `drawviewer` - each where it says, else as it was.
 fn calc_view(lua: &Lua, player: EntityHandle, view: View) -> View {
+    // the view shakes before Lua sees it, as in Source
+    let view = crate::shake::apply(lua, view);
     let client = &host(lua).client;
     client.draw_viewer.set(false);
     let args = (|| -> mlua::Result<MultiValue> {

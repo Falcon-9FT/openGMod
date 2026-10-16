@@ -103,3 +103,55 @@ fn util_reads_what_models_say() {
              and util.GetModelMeshes('models/none.mdl') == nil and util.GetModelInfo('models/none.mdl') == nil"
     ));
 }
+
+#[test]
+fn util_hashes_and_geometry() {
+    let g = game(Realm::Server, &[]);
+    assert!(g.eval::<bool>(
+        "return util.MD5('abc') == '900150983cd24fb0d6963f7d28e17f72'
+             and util.SHA1('abc') == 'a9993e364706816aba3e25717850c26c9cd0d89d'
+             and util.SHA256('abc') == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'"
+    ));
+    assert!(g.eval::<bool>(
+        "local pos, normal, t = util.IntersectRayWithOBB(Vector(-100, 0, 0), Vector(200, 0, 0), Vector(0, 0, 0), Angle(0, 0, 0), Vector(-10, -10, -10), Vector(10, 10, 10))
+         return pos:Distance(Vector(-10, 0, 0)) < 1e-3 and normal:Distance(Vector(-1, 0, 0)) < 1e-4 and math.abs(t - 0.45) < 1e-4
+             and util.IntersectRayWithOBB(Vector(-100, 50, 0), Vector(200, 0, 0), Vector(0, 0, 0), Angle(0, 0, 0), Vector(-10, -10, -10), Vector(10, 10, 10)) == nil
+             and util.IsBoxIntersectingBox(Vector(0, 0, 0), Vector(2, 2, 2), Vector(1, 1, 1), Vector(3, 3, 3))
+             and not util.IsSphereIntersectingSphere(Vector(0, 0, 0), 1, Vector(5, 0, 0), 1)
+             and util.IsOBBIntersectingOBB(Vector(0, 0, 0), Angle(0, 45, 0), Vector(-1, -1, -1), Vector(1, 1, 1), Vector(2.3, 0, 0), Angle(0, 0, 0), Vector(-1, -1, -1), Vector(1, 1, 1))
+             and not util.IsOBBIntersectingOBB(Vector(0, 0, 0), Angle(0, 0, 0), Vector(-1, -1, -1), Vector(1, 1, 1), Vector(2.5, 0, 0), Angle(0, 0, 0), Vector(-1, -1, -1), Vector(1, 1, 1))"
+    ));
+}
+
+#[test]
+fn blast_damage_falls_off_and_shakes_are_sent() {
+    let g = player_game();
+    let alice = g.runtime.join(PlayerInfo { name: "Alice".into(), ..PlayerInfo::default() }).unwrap();
+    g.runtime.take_to_clients();
+    let (health, gone): (i64, bool) = g.eval(
+        "local p = Entity(1) local before = p:Health()
+         util.BlastDamage(game.GetWorld(), game.GetWorld(), p:GetPos() + Vector(0, 0, 36) + Vector(100, 0, 0), 200, 50)
+         local hurt = before - p:Health()
+         util.BlastDamage(game.GetWorld(), game.GetWorld(), p:GetPos() + Vector(1000, 0, 0), 200, 50)
+         return hurt, before - p:Health() == hurt",
+    );
+    assert!(health > 0 && health < 50 && gone, "{health}");
+    g.runtime
+        .run_string(
+            "util.ScreenShake(Entity(1):GetPos(), 5, 5, 1, 500) util.ScreenShake(Entity(1):GetPos() + Vector(5000, 0, 0), 5, 5, 1, 500)",
+            "shake",
+        )
+        .unwrap();
+    let sent = asked_of(&g);
+    assert!(matches!(sent.as_slice(), [(to, ToClient::Shake(a, ..))] if *to == alice && *a > 4.0), "{sent:?}");
+}
+
+#[test]
+fn a_panel_faded_out_is_still_painted() {
+    let g = client_game(&[]);
+    g.runtime
+        .run_string("P = vgui.Create('Panel') P:SetSize(100, 100) P:SetAlpha(0) function P:Paint() PAINTED = true end", "panel")
+        .unwrap();
+    g.runtime.paint(0.01);
+    assert!(g.eval::<bool>("return PAINTED == true"));
+}

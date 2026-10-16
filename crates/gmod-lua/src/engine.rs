@@ -50,6 +50,8 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
 pub(crate) struct Game {
     /// Where the map's sun is (`env_sun`, `light_environment`), towards it.
     pub sun: std::cell::Cell<Option<crate::vector::Vector>>,
+    /// When `util.TimerCycle` was last called.
+    pub timer_cycle: std::cell::Cell<f64>,
     pub map: RefCell<String>,
     pub gamemode_name: RefCell<String>,
     /// The table of the active gamemode (`GAMEMODE`).

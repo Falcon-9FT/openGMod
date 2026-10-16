@@ -96,6 +96,7 @@ pub mod material;
 pub mod matrix;
 pub mod menu;
 pub mod meta;
+mod misc;
 mod models;
 pub mod movedata;
 pub mod movers;
@@ -117,6 +118,7 @@ pub mod render3d;
 pub mod resource;
 pub mod sandbox;
 pub mod serverlist;
+mod shake;
 pub mod snapshot;
 pub mod sound;
 pub mod sql;
@@ -326,6 +328,8 @@ pub(crate) struct Host {
     pub(crate) game_events: gameevent::Listening,
     /// The user message the server's Lua is writing (`umsg`).
     pub(crate) user_messages: usermessage::Writing,
+    /// How the client's view shakes (`util.ScreenShake`).
+    pub(crate) shakes: shake::Shakes,
     /// The engine's HUD: where its elements go, its colours.
     pub hud: RefCell<hud::Hud>,
     /// The row of weapon slots the HUD chooses a weapon in.
@@ -442,6 +446,7 @@ impl Runtime {
             effects: effect::Effects::default(),
             game_events: gameevent::Listening::default(),
             user_messages: usermessage::Writing::default(),
+            shakes: shake::Shakes::default(),
             hud: RefCell::new(hud::Hud::default()),
             selection: weaponselect::Selection::default(),
             sounds: sound::Sounds::new(realm),
@@ -511,6 +516,8 @@ impl Runtime {
             client::load(&lua);
             hud::load(&lua);
         }
+        misc::install(&lua)?;
+        shake::install(&lua)?;
         menu::install(&lua, realm)?;
         Ok(Runtime { lua })
     }
@@ -776,6 +783,7 @@ impl Runtime {
             player::ToClient::Effect(name, data) => effect::make(&self.lua, name, *data),
             player::ToClient::GameEvent(name, fields) => gameevent::heard(&self.lua, name, fields),
             player::ToClient::UserMessage(name, parts) => usermessage::receive(&self.lua, name, parts),
+            player::ToClient::Shake(amplitude, frequency, duration) => shake::start(&self.lua, *amplitude, *frequency, *duration),
         }
     }
 

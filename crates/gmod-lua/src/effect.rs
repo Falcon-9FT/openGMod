@@ -168,7 +168,7 @@ pub(crate) struct Effects {
 
 /// The server's effect goes to its players: those of a filter given, or all but the one whose
 /// command makes it - its client made it already, predicting - unless told to ignore that.
-fn send(lua: &Lua, name: &str, data: EffectData, filter: Option<&Value>) {
+pub(crate) fn send(lua: &Lua, name: &str, data: EffectData, filter: Option<&Value>) {
     let players = match filter {
         Some(value @ Value::UserData(_)) => crate::recipients::players_of(lua, Some(value)),
         _ => {
