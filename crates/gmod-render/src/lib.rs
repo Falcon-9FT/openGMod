@@ -312,13 +312,19 @@ fn buffer(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, usage: wgpu::
     buffer
 }
 
-fn wgpu_format(format: PixelFormat) -> wgpu::TextureFormat {
-    match format {
-        PixelFormat::Bc1 => wgpu::TextureFormat::Bc1RgbaUnormSrgb,
-        PixelFormat::Bc2 => wgpu::TextureFormat::Bc2RgbaUnormSrgb,
-        PixelFormat::Bc3 => wgpu::TextureFormat::Bc3RgbaUnormSrgb,
-        PixelFormat::Bgra8 => wgpu::TextureFormat::Bgra8UnormSrgb,
-        PixelFormat::Rgba8 => wgpu::TextureFormat::Rgba8UnormSrgb,
+/// The format of a texture: sRGB colour, or values taken as they are when `linear`.
+fn wgpu_format(format: PixelFormat, linear: bool) -> wgpu::TextureFormat {
+    match (format, linear) {
+        (PixelFormat::Bc1, false) => wgpu::TextureFormat::Bc1RgbaUnormSrgb,
+        (PixelFormat::Bc2, false) => wgpu::TextureFormat::Bc2RgbaUnormSrgb,
+        (PixelFormat::Bc3, false) => wgpu::TextureFormat::Bc3RgbaUnormSrgb,
+        (PixelFormat::Bgra8, false) => wgpu::TextureFormat::Bgra8UnormSrgb,
+        (PixelFormat::Rgba8, false) => wgpu::TextureFormat::Rgba8UnormSrgb,
+        (PixelFormat::Bc1, true) => wgpu::TextureFormat::Bc1RgbaUnorm,
+        (PixelFormat::Bc2, true) => wgpu::TextureFormat::Bc2RgbaUnorm,
+        (PixelFormat::Bc3, true) => wgpu::TextureFormat::Bc3RgbaUnorm,
+        (PixelFormat::Bgra8, true) => wgpu::TextureFormat::Bgra8Unorm,
+        (PixelFormat::Rgba8, true) => wgpu::TextureFormat::Rgba8Unorm,
     }
 }
 
@@ -331,7 +337,7 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data:
         mip_level_count: data.levels.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu_format(data.format),
+        format: wgpu_format(data.format, data.linear),
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -362,10 +368,12 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data:
     (view(wgpu::TextureViewDimension::D2Array, layers), view(wgpu::TextureViewDimension::D2, 1))
 }
 
-fn upload_lightmap(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, bytes: &[u8]) -> wgpu::TextureView {
+/// Uploads light maps, `layers` of them one after another in `bytes` (the bumped ones after
+/// the flat one).
+fn upload_lightmap(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, layers: u32, bytes: &[u8]) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("light map"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: layers },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -377,9 +385,9 @@ fn upload_lightmap(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, heigh
         wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         bytes,
         wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 8), rows_per_image: Some(height) },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        wgpu::Extent3d { width, height, depth_or_array_layers: layers },
     );
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
+    texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
 }
 
 fn sampler(device: &wgpu::Device, clamp_s: bool, clamp_t: bool, filtered: bool) -> wgpu::Sampler {
@@ -512,6 +520,8 @@ struct Layouts {
     camera: wgpu::BindGroupLayout,
     surface: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
+    /// Light maps: the flat one, and the bumped ones after it.
+    lightmap: wgpu::BindGroupLayout,
     bones: wgpu::BindGroupLayout,
 }
 
@@ -544,7 +554,8 @@ struct Shared {
 
 impl Shared {
     fn texture(&self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &Texture) -> Uploaded {
-        let data = gpu::texture_data(&texture.vtf, self.compressed, MAX_TEXTURE)?;
+        let mut data = gpu::texture_data(&texture.vtf, self.compressed, MAX_TEXTURE)?;
+        data.linear = texture.normal;
         Some(views(device, queue, &texture.name, &data))
     }
 
@@ -589,6 +600,9 @@ impl Shared {
                 let base = texture(surface.base);
                 let blend = texture(surface.base2.or(surface.base));
                 let detail = texture(surface.detail.map(|d| d.texture).or(surface.base));
+                // bump maps, the base standing in for none
+                let bump = texture(surface.bump.map(|b| b.texture).or(surface.base));
+                let bump2 = texture(surface.bump.and_then(|b| b.second.or(Some(b.texture))).or(surface.base));
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("surface"),
                     layout: &self.layouts.surface,
@@ -605,6 +619,8 @@ impl Shared {
                         wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&blend.layers) },
                         wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[base.sampler]) },
                         wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&detail.layers) },
+                        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&bump.layers) },
+                        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&bump2.layers) },
                     ],
                 })
             })
@@ -617,10 +633,10 @@ impl Shared {
                     .lightmap
                     .as_ref()
                     .filter(|l| l.width > 0 && l.height > 0)
-                    .map(|l| upload_lightmap(device, queue, l.width, l.height, &gpu::lightmap_data(l)));
+                    .map(|l| upload_lightmap(device, queue, l.width, l.height, gpu::lightmap_layers(l), &gpu::lightmap_data(l)));
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("light map"),
-                    layout: &self.layouts.texture,
+                    layout: &self.layouts.lightmap,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -659,6 +675,7 @@ fn pipeline(
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 40, shader_location: 3 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 44, shader_location: 4 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 5 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 56, shader_location: 8 },
     ];
     // the bones of each vertex of a posed model: three numbers, then their weights
     let skin_attributes = [
@@ -809,11 +826,17 @@ impl Renderer {
                     view_entry(2, wgpu::TextureViewDimension::D2Array),
                     sampler_entry(3),
                     view_entry(4, wgpu::TextureViewDimension::D2Array),
+                    view_entry(5, wgpu::TextureViewDimension::D2Array),
+                    view_entry(6, wgpu::TextureViewDimension::D2Array),
                 ],
             }),
             texture: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("texture"),
                 entries: &[texture_entry(0), sampler_entry(1)],
+            }),
+            lightmap: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("light map"),
+                entries: &[view_entry(0, wgpu::TextureViewDimension::D2Array), sampler_entry(1)],
             }),
             bones: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("bones"),
@@ -835,12 +858,12 @@ impl Renderer {
         });
         let world_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world"),
-            bind_group_layouts: &[Some(&layouts.camera), Some(&layouts.surface), Some(&layouts.texture)],
+            bind_group_layouts: &[Some(&layouts.camera), Some(&layouts.surface), Some(&layouts.lightmap)],
             immediate_size: 0,
         });
         let posed_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("posed"),
-            bind_group_layouts: &[Some(&layouts.camera), Some(&layouts.surface), Some(&layouts.texture), Some(&layouts.bones)],
+            bind_group_layouts: &[Some(&layouts.camera), Some(&layouts.surface), Some(&layouts.lightmap), Some(&layouts.bones)],
             immediate_size: 0,
         });
         let pipelines = Pipelines {
@@ -866,7 +889,8 @@ impl Renderer {
                 queue,
                 1,
                 1,
-                &gpu::lightmap_data(&gmod_world::Lightmap { width: 1, height: 1, texels: vec![[1.0; 3]] }),
+                1,
+                &gpu::lightmap_data(&gmod_world::Lightmap { width: 1, height: 1, texels: vec![[1.0; 3]], bumped: Vec::new() }),
             ),
             lightmap_sampler: sampler(device, true, true, false),
             compressed: device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
@@ -963,7 +987,16 @@ impl Renderer {
     /// A texture for effects from RGBA pixels, `width` by `height`, made again each time it is
     /// given: a page of the fonts' glyphs, which text drawn in the world is cut from.
     pub fn set_effect_pixels(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, name: &str, width: u32, height: u32, rgba: Vec<u8>) {
-        let data = TextureData { width, height, format: PixelFormat::Rgba8, frames: 1, levels: vec![rgba], clamp_s: true, clamp_t: true };
+        let data = TextureData {
+            width,
+            height,
+            format: PixelFormat::Rgba8,
+            frames: 1,
+            levels: vec![rgba],
+            clamp_s: true,
+            clamp_t: true,
+            linear: false,
+        };
         self.textures.insert(name.to_string(), Some(views(device, queue, name, &data)));
         self.effects.forget(name);
     }

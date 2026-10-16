@@ -115,6 +115,31 @@ fn world_mesh() {
 }
 
 #[test]
+fn bumped_faces_have_the_light_along_each_direction() {
+    let mut bsp = map();
+    // the floor bump mapped: after its flat light (red) the three bumped ones
+    bsp.texinfo[0].flags |= surf::BUMPLIGHT;
+    let white = [128, 128, 128, 0];
+    bsp.lighting.extend(std::iter::repeat_n(white, 81).flatten());
+    let mesh = mesh::build(&bsp, mesh::Options::default());
+    let lightmap = &mesh.lightmap;
+    let area = (lightmap.width * lightmap.height) as usize;
+    assert_eq!(lightmap.bumped.len(), area * 3);
+    let page = |p: usize, uv: [f32; 2]| {
+        let (x, y) = ((uv[0] * lightmap.width as f32) as usize, (uv[1] * lightmap.height as f32) as usize);
+        let at = y * lightmap.width as usize + x;
+        if p == 0 { lightmap.texels[at] } else { lightmap.bumped[(p - 1) * area + at] }
+    };
+    let floor = mesh.vertices[0].lightmap_uv;
+    let pages: Vec<[f32; 3]> = (0..4).map(|p| page(p, floor)).collect();
+    assert_eq!(pages, [RED, GREEN, BLUE, white].map(rgbe_to_linear));
+    // the wall is not: its one light along every direction
+    let wall = mesh.vertices[4].lightmap_uv;
+    assert!((1..4).all(|p| page(p, wall) == page(0, wall)));
+    assert_eq!(page(0, wall), rgbe_to_linear(GREEN));
+}
+
+#[test]
 fn faces_look_along_their_plane() {
     // `side` only says that the plane is the flipped one of a pair; it faces the way the face does
     let mut bytes = testmap::bytes();

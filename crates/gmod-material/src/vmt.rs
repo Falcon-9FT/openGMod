@@ -17,7 +17,10 @@
 //! * `Proxies`: code that changes parameters as the game runs (animated textures and more);
 //! * blocks named after a DirectX level condition (`">=dx90"`, `"<dx90_20b"`): their parameters
 //!   count when it holds, over the others. openGMOD answers as DirectX 9 hardware does (`dx95`);
-//! * fallback blocks for older hardware (`LightmappedGeneric_DX8`), not used;
+//! * blocks for the shader at a DirectX level (`LightmappedGeneric_DX9`, with HDR
+//!   `LightmappedGeneric_HDR_DX9` in its place): the DirectX 9 one's parameters count, over
+//!   the others (many materials keep `$bumpmap` there); those for older hardware
+//!   (`LightmappedGeneric_DX8`) are not used;
 //! * parameters behind a condition, `"hdr?$envmaptint"` or `"!srgb?$color"` ([`condition`]).
 //!
 //! A `patch` material takes another and changes it:
@@ -161,6 +164,10 @@ impl Material {
     fn resolve(&mut self) {
         let mut params = Vec::new();
         let mut later = Vec::new();
+        // the shader's own block for DirectX 9: the HDR one when there is one
+        let level = [format!("{}_hdr_dx9", self.shader), format!("{}_dx9", self.shader)]
+            .into_iter()
+            .find(|name| self.block.pairs.iter().any(|p| p.key.eq_ignore_ascii_case(name) && matches!(p.value, Value::Block(_))));
         for pair in &self.block.pairs {
             let name = pair.key.to_ascii_lowercase();
             match &pair.value {
@@ -174,7 +181,7 @@ impl Material {
                     None => params.push((name, value.clone())),
                 },
                 Value::Block(block) => {
-                    if dx_condition(&name) == Some(true) {
+                    if dx_condition(&name) == Some(true) || level.as_deref() == Some(name.as_str()) {
                         for inner in &block.pairs {
                             if let Value::Str(value) = &inner.value {
                                 later.push((inner.key.to_ascii_lowercase(), value.as_str()));

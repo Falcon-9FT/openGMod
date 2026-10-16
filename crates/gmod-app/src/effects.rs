@@ -51,7 +51,7 @@ impl Materials {
         let additive = material.additive.unwrap_or_else(|| vmt.as_ref().is_some_and(|m| m.flag("$additive")));
         let texture = texture_name.and_then(|name| {
             let vtf = gmod_material::load_texture(&self.vfs, &name).ok()?;
-            Some(gmod_world::Texture { name, vtf: Arc::new(vtf) })
+            Some(gmod_world::Texture { name, vtf: Arc::new(vtf), normal: false })
         });
         let look = (texture, additive);
         self.looks.insert(key, look.clone());

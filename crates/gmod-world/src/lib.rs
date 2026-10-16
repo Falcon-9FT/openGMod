@@ -79,6 +79,9 @@ pub struct Vertex {
     pub alpha: f32,
     /// Linear light at the vertex, for props; 1 for brushes, lit by their light map.
     pub light: Vec3,
+    /// A model's: the direction the texture's u runs along (x y z), and w the side of the
+    /// bitangent (its v), for its bump map; all 0 for none.
+    pub tangent: [f32; 4],
 }
 
 /// Triangles that share a material, and how to draw them.
@@ -96,6 +99,9 @@ pub struct Surface {
     /// `$detail`: a texture laid over the base, `scale` times as fine, mixed in as its mode
     /// says (0: it doubles or darkens, 1: it adds) by `blend`.
     pub detail: Option<Detail>,
+    /// `$bumpmap`: which way the surface faces at each texel, to light it by its bumped
+    /// lightmaps.
+    pub bump: Option<Bump>,
     /// Texels less opaque than this are not drawn.
     pub alpha_test: Option<f32>,
     pub translucent: bool,
@@ -130,6 +136,20 @@ pub struct Surface {
     pub overlay: bool,
 }
 
+/// A surface's bump map.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bump {
+    /// Index into [`World::textures`], a [`Texture::normal`] one.
+    pub texture: usize,
+    /// `$bumpmap2` of `WorldVertexTransition`: blended in as the second base texture is.
+    pub second: Option<usize>,
+    /// `$ssbump`: its texels say how much of the light along each direction of the bumped
+    /// lightmaps reaches them, not which way they face.
+    pub self_shadowed: bool,
+    /// `$bumptransform`: how its coordinates are scaled, turned and moved.
+    pub transform: Matrix,
+}
+
 /// A texture laid over a surface's base (`$detail`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Detail {
@@ -162,6 +182,7 @@ impl Surface {
             base: None,
             base2: None,
             detail: None,
+            bump: None,
             alpha_test: None,
             translucent: false,
             additive: false,
@@ -229,6 +250,9 @@ pub struct Texture {
     /// As materials name it (`concrete/concretefloor001a`).
     pub name: String,
     pub vtf: Arc<Vtf>,
+    /// It holds directions or amounts, not colour: its texels are taken as they are, not as
+    /// sRGB (bump maps).
+    pub normal: bool,
 }
 
 /// A texture coordinate transform (`$basetexturetransform`): `center`, `scale`, `rotate`
@@ -473,6 +497,9 @@ pub fn place(vertices: &mut [Vertex], origin: Vec3, angles: Vec3) {
     for vertex in vertices {
         vertex.position = add(origin, turn(axes, vertex.position));
         vertex.normal = turn(axes, vertex.normal);
+        let [x, y, z, w] = vertex.tangent;
+        let [x, y, z] = turn(axes, [x, y, z]);
+        vertex.tangent = [x, y, z, w];
     }
 }
 
@@ -524,12 +551,22 @@ impl Gather<'_> {
     }
 
     fn texture(&mut self, name: &str) -> Option<usize> {
-        if let Some(&known) = self.by_name.get(name) {
+        self.texture_as(name, false)
+    }
+
+    /// A texture of directions or amounts ([`Texture::normal`]).
+    fn normal_texture(&mut self, name: &str) -> Option<usize> {
+        self.texture_as(name, true)
+    }
+
+    fn texture_as(&mut self, name: &str, normal: bool) -> Option<usize> {
+        let key = if normal { format!("{name} (normal)") } else { name.to_string() };
+        if let Some(&known) = self.by_name.get(&key) {
             return known;
         }
         let index = match self.library.texture(self.vfs, name) {
             Ok(vtf) => {
-                self.textures.push(Texture { name: name.to_string(), vtf });
+                self.textures.push(Texture { name: name.to_string(), vtf, normal });
                 Some(self.textures.len() - 1)
             }
             Err(_) => {
@@ -537,7 +574,7 @@ impl Gather<'_> {
                 None
             }
         };
-        self.by_name.insert(name.to_string(), index);
+        self.by_name.insert(key, index);
         index
     }
 
@@ -579,6 +616,15 @@ impl Gather<'_> {
                 scale: m.float("$detailscale").unwrap_or(4.0),
                 blend: m.float("$detailblendfactor").unwrap_or(1.0).clamp(0.0, 1.0),
                 mode: m.float("$detailblendmode").unwrap_or(0.0) as u32,
+            });
+        }
+        // a model's is lit by the light around it, texel by texel
+        if m.shader.starts_with("lightmappedgeneric") || m.shader.starts_with("worldvertextransition") || m.shader == "vertexlitgeneric" {
+            s.bump = m.texture("$bumpmap").and_then(|t| self.normal_texture(&t)).map(|texture| Bump {
+                texture,
+                second: s.base2.and(m.texture("$bumpmap2")).and_then(|t| self.normal_texture(&t)),
+                self_shadowed: m.flag("$ssbump") && m.shader != "vertexlitgeneric",
+                transform: m.get("$bumptransform").and_then(proxy::transform).unwrap_or(IDENTITY),
             });
         }
         if m.flag("$alphatest") {
@@ -699,7 +745,15 @@ fn brush_piece(bsp: &Bsp, gather: &mut Gather, materials: &mut HashMap<usize, Op
     let vertices: Vec<Vertex> = mesh
         .vertices
         .iter()
-        .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: v.lightmap_uv, alpha: v.alpha, light: [1.0; 3] })
+        .map(|v| Vertex {
+            position: v.position,
+            normal: v.normal,
+            uv: v.uv,
+            lightmap_uv: v.lightmap_uv,
+            alpha: v.alpha,
+            light: [1.0; 3],
+            tangent: [0.0; 4],
+        })
         .collect();
     let mut surfaces = Vec::new();
     for batch in &mesh.batches {
@@ -775,6 +829,7 @@ fn static_props(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>, [world, s
                 lightmap_uv: [0.0; 2],
                 alpha: 0.0,
                 light: mesh.light.as_ref().map_or([1.0; 3], |light| light[i]),
+                tangent: mesh.tangents.get(i).copied().unwrap_or_default(),
             })
             .collect();
         place(&mut vertices, prop.origin, prop.angles);
@@ -847,7 +902,16 @@ pub fn model(vfs: &Vfs, name: &str, skin: usize, body: usize) -> io::Result<Worl
     let vertices = mesh
         .vertices
         .iter()
-        .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: [0.0; 2], alpha: 0.0, light: [1.0; 3] })
+        .zip(mesh.tangents.iter().copied().chain(std::iter::repeat([0.0; 4])))
+        .map(|(v, tangent)| Vertex {
+            position: v.position,
+            normal: v.normal,
+            uv: v.uv,
+            lightmap_uv: [0.0; 2],
+            alpha: 0.0,
+            light: [1.0; 3],
+            tangent,
+        })
         .collect();
     let bones = mesh.vertices.iter().map(weights).collect();
     let surfaces = model_surfaces(&mut gather, &model, &mesh);

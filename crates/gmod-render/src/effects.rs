@@ -229,5 +229,6 @@ fn white_texture() -> gmod_world::gpu::TextureData {
         levels: vec![vec![255, 255, 255, 255]],
         clamp_s: false,
         clamp_t: false,
+        linear: false,
     }
 }

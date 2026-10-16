@@ -200,3 +200,14 @@ fn a_fall_hurts_and_the_corpse_goes_with_the_next_life() {
     g.runtime.think(crate::timer::TICK_INTERVAL);
     assert!(g.eval::<bool>("return #ents.FindByClass('hl2mp_ragdoll') == 0 and not Entity(1):GetRagdollEntity():IsValid()"));
 }
+
+#[test]
+fn properties_files_spell_any_character() {
+    let text = r"# a note
+Hint_A=\u041f\u0440\u0438 \
+    \u0432\u0435\u0442 \ud83d\ude00
+B = x\ty
+";
+    let pairs = crate::client::properties(text);
+    assert_eq!(pairs, [("Hint_A".to_string(), "При вет 😀".to_string()), ("B".to_string(), "x\ty".to_string())]);
+}

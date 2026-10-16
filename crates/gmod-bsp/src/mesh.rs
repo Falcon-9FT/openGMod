@@ -10,7 +10,9 @@
 //!   distance; texture and lightmap coordinates are those of the flat base, interpolated.
 //! * A face's light is that of its light styles added up - style 0, and those of the lights
 //!   that are switched on as the map starts ([`dark_styles`] are not); with bump mapping a
-//!   style has four lightmaps, the first unbumped. Faces without one are lit by a white luxel.
+//!   style has four lightmaps, the first unbumped, the others of the light along the three
+//!   directions of [`BUMP_BASIS`] (kept in [`Lightmap::bumped`]). Faces without one are lit by
+//!   a white luxel.
 //! * Faces flagged nodraw, sky, trigger, hint or skip are left out.
 //! * The overlays on the faces built come after them, a batch each from the lowest render
 //!   order up, lifted a little off their faces and lit by their light maps
@@ -53,7 +55,19 @@ pub struct Lightmap {
     pub width: u32,
     pub height: u32,
     pub texels: Vec<[f32; 3]>,
+    /// When some face is bump mapped: three more lightmaps as large, one after another, of the
+    /// light coming along the three directions of [`BUMP_BASIS`]; faces that are not have their
+    /// one light in all three. Empty otherwise.
+    pub bumped: Vec<[f32; 3]>,
 }
+
+/// The directions, in the space of a face's texture (x along it, z out of the face), of the
+/// light in its bumped lightmaps, as vrad bakes them.
+pub const BUMP_BASIS: [[f32; 3]; 3] = [
+    [0.816_496_6, 0.0, 0.577_350_3],
+    [-0.408_248_3, std::f32::consts::FRAC_1_SQRT_2, 0.577_350_3],
+    [-0.408_248_3, -std::f32::consts::FRAC_1_SQRT_2, 0.577_350_3],
+];
 
 /// What [`build`] made.
 #[derive(Debug, Clone, Default)]
@@ -204,6 +218,13 @@ pub fn build_faces(bsp: &Bsp, options: Options, keep: impl Fn(usize) -> bool) ->
     let (width, height, positions) = pack(&sizes);
     let mut texels = vec![[0.0f32; 3]; width as usize * height as usize];
     texels[0] = [1.0, 1.0, 1.0];
+    let bumps = |k: usize| {
+        let face = &faces[drawn[k].1];
+        slot[k].is_some() && bsp.texinfo[face.texinfo as usize].flags & surf::BUMPLIGHT != 0
+    };
+    let any_bumped = (0..drawn.len()).any(bumps);
+    let area = texels.len();
+    let mut bumped = if any_bumped { vec![[0.0f32; 3]; area * 3] } else { Vec::new() };
     let dark = dark_styles(bsp);
     // an HDR map's light shows twice as bright as it is stored, an LDR map's as stored (as
     // measured in GMod: gm_construct, gm_polye_v1)
@@ -214,24 +235,46 @@ pub fn build_faces(bsp: &Bsp, options: Options, keep: impl Fn(usize) -> bool) ->
         let (x, y) = positions[slot];
         let (w, h) = sizes[slot];
         let page = w as usize * h as usize * 4;
-        let pages = if bsp.texinfo[face.texinfo as usize].flags & surf::BUMPLIGHT != 0 { 4 } else { 1 };
+        let pages = if bumps(k) { 4 } else { 1 };
         for (n, &style) in face.styles.iter().enumerate() {
             if style == 255 {
                 break;
             }
             let first = face.light_offset as usize + n * pages * page;
-            if dark.contains(&style) || first + page > lighting.len() {
+            if dark.contains(&style) || first + pages * page > lighting.len() {
                 continue;
             }
-            for t in 0..h as usize {
-                for s in 0..w as usize {
-                    let at = first + (t * w as usize + s) * 4;
-                    let sample: [u8; 4] = lighting[at..at + 4].try_into().unwrap();
-                    let [r, g, b] = rgbe_to_linear(sample).map(|c| c * scale);
-                    let texel = &mut texels[(y as usize + t) * width as usize + x as usize + s];
-                    *texel = [texel[0] + r, texel[1] + g, texel[2] + b];
+            // the flat light, then each bumped one
+            for p in 0..pages {
+                for t in 0..h as usize {
+                    for s in 0..w as usize {
+                        let at = first + p * page + (t * w as usize + s) * 4;
+                        let sample: [u8; 4] = lighting[at..at + 4].try_into().unwrap();
+                        let [r, g, b] = rgbe_to_linear(sample).map(|c| c * scale);
+                        let index = (y as usize + t) * width as usize + x as usize + s;
+                        let texel = if p == 0 { &mut texels[index] } else { &mut bumped[(p - 1) * area + index] };
+                        *texel = [texel[0] + r, texel[1] + g, texel[2] + b];
+                    }
                 }
             }
+        }
+    }
+    // what is not bump mapped has its one light from every direction
+    if any_bumped {
+        for k in 0..drawn.len() {
+            let Some(slot) = slot[k].filter(|_| !bumps(k)) else { continue };
+            let ((x, y), (w, h)) = (positions[slot], sizes[slot]);
+            for t in 0..h as usize {
+                for s in 0..w as usize {
+                    let at = (y as usize + t) * width as usize + x as usize + s;
+                    for p in 0..3 {
+                        bumped[p * area + at] = texels[at];
+                    }
+                }
+            }
+        }
+        for p in 0..3 {
+            bumped[p * area] = texels[0];
         }
     }
 
@@ -276,7 +319,7 @@ pub fn build_faces(bsp: &Bsp, options: Options, keep: impl Fn(usize) -> bool) ->
     for vertex in &mut mesh.vertices {
         vertex.lightmap_uv = [vertex.lightmap_uv[0] / width as f32, vertex.lightmap_uv[1] / height as f32];
     }
-    mesh.lightmap = Lightmap { width, height, texels };
+    mesh.lightmap = Lightmap { width, height, texels, bumped };
     mesh
 }
 

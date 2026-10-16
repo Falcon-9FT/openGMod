@@ -386,33 +386,67 @@ pub(crate) fn load_phrases(lua: &Lua) {
         let folder = format!("resource/localization/{language}");
         for file in vfs.find(&format!("{folder}/*.properties"), "GAME").files {
             let Ok(data) = vfs.read(&format!("{folder}/{file}"), "GAME") else { continue };
-            for line in String::from_utf8_lossy(&data).lines() {
-                let line = line.trim_start_matches('\u{feff}').trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((key, value)) = line.split_once('=') {
-                    phrases.insert(key.trim().to_lowercase(), unescape(value.trim()));
-                }
+            for (key, value) in properties(&String::from_utf8_lossy(&data)) {
+                phrases.insert(key.to_lowercase(), value);
             }
         }
     }
 }
 
-/// A value of a `.properties` file: `\:` is `:`, `\n` a line break.
+/// The pairs of a `.properties` file: `key=value` a line, `#` lines left out; a line ending in
+/// `\` goes on in the next, whose leading blanks are left out.
+pub(crate) fn properties(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut logical = String::new();
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}');
+        let line = if logical.is_empty() { line.trim() } else { line.trim_start() };
+        if logical.is_empty() && (line.is_empty() || line.starts_with('#')) {
+            continue;
+        }
+        // an odd number of backslashes at the end: it goes on
+        let trailing = line.len() - line.trim_end_matches('\\').len();
+        if trailing % 2 == 1 {
+            logical.push_str(&line[..line.len() - 1]);
+            continue;
+        }
+        logical.push_str(line);
+        if let Some((key, value)) = logical.split_once('=') {
+            out.push((key.trim().to_string(), unescape(value.trim())));
+        }
+        logical.clear();
+    }
+    out
+}
+
+/// A value of a `.properties` file: `\uXXXX` is that character (two of them a pair of
+/// surrogates), `\n` a line break, `\t` a tab, a backslash before anything else that thing.
 fn unescape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
+    let mut chars = value.chars().peekable();
+    let mut high: Option<u32> = None;
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => {}
-            }
-        } else {
+        if c != '\\' {
             out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = std::iter::from_fn(|| chars.next_if(char::is_ascii_hexdigit)).take(4).collect();
+                let Ok(unit) = u32::from_str_radix(&hex, 16) else {
+                    out.push('u');
+                    continue;
+                };
+                match (high.take(), unit) {
+                    (_, 0xD800..=0xDBFF) => high = Some(unit),
+                    (Some(h), 0xDC00..=0xDFFF) => out.extend(char::from_u32(0x10000 + ((h - 0xD800) << 10) + (unit - 0xDC00))),
+                    (_, unit) => out.push(char::from_u32(unit).unwrap_or('\u{fffd}')),
+                }
+            }
+            Some(other) => out.push(other),
+            None => {}
         }
     }
     out
