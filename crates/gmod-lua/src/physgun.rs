@@ -247,7 +247,7 @@ pub(crate) fn think(lua: &Lua) {
         let yaw = player::eye_angles(lua, player).map_or(held.yaw, |a| a.y);
         let angles = held.angles.rotated_about(Vector::new(0.0, 0.0, 1.0), yaw - held.yaw);
         let origin = eye + aim * held.distance - held.point.rotated(angles);
-        let seconds = number(lua, "physgun_timeToArrive", 0.05).max(timer::TICK_INTERVAL as f32);
+        let seconds = number(lua, "physgun_timeToArrive", 0.05).max(timer::tick_interval() as f32);
         let (speed, turn) = (number(lua, "physgun_maxSpeed", 5000.0), number(lua, "physgun_maxAngular", 5000.0));
         host(lua).physics.physics.borrow_mut().steer(
             body,

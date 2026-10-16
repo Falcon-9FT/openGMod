@@ -9,6 +9,11 @@ use super::*;
 /// A tick of the server: 66⅔ a second.
 const TICK: f32 = 0.015;
 
+thread_local! {
+    /// The tick [`run`] takes: 66⅔ a second, or another tick rate's.
+    static STEP: std::cell::Cell<f32> = const { std::cell::Cell::new(TICK) };
+}
+
 fn world(mut brushes: Vec<TestBrush>, displacements: Vec<TestDisplacement>) -> Collision {
     // a floor with its top at 0
     brushes.insert(0, TestBrush::cuboid([-4096.0, -4096.0, -64.0], [4096.0, 4096.0, 0.0]));
@@ -23,8 +28,9 @@ fn forward(buttons: u32) -> Command {
 /// Runs ticks for `seconds`, and returns the highest the feet got.
 fn run(player: &mut Player, world: &Collision, command: &Command, seconds: f32) -> f32 {
     let mut highest = player.origin[2];
-    for _ in 0..(seconds / TICK).round() as usize {
-        player.tick(world, &Settings::default(), command, TICK);
+    let step = STEP.with(std::cell::Cell::get);
+    for _ in 0..(seconds / step).round() as usize {
+        player.tick(world, &Settings::default(), command, step);
         highest = highest.max(player.origin[2]);
     }
     highest
@@ -72,9 +78,12 @@ fn falls_as_gravity_says_and_lands() {
     let mut player = Player::spawn(&world, &Settings::default(), [0.0, 0.0, 100.0]).unwrap();
     assert!(!player.on_ground);
     run(&mut player, &world, &Command::default(), 0.3);
-    // 600 units a second, a second: 27 units in 0.3 s, whatever the tick
-    assert!((player.origin[2] - 73.0).abs() < 0.01, "{:?}", player.origin);
-    assert!((player.velocity[2] + 180.0).abs() < 0.01, "{:?}", player.velocity);
+    // 600 units a second, a second: 27 units in 0.3 s, whatever the tick (of the ticks 0.3 s
+    // makes)
+    let step = STEP.with(std::cell::Cell::get);
+    let t = (0.3 / step).round() * step;
+    assert!((player.origin[2] - (100.0 - 300.0 * t * t)).abs() < 0.01, "{:?}", player.origin);
+    assert!((player.velocity[2] + 600.0 * t).abs() < 0.01, "{:?}", player.velocity);
     run(&mut player, &world, &Command::default(), 0.5);
     assert!(player.on_ground && player.velocity == [0.0; 3]);
     assert!((player.origin[2] - EPSILON).abs() < 1e-3, "{:?}", player.origin);
@@ -108,9 +117,10 @@ fn friction_stops_a_player() {
     assert!(player.velocity[0] > 0.0 && player.velocity[0] < 30.0, "{:?}", player.velocity);
     run(&mut player, &world, &Command::default(), 0.3);
     assert_eq!(player.velocity, [0.0; 3]);
-    // from 200 down to 10 as speed × 8 a second (190 / 8 units), then 80 a second
+    // from 200 down to 10 as speed × 8 a second (190 / 8 units), then 80 a second; taken a
+    // tick at a time, as Source takes it, less at fewer ticks (19 at 33)
     let slid = player.origin[0] - from;
-    assert!((20.0..27.0).contains(&slid), "{slid}");
+    assert!((18.0..27.0).contains(&slid), "{slid}");
 }
 
 #[test]
@@ -184,7 +194,7 @@ fn jumps_as_high_as_its_power_and_only_when_pressed() {
     // still held: no further jump
     let again = run(&mut player, &world, &jump, 1.0);
     assert!(again < 1.0 && player.on_ground, "{again}");
-    run(&mut player, &world, &Command::default(), TICK);
+    run(&mut player, &world, &Command::default(), STEP.with(std::cell::Cell::get));
     assert!(run(&mut player, &world, &jump, 0.4) > 30.0);
 }
 
@@ -311,7 +321,7 @@ fn climbs_ladders() {
         run(&mut player, &world, &down, 0.2);
         assert!(player.origin[2] < z - 10.0, "{player:?}");
         // jump pushes off
-        run(&mut player, &world, &Command { buttons: buttons::JUMP, ..Command::default() }, TICK);
+        run(&mut player, &world, &Command { buttons: buttons::JUMP, ..Command::default() }, STEP.with(std::cell::Cell::get));
         assert!(player.ladder.is_none() && player.velocity[0] < -200.0, "{player:?}");
         run(&mut player, &world, &Command::default(), 2.0);
         assert!(player.on_ground && player.origin[2] < 1.0 && player.origin[0] < 50.0, "{player:?}");
@@ -360,4 +370,25 @@ fn noclip_flies_through_walls_where_the_player_looks() {
     player.noclip(&s, &Command::default(), TICK);
     assert_eq!(player.velocity, [0.0; 3]);
     assert_eq!(player.origin[2], z);
+}
+
+#[test]
+fn moves_alike_at_other_tick_rates() {
+    // as at 66 ticks a second, so at 33, 100 and 128
+    for rate in [33.0f32, 100.0, 128.0] {
+        STEP.with(|s| s.set(1.0 / rate));
+        falls_as_gravity_says_and_lands();
+        walks_and_runs_at_their_speeds();
+        friction_stops_a_player();
+        walls_stop_and_the_player_slides_along_them();
+        steps_up_to_the_step_size();
+        walks_up_gentle_slopes_and_slides_off_steep_ones();
+        jumps_as_high_as_its_power_and_only_when_pressed();
+        ducks_under_what_a_standing_player_cannot_pass();
+        swims_in_water();
+        walks_up_a_displacement();
+        climbs_ladders();
+        noclip_flies_through_walls_where_the_player_looks();
+    }
+    STEP.with(|s| s.set(TICK));
 }

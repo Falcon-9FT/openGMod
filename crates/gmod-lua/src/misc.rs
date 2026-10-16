@@ -171,7 +171,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         let name = a.string(1)?;
         let (low, high) = (a.number(2)?, a.number(3)?);
         let seed = a.opt_number(4)?.unwrap_or(0.0) as i64;
-        let tick = (host(a.lua).clock.cur_time.get() / crate::timer::TICK_INTERVAL).round() as i64;
+        let tick = (host(a.lua).clock.cur_time.get() / crate::timer::tick_interval()).round() as i64;
         let mut x = u64::from(gmod_fs::crc32::crc32(format!("{name}{tick}{seed}").as_bytes())) | 1;
         for _ in 0..3 {
             x ^= x << 13;

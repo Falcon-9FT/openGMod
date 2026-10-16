@@ -164,7 +164,7 @@ fn reset(lua: &Lua, timer: &mut Timer) {
         timer.refire
     };
     // once a tick at most, however short it is told to be
-    timer.next = if timer.enabled { now + f64::from(wait).max(crate::timer::TICK_INTERVAL) } else { f64::INFINITY };
+    timer.next = if timer.enabled { now + f64::from(wait).max(crate::timer::tick_interval()) } else { f64::INFINITY };
 }
 
 /// One tick: the timers whose time has come fire.

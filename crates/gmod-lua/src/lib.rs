@@ -612,13 +612,13 @@ impl Runtime {
             let (now, last) = (clock.cur_time.get(), clock.thought.get());
             // the first frame, or one long after the last: from the server's time
             let start = if given && last > 0.0 && (now - last).abs() < 1.0 { last } else { now };
-            let before = (start / timer::TICK_INTERVAL).floor();
+            let before = (start / timer::tick_interval()).floor();
             let end = if given { now.max(start) } else { now + seconds };
             clock.thought.set(end);
             clock.cur_time.set(end);
             // a server's frame is a tick, as in GMod; a client's is what was drawn
-            clock.frame_time.set(if self.realm() == Realm::Server { timer::TICK_INTERVAL } else { seconds });
-            let ticks = ((end / timer::TICK_INTERVAL).floor() - before).max(0.0) as u64;
+            clock.frame_time.set(if self.realm() == Realm::Server { timer::tick_interval() } else { seconds });
+            let ticks = ((end / timer::tick_interval()).floor() - before).max(0.0) as u64;
             clock.ticks.set(clock.ticks.get() + ticks);
             (before, end, ticks)
         };
@@ -629,7 +629,7 @@ impl Runtime {
         // a client does not simulate: what moves comes from the server
         let server = self.realm() == Realm::Server;
         for tick in 1..=ticks {
-            host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::TICK_INTERVAL).min(end));
+            host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::tick_interval()).min(end));
             if server {
                 player::tick_all(&self.lua);
                 // what the players' commands removed goes before the frame, as in Source
@@ -862,7 +862,7 @@ impl Runtime {
     /// How far game time is into the next tick, 0 to 1: where to draw between where things
     /// were at the last two ticks.
     pub fn tick_fraction(&self) -> f32 {
-        let ticks = host(&self.lua).clock.cur_time.get() / timer::TICK_INTERVAL;
+        let ticks = host(&self.lua).clock.cur_time.get() / timer::tick_interval();
         (ticks - ticks.floor()) as f32
     }
 

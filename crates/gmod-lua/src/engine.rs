@@ -144,7 +144,7 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     })?;
     def(lua, &engine, "GetAddons", |a| Ok(Value::Table(a.lua.create_table()?)))?;
     def(lua, &engine, "GetGames", |a| Ok(Value::Table(a.lua.create_table()?)))?;
-    def(lua, &engine, "TickInterval", |_| Ok(Value::Number(timer::TICK_INTERVAL)))?;
+    def(lua, &engine, "TickInterval", |_| Ok(Value::Number(timer::tick_interval())))?;
     def(lua, &engine, "TickCount", |a| Ok(Value::Integer(host(a.lua).clock.ticks.get() as i64)))?;
     def(lua, &engine, "AbsoluteFrameTime", |a| Ok(Value::Number(host(a.lua).clock.frame_time.get())))?;
     def(lua, &engine, "ServerFrameTime", |a| Ok(Value::Number(host(a.lua).clock.frame_time.get())))?;

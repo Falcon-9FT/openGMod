@@ -132,6 +132,9 @@ pub struct Game {
     impulse: u8,
     /// The turns of the player by the game the camera has taken ([`PlayerView::turned`]).
     turned: Option<u32>,
+    /// In this program: the angles of the latest commands, newest last - what the player's
+    /// angles are as the ticks take them, unless something else turned them.
+    sent: std::collections::VecDeque<(f32, f32)>,
     /// The server's sounds for the client since the last frame.
     sounds: Vec<gmod_lua::sound::SoundEvent>,
     /// Console lines typed for the next frame.
@@ -195,6 +198,7 @@ impl Game {
             player,
             impulse: 0,
             turned: None,
+            sent: std::collections::VecDeque::new(),
             sounds: Vec::new(),
             typed: Vec::new(),
             console_keys: 0,
@@ -219,6 +223,7 @@ impl Game {
             player,
             impulse: 0,
             turned: None,
+            sent: std::collections::VecDeque::new(),
             sounds: Vec::new(),
             typed: Vec::new(),
             console_keys: 0,
@@ -479,9 +484,9 @@ impl Game {
         };
         let view = self.client.view(self.player)?;
         let local = matches!(self.link, Link::Local(_));
-        // over the network the player's angles come back late: the eyes look where the mouse
-        // says now
-        let angles = if local { view.angles } else { Angle::new(pitch, yaw, 0.0) };
+        // the player's angles change with the ticks, here too, and come back late over the
+        // network: the eyes look where the mouse says now
+        let angles = Angle::new(pitch, yaw, 0.0);
         // as the client's Lua makes the view of it (a vehicle's, from behind)
         // the player's own field of view (`fov_desired`) where the game leaves it as it is
         let fov = match self.client.convar("fov_desired").and_then(|v| v.trim().parse::<f32>().ok()) {
@@ -498,7 +503,15 @@ impl Game {
         // this program also whatever else turned them, which comes at once
         let given = self.turned != Some(view.turned);
         self.turned = Some(view.turned);
-        let apart = local && (angle_apart(view.angles.p, pitch) || angle_apart(view.angles.y, yaw));
+        // here, what turned them is what makes them other than those of any command lately
+        // (the mouse since the tick, which the next one takes, is not)
+        if local {
+            self.sent.push_back((pitch, yaw));
+            if self.sent.len() > SENT_KEPT {
+                self.sent.pop_front();
+            }
+        }
+        let apart = local && !self.sent.iter().any(|&(p, y)| !angle_apart(view.angles.p, p) && !angle_apart(view.angles.y, y));
         let turned = (given || apart).then_some((view.angles.p, view.angles.y));
         Some(Shown { eye, turned, look, fov: seen.fov, view })
     }
@@ -538,7 +551,7 @@ impl Game {
 /// themselves, and whose angles are the mouse's.
 fn between_ticks(ticks: &mut Option<(Snapshot, Snapshot)>, latest: Snapshot, fraction: f32, player: EntityHandle) -> Snapshot {
     // the server's time goes on between its ticks: what it has is of its last tick
-    let tick = |time: f64| (time / gmod_lua::timer::TICK_INTERVAL + 1e-6).floor();
+    let tick = |time: f64| (time / gmod_lua::timer::tick_interval() + 1e-6).floor();
     let time = latest.time;
     match ticks {
         Some((_, now)) if tick(now.time) == tick(latest.time) => *now = latest,
@@ -548,7 +561,7 @@ fn between_ticks(ticks: &mut Option<(Snapshot, Snapshot)>, latest: Snapshot, fra
     let (before, now) = ticks.as_ref().expect("set above");
     let mut shown = Snapshot::between(before, now, fraction);
     // a tick ago, as what is shown is
-    shown.time = time - gmod_lua::timer::TICK_INTERVAL;
+    shown.time = time - gmod_lua::timer::tick_interval();
     let own = |e: &&gmod_lua::snapshot::EntityState| Some(e.index) == player.index && e.serial == player.serial;
     if let (Some(state), Some(slot)) = (now.entities.iter().find(own), shown.entities.iter_mut().find(|e| own(&&**e))) {
         *slot = state.clone();
@@ -665,6 +678,10 @@ fn between(from: Vector, to: Vector, t: f32) -> [f32; 3] {
 }
 
 /// Whether two angles in degrees differ, a turn apart counting as the same.
+/// How many commands' angles are kept to tell the player's own turning from the game's: more
+/// than the frames a tick takes at the slowest tick rate.
+const SENT_KEPT: usize = 64;
+
 fn angle_apart(a: f32, b: f32) -> bool {
     ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs() > 0.01
 }
@@ -761,6 +778,13 @@ mod tests {
             shown = game.frame(&forward, &still.1, 0.0, 90.0, 1.0 / 60.0).unwrap();
         }
         assert!(shown.eye[1] > 50.0 && shown.eye[0].abs() < 0.1 && shown.turned.is_none(), "{:?}", shown.eye);
+
+        // the mouse turns the camera between the ticks too, and the game leaves it where it is
+        for frame in 0..40 {
+            let yaw = 90.0 + frame as f32 * 0.7;
+            let shown = game.frame(&forward, &still.1, 0.0, yaw, 1.0 / 144.0).unwrap();
+            assert!(shown.turned.is_none(), "frame {frame}: the camera was put back to {:?}", shown.turned);
+        }
 
         // the console: the game's commands and those of Lua, as the player
         game.command("health 42; noclip");

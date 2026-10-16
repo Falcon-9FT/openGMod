@@ -356,7 +356,7 @@ fn touch(lua: &Lua, trigger: EntityHandle, other: EntityHandle, scripted: bool) 
                 crate::ents::remove(lua, trigger);
                 return;
             }
-            state.next = if wait < 0.0 { f64::INFINITY } else { now + wait.max(crate::timer::TICK_INTERVAL) };
+            state.next = if wait < 0.0 { f64::INFINITY } else { now + wait.max(crate::timer::tick_interval()) };
             set_state(lua, trigger, state);
         }
         "trigger_push" => push(lua, trigger, other),
@@ -438,7 +438,7 @@ fn push(lua: &Lua, trigger: EntityHandle, other: EntityHandle) {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
         let v = physics.velocity(id);
-        let push = direction * (speed * crate::timer::TICK_INTERVAL as f32);
+        let push = direction * (speed * crate::timer::tick_interval() as f32);
         physics.set_velocity(id, [v[0] + push.x, v[1] + push.y, v[2] + push.z]);
         physics.wake(id);
     }

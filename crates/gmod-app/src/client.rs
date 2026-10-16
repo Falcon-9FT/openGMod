@@ -112,6 +112,7 @@ impl Connection {
                 max_players: 1,
                 allow_cs_lua: false,
                 loading_url: String::new(),
+                tick_interval: gmod_lua::timer::DEFAULT_TICK_INTERVAL,
             },
             listed_lua: Vec::new(),
             snapshots: SnapshotReceiver::default(),
@@ -129,6 +130,8 @@ impl Connection {
         loop {
             if let Some(welcome) = connection.receive() {
                 connection.welcome = proto::decode::<Welcome>(&welcome).ok_or("the server is not an openGMOD server")?;
+                // the server's ticks are the game's
+                gmod_lua::timer::set_tick_interval(connection.welcome.tick_interval);
                 if let Some(key) = connection.key {
                     known.remember(&address, key);
                 }

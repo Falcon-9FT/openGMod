@@ -400,7 +400,7 @@ pub(crate) fn simulate(lua: &Lua) {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
         physics.set_gravity(gravity);
-        physics.step(timer::TICK_INTERVAL as f32);
+        physics.step(timer::tick_interval() as f32);
         let bodies = host.physics.bodies.borrow();
         for id in physics.awake() {
             // a ragdoll's entity follows its first part
@@ -492,7 +492,7 @@ fn motion_controllers(lua: &Lua) {
             })
             .collect()
     };
-    let dt = timer::TICK_INTERVAL as f32;
+    let dt = timer::tick_interval() as f32;
     for (handle, objects) in controllers {
         let Ok(Value::UserData(ud)) = entity::push(lua, handle) else { continue };
         let Ok(Value::Function(simulate)) = ud.get::<Value>("PhysicsSimulate") else { continue };
@@ -598,7 +598,7 @@ fn collided(lua: &Lua, c: &Collision) {
         t.raw_set("HitObject", push_part(lua, c.other, c.other_part)?)?;
         t.raw_set("OurSurfaceProps", our as i64)?;
         t.raw_set("TheirSurfaceProps", their as i64)?;
-        t.raw_set("DeltaTime", timer::TICK_INTERVAL)?;
+        t.raw_set("DeltaTime", timer::tick_interval())?;
         Ok(t)
     })();
     let Ok(data) = data else { return };

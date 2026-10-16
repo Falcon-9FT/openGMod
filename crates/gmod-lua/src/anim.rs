@@ -785,7 +785,7 @@ pub(crate) fn approach_view_model_pose(lua: &Lua, owner: EntityHandle, name: &st
     let Some(index) = rig.pose_parameters().iter().position(|p| p.name.eq_ignore_ascii_case(name)) else { return };
     let goal = rig.pose_parameters()[index].normalize(target);
     let now = anim.parameters(&rig).get(index).copied().unwrap_or(goal);
-    let step = rate * crate::timer::TICK_INTERVAL as f32;
+    let step = rate * crate::timer::tick_interval() as f32;
     let next = if (goal - now).abs() <= step { goal } else { now + step * (goal - now).signum() };
     change(lua, vm, |anim| anim.set_pose(index, next));
 }
@@ -886,7 +886,7 @@ pub(crate) fn animate_player(lua: &Lua, handle: EntityHandle) {
     let ground_speed = sequence_of(&rig, sequence).map_or(0.0, |s| rig.ground_speed(s, &parameters));
     crate::call_hook(lua, "UpdateAnimation", MultiValue::from_iter([ply, v, Value::Number(f64::from(ground_speed))]));
     aim_and_move(lua, handle, &rig, velocity, ground_speed);
-    frame_advance(lua, handle, Some(crate::timer::TICK_INTERVAL));
+    frame_advance(lua, handle, Some(crate::timer::tick_interval()));
 }
 
 /// The pose parameters the engine sets on a player: the legs turning after the eyes, `move_x`

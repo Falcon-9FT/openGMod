@@ -261,7 +261,7 @@ fn a_client_moves_its_player_as_the_server_will() {
     );
     client.runtime.init();
     client.runtime.spawn_map(&player_map());
-    let tick = crate::timer::TICK_INTERVAL;
+    let tick = crate::timer::tick_interval();
     // what the server does in a while, and how many of its ticks that was
     let run = |cmd: UserCmd, seconds: f64| -> u32 {
         let before = (server.runtime.cur_time() / tick).floor();
@@ -322,7 +322,7 @@ fn a_client_fires_its_weapon_as_the_server_will() {
     client.runtime.init();
     client.runtime.run_string(TESTER_LUA, "tester").unwrap();
     client.runtime.spawn_map(&player_map());
-    let tick = crate::timer::TICK_INTERVAL;
+    let tick = crate::timer::tick_interval();
     let attack = UserCmd { buttons: crate::player::key::ATTACK, ..UserCmd::default() };
     let clip = |runtime: &Runtime| runtime.view(alice).and_then(|v| v.weapon).map(|w| (w.class, w.clip));
     use crate::sound::{SoundEvent, SoundPlay};

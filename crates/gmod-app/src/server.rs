@@ -304,6 +304,7 @@ impl Server {
             max_players: max as u32,
             allow_cs_lua,
             loading_url,
+            tick_interval: gmod_lua::timer::tick_interval(),
         };
         let Some(net) = &mut self.net else { return };
         let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
@@ -534,7 +535,7 @@ impl Server {
             };
         }
         // the entities, once a tick has passed
-        let tick = (self.runtime.cur_time() / gmod_lua::timer::TICK_INTERVAL).floor() as i64;
+        let tick = (self.runtime.cur_time() / gmod_lua::timer::tick_interval()).floor() as i64;
         if tick != self.last_tick && !joined.is_empty() {
             self.last_tick = tick;
             let snapshot = self.runtime.snapshot();

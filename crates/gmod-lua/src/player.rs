@@ -594,7 +594,7 @@ pub(crate) fn view_punch(lua: &Lua, handle: EntityHandle, punch: Angle) {
 
 /// A tick of the view's kick: it moves on, and springs back to nothing.
 fn decay_punch(lua: &Lua, handle: EntityHandle) {
-    let dt = crate::timer::TICK_INTERVAL as f32;
+    let dt = crate::timer::tick_interval() as f32;
     with_player(lua, handle, |_, p| {
         let (punch, velocity) = (p.view_punch, p.view_punch_velocity);
         if punch == Angle::default() && velocity == Angle::default() {
@@ -1123,7 +1123,7 @@ fn engine_move(lua: &Lua, handle: EntityHandle, mv: &mut MoveData) {
     }) else {
         return;
     };
-    let seconds = crate::timer::TICK_INTERVAL as f32 * lag;
+    let seconds = crate::timer::tick_interval() as f32 * lag;
     if move_type == MOVETYPE_WALK {
         mv.origin = carried(lua, handle, mv.origin, &moving, &settings);
     }
@@ -1161,7 +1161,7 @@ fn engine_move(lua: &Lua, handle: EntityHandle, mv: &mut MoveData) {
 /// time goes into a tick not run yet, 0 to 1: the eyes are drawn that far from where they were
 /// before the last tick ([`PlayerState::previous_eye`]) to where they are.
 pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32)], from: f64, played: f64) -> f32 {
-    let tick = crate::timer::TICK_INTERVAL as f32;
+    let tick = crate::timer::tick_interval() as f32;
     let still = eye(lua, handle).map(|(eye, _)| eye);
     with_player(lua, handle, |_, p| p.previous_eye = still);
     // the time each tick falls in, from the oldest command on
@@ -1175,7 +1175,7 @@ pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32
     let outside = clock.cur_time.get();
     clock.unpredicted.set(Some(outside));
     // the server's ticks after the one of the snapshot
-    let base = (from / crate::timer::TICK_INTERVAL + 1e-6).floor();
+    let base = (from / crate::timer::tick_interval() + 1e-6).floor();
     let mut ticks = 0.0;
     let fraction = loop {
         if time + tick > total + 1e-4 {
@@ -1189,7 +1189,7 @@ pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32
         }
         time += tick;
         ticks += 1.0;
-        clock.cur_time.set((base + ticks) * crate::timer::TICK_INTERVAL);
+        clock.cur_time.set((base + ticks) * crate::timer::tick_interval());
         let reached = played + f64::from(time);
         clock.first_prediction.set(reached > clock.predicted_until.get() + 1e-4);
         if !predict_tick(lua, handle, &cmd) {
@@ -1198,7 +1198,7 @@ pub(crate) fn predict(lua: &Lua, handle: EntityHandle, commands: &[(UserCmd, f32
         clock.predicted_until.set(clock.predicted_until.get().max(reached));
     };
     // what is before the eyes plays on to the time of the newest command
-    clock.cur_time.set(base * crate::timer::TICK_INTERVAL + f64::from(total));
+    clock.cur_time.set(base * crate::timer::tick_interval() + f64::from(total));
     for vm in crate::anim::view_models_of(lua, handle) {
         crate::anim::frame_advance(lua, vm, None);
     }
@@ -1430,9 +1430,9 @@ fn play_step(lua: &Lua, handle: EntityHandle, ply: &AnyUserData, volume: f32) {
 /// or of the water waded in - as loud as the pace. `PlayerFootstep` returning true keeps one
 /// quiet.
 fn footsteps(lua: &Lua, handle: EntityHandle, ply: &AnyUserData) {
-    const TICK_MS: f32 = (crate::timer::TICK_INTERVAL * 1000.0) as f32;
+    let tick_ms = (crate::timer::tick_interval() * 1000.0) as f32;
     let Some((moving, ducked_speed, wait)) = with_player(lua, handle, |ent, p| {
-        p.step_time = (p.step_time - TICK_MS).max(0.0);
+        p.step_time = (p.step_time - tick_ms).max(0.0);
         let walking = ent.move_type == MOVETYPE_WALK;
         (walking.then_some(p.moving), p.moving.ducked, p.step_time)
     }) else {

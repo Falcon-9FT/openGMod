@@ -437,7 +437,7 @@ pub(crate) fn input(lua: &Lua, handle: EntityHandle, input: &str, param: &str, a
 /// One tick: the movers go on their ways, then what is solid follows what may move.
 pub(crate) fn tick(lua: &Lua) {
     let now = host(lua).clock.cur_time.get();
-    let dt = crate::timer::TICK_INTERVAL as f32;
+    let dt = crate::timer::tick_interval() as f32;
     let moving: Vec<EntityHandle> = {
         let entities = &host(lua).entities;
         entities.handles().into_iter().filter(|&h| entities.get(h).is_some_and(|e| e.mover.is_some() && !e.removed && e.spawned)).collect()

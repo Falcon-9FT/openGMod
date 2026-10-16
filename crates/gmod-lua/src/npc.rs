@@ -1022,7 +1022,7 @@ fn think(lua: &Lua, handle: EntityHandle, now: f64) {
             });
         }
     }
-    crate::ai::think(lua, handle, timer::TICK_INTERVAL);
+    crate::ai::think(lua, handle, timer::tick_interval());
 }
 
 /// Where an NPC's eyes are: near the top of its box.

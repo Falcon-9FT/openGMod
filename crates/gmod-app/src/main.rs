@@ -90,6 +90,8 @@ OPTIONS:
     --master             a master server: the list of the servers that tell it they are
                          here, for the browsers of those who name it in their masters.txt
                          (UDP port 27011 unless --port says otherwise)
+    --tickrate <N>       ticks a second of a game started here (also -tickrate); GMod's 66
+                         by default. Joined, a server's are taken
     -h, --help           this text
 
     Playing takes Steam running, signed in to an account that owns Garry's Mod: the player's
@@ -135,6 +137,8 @@ struct Args {
     /// Master servers a server here tells it is here.
     announce: Vec<String>,
     master: bool,
+    /// Ticks a second (`-tickrate`); none: GMod's 66.
+    tick_rate: Option<f64>,
 }
 
 fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
@@ -152,6 +156,7 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
         hostname: None,
         announce: Vec::new(),
         master: false,
+        tick_rate: None,
     };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
@@ -171,6 +176,10 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
             "--hostname" => args.hostname = Some(raw.next().ok_or("--hostname needs a name")?),
             "--announce" => args.announce.push(raw.next().ok_or("--announce needs a master server's address")?),
             "--master" => args.master = true,
+            "--tickrate" | "-tickrate" => {
+                let rate = raw.next().and_then(|n| n.parse::<f64>().ok()).filter(|n| (10.0..=1000.0).contains(n));
+                args.tick_rate = Some(rate.ok_or("--tickrate needs a number of ticks a second, 10 to 1000")?);
+            }
             "-h" | "--help" => return Ok(None),
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if args.map.is_none() => args.map = Some(arg),
@@ -466,10 +475,10 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
         at.port()
     );
     say!("Its key, which players know it by: {key}");
-    let tick = Duration::from_secs_f64(gmod_lua::timer::TICK_INTERVAL);
+    let tick = Duration::from_secs_f64(gmod_lua::timer::tick_interval());
     let mut next = Instant::now();
     loop {
-        server.frame(gmod_lua::timer::TICK_INTERVAL);
+        server.frame(gmod_lua::timer::tick_interval());
         for line in game::typed_lines() {
             match line.trim() {
                 "quit" | "exit" => {
@@ -2281,6 +2290,10 @@ fn main() -> ExitCode {
         Err(e) => return fail(&format!("{e}\n\n{USAGE}")),
     };
     say!("openGMOD {}", env!("CARGO_PKG_VERSION"));
+    if let Some(rate) = args.tick_rate {
+        gmod_lua::timer::set_tick_rate(rate);
+        say!("Tick rate: {rate} ({:.4} s a tick)", gmod_lua::timer::tick_interval());
+    }
     if args.master {
         return match master(args.port.unwrap_or(gmod_net::MASTER_PORT)) {
             Ok(()) => ExitCode::SUCCESS,
@@ -2467,6 +2480,8 @@ mod tests {
         assert_eq!((args.map.as_deref(), args.addons, args.lua, args.html), (None, true, true, true));
         assert!(!parse(&["--no-lua"]).unwrap().unwrap().lua);
         assert!(!parse(&["--no-html"]).unwrap().unwrap().html);
+        assert_eq!(parse(&["-tickrate", "33"]).unwrap().unwrap().tick_rate, Some(33.0));
+        assert!(parse(&["--tickrate", "5"]).is_err());
         let args = parse(&["gm_flatgrass", "--gmod", "D:/GarrysMod", "--no-addons"]).unwrap().unwrap();
         assert_eq!(
             (args.map.as_deref(), args.gmod.as_deref(), args.addons),

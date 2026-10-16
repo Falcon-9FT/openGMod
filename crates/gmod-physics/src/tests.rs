@@ -2,6 +2,21 @@ use super::*;
 
 const TICK: f32 = 0.015;
 
+thread_local! {
+    /// The step [`run`] takes: a tick of 66 a second, or of another tick rate.
+    static STEP: std::cell::Cell<f32> = const { std::cell::Cell::new(TICK) };
+}
+
+/// Runs `test` with ticks of each of the rates the game may run at: 66 (GMod's), 33, 128, and
+/// 100.
+fn at_tick_rates(test: impl Fn()) {
+    for rate in [66.6667f32, 33.0, 128.0, 100.0] {
+        STEP.with(|s| s.set(1.0 / rate));
+        test();
+    }
+    STEP.with(|s| s.set(TICK));
+}
+
 fn near(a: Vec3, b: Vec3, within: f32) -> bool {
     (0..3).all(|i| (a[i] - b[i]).abs() <= within)
 }
@@ -19,8 +34,9 @@ fn crate_body(origin: Vec3) -> Body {
 }
 
 fn run(physics: &mut Physics, seconds: f32) {
-    for _ in 0..(seconds / TICK).round() as usize {
-        physics.step(TICK);
+    let step = STEP.with(std::cell::Cell::get);
+    for _ in 0..(seconds / step).round() as usize {
+        physics.step(step);
     }
 }
 
@@ -614,10 +630,15 @@ fn collision_groups_say_what_collides() {
 
 #[test]
 fn a_concrete_barrier_lying_across_a_crest_of_the_ground_falls_asleep() {
+    at_tick_rates(barrier_on_crests);
+}
+
+fn barrier_on_crests() {
     // where gm_construct has it, and nearer the middle of the world
+    let step = STEP.with(std::cell::Cell::get);
     for at in [[-3952.0, 4100.0, -100.0], [-250.0, 250.0, -100.0], [-8000.0, 8000.0, 0.0]] {
         let fastest = barrier_on_crest(at);
-        assert_eq!(fastest, 0.0, "at {at:?} still moving, as fast as {fastest} units/s after 5 s");
+        assert_eq!(fastest, 0.0, "a tick of {step} s: at {at:?} still moving, as fast as {fastest} units/s after 5 s");
     }
 }
 
@@ -682,6 +703,10 @@ fn barrier_on_crest(at: Vec3) -> f32 {
 
 #[test]
 fn what_falls_fast_does_not_go_through_the_ground() {
+    at_tick_rates(falls_fast);
+}
+
+fn falls_fast() {
     for speed in [1000.0f32, 3000.0, 6000.0] {
         for small in [4.0f32, 16.0] {
             // ground as a displacement makes it: triangles, no thickness
@@ -717,6 +742,10 @@ fn what_falls_fast_does_not_go_through_the_ground() {
 
 #[test]
 fn a_car_held_on_its_wheels_by_rods_and_springs_stands_still() {
+    at_tick_rates(car_stands_still);
+}
+
+fn car_stands_still() {
     // simfphys' Volga as GMod joins it: a body, and four wheels each held by two rods to the
     // far side, a rope that limits how far it hangs, a spring, and a ball joint that keeps it
     // from turning

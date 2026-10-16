@@ -188,7 +188,7 @@ fn a_fall_hurts_and_the_corpse_goes_with_the_next_life() {
         )
         .unwrap();
     for _ in 0..200 {
-        g.runtime.think(crate::timer::TICK_INTERVAL);
+        g.runtime.think(crate::timer::tick_interval());
     }
     let (landed, health): (f64, i64) = g.eval("return LANDED, Entity(1):Health()");
     assert!(landed > 1000.0, "{landed}");
@@ -197,7 +197,7 @@ fn a_fall_hurts_and_the_corpse_goes_with_the_next_life() {
     g.runtime.run_string("Entity(1):Kill() Entity(1):CreateRagdoll()", "kill").unwrap();
     assert!(g.eval::<bool>("return #ents.FindByClass('hl2mp_ragdoll') == 1"));
     g.runtime.run_string("Entity(1):Spawn()", "spawn").unwrap();
-    g.runtime.think(crate::timer::TICK_INTERVAL);
+    g.runtime.think(crate::timer::tick_interval());
     assert!(g.eval::<bool>("return #ents.FindByClass('hl2mp_ragdoll') == 0 and not Entity(1):GetRagdollEntity():IsValid()"));
 }
 

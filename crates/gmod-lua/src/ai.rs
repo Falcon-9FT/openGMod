@@ -298,7 +298,7 @@ fn ensure_activity(lua: &Lua, handle: EntityHandle, wanted: &[i64]) {
 
 /// Faces the point at the NPC's speed of turning; whether it faces it within `cone` degrees.
 fn face(lua: &Lua, handle: EntityHandle, point: Vector, cone: f32) -> bool {
-    npc::turn_towards(lua, handle, point, crate::timer::TICK_INTERVAL as f32);
+    npc::turn_towards(lua, handle, point, crate::timer::tick_interval() as f32);
     facing(lua, handle, point, cone)
 }
 
@@ -1086,7 +1086,7 @@ pub(crate) fn think(lua: &Lua, handle: EntityHandle, dt: f64) {
         && schedule != sched::NPC_FREEZE
         && let Some(at) = enemy_of(lua, handle).and_then(|e| pos(lua, e))
     {
-        npc::turn_towards(lua, handle, at, crate::timer::TICK_INTERVAL as f32);
+        npc::turn_towards(lua, handle, at, crate::timer::tick_interval() as f32);
     }
     // what it plays when it stands: done with an attack, it idles
     let idle = npc::with_npc(lua, handle, |_, npc| npc.mind.goal.is_none() && npc.mind.swing.is_none() && npc.mind.reload_until.is_none())
