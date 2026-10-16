@@ -103,7 +103,7 @@ pub(crate) struct Screen {
     /// Image sizes measured, by number.
     image_sizes: RefCell<HashMap<u32, (u32, u32)>>,
     /// Pixels read for `GetColor`, by lower-case name; none for what is not there.
-    pixels: RefCell<HashMap<String, Option<Rc<Rgba>>>>,
+    pub(crate) pixels: RefCell<HashMap<String, Option<Rc<Rgba>>>>,
     /// Where panels keep drawing, and `render.SetScissorRect`'s rectangle.
     pub panel_clip: Cell<Option<Clip>>,
     pub scissor: Cell<Option<Clip>>,

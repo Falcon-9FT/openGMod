@@ -144,6 +144,11 @@ fn attach_world(lua: &Lua) {
     host.entities.with_mut(world, |ent| ent.physics = Some(ground));
 }
 
+/// The models that had no physics model are looked for again (an addon was mounted).
+pub(crate) fn forget_missing(lua: &Lua) {
+    host(lua).physics.models.borrow_mut().retain(|_, model| model.is_some());
+}
+
 /// The physics model of a studio model, read once.
 fn phys_model(lua: &Lua, model: &str) -> Option<PhysModel> {
     if model.is_empty() || model.starts_with('*') {

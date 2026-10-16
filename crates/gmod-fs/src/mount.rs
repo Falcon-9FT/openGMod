@@ -23,7 +23,7 @@ use crate::install::Install;
 use crate::user::is_inside;
 use crate::vfs::{Backing, Mount, Vfs};
 use crate::vpk::VpkArchive;
-use crate::workshop::{self, Origin};
+use crate::workshop::{self, AddonFile, Origin};
 
 /// What to mount besides the game itself.
 #[derive(Debug, Clone)]
@@ -56,6 +56,100 @@ impl Default for MountOptions {
             subscribed: None,
         }
     }
+}
+
+/// The mount of an addon file: its `.gma`, an old compressed download unpacked first into
+/// `unpack_dir` (none: it is not mounted). The addon's title is a search path of its own, as
+/// in GMod.
+pub fn addon_mount(addon: &AddonFile, unpack_dir: Option<&Path>) -> Result<Mount, String> {
+    let path = if addon.packed {
+        let dir =
+            unpack_dir.ok_or_else(|| format!("{}: compressed download not mounted (no folder to unpack it to)", addon.path.display()))?;
+        workshop::unpack_legacy(&addon.path, addon.workshop_id, dir).map_err(|e| e.to_string())?
+    } else {
+        addon.path.clone()
+    };
+    let gma = GmaArchive::open(&path).map_err(|e| e.to_string())?;
+    let title = gma.info().title.clone();
+    let ids: Vec<&str> = if title.is_empty() { vec!["GAME", "WORKSHOP"] } else { vec!["GAME", "WORKSHOP", &title] };
+    Ok(Mount::new(&ids, Backing::Gma(gma)).of_addon())
+}
+
+/// The file an addon is read from once mounted: its own, or where its old compressed download
+/// is unpacked to.
+fn addon_origin(addon: &AddonFile, unpack_dir: Option<&Path>) -> Option<PathBuf> {
+    if !addon.packed {
+        return Some(addon.path.clone());
+    }
+    let name = match addon.workshop_id {
+        Some(id) => format!("{id}.gma"),
+        None => format!("{}.gma", addon.path.file_stem()?.to_string_lossy()),
+    };
+    Some(unpack_dir?.join(name))
+}
+
+/// What changed when a running game's addons were brought up to date ([`sync_addons`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AddonChanges {
+    /// The titles of the addons mounted.
+    pub mounted: Vec<String>,
+    /// How many were taken out.
+    pub unmounted: usize,
+    /// What could not be mounted.
+    pub warnings: Vec<String>,
+}
+
+/// Brings a running game's file system to the addons `options` want, as GMod does when one is
+/// switched on or off or has downloaded: those wanted and not mounted are mounted, those
+/// mounted and no longer wanted go. Only the player's own addons - subscribed items and
+/// `.gma` files of `garrysmod/addons` - come and go; the rest stays as it was mounted.
+pub fn sync_addons(vfs: &Vfs, install: &Install, options: &MountOptions) -> AddonChanges {
+    let mut changes = AddonChanges::default();
+    let unpack_dir = options.unpack_dir.as_deref().filter(|dir| !is_inside(dir, &install.root));
+    let own: Vec<AddonFile> = workshop::addon_files(install, options.subscribed.as_ref())
+        .into_iter()
+        .filter(|a| matches!(a.origin, Origin::Subscribed | Origin::AddonsFolder))
+        .collect();
+    let wanted = |a: &AddonFile| options.addons && !options.disabled.contains(&workshop::addon_key(a));
+    // every file of the player's addons there is, and those to stay
+    let mut keep = HashSet::new();
+    for addon in &own {
+        if wanted(addon)
+            && let Some(origin) = addon_origin(addon, unpack_dir)
+        {
+            keep.insert(origin);
+        }
+    }
+    // addons that are no longer there at all (unsubscribed) go too: any `.gma` addon mount
+    // under the workshop or addons folders not kept
+    let managed = |origin: &Path| {
+        install.workshop_dir().is_some_and(|dir| is_inside(origin, &dir))
+            || is_inside(origin, &install.game_dir().join("addons"))
+            || unpack_dir.is_some_and(|dir| is_inside(origin, dir))
+    };
+    for mount in vfs.mounts().iter() {
+        let origin = mount.origin();
+        if mount.addon && matches!(mount.backing, Backing::Gma(_)) && managed(origin) && !keep.contains(origin) && vfs.unmount(origin) {
+            changes.unmounted += 1;
+        }
+    }
+    for addon in own.iter().filter(|a| wanted(a)) {
+        if addon_origin(addon, unpack_dir).is_some_and(|origin| vfs.is_mounted(&origin)) {
+            continue;
+        }
+        match addon_mount(addon, unpack_dir) {
+            Ok(mount) => {
+                let title = match &mount.backing {
+                    Backing::Gma(gma) => gma.info().title.clone(),
+                    _ => String::new(),
+                };
+                vfs.mount_addon(mount);
+                changes.mounted.push(title);
+            }
+            Err(e) => changes.warnings.push(e),
+        }
+    }
+    changes
 }
 
 fn read_kv(path: &Path, warnings: &mut Vec<String>) -> Option<Document> {
@@ -140,30 +234,12 @@ pub fn mount_install(install: &Install, options: &MountOptions) -> (Vfs, Vec<Str
             if !wanted || options.disabled.contains(&workshop::addon_key(&addon)) {
                 continue;
             }
-            let path = if addon.packed {
-                let Some(dir) = unpack_dir else {
-                    warnings.push(format!("{}: compressed download not mounted (no folder to unpack it to)", addon.path.display()));
-                    continue;
-                };
-                match workshop::unpack_legacy(&addon.path, addon.workshop_id, dir) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        warnings.push(e.to_string());
-                        continue;
-                    }
-                }
-            } else {
-                addon.path
-            };
-            match GmaArchive::open(&path) {
-                Ok(gma) => {
-                    // the addon's title is a search path of its own, as in GMod
-                    let title = gma.info().title.clone();
-                    let ids: Vec<&str> = if title.is_empty() { vec!["GAME", "WORKSHOP"] } else { vec!["GAME", "WORKSHOP", &title] };
-                    vfs.insert(slot, Mount::new(&ids, Backing::Gma(gma)).of_addon());
+            match addon_mount(&addon, unpack_dir) {
+                Ok(mount) => {
+                    vfs.insert(slot, mount);
                     slot += 1;
                 }
-                Err(e) => warnings.push(e.to_string()),
+                Err(e) => warnings.push(e),
             }
         }
     }
@@ -195,6 +271,9 @@ pub fn mount_install(install: &Install, options: &MountOptions) -> (Vfs, Vec<Str
         }
     }
 
+    if let Some(slot) = addon_slot {
+        vfs.set_addon_slot(slot);
+    }
     (vfs, warnings)
 }
 
@@ -223,6 +302,34 @@ mod tests {
 	}
 }
 "#;
+
+    #[test]
+    fn addons_come_and_go_while_the_game_runs() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("Library/steamapps/common/GarrysMod");
+        fake_install(&root);
+        let game = root.join("garrysmod");
+        std::fs::write(game.join("gameinfo.txt"), GAMEINFO).unwrap();
+        vpk::write_single(&game.join("garrysmod_dir.vpk"), &[("materials/x.vmt", b"the game's")]).unwrap();
+        std::fs::create_dir_all(game.join("addons")).unwrap();
+        let addon = game.join("addons/later.gma");
+        gma::write(&addon, &GmaInfo { title: "Later".into(), ..Default::default() }, &[("materials/x.vmt", b"the addon's")]).unwrap();
+        let install = Install::at(&root).unwrap();
+        // switched off when the game started
+        let off = MountOptions { disabled: HashSet::from(["later.gma".to_string()]), ..MountOptions::default() };
+        let (vfs, _) = mount_install(&install, &off);
+        assert_eq!(vfs.read("materials/x.vmt", "GAME").unwrap(), b"the game's");
+        // switched on: there at once, in front of the game's own
+        let changes = sync_addons(&vfs, &install, &MountOptions::default());
+        assert_eq!(changes.mounted, ["Later"]);
+        assert_eq!(vfs.read("materials/x.vmt", "GAME").unwrap(), b"the addon's");
+        assert!(vfs.find("materials/*", "Later").files.contains(&"x.vmt".to_string()));
+        assert_eq!(sync_addons(&vfs, &install, &MountOptions::default()), AddonChanges::default(), "once");
+        // and off again
+        let changes = sync_addons(&vfs, &install, &off);
+        assert_eq!(changes.unmounted, 1);
+        assert_eq!(vfs.read("materials/x.vmt", "GAME").unwrap(), b"the game's");
+    }
 
     #[test]
     fn mounts_like_gmod() {

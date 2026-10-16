@@ -260,7 +260,7 @@ pub(crate) fn translate_activity(lua: &Lua, player: EntityHandle, act: i64) -> i
 /// Weapon scripts and ammo types, kept with the [`crate::Host`].
 #[derive(Default)]
 pub(crate) struct Weapons {
-    scripts: RefCell<HashMap<String, Option<WeaponData>>>,
+    pub(crate) scripts: RefCell<HashMap<String, Option<WeaponData>>>,
     /// The ammo types once the game has started; until then they are built when asked for.
     ammo: RefCell<Option<Vec<AmmoType>>>,
     /// The skill settings of the game's `cfg/skill.cfg` (`sk_plr_dmg_pistol` ...), read when

@@ -692,6 +692,19 @@ impl Runtime {
         self.call_hook(hook, mlua::MultiValue::from_iter([ply, mlua::Value::Integer(code.into())]));
     }
 
+    /// The game's files changed while it runs - an addon was mounted or taken out: what was
+    /// not there before is looked for again, and Lua hears of it (`GameContentChanged`).
+    pub fn content_changed(&self) {
+        let host = host(&self.lua);
+        host.anims.rigs.borrow_mut().retain(|_, rig| rig.is_some());
+        host.models.studio.borrow_mut().retain(|_, model| model.is_some());
+        host.screen.pixels.borrow_mut().retain(|_, pixels| pixels.is_some());
+        host.weapons.scripts.borrow_mut().retain(|_, script| script.is_some());
+        drop(host);
+        physics::forget_missing(&self.lua);
+        self.call_hook("GameContentChanged", mlua::MultiValue::new());
+    }
+
     /// Runs console commands typed by a player, as a client's console sends them: the
     /// engine's commands for players (`noclip`, `kill`, `give`, choosing a weapon), their user
     /// info (`gmod_toolmode weld`), ConVars, and the commands of `concommand.Add`, which get

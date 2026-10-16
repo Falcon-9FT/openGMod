@@ -68,7 +68,7 @@ impl Map {
 #[derive(Default)]
 pub(crate) struct Models {
     brush: RefCell<Vec<(Vector, Vector)>>,
-    studio: RefCell<HashMap<String, Option<Studio>>>,
+    pub(crate) studio: RefCell<HashMap<String, Option<Studio>>>,
 }
 
 /// What the engine takes from a studio model (`.mdl`).

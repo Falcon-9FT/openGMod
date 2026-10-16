@@ -28,6 +28,11 @@ impl Materials {
         Materials { vfs, looks: HashMap::new() }
     }
 
+    /// The game's files changed (an addon came or went): materials are read again.
+    pub fn forget(&mut self) {
+        self.looks.clear();
+    }
+
     /// The texture a material shows (none for a plain colour, or one that is not there) and
     /// whether it adds to what is behind it.
     fn look(&mut self, material: &Material3d) -> Look {

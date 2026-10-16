@@ -527,7 +527,7 @@ fn entries(backing: &Backing) -> Option<usize> {
 
 fn print_mount_summary(out: &mut Out, vfs: &Vfs) {
     let (mut packs, mut pack_files, mut addons, mut addon_files, mut folders) = (0, 0, 0, 0, 0);
-    for mount in vfs.mounts() {
+    for mount in vfs.mounts().iter() {
         match &mount.backing {
             Backing::Dir(_) => folders += 1,
             Backing::Vpk(v) => {

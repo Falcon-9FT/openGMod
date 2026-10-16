@@ -283,7 +283,7 @@ impl Connection {
         }
         // the download folder, read while looking for what to fetch, has more in it now
         if let Some(dir) = download {
-            for mount in vfs.mounts() {
+            for mount in vfs.mounts().iter() {
                 if let gmod_fs::Backing::Dir(folder) = &mount.backing
                     && folder.root() == dir
                 {

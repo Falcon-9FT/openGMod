@@ -39,6 +39,12 @@ fn array(v: Vector) -> [f32; 3] {
 }
 
 impl Audio {
+    /// The game's files changed (an addon came or went): the sounds that were not there are
+    /// looked for again.
+    pub fn forget_missing(&mut self) {
+        self.clips.retain(|_, clip| clip.is_some());
+    }
+
     /// Opens the sound card. Without one the game runs silent.
     pub fn new(vfs: Arc<Vfs>) -> Audio {
         #[cfg(windows)]

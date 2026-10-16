@@ -486,6 +486,15 @@ impl Game {
         self.client.drawn(self.player)
     }
 
+    /// The game's files changed (an addon came or went): the server here and the client look
+    /// again for what was not there, and their Lua hears of it.
+    pub fn content_changed(&self) {
+        if let Link::Local(server) = &self.link {
+            server.runtime().content_changed();
+        }
+        self.client.content_changed();
+    }
+
     /// What the player holds before their eyes - the weapon's view model and the hands - put
     /// where the client's Lua puts it from the eyes, and the field of view to draw it with.
     pub fn view_models(&self, eye: [f32; 3], pitch: f32, yaw: f32) -> (Vec<Drawn>, f32) {
@@ -561,6 +570,18 @@ impl Models {
     pub fn with_brushes(mut self, brushes: HashMap<usize, World>) -> Models {
         self.brushes = brushes;
         self
+    }
+
+    /// The game's files these are read from.
+    pub fn vfs(&self) -> Arc<Vfs> {
+        self.vfs.clone()
+    }
+
+    /// The game's files changed (an addon came or went): the models and materials that were
+    /// not there are looked for again.
+    pub fn forget_missing(&mut self) {
+        self.loaded.retain(|_, model| model.is_some());
+        self.materials.forget();
     }
 
     /// A model to picture alone (a spawn icon), as it is made - skin 0, its first body - read

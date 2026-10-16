@@ -161,7 +161,7 @@ impl AnimState {
 /// Rigs of the models entities have, each read once, and the activities models name.
 #[derive(Default)]
 pub(crate) struct Anims {
-    rigs: RefCell<HashMap<String, Option<Arc<Rig>>>>,
+    pub(crate) rigs: RefCell<HashMap<String, Option<Arc<Rig>>>>,
     /// Activities of models that the game's enumerations do not have, in the order they came.
     private: RefCell<Vec<String>>,
     /// For choosing among sequences of an activity.

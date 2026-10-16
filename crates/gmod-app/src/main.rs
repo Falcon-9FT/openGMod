@@ -202,17 +202,21 @@ struct Setup {
 }
 
 impl Setup {
-    /// The game's files as Garry's Mod mounts them, the addons switched off left out.
-    fn mount(&self, install: &Install) -> Vfs {
+    /// How Garry's Mod's files are mounted: the addons switched off left out.
+    fn mount_options(&self) -> MountOptions {
         let unpack_dir = UserDir::default_root().map(|root| root.join("cache").join("workshop"));
-        let options = MountOptions {
+        MountOptions {
             addons: self.addons,
             unpack_dir,
             disabled: self.disabled.clone(),
             subscribed: self.subscribed.clone(),
             ..MountOptions::default()
-        };
-        mount_install(install, &options).0
+        }
+    }
+
+    /// The game's files as Garry's Mod mounts them, the addons switched off left out.
+    fn mount(&self, install: &Install) -> Vfs {
+        mount_install(install, &self.mount_options()).0
     }
 }
 
@@ -1330,6 +1334,47 @@ impl App {
         {
             menu.runtime().addons_changed(menu::addons(&install, &self.setup.disabled, self.setup.subscribed.as_ref()));
         }
+        self.sync_addons();
+    }
+
+    /// The addons switched on, off, subscribed to or downloaded are mounted or taken out at
+    /// once, in the menu and in the game running, as GMod does: their content is there from
+    /// now on (their Lua runs from the next map on).
+    fn sync_addons(&mut self) {
+        let Ok(install) = Install::locate(self.setup.gmod.as_deref()) else { return };
+        let options = self.setup.mount_options();
+        let mut systems: Vec<Arc<Vfs>> = Vec::new();
+        for vfs in self.menu.as_ref().map(menu::Menu::vfs).into_iter().chain(self.models.as_ref().map(Models::vfs)) {
+            if !systems.iter().any(|known| Arc::ptr_eq(known, &vfs)) {
+                systems.push(vfs);
+            }
+        }
+        let mut changed = false;
+        for vfs in &systems {
+            let changes = gmod_fs::mount::sync_addons(vfs, &install, &options);
+            changed |= !changes.mounted.is_empty() || changes.unmounted > 0;
+            for title in &changes.mounted {
+                println!("Mounted {title}");
+            }
+            for warning in &changes.warnings {
+                eprintln!("{warning}");
+            }
+        }
+        if !changed {
+            return;
+        }
+        if let Some(menu) = &self.menu {
+            menu.runtime().content_changed();
+        }
+        if let Some(models) = &mut self.models {
+            models.forget_missing();
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.forget_missing();
+        }
+        if let Some(game) = &self.game {
+            game.content_changed();
+        }
     }
 
     /// A frame of the main menu: Chromium's work, the menu's Lua when it shows, and what it
@@ -1348,10 +1393,11 @@ impl App {
                 menu.console(&line);
             }
         }
-        if let Some(addons) = menu.runtime().take_addon_changes() {
+        let addons_changed = menu.runtime().take_addon_changes();
+        if let Some(addons) = &addons_changed {
             self.setup.disabled = addons.iter().filter(|a| !a.mounted).map(menu::addon_key).collect();
             let on = addons.iter().filter(|a| a.mounted).count();
-            println!("Addons: {on} on, {} off - from the next game on", addons.len() - on);
+            println!("Addons: {on} on, {} off", addons.len() - on);
             if let Some(file) = menu::disabled_file()
                 && let Err(e) = gmod_fs::workshop::write_disabled(&file, &self.setup.disabled)
             {
@@ -1391,6 +1437,9 @@ impl App {
             if self.menu.is_none() {
                 break;
             }
+        }
+        if addons_changed.is_some() {
+            self.sync_addons();
         }
     }
 
