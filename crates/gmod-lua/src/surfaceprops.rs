@@ -4,7 +4,7 @@
 //! A surface of the map is its material's `$surfaceprop`; a body's is its model's `.phy`
 //! (`PhysObj:GetMaterial`). What names none, or one there is not, is `default`.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use gmod_material::{SurfaceProp, SurfaceProps};
@@ -15,7 +15,7 @@ use crate::host;
 /// The surfaces of a runtime, read when first asked for.
 #[derive(Default)]
 pub(crate) struct Surfaces {
-    props: OnceCell<SurfaceProps>,
+    props: RefCell<Option<SurfaceProps>>,
     /// The surface of each material of the map, by lower-case name.
     by_material: RefCell<HashMap<String, usize>>,
 }
@@ -24,7 +24,16 @@ pub(crate) struct Surfaces {
 pub(crate) fn with<R>(lua: &Lua, f: impl FnOnce(&SurfaceProps) -> R) -> R {
     let host = host(lua);
     let vfs = host.vfs.clone();
-    f(host.surfaces.props.get_or_init(|| SurfaceProps::load(&vfs)))
+    let mut props = host.surfaces.props.borrow_mut();
+    f(props.get_or_insert_with(|| SurfaceProps::load(&vfs)))
+}
+
+/// Surfaces of a `surfaceproperties` file's text (`physenv.AddSurfaceData`), after the game's.
+pub(crate) fn add(lua: &Lua, text: &str) {
+    with(lua, |_| ());
+    if let Some(props) = host(lua).surfaces.props.borrow_mut().as_mut() {
+        props.add_file(text);
+    }
 }
 
 /// `util.GetSurfaceData`, `util.GetSurfacePropName` and `util.GetSurfaceIndex`: the surfaces

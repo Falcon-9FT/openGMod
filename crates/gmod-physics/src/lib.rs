@@ -23,9 +23,10 @@ use std::collections::{HashMap, HashSet};
 
 use rapier3d::math::{Mat3, Pose, Rotation, Vector};
 use rapier3d::prelude::{
-    ActiveHooks, CoefficientCombineRule, Collider, ColliderBuilder, ColliderHandle, GenericJoint, GenericJointBuilder, ImpulseJointHandle,
-    InteractionGroups, JointAxesMask, JointAxis, MassProperties, PairFilterContext, PhysicsHooks, PhysicsWorld, QueryFilter, Ray,
-    RigidBodyBuilder, RigidBodyHandle, RigidBodyType, SharedShape, SolverFlags, SpringJointBuilder,
+    ActiveHooks, CoefficientCombineRule, Collider, ColliderBuilder, ColliderHandle, ContactModificationContext, GenericJoint,
+    GenericJointBuilder, ImpulseJointHandle, InteractionGroups, JointAxesMask, JointAxis, MassProperties, ModifiableContacts,
+    PairFilterContext, PhysicsHooks, PhysicsWorld, QueryFilter, Ray, RigidBodyBuilder, RigidBodyHandle, RigidBodyType, SharedShape,
+    SolverFlags, SpringJointBuilder,
 };
 
 pub type Vec3 = [f32; 3];
@@ -37,8 +38,9 @@ pub const DEFAULT_GRAVITY: f32 = 600.0;
 /// Kilograms in a cubic metre of what has no mass of its own: the `default` surface property.
 pub const DEFAULT_DENSITY: f32 = 2000.0;
 /// How much what slides along something holds back, when nothing says otherwise. Two things
-/// sliding along each other hold back as the one that holds back less does: a body of
-/// `friction_00` slides on anything.
+/// sliding along each other hold back as much as the two together, multiplied, as IVP has it
+/// (measured in GMod: a crate of wood, 0.8, on concrete, 0.8, slides as 0.64; of glass, 0.5,
+/// as 0.4): a body of `friction_00` slides on anything.
 pub const DEFAULT_FRICTION: f32 = 0.8;
 
 /// How hard a rigid rope holds its length against being pushed shorter: a spring of this
@@ -233,6 +235,62 @@ pub struct Physics {
     inertia: HashMap<RigidBodyHandle, f32>,
     /// Seconds stepped.
     clock: f32,
+    /// The most a body moves and turns: units and degrees a second (`physenv`'s performance
+    /// settings, `MaxVelocity` and `MaxAngularVelocity`).
+    speed_limits: [f32; 2],
+    /// The solids of the world that touch others, and those they touch ([`Physics::add_world`]).
+    seams: HashMap<ColliderHandle, Vec<ColliderHandle>>,
+    /// The solids of the world, convex.
+    solids: Vec<ColliderHandle>,
+}
+
+/// How far out of a solid of the world a contact is looked past, metres: into a neighbour, it
+/// is a face between the two, which nothing touches.
+const SEAM_PROBE: f32 = 0.01;
+
+/// GMod's limits of how fast a body moves and turns, units and degrees a second, as
+/// `physenv.GetPerformanceSettings` gives them (measured).
+pub const MAX_VELOCITY: f32 = 4000.0;
+pub const MAX_ANGULAR_VELOCITY: f32 = 7272.728;
+
+/// Where a body is to go, and how, for [`Physics::shadow`]: as Source's shadow controllers
+/// steer what they hold (`ComputeShadowControl`), the physics gun's among them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Shadow {
+    pub origin: Vec3,
+    pub angles: Vec3,
+    /// Seconds to get there.
+    pub seconds: f32,
+    /// The most it goes, units a second, and the most of its own speed held back in a step.
+    pub max_speed: f32,
+    pub max_damp_speed: f32,
+    /// The same for turning, degrees a second.
+    pub max_angular: f32,
+    pub max_damp_angular: f32,
+    /// How much of its own speed is held back in a step, 0 to 1.
+    pub damp_factor: f32,
+    /// Farther than this from where it is to be, it is put there; 0 for never.
+    pub teleport_distance: f32,
+}
+
+/// One part of a shadow's control, as IVP's `ComputeController`: the speed `v` held back by
+/// `damp` of itself (no more than `max_damp` a step), then pushed towards `delta` at `scale`
+/// of it a second (no more than `max_speed`).
+fn shadow_control(v: Vector, delta: Vector, max_speed: f32, max_damp: f32, scale: f32, damp: f32) -> Vector {
+    let mut v = v;
+    if v.length_squared() < 1e-6 {
+        v = Vector::ZERO;
+    } else if max_damp > 0.0 {
+        let held = v.length() * damp.abs();
+        let back = -v * damp;
+        v += if held > max_damp { back * (max_damp / held) } else { back };
+    }
+    if max_speed > 0.0 {
+        let push = delta * scale;
+        let fast = push.length();
+        v += if fast > max_speed { push * (max_speed / fast) } else { push };
+    }
+    v
 }
 
 /// A body hit something hard enough to be heard, as Source tells its entities
@@ -303,7 +361,107 @@ impl Physics {
             limits: Vec::new(),
             inertia: HashMap::new(),
             clock: 0.0,
+            speed_limits: [MAX_VELOCITY, MAX_ANGULAR_VELOCITY],
+            seams: HashMap::new(),
+            solids: Vec::new(),
         }
+    }
+
+    /// Finds which solids of the world touch which, so that what slides over the seam of two
+    /// does not meet the face between them ([`Apart::modify_solver_contacts`]): side by side,
+    /// their boxes overlap, swept along x.
+    fn join_seams(&mut self) {
+        let margin = 0.1 * METRES_PER_UNIT;
+        self.seams.clear();
+        let mut boxes: Vec<(ColliderHandle, Vector, Vector)> = self
+            .solids
+            .iter()
+            .filter_map(|&h| self.world.colliders.get(h).map(|c| (h, c.compute_aabb())))
+            .map(|(h, aabb)| (h, aabb.mins - Vector::splat(margin), aabb.maxs + Vector::splat(margin)))
+            .collect();
+        boxes.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+        for i in 0..boxes.len() {
+            let (a, lo, hi) = boxes[i];
+            for &(b, lo2, hi2) in &boxes[i + 1..] {
+                if lo2.x > hi.x {
+                    break;
+                }
+                if lo.y <= hi2.y && lo2.y <= hi.y && lo.z <= hi2.z && lo2.z <= hi.z {
+                    self.seams.entry(a).or_default().push(b);
+                    self.seams.entry(b).or_default().push(a);
+                }
+            }
+        }
+        for &h in &self.solids {
+            if self.seams.contains_key(&h)
+                && let Some(collider) = self.world.colliders.get_mut(h)
+            {
+                collider.set_active_hooks(collider.active_hooks() | ActiveHooks::MODIFY_SOLVER_CONTACTS);
+            }
+        }
+    }
+
+    /// The most a body moves and turns from now on, units and degrees a second.
+    pub fn set_speed_limits(&mut self, speed: f32, turn: f32) {
+        self.speed_limits = [speed.max(0.0), turn.max(0.0)];
+    }
+
+    /// Gravity from now on as a direction too: units/s² (`physenv.SetGravity`).
+    pub fn set_gravity_vector(&mut self, gravity: Vec3) {
+        self.world.gravity = metres(gravity);
+    }
+
+    /// Gravity, units/s².
+    pub fn gravity(&self) -> Vec3 {
+        let g = self.world.gravity / METRES_PER_UNIT;
+        [g.x, g.y, g.z]
+    }
+
+    /// Steers a body as Source's shadow controllers steer what they hold
+    /// (`ComputeShadowControl`), a step of `dt` seconds: what it was going keeps on, held back
+    /// by `damp_factor` of it, and it is pushed towards the pose to be there in `seconds`; its
+    /// origin goes and it turns about it. What is in the way still stops it.
+    pub fn shadow(&mut self, id: BodyId, shadow: &Shadow, dt: f32) {
+        let Some(body) = self.world.bodies.get_mut(id.0) else { return };
+        let dt = dt.max(1e-4);
+        let fraction = if shadow.seconds > 0.0 { (dt / shadow.seconds).min(1.0) } else { 1.0 };
+        let scale = fraction / dt;
+        let pose = body.translation();
+        let centre = body.center_of_mass();
+        let target = metres(shadow.origin);
+        let mut delta = target - pose;
+        let turn_to = rotation(shadow.angles);
+        if shadow.teleport_distance > 0.0 && delta.length() > shadow.teleport_distance * METRES_PER_UNIT {
+            body.set_position(Pose::from_parts(target, turn_to), true);
+            delta = Vector::ZERO;
+        }
+        // the shortest way round from how it is turned to how it should be
+        let (axis, mut angle) = (turn_to * body.rotation().inverse()).to_axis_angle();
+        if angle > std::f32::consts::PI {
+            angle -= std::f32::consts::TAU;
+        }
+        let pose = body.translation();
+        let w = body.angvel();
+        // the speed of its origin, which is steered
+        let v = body.linvel() + w.cross(pose - centre);
+        let v = shadow_control(
+            v,
+            delta,
+            shadow.max_speed * METRES_PER_UNIT,
+            shadow.max_damp_speed * METRES_PER_UNIT,
+            scale,
+            shadow.damp_factor,
+        );
+        let w = shadow_control(
+            w,
+            axis * angle,
+            shadow.max_angular.to_radians(),
+            shadow.max_damp_angular.to_radians(),
+            scale,
+            shadow.damp_factor,
+        );
+        body.set_linvel(v + w.cross(centre - pose), true);
+        body.set_angvel(w, true);
     }
 
     /// The world as a body, to join bodies to: it never moves.
@@ -319,14 +477,20 @@ impl Physics {
     /// Adds what never moves, in the world's space: convex solids by their corners, and
     /// triangles. Returns how many solids could be made of `hulls`; the rest had no volume.
     pub fn add_world(&mut self, hulls: &[Vec<Vec3>], vertices: &[Vec3], triangles: &[[u32; 3]]) -> usize {
-        let mut added = 0;
+        let mut added = Vec::new();
         for corners in hulls {
             let points: Vec<Vector> = corners.iter().map(|&p| metres(p)).collect();
             if let Some(collider) = ColliderBuilder::convex_hull(&points) {
-                self.world.colliders.insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min));
-                added += 1;
+                added.push(
+                    self.world
+                        .colliders
+                        .insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Multiply)),
+                );
             }
         }
+        self.solids.extend(&added);
+        self.join_seams();
+        let added = added.len();
         // the triangles as one surface, their shared edges known: what slides or lies over
         // an edge between two of them is not knocked by it (a contact's normal there would
         // be the edge's), from either side
@@ -335,7 +499,7 @@ impl Physics {
             && let Ok(collider) =
                 ColliderBuilder::trimesh_with_flags(vertices.iter().map(|&p| metres(p)).collect(), triangles.to_vec(), flags)
         {
-            self.world.colliders.insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min));
+            self.world.colliders.insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Multiply));
         }
         added
     }
@@ -359,8 +523,10 @@ impl Physics {
             .user_data(u128::from(body.user));
         let handle = self.world.insert_body(rigid);
         for (shape, _) in shapes {
-            let collider =
-                ColliderBuilder::new(shape).density(density).friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min);
+            let collider = ColliderBuilder::new(shape)
+                .density(density)
+                .friction(DEFAULT_FRICTION)
+                .friction_combine_rule(CoefficientCombineRule::Multiply);
             self.world.insert_collider(collider, Some(handle));
         }
         if body.inertia > 0.0 && body.inertia != 1.0 {
@@ -418,7 +584,7 @@ impl Physics {
         let handle = self.world.insert_body(rigid);
         for collider in colliders {
             self.world
-                .insert_collider(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min), Some(handle));
+                .insert_collider(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Multiply), Some(handle));
         }
         Some(BodyId(handle))
     }
@@ -1098,9 +1264,10 @@ impl Physics {
         self.world.integration_parameters.dt = seconds;
         self.aim_limits();
         self.damp_springs(seconds);
-        let hooks = Apart { pairs: &self.apart, aloof: &self.aloof, groups: &self.groups, rule: self.group_rule };
+        let hooks = Apart { pairs: &self.apart, aloof: &self.aloof, groups: &self.groups, rule: self.group_rule, seams: &self.seams };
         self.world.step_with_events(&hooks, &());
         self.clock += seconds;
+        self.limit_speeds();
         self.find_impacts();
         let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
         let joints = &self.world.impulse_joints;
@@ -1120,6 +1287,25 @@ impl Physics {
         for id in snapped {
             self.world.remove_impulse_joint(id.0);
             self.broken.push(id);
+        }
+    }
+}
+
+impl Physics {
+    /// No body faster than the limits ([`Physics::set_speed_limits`]), as VPhysics keeps them.
+    fn limit_speeds(&mut self) {
+        let [speed, turn] = self.speed_limits;
+        let (speed, turn) = (speed * METRES_PER_UNIT, turn.to_radians());
+        let active: Vec<RigidBodyHandle> = self.world.active_bodies().map(|(handle, _)| handle).collect();
+        for handle in active {
+            let Some(body) = self.world.bodies.get_mut(handle) else { continue };
+            let (v, w) = (body.linvel(), body.angvel());
+            if speed > 0.0 && v.length() > speed {
+                body.set_linvel(v * (speed / v.length()), false);
+            }
+            if turn > 0.0 && w.length() > turn {
+                body.set_angvel(w * (turn / w.length()), false);
+            }
         }
     }
 }
@@ -1149,6 +1335,7 @@ struct Apart<'a> {
     aloof: &'a HashSet<RigidBodyHandle>,
     groups: &'a HashMap<RigidBodyHandle, i64>,
     rule: Option<fn(i64, i64) -> bool>,
+    seams: &'a HashMap<ColliderHandle, Vec<ColliderHandle>>,
 }
 
 /// `COLLISION_GROUP_WORLD`: what collides with the map only.
@@ -1176,6 +1363,27 @@ impl PhysicsHooks for Apart<'_> {
             _ if aloof(a) != aloof(b) && (aloof(a) && moves(b) || aloof(b) && moves(a)) => None,
             _ => Some(SolverFlags::COMPUTE_RIGID_IMPULSES),
         }
+    }
+
+    /// A contact with a solid of the world on a face it shares with a neighbour - one a step
+    /// out of it along the contact is inside that neighbour - is no contact: the face is inside
+    /// the world, between two brushes, and what slides over their seam would trip on its edge.
+    /// IVP's world is one surface and has no such faces.
+    fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+        let (solid, first) = match (self.seams.get(&context.collider1), self.seams.get(&context.collider2)) {
+            (Some(_), _) => (context.collider1, true),
+            (None, Some(_)) => (context.collider2, false),
+            _ => return,
+        };
+        let Some(neighbours) = self.seams.get(&solid) else { return };
+        let colliders = context.colliders;
+        let ModifiableContacts::Rigid(manifold) = &mut context.contacts else { return };
+        let out = if first { *manifold.normal } else { -*manifold.normal };
+        manifold.solver_contacts.retain(|c| {
+            let on_solid = if first { c.anchor1 } else { c.anchor2 };
+            let probe = on_solid + out * SEAM_PROBE;
+            !neighbours.iter().any(|&n| colliders.get(n).is_some_and(|other| other.shape().contains_point(other.position(), probe)))
+        });
     }
 }
 

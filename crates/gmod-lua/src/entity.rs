@@ -839,6 +839,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     }
 
     crate::physics::install(lua)?;
+    crate::physenv::install(lua)?;
 
     let def = |name: &'static str, f: fn(&Args) -> mlua::Result<Value>| -> mlua::Result<()> {
         entity.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)

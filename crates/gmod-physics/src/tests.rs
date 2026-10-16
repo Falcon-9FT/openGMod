@@ -793,3 +793,100 @@ fn car_stands_still() {
         later[1] - angles[1]
     );
 }
+
+#[test]
+fn a_shadow_holds_back_some_of_its_own_speed_and_is_pushed_to_where_it_is_to_be() {
+    // as IVP's ComputeController: 0.8 of the speed held back, no more than the damping allows
+    let v = Vector::new(10.0, 0.0, 0.0);
+    assert!((shadow_control(v, Vector::ZERO, 0.0, 100.0, 0.0, 0.8).x - 2.0).abs() < 1e-5);
+    assert!((shadow_control(v, Vector::ZERO, 0.0, 1.0, 0.0, 0.8).x - 9.0).abs() < 1e-5);
+    // and pushed by the way to go times the scale, no faster than its most
+    let pushed = shadow_control(Vector::ZERO, Vector::new(0.0, 1.0, 0.0), 5.0, 0.0, 20.0, 0.8);
+    assert!((pushed.y - 5.0).abs() < 1e-5);
+
+    // the physics gun's: up in the air, steered 100 units away and held there
+    let mut physics = Physics::new();
+    physics.set_gravity(0.0);
+    let body = physics.add(&crate_body([0.0, 0.0, 500.0])).unwrap();
+    let held = Shadow {
+        origin: [100.0, 0.0, 500.0],
+        angles: [0.0, 90.0, 0.0],
+        seconds: 0.05,
+        max_speed: 5000.0,
+        max_damp_speed: 10000.0,
+        max_angular: 5000.0,
+        max_damp_angular: 10000.0,
+        damp_factor: 0.8,
+        teleport_distance: 0.0,
+    };
+    for _ in 0..60 {
+        physics.shadow(body, &held, TICK);
+        physics.step(TICK);
+    }
+    let (origin, angles) = physics.pose(body).unwrap();
+    assert!(near(origin, [100.0, 0.0, 500.0], 0.5) && near(angles, [0.0, 90.0, 0.0], 0.5), "{origin:?} {angles:?}");
+    // far beyond its teleport distance it is put there at once
+    let far = Shadow { origin: [5000.0, 0.0, 500.0], teleport_distance: 1000.0, ..held };
+    physics.shadow(body, &far, TICK);
+    assert!(near(physics.pose(body).unwrap().0, [5000.0, 0.0, 500.0], 0.01));
+}
+
+#[test]
+fn nothing_goes_faster_than_the_limits() {
+    let mut physics = Physics::new();
+    physics.set_gravity(0.0);
+    let body = physics.add(&crate_body([0.0, 0.0, 500.0])).unwrap();
+    physics.set_velocity(body, [20000.0, 0.0, 0.0]);
+    physics.step(TICK);
+    assert!((physics.velocity(body)[0] - MAX_VELOCITY).abs() < 1.0, "{:?}", physics.velocity(body));
+    physics.set_speed_limits(1000.0, 360.0);
+    physics.step(TICK);
+    assert!((physics.velocity(body)[0] - 1000.0).abs() < 1.0);
+}
+
+#[test]
+fn friction_is_the_two_surfaces_multiplied() {
+    // a crate of glass (0.5) pushed along the floor (0.8) at 400 units/s slides as 0.4 does:
+    // v² / (2 μ g), 333 units (GMod: 349, the crate turning as it went)
+    let mut physics = floor();
+    let body = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    physics.set_friction(body, 0.5);
+    run(&mut physics, 0.5);
+    physics.set_velocity(body, [400.0, 0.0, 0.0]);
+    run(&mut physics, 3.0);
+    let slid = physics.pose(body).unwrap().0[0];
+    assert!((slid - 333.0).abs() < 25.0, "slid {slid}");
+}
+
+#[test]
+fn what_slides_over_the_seams_of_brushes_does_not_trip_on_them() {
+    // a floor of brushes side by side, as maps are made, and a crate sliding over their
+    // seams fast; it went head over heels on the first (the face between two brushes caught
+    // its edge)
+    at_tick_rates(|| {
+        for speed in [300.0f32, 600.0, 1000.0] {
+            let mut physics = Physics::new();
+            let hulls: Vec<Vec<Vec3>> = (0..24)
+                .flat_map(|i| {
+                    let x = -256.0 + i as f32 * 128.0;
+                    let Shape::Hulls(hulls) = Shape::cuboid([x, -512.0, -64.0], [x + 128.0, 512.0, 0.0]) else { unreachable!() };
+                    hulls
+                })
+                .collect();
+            physics.add_world(&hulls, &[], &[]);
+            let body = physics.add(&crate_body([-200.0, 0.0, 16.0])).unwrap();
+            physics.set_friction(body, 0.1);
+            run(&mut physics, 0.5);
+            physics.set_velocity(body, [speed, 0.0, 0.0]);
+            // until it is near the floor's end
+            for step in 0..90 {
+                run(&mut physics, 0.025);
+                let (origin, angles) = physics.pose(body).unwrap();
+                assert!(
+                    angles[0].abs() < 1.0 && angles[2].abs() < 1.0 && (origin[2] - 16.0).abs() < 1.0,
+                    "at {speed} units/s it tripped by {origin:?} {angles:?} ({step})"
+                );
+            }
+        }
+    });
+}

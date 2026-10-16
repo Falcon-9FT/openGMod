@@ -39,6 +39,8 @@ pub(crate) struct World {
     models: RefCell<HashMap<String, Option<PhysModel>>>,
     /// The ragdolls, by the number of their entity.
     pub ragdolls: RefCell<HashMap<u32, crate::ragdoll::Ragdoll>>,
+    /// Their surroundings: gravity, pace, limits (`physenv`).
+    pub environment: crate::physenv::Environment,
 }
 
 /// What a physics model gives a body.
@@ -394,13 +396,22 @@ struct Collision {
 /// constraints that broke go, and the bodies that hit something make their sounds and tell
 /// Lua.
 pub(crate) fn simulate(lua: &Lua) {
-    let gravity = crate::convar::value(lua, "sv_gravity").and_then(|g| g.trim().parse::<f32>().ok()).unwrap_or(600.0);
+    // paused, or with time stopped, nothing moves (`physenv.SetPhysicsPaused`, `SetTimeScale`)
+    let env = &host(lua).physics.environment;
+    let seconds = timer::tick_interval() * env.time_scale.get();
+    if env.paused.get() || seconds <= 0.0 {
+        return;
+    }
+    let sv_gravity = crate::convar::value(lua, "sv_gravity").and_then(|g| g.trim().parse::<f32>().ok()).unwrap_or(600.0);
+    let gravity = crate::physenv::gravity(lua, sv_gravity);
     motion_controllers(lua);
     let (broken, collisions) = {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
-        physics.set_gravity(gravity);
-        physics.step(timer::tick_interval() as f32);
+        physics.set_gravity_vector([gravity.x, gravity.y, gravity.z]);
+        let started = std::time::Instant::now();
+        physics.step(seconds as f32);
+        host.physics.environment.last_simulation.set(started.elapsed().as_secs_f64());
         let bodies = host.physics.bodies.borrow();
         for id in physics.awake() {
             // a ragdoll's entity follows its first part

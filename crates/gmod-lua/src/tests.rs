@@ -1626,6 +1626,48 @@ fn props_fall_and_come_to_rest() {
 }
 
 #[test]
+fn the_physics_surroundings_are_as_gmod_has_them() {
+    let g = physics_game(&[]);
+    // as GMod gives them at first (measured)
+    assert!(g.eval::<bool>(
+        "local p = physenv.GetPerformanceSettings()
+         return physenv.GetGravity() == Vector(0, 0, -600) and physenv.GetAirDensity() == 2 and physenv.GetTimeScale() == 1
+             and not physenv.GetPhysicsPaused() and p.MaxVelocity == 4000 and math.abs(p.MaxAngularVelocity - 7272.728) < 0.01
+             and p.MinFrictionMass == 10 and p.MaxFrictionMass == 2500"
+    ));
+    // gravity set holds until sv_gravity changes
+    g.runtime
+        .run_string(
+            "physenv.SetGravity(Vector(0, 0, 0))
+             CRATE = ents.Create('prop_physics') CRATE:SetModel('models/crate.mdl') CRATE:SetPos(Vector(-200, 0, 100)) CRATE:Spawn()",
+            "gravity",
+        )
+        .unwrap();
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>("return math.abs(CRATE:GetPos().z - 100) < 0.01 and physenv.GetGravity() == Vector(0, 0, 0)"));
+    g.runtime.run_string("RunConsoleCommand('sv_gravity', '300')", "sv_gravity").unwrap();
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>("return physenv.GetGravity() == Vector(0, 0, -300) and CRATE:GetPos().z < 100"));
+    // paused, nothing moves; nothing faster than the limits
+    g.runtime.run_string("physenv.SetPhysicsPaused(true) Z = CRATE:GetPos().z", "pause").unwrap();
+    g.runtime.think(0.3);
+    assert!(g.eval::<bool>("return CRATE:GetPos().z == Z"));
+    g.runtime
+        .run_string(
+            "physenv.SetPhysicsPaused(false) physenv.SetPerformanceSettings({ MaxVelocity = 100 })
+             CRATE:GetPhysicsObject():SetVelocity(Vector(5000, 0, 0))",
+            "limit",
+        )
+        .unwrap();
+    g.runtime.think(0.05);
+    assert!(g.eval::<bool>("return CRATE:GetVelocity().x <= 100.5 and physenv.GetPerformanceSettings().MaxVelocity == 100"));
+    // surfaces added
+    g.runtime.run_string("physenv.AddSurfaceData('\"opengmod_test\" { \"friction\" \"0.1\" }')", "surface").unwrap();
+    assert!(g.eval::<bool>("return util.GetSurfaceIndex('opengmod_test') >= 0"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
 fn physics_objects() {
     let g = physics_game(&[]);
     assert!(g.eval::<bool>(
