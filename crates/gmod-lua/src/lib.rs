@@ -137,7 +137,7 @@ pub use chat::ChatMessage;
 pub use entity::EntityHandle;
 pub use ents::{Drawn, Map};
 pub use html::{WebButton, WebEvent, WebPage, WebPages};
-pub use menu::{Addon, MountableGame};
+pub use menu::{Addon, MountableGame, SettingChange};
 pub use mlua;
 pub use movedata::UserCmd;
 pub use player::{PlayerInfo, PlayerView, ToClient, WeaponView};
@@ -754,6 +754,17 @@ impl Runtime {
     /// A console variable's value, if there is one of that name.
     pub fn convar(&self, name: &str) -> Option<String> {
         convar::value(&self.lua, name)
+    }
+
+    /// Sets a console variable, as the player's settings say (`fov_desired`, `cl_drawhud`).
+    pub fn set_convar(&self, name: &str, value: &str) {
+        convar::set_value(&self.lua, name, value);
+    }
+
+    /// The player's key bindings from now on, key name (lower case) to command, in place of
+    /// the game's defaults.
+    pub fn set_binds(&self, binds: Vec<(String, String)>) {
+        *host(&self.lua).client.binds.borrow_mut() = binds;
     }
 
     /// The players who hear a sound, by the map's PAS; `None` for everyone.

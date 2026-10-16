@@ -40,6 +40,15 @@ impl Addon {
     }
 }
 
+/// What the options window changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingChange {
+    /// A setting (`sensitivity`) and its value.
+    Value(String, String),
+    /// A key (its engine name, lower case) and the command it does from now on; none: nothing.
+    Bind(String, Option<String>),
+}
+
 /// A game whose content can be mounted, as `engine.GetGames` lists it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MountableGame {
@@ -58,6 +67,11 @@ pub(crate) struct Menu {
     pub applied: Cell<bool>,
     /// The lines typed into the console window, for the program to run.
     pub console_typed: RefCell<Vec<String>>,
+    /// The player's settings as the program has them, for the options window; and what the
+    /// window changed, for the program.
+    pub settings: RefCell<std::collections::BTreeMap<String, String>>,
+    pub binds: RefCell<Vec<(String, String)>>,
+    pub setting_changes: RefCell<Vec<SettingChange>>,
     pub games: RefCell<Vec<MountableGame>>,
     pub in_game: Cell<bool>,
     /// Addons were not mounted at all (`-noaddons`), workshop ones were not (`-noworkshop`).
@@ -359,6 +373,163 @@ end
 function Console.IsOpen()
 	return IsValid( Console.Frame ) and Console.Frame:IsVisible()
 end
+
+-- the options window (Options in the main menu): keys, mouse, video, sound; what is changed
+-- is the player's at once, and kept
+OpenGMODOptions = OpenGMODOptions or {}
+local Options = OpenGMODOptions
+
+local PHRASES = {
+	title = { "Options", "Настройки" },
+	keyboard = { "Keyboard", "Клавиатура" }, mouse = { "Mouse", "Мышь" }, video = { "Video", "Видео" }, audio = { "Audio", "Звук" },
+	forward = { "Move forward", "Вперёд" }, back = { "Move back", "Назад" }, left = { "Move left", "Влево" }, right = { "Move right", "Вправо" },
+	jump = { "Jump", "Прыжок" }, duck = { "Duck", "Присесть" }, speed = { "Sprint", "Бег" }, walk = { "Walk", "Шаг" },
+	attack = { "Primary attack", "Основная атака" }, attack2 = { "Secondary attack", "Дополнительная атака" }, reload = { "Reload", "Перезарядка" },
+	use = { "Use", "Использовать" }, flashlight = { "Flashlight", "Фонарик" }, noclip = { "Noclip", "Noclip" }, undo = { "Undo", "Отменить" },
+	menu = { "Spawn menu", "Меню спавна" }, context = { "Context menu", "Контекстное меню" }, chat = { "Chat", "Чат" }, teamchat = { "Team chat", "Командный чат" },
+	scores = { "Scoreboard", "Таблица игроков" }, lastinv = { "Last weapon", "Прошлое оружие" }, zoom = { "Zoom", "Приближение" },
+	console = { "Console", "Консоль" }, screenshot = { "Screenshot", "Снимок экрана" }, voice = { "Voice chat", "Голосовой чат" },
+	sensitivity = { "Sensitivity", "Чувствительность" }, invert = { "Invert mouse", "Инвертировать мышь" },
+	fullscreen = { "Fullscreen", "Полный экран" }, vsync = { "Vertical sync", "Вертикальная синхронизация" },
+	fps = { "Frame rate limit (0: none)", "Ограничение FPS (0: нет)" }, fov = { "Field of view", "Поле зрения" },
+	hud = { "Draw the HUD", "Показывать HUD" }, showfps = { "Show FPS", "Показывать FPS" }, crosshair = { "Crosshair", "Прицел" },
+	viewmodel = { "Draw the weapon in hand", "Показывать оружие в руках" },
+	volume = { "Master volume", "Общая громкость" }, music = { "Music volume", "Громкость музыки" },
+	close = { "Close", "Закрыть" },
+}
+local function T( id )
+	local phrase = PHRASES[ id ] or { id, id }
+	local ok, language = pcall( function() return GetConVar( "gmod_language" ):GetString() end )
+	if ( !ok ) then language = "en" end
+	return phrase[ language == "ru" and 2 or 1 ]
+end
+
+local ACTIONS = {
+	{ "forward", "+forward" }, { "back", "+back" }, { "left", "+moveleft" }, { "right", "+moveright" },
+	{ "jump", "+jump" }, { "duck", "+duck" }, { "speed", "+speed" }, { "walk", "+walk" },
+	{ "attack", "+attack" }, { "attack2", "+attack2" }, { "reload", "+reload" }, { "use", "+use" },
+	{ "flashlight", "impulse 100" }, { "noclip", "noclip" }, { "undo", "gmod_undo" }, { "menu", "+menu" },
+	{ "context", "+menu_context" }, { "chat", "messagemode" }, { "teamchat", "messagemode2" }, { "scores", "+showscores" },
+	{ "lastinv", "lastinv" }, { "zoom", "+zoom" }, { "voice", "+voicerecord" }, { "console", "toggleconsole" },
+	{ "screenshot", "jpeg" },
+}
+
+local function Number( name, default )
+	return tonumber( OpenGMOD.GetSetting( name ) or "" ) or default
+end
+
+local function Slider( parent, label, name, min, max, decimals, default, show, store )
+	local slider = parent:Add( "DNumSlider" )
+	slider:Dock( TOP )
+	slider:DockMargin( 8, 4, 8, 0 )
+	slider:SetText( label )
+	slider:SetMinMax( min, max )
+	slider:SetDecimals( decimals )
+	slider:SetDark( true )
+	slider:SetValue( show and show( Number( name, default ) ) or Number( name, default ) )
+	slider.OnValueChanged = function( self, value )
+		OpenGMOD.SetSetting( name, store and store( value ) or value )
+	end
+	return slider
+end
+
+local function Check( parent, label, name, default, store, show )
+	local check = parent:Add( "DCheckBoxLabel" )
+	check:Dock( TOP )
+	check:DockMargin( 8, 6, 8, 0 )
+	check:SetText( label )
+	check:SetDark( true )
+	check:SetChecked( show and show( Number( name, default ) ) or Number( name, default ) != 0 )
+	check.OnChange = function( self, on )
+		OpenGMOD.SetSetting( name, store and store( on ) or ( on and "1" or "0" ) )
+	end
+	return check
+end
+
+local function KeyboardTab( sheet )
+	local list = vgui.Create( "DScrollPanel", sheet )
+	for _, action in ipairs( ACTIONS ) do
+		local row = list:Add( "Panel" )
+		row:Dock( TOP )
+		row:SetTall( 26 )
+		row:DockMargin( 8, 2, 8, 0 )
+		local label = row:Add( "DLabel" )
+		label:Dock( FILL )
+		label:SetText( T( action[ 1 ] ) )
+		label:SetDark( true )
+		-- the key and another, as GMod's keyboard options have them; the second rightmost
+		local keys = OpenGMOD.GetBindKeys( action[ 2 ] )
+		for slot = 2, 1, -1 do
+			local binder = row:Add( "DBinder" )
+			binder:Dock( RIGHT )
+			binder:DockMargin( 4, 0, 0, 0 )
+			binder:SetWide( 110 )
+			binder:SetValue( keys[ slot ] and input.GetKeyCode( keys[ slot ] ) or 0 )
+			binder.Key = keys[ slot ]
+			binder.OnChange = function( self, code )
+				if ( self.Key ) then OpenGMOD.BindKey( self.Key, nil ) end
+				local name = code and code != 0 and input.GetKeyName( code ) or nil
+				self.Key = name and string.lower( name ) or nil
+				if ( self.Key ) then OpenGMOD.BindKey( self.Key, action[ 2 ] ) end
+			end
+		end
+	end
+	return list
+end
+
+local function MouseTab( sheet )
+	local panel = vgui.Create( "Panel", sheet )
+	Slider( panel, T( "sensitivity" ), "sensitivity", 0.1, 20, 2, 3 )
+	-- the pitch factor below 0 turns the mouse upside down
+	Check( panel, T( "invert" ), "m_pitch", 0.022, function( on ) return on and "-0.022" or "0.022" end, function( value ) return value < 0 end )
+	return panel
+end
+
+local function VideoTab( sheet )
+	local panel = vgui.Create( "Panel", sheet )
+	Check( panel, T( "fullscreen" ), "opengmod_fullscreen", 0 )
+	Check( panel, T( "vsync" ), "mat_vsync", 1 )
+	Slider( panel, T( "fps" ), "fps_max", 0, 500, 0, 0 )
+	Slider( panel, T( "fov" ), "fov_desired", 75, 100, 0, 75 )
+	Check( panel, T( "hud" ), "cl_drawhud", 1 )
+	Check( panel, T( "crosshair" ), "crosshair", 1 )
+	Check( panel, T( "viewmodel" ), "r_drawviewmodel", 1 )
+	Check( panel, T( "showfps" ), "cl_showfps", 0 )
+	return panel
+end
+
+local function AudioTab( sheet )
+	local panel = vgui.Create( "Panel", sheet )
+	Slider( panel, T( "volume" ), "volume", 0, 1, 2, 1 )
+	Slider( panel, T( "music" ), "snd_musicvolume", 0, 1, 2, 1 )
+	return panel
+end
+
+function Options.Open()
+	if ( IsValid( Options.Frame ) ) then Options.Frame:Remove() end
+	local frame = vgui.Create( "DFrame" )
+	frame:SetTitle( T( "title" ) )
+	frame:SetSize( math.min( ScrW() - 40, 560 ), math.min( ScrH() - 40, 520 ) )
+	frame:Center()
+	frame:MakePopup()
+	frame.btnMaxim:SetVisible( false )
+	frame.btnMinim:SetVisible( false )
+	Options.Frame = frame
+
+	local close = frame:Add( "DButton" )
+	close:Dock( BOTTOM )
+	close:DockMargin( 0, 6, 0, 0 )
+	close:SetTall( 26 )
+	close:SetText( T( "close" ) )
+	close.DoClick = function() frame:Close() end
+
+	local sheet = frame:Add( "DPropertySheet" )
+	sheet:Dock( FILL )
+	sheet:AddSheet( T( "keyboard" ), KeyboardTab( sheet ), "icon16/keyboard.png" )
+	sheet:AddSheet( T( "mouse" ), MouseTab( sheet ), "icon16/mouse.png" )
+	sheet:AddSheet( T( "video" ), VideoTab( sheet ), "icon16/monitor.png" )
+	sheet:AddSheet( T( "audio" ), AudioTab( sheet ), "icon16/sound.png" )
+end
 "#;
 
 /// Where the previews of workshop items are kept, in openGMOD's folder: the menu's page
@@ -461,6 +632,15 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
             "quit" | "quitnoconfirm" => "quit",
             "disconnect" | "engine disconnect" => "disconnect",
             "resumegame" => "resume",
+            // the options window, the menu's own
+            "openoptionsdialog" => {
+                if let Ok(options) = a.lua.globals().raw_get::<Table>("OpenGMODOptions")
+                    && let Ok(open) = options.raw_get::<mlua::Function>("Open")
+                {
+                    let _ = crate::files::call_reporting(a.lua, open, MultiValue::new());
+                }
+                return Ok(Value::Nil);
+            }
             _ => {
                 host(a.lua).print(&format!("{command} is not in openGMOD yet\n"));
                 return Ok(Value::Nil);
@@ -487,6 +667,51 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     })?;
     // the console window's side of the program: what is typed into it goes to the program
     let opengmod = library(lua, "OpenGMOD")?;
+    // the options window's: the player's settings and key bindings
+    def(lua, &opengmod, "GetSetting", |a| {
+        let name = a.string(1)?.to_ascii_lowercase();
+        let value = host(a.lua).menu.settings.borrow().get(&name).cloned();
+        Ok(match value {
+            Some(value) => Value::String(a.lua.create_string(value)?),
+            None => Value::Nil,
+        })
+    })?;
+    def(lua, &opengmod, "SetSetting", |a| {
+        let name = a.string(1)?.to_ascii_lowercase();
+        let value = match a.get(2) {
+            Some(Value::Boolean(b)) => if *b { "1" } else { "0" }.to_string(),
+            Some(Value::Number(n)) if n.fract() == 0.0 && n.abs() < 1e15 => (*n as i64).to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::Integer(n)) => n.to_string(),
+            _ => a.string(2)?,
+        };
+        let menu = &host(a.lua).menu;
+        menu.settings.borrow_mut().insert(name.clone(), value.clone());
+        menu.setting_changes.borrow_mut().push(SettingChange::Value(name, value));
+        Ok(Value::Nil)
+    })?;
+    // the keys that do a command, in the order they were bound
+    def(lua, &opengmod, "GetBindKeys", |a| {
+        let command = a.string(1)?;
+        let keys: Vec<String> =
+            host(a.lua).menu.binds.borrow().iter().filter(|(_, c)| c.eq_ignore_ascii_case(&command)).map(|(k, _)| k.clone()).collect();
+        Ok(Value::Table(a.lua.create_sequence_from(keys)?))
+    })?;
+    // a key does a command from now on (nil: nothing)
+    def(lua, &opengmod, "BindKey", |a| {
+        let key = a.string(1)?.to_lowercase();
+        let command = a.opt_string(2)?.filter(|c| !c.is_empty());
+        let menu = &host(a.lua).menu;
+        {
+            let mut binds = menu.binds.borrow_mut();
+            binds.retain(|(k, _)| *k != key);
+            if let Some(command) = &command {
+                binds.push((key.clone(), command.clone()));
+            }
+        }
+        menu.setting_changes.borrow_mut().push(SettingChange::Bind(key, command));
+        Ok(Value::Nil)
+    })?;
     def(lua, &opengmod, "ConsoleCommand", |a| {
         let line = a.string(1)?;
         host(a.lua).menu.console_typed.borrow_mut().push(line);
@@ -607,6 +832,18 @@ impl crate::Runtime {
     /// Whether the console window shows.
     pub fn console_shown(&self) -> bool {
         self.console_call("IsOpen", ()).and_then(|v| v.into_iter().next()).is_some_and(|v| matches!(v, Value::Boolean(true)))
+    }
+
+    /// The player's settings and key bindings, for the options window.
+    pub fn set_settings(&self, values: std::collections::BTreeMap<String, String>, binds: Vec<(String, String)>) {
+        let menu = &host(&self.lua).menu;
+        *menu.settings.borrow_mut() = values;
+        *menu.binds.borrow_mut() = binds;
+    }
+
+    /// What the options window changed since the last call, in order.
+    pub fn take_setting_changes(&self) -> Vec<SettingChange> {
+        std::mem::take(&mut *host(&self.lua).menu.setting_changes.borrow_mut())
     }
 
     /// The lines typed into the console window since the last call, oldest first.

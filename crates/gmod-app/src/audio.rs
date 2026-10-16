@@ -39,6 +39,13 @@ fn array(v: Vector) -> [f32; 3] {
 }
 
 impl Audio {
+    /// How loud everything is (`volume`), 0 to 1.
+    pub fn set_master(&mut self, volume: f32) {
+        if let Ok(mut mixer) = self.mixer.lock() {
+            mixer.master = volume.clamp(0.0, 1.0);
+        }
+    }
+
     /// The game's files changed (an addon came or went): the sounds that were not there are
     /// looked for again.
     pub fn forget_missing(&mut self) {

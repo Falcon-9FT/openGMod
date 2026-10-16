@@ -51,7 +51,7 @@ pub(crate) struct Client {
     /// `gui.EnableScreenClicker`: the cursor is free over the game.
     pub screen_clicker: Cell<bool>,
     /// Key name (lower case) to command, as `cfg/config_default.cfg` binds them.
-    binds: RefCell<Vec<(String, String)>>,
+    pub(crate) binds: RefCell<Vec<(String, String)>>,
     phrases: RefCell<HashMap<String, String>>,
     /// Console lines for the server.
     pub to_server: RefCell<Vec<String>>,

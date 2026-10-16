@@ -50,6 +50,7 @@ mod keys;
 mod menu;
 mod proto;
 mod server;
+mod settings;
 mod walk;
 
 use game::{Buttons, Game, Models};
@@ -110,8 +111,6 @@ CONTROLS:
     joins a server, disconnect leaves it, lua_run_cl runs Lua in your client and lua_run_menu
     in the main menu.";
 
-/// Degrees the view turns per pixel the mouse moves.
-const MOUSE_DEGREES: f32 = 0.12;
 /// Units a second flying; Shift makes it four times as much.
 const SPEED: f32 = 400.0;
 /// The game's field of view, across a 4:3 picture.
@@ -552,8 +551,11 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new(event_loop: &ActiveEventLoop, title: &str) -> Result<Gpu, String> {
-        let attributes = Window::default_attributes().with_title(title).with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+    fn new(event_loop: &ActiveEventLoop, title: &str, vsync: bool, fullscreen: bool) -> Result<Gpu, String> {
+        let attributes = Window::default_attributes()
+            .with_title(title)
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+            .with_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
         let window = Arc::new(event_loop.create_window(attributes).map_err(|e| format!("window: {e}"))?);
         let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle()));
         let backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
@@ -589,7 +591,7 @@ impl Gpu {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync },
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![view_format],
@@ -626,6 +628,12 @@ impl Gpu {
         }
         self.renderer = Some(renderer);
         self.map_started = Instant::now();
+    }
+
+    /// Waits for the screen to show each frame, or not (`mat_vsync`).
+    fn set_vsync(&mut self, vsync: bool) {
+        self.config.present_mode = if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+        self.surface.configure(&self.device, &self.config);
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -924,6 +932,8 @@ struct App {
     setup: Setup,
     menu: Option<menu::Menu>,
     menu_open: bool,
+    /// The player's settings and key bindings.
+    config: settings::Config,
     /// The console window opened the main menu over the game: it closes it again.
     console_menu: bool,
     /// How much of what the console said the console window has.
@@ -1000,29 +1010,102 @@ impl App {
 
     /// The keys that move a walking player.
     fn movement_keys(&self) -> Keys {
-        let held = |key: KeyCode| self.keys.contains(&key);
         Keys {
-            forward: held(KeyCode::KeyW),
-            back: held(KeyCode::KeyS),
-            left: held(KeyCode::KeyA),
-            right: held(KeyCode::KeyD),
-            jump: held(KeyCode::Space),
-            duck: held(KeyCode::ControlLeft) || held(KeyCode::ControlRight),
-            run: held(KeyCode::ShiftLeft) || held(KeyCode::ShiftRight),
+            forward: self.bound("+forward"),
+            back: self.bound("+back"),
+            left: self.bound("+moveleft"),
+            right: self.bound("+moveright"),
+            jump: self.bound("+jump"),
+            duck: self.bound("+duck"),
+            run: self.bound("+speed"),
         }
     }
 
     /// The buttons held besides the walking keys.
     fn buttons(&self) -> Buttons {
-        let held = |key: KeyCode| self.keys.contains(&key);
         Buttons {
-            attack: self.mouse[0],
-            attack2: self.mouse[1],
-            reload: held(KeyCode::KeyR),
-            using: held(KeyCode::KeyE),
-            walk: held(KeyCode::AltLeft) || held(KeyCode::AltRight),
+            attack: self.bound("+attack"),
+            attack2: self.bound("+attack2"),
+            reload: self.bound("+reload"),
+            using: self.bound("+use"),
+            walk: self.bound("+walk"),
             ..Buttons::default()
         }
+    }
+
+    /// Whether a key or mouse button held does `command` (`+forward`), as the player bound them.
+    fn bound(&self, command: &str) -> bool {
+        let does = |name: &str| self.config.command(name).is_some_and(|c| c.eq_ignore_ascii_case(command));
+        self.keys.iter().filter_map(|&key| key_name(key)).any(does)
+            || (self.mouse[0] && does("mouse1"))
+            || (self.mouse[1] && does("mouse2"))
+    }
+
+    /// Whether a key does `command`, as the player bound it.
+    fn key_does(&self, key: KeyCode, command: &str) -> bool {
+        key_name(key).and_then(|name| self.config.command(name)).is_some_and(|c| c.eq_ignore_ascii_case(command))
+    }
+
+    /// A setting changed, or a game came: what it is for follows it.
+    fn apply_setting(&mut self, name: &str) {
+        let value = self.config.value(name).to_string();
+        match name {
+            "volume" => {
+                if let Some(audio) = &mut self.audio {
+                    audio.set_master(value.parse().unwrap_or(1.0));
+                }
+            }
+            "mat_vsync" => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.set_vsync(value != "0");
+                }
+            }
+            "opengmod_fullscreen" => {
+                if let Some(gpu) = &self.gpu {
+                    gpu.window.set_fullscreen((value != "0").then_some(Fullscreen::Borderless(None)));
+                }
+            }
+            _ => {}
+        }
+        if settings::CLIENT_CONVARS.contains(&name)
+            && let Some(game) = &self.game
+        {
+            game.client().set_convar(name, &value);
+        }
+    }
+
+    /// A game came: the player's settings and key bindings are its client's.
+    fn apply_to_game(&mut self) {
+        for name in settings::CLIENT_CONVARS {
+            self.apply_setting(name);
+        }
+        if let Some(game) = &self.game {
+            game.client().set_binds(self.config.binds().to_vec());
+        }
+    }
+
+    /// What the options window changed: kept, and followed at once.
+    fn apply_setting_changes(&mut self, changes: Vec<gmod_lua::SettingChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut rebound = false;
+        for change in changes {
+            match change {
+                gmod_lua::SettingChange::Value(name, value) => {
+                    self.config.set(&name, &value);
+                    self.apply_setting(&name);
+                }
+                gmod_lua::SettingChange::Bind(key, command) => {
+                    self.config.bind(&key, command.as_deref());
+                    rebound = true;
+                }
+            }
+        }
+        if rebound && let Some(game) = &self.game {
+            game.client().set_binds(self.config.binds().to_vec());
+        }
+        self.config.save();
     }
 
     /// Moves the camera by the keys held, for the time since the last frame: the game runs
@@ -1253,6 +1336,7 @@ impl App {
         self.game = game;
         self.models = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone()).with_brushes(loaded.brushes));
         self.audio = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| audio::Audio::new(vfs.clone()));
+        self.apply_to_game();
         self.collision = Some(loaded.collision);
         self.light = Some(loaded.light);
         self.lit.clear();
@@ -1423,6 +1507,7 @@ impl App {
             }
         }
         let addons_changed = menu.runtime().take_addon_changes();
+        let setting_changes = menu.runtime().take_setting_changes();
         if let Some(addons) = &addons_changed {
             self.setup.disabled = addons.iter().filter(|a| !a.mounted).map(menu::addon_key).collect();
             let on = addons.iter().filter(|a| a.mounted).count();
@@ -1470,6 +1555,7 @@ impl App {
         if addons_changed.is_some() {
             self.sync_addons();
         }
+        self.apply_setting_changes(setting_changes);
     }
 
     /// The game's menus show the cursor or hide it again: the mouse is let go and taken back.
@@ -1606,15 +1692,19 @@ impl App {
 
     /// A key pressed while the game runs: what the game binds to it. Whether it was one.
     fn game_key(&mut self, key: KeyCode) -> bool {
+        let Some(command) = key_name(key).and_then(|name| self.config.command(name)).map(str::to_lowercase) else { return false };
         let Some(game) = &mut self.game else { return false };
-        let slot = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6]
-            .iter()
-            .position(|&k| k == key);
-        match (key, slot) {
-            (_, Some(slot)) => game.choose_weapon(Choose::Slot(slot as i64)),
-            (KeyCode::KeyV, _) => game.command("noclip"),
-            (KeyCode::KeyZ, _) => game.command("gmod_undo"),
-            (KeyCode::KeyF, _) => game.flashlight(),
+        let words: Vec<&str> = command.split_whitespace().collect();
+        match words.as_slice() {
+            // slot1 the first, slot0 the tenth
+            [slot] if slot.starts_with("slot") && slot[4..].parse::<i64>().is_ok() => {
+                let n: i64 = slot[4..].parse().unwrap_or(1);
+                game.choose_weapon(Choose::Slot(if n == 0 { 9 } else { n - 1 }));
+            }
+            ["invnext"] => game.choose_weapon(Choose::Next),
+            ["invprev"] => game.choose_weapon(Choose::Previous),
+            ["impulse", "100"] => game.flashlight(),
+            ["noclip" | "gmod_undo" | "lastinv" | "kill" | "undo"] => game.command(&command),
             _ => return false,
         }
         true
@@ -1622,7 +1712,7 @@ impl App {
 
     /// Flies the camera by the keys held, through walls.
     fn fly(&mut self, seconds: f32) {
-        let held = |key: KeyCode| self.keys.contains(&key);
+        let keys = self.movement_keys();
         let forward = self.camera.forward();
         let right = self.camera.right();
         let mut step = [0.0f32; 3];
@@ -1631,10 +1721,10 @@ impl App {
                 *s += d * amount;
             }
         };
-        push(forward, f32::from(held(KeyCode::KeyW)) - f32::from(held(KeyCode::KeyS)));
-        push(right, f32::from(held(KeyCode::KeyD)) - f32::from(held(KeyCode::KeyA)));
-        push([0.0, 0.0, 1.0], f32::from(held(KeyCode::Space)) - f32::from(held(KeyCode::ControlLeft) || held(KeyCode::ControlRight)));
-        let fast = if held(KeyCode::ShiftLeft) || held(KeyCode::ShiftRight) { 4.0 } else { 1.0 };
+        push(forward, f32::from(keys.forward) - f32::from(keys.back));
+        push(right, f32::from(keys.right) - f32::from(keys.left));
+        push([0.0, 0.0, 1.0], f32::from(keys.jump) - f32::from(keys.duck));
+        let fast = if keys.run { 4.0 } else { 1.0 };
         for (eye, s) in self.camera.eye.iter_mut().zip(step) {
             *eye += s * SPEED * fast * seconds;
         }
@@ -1722,7 +1812,8 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        match Gpu::new(event_loop, &format!("openGMOD - {}", self.name)) {
+        let (vsync, fullscreen) = (self.config.number("mat_vsync", 1.0) != 0.0, self.config.number("opengmod_fullscreen", 0.0) != 0.0);
+        match Gpu::new(event_loop, &format!("openGMOD - {}", self.name), vsync, fullscreen) {
             Ok(mut gpu) => {
                 if let Some(world) = self.world.take() {
                     gpu.set_world(Some(&world));
@@ -1837,7 +1928,10 @@ impl ApplicationHandler for App {
                     return;
                 }
                 // `: the console window, over the main menu as GMod opens it, and away again
-                if key == KeyCode::Backquote && self.menu.is_some() && !self.game.as_ref().is_some_and(Game::chat_open) {
+                if (key == KeyCode::Backquote || self.key_does(key, "toggleconsole"))
+                    && self.menu.is_some()
+                    && !self.game.as_ref().is_some_and(Game::chat_open)
+                {
                     if pressed && !repeat {
                         self.toggle_console();
                     }
@@ -1878,12 +1972,18 @@ impl ApplicationHandler for App {
                     match key {
                         KeyCode::Escape => self.capture(false),
                         _ if !repeat && self.game_key(key) => {}
-                        KeyCode::KeyV if !repeat => self.toggle_noclip(),
+                        _ if !repeat && self.key_does(key, "noclip") => self.toggle_noclip(),
+                        _ if !repeat && (self.key_does(key, "jpeg") || self.key_does(key, "screenshot")) => self.screenshot = true,
                         KeyCode::F12 if !repeat => self.screenshot = true,
                         KeyCode::F11 if !repeat => {
                             if let Some(gpu) = &self.gpu {
                                 let full = gpu.window.fullscreen().is_some();
                                 gpu.window.set_fullscreen(if full { None } else { Some(Fullscreen::Borderless(None)) });
+                                self.config.set("opengmod_fullscreen", if full { "0" } else { "1" });
+                                self.config.save();
+                                if let Some(menu) = &self.menu {
+                                    menu.runtime().set_settings(self.config.values(), self.config.binds().to_vec());
+                                }
                             }
                         }
                         _ => {}
@@ -1901,6 +2001,15 @@ impl ApplicationHandler for App {
                     self.begin_loading(Loadable::Server(address));
                 }
                 self.poll_loading();
+                // fps_max: no more frames a second than the player wants
+                let fps_max = self.config.number("fps_max", 0.0);
+                if fps_max >= 10.0 {
+                    let frame = Duration::from_secs_f32(1.0 / fps_max);
+                    let spent = self.last_frame.elapsed();
+                    if spent < frame {
+                        std::thread::sleep(frame - spent);
+                    }
+                }
                 let now = Instant::now();
                 let seconds = (now - self.last_frame).as_secs_f32().min(0.25);
                 self.last_frame = now;
@@ -1951,9 +2060,12 @@ impl ApplicationHandler for App {
         {
             self.mouse_moved = [self.mouse_moved[0] + dx, self.mouse_moved[1] + dy];
             // E with the physics gun holding something: the mouse turns that, not the view
-            if !(self.holding && self.keys.contains(&KeyCode::KeyE)) {
-                self.camera.yaw -= dx as f32 * MOUSE_DEGREES;
-                self.camera.pitch = (self.camera.pitch + dy as f32 * MOUSE_DEGREES).clamp(-89.0, 89.0);
+            if !(self.holding && self.bound("+use")) {
+                // degrees a count, as the engine has them: sensitivity by m_yaw and m_pitch
+                let sensitivity = self.config.number("sensitivity", 3.0);
+                let (yaw, pitch) = (sensitivity * self.config.number("m_yaw", 0.022), sensitivity * self.config.number("m_pitch", 0.022));
+                self.camera.yaw -= dx as f32 * yaw;
+                self.camera.pitch = (self.camera.pitch + dy as f32 * pitch).clamp(-89.0, 89.0);
             }
         }
     }
@@ -1989,6 +2101,11 @@ fn mouse_code(button: MouseButton) -> Option<i32> {
         MouseButton::Forward => MOUSE_LEFT + 4,
         MouseButton::Other(_) => return None,
     })
+}
+
+/// The engine's name of a key of the keyboard (`w`, `SPACE`), as binds name it.
+fn key_name(key: KeyCode) -> Option<&'static str> {
+    gmod_key(key).and_then(gmod_lua::client::key_name)
 }
 
 /// The game's number of a key (`KEY_*`), by where it is on the keyboard.
@@ -2177,7 +2294,12 @@ fn main() -> ExitCode {
     // draw as fast as the screen takes it
     event_loop.set_control_flow(ControlFlow::Poll);
     let now = Instant::now();
+    let config = settings::Config::load(Install::locate(setup.gmod.as_deref()).ok().map(|install| install.game_dir()).as_deref());
+    if let Some(menu) = &main_menu {
+        menu.runtime().set_settings(config.values(), config.binds().to_vec());
+    }
     let mut app = App {
+        config,
         world: None,
         collision: None,
         models: None,
