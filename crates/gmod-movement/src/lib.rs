@@ -23,10 +23,10 @@
 //!   moves or where the ladder was - there is no gravity either: the player hangs on it, and
 //!   moves at 200 units a second where they look, what goes into the ladder turned upward (so
 //!   looking down and walking at it goes down). Jump pushes them off it.
-//! * Noclip ([`Player::noclip`]) flies where the player looks, through everything: the
-//!   speed builds up by `noclip_accelerate` toward `noclip_speed` times the player's speed and
-//!   bleeds off by friction, never by less than a quarter of that top speed a second times
-//!   the friction, so that letting go stops the player quickly.
+//! * Noclip ([`Player::noclip`]) flies through everything as GMod's does: where the keys say
+//!   (forward along the look, up and down included, sideways, and up with jump) at once at
+//!   `noclip_speed` hundred units a second, three times that running, a tenth ducked; letting
+//!   go stops at once.
 //!
 //! Not yet: ladders of HL2 that are used (`func_useableladder`), ground that moves, the push
 //! of conveyors and triggers, jumping out of water onto a ledge.
@@ -68,6 +68,12 @@ pub mod buttons {
     /// Run (`+speed`).
     pub const SPEED: u32 = 131072;
 }
+
+/// Noclip's speed: `sv_noclipspeed` this many units a second; running and ducked, so many
+/// times that.
+const NOCLIP_UNIT: f32 = 100.0;
+const NOCLIP_RUN: f32 = 3.0;
+const NOCLIP_DUCK: f32 = 0.1;
 
 /// How fast a player climbs a ladder, and how hard jumping pushes them off it.
 const CLIMB_SPEED: f32 = 200.0;
@@ -130,8 +136,8 @@ pub struct Settings {
     /// The eyes over the feet, standing and ducked.
     pub view_height: f32,
     pub duck_view_height: f32,
-    /// Noclip goes this many times the player's speed (`sv_noclipspeed`), speeding up by
-    /// `sv_noclipaccelerate`.
+    /// Noclip flies this many hundred units a second (`sv_noclipspeed`); GMod's noclip does
+    /// not speed up, so `sv_noclipaccelerate` is kept but goes unused.
     pub noclip_speed: f32,
     pub noclip_accelerate: f32,
 }
@@ -347,26 +353,42 @@ impl Player {
         }
     }
 
-    /// One tick of noclip: flying where the player looks, up and down included, through
-    /// everything and without gravity. Running (`+speed`) flies at the running speed.
+    /// One tick of noclip, as GMod flies (measured there): through everything, without
+    /// gravity or speeding up - forward along the look, sideways, and up with jump, each key
+    /// a whole step whatever its amount, at `sv_noclipspeed` hundred units a second; three
+    /// times as fast running, a tenth ducked.
     pub fn noclip(&mut self, settings: &Settings, command: &Command, seconds: f32) {
         self.buttons = command.buttons;
         self.on_ground = false;
         self.ladder = None;
         let [pitch, yaw, _] = command.angles.map(f32::to_radians);
         let ((sp, cp), (sy, cy)) = (pitch.sin_cos(), yaw.sin_cos());
-        let wish = add(scale([cp * cy, cp * sy, -sp], command.forward_move), scale([sy, -cy, 0.0], command.side_move));
-        let top = if command.buttons & buttons::SPEED != 0 { settings.run_speed } else { settings.walk_speed } * settings.noclip_speed;
+        let step = |amount: f32| {
+            if amount > 0.0 {
+                1.0
+            } else if amount < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        };
+        let up = if command.buttons & buttons::JUMP != 0 { 1.0 } else { 0.0 };
+        let wish = add(
+            add(scale([cp * cy, cp * sy, -sp], step(command.forward_move)), scale([sy, -cy, 0.0], step(command.side_move))),
+            [0.0, 0.0, up],
+        );
         let len = length(wish);
-        let (direction, wanted) = if len > 0.0 { (scale(wish, 1.0 / len), len.min(top)) } else { ([0.0; 3], 0.0) };
-        self.accelerate(direction, wanted, settings.noclip_accelerate, seconds);
-        let speed = length(self.velocity);
-        if speed < 1.0 {
+        if len < 1e-6 {
             self.velocity = [0.0; 3];
             return;
         }
-        let slower = (speed - speed.max(top / 4.0) * settings.friction * seconds).max(0.0);
-        self.velocity = scale(self.velocity, slower / speed);
+        let mut speed = settings.noclip_speed * NOCLIP_UNIT;
+        if command.buttons & buttons::SPEED != 0 {
+            speed *= NOCLIP_RUN;
+        } else if command.buttons & buttons::DUCK != 0 {
+            speed *= NOCLIP_DUCK;
+        }
+        self.velocity = scale(wish, speed / len);
         self.origin = add(self.origin, scale(self.velocity, seconds));
     }
 

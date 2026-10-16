@@ -750,20 +750,28 @@ fn remove(lua: &Lua, h: PanelHandle) {
     }
 }
 
-/// Deletes a panel and those in it: `OnRemove` runs for each.
+/// Deletes a panel and those in it: `OnRemove` runs for each. Its parent hears of it
+/// (`OnChildRemoved`) unless the parent goes too: a tree that goes does not lay itself out
+/// again around what is already gone.
 fn delete(lua: &Lua, h: PanelHandle) {
+    delete_in(lua, h, false);
+}
+
+fn delete_in(lua: &Lua, h: PanelHandle, parent_goes: bool) {
     let panels = &host(lua).panels;
     if !panels.is_valid(h) {
         return;
     }
     call(lua, h, "OnRemove", ());
     for child in panels.children(h) {
-        delete(lua, child);
+        delete_in(lua, child, true);
     }
     if let Some(parent) = panels.parent(h) {
         panels.detach(h);
         panels.with(parent, |n| n.dirty = true);
-        if hears_children(lua, parent)
+        let going = parent_goes || panels.get(parent, |n| n.removing).unwrap_or(true);
+        if !going
+            && hears_children(lua, parent)
             && let Ok(child) = push(lua, h)
         {
             call(lua, parent, "OnChildRemoved", child);

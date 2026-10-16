@@ -25,6 +25,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cl_showfps", "0"),
     ("crosshair", "1"),
     ("r_drawviewmodel", "1"),
+    // the language of the game and its menu (the main menu's flag chooses it)
+    ("gmod_language", "en"),
     // the options dialog's, as GameUI's pages have them
     ("cl_downloadfilter", "all"),
     ("cl_enable_loadingurl", "1"),
@@ -81,6 +83,7 @@ pub const CLIENT_CONVARS: &[&str] = &[
     "r_drawviewmodel",
     "snd_musicvolume",
     "volume",
+    "gmod_language",
 ];
 
 /// The player's settings and key bindings.
@@ -127,7 +130,21 @@ impl Config {
         let path = gmod_fs::UserDir::default_root().map(|root| root.join("cfg").join("config.cfg"));
         let mut config = Config { path: path.clone(), ..Config::defaults() };
         match path.as_deref().and_then(|p| std::fs::read(p).ok()) {
-            Some(kept) => config.read(&String::from_utf8_lossy(&kept)),
+            Some(kept) => {
+                let kept = String::from_utf8_lossy(&kept).into_owned();
+                config.read(&kept);
+                // settings openGMOD did not keep yet (they came later): as Garry's Mod has them
+                let mut gmod = Config::defaults();
+                for file in ["cfg/config_default.cfg", "cfg/config.cfg"] {
+                    if let Some(text) = game_dir.and_then(|dir| std::fs::read(dir.join(file)).ok()) {
+                        gmod.read(&String::from_utf8_lossy(&text));
+                    }
+                }
+                let mentioned = |name: &str| kept.lines().any(|l| words(l).first().is_some_and(|w| w.eq_ignore_ascii_case(name)));
+                for (name, _) in DEFAULTS.iter().filter(|(name, _)| !mentioned(name)) {
+                    config.set(name, gmod.value(name));
+                }
+            }
             None => {
                 config.read(DEFAULT_BINDS);
                 for file in ["cfg/config_default.cfg", "cfg/config.cfg"] {

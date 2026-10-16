@@ -1129,6 +1129,7 @@ dependencies = [
  "gmod-ui",
  "mlua",
  "postcard",
+ "ring",
  "rusqlite",
  "serde",
  "ureq",

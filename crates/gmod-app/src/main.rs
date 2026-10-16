@@ -1074,6 +1074,12 @@ impl App {
                     let _ = gpu.window.request_inner_size(winit::dpi::PhysicalSize::new(w.max(320), h.max(240)));
                 }
             }
+            // the menu speaks it too
+            "gmod_language" => {
+                if let Some(menu) = &self.menu {
+                    menu.runtime().set_convar(name, &value);
+                }
+            }
             _ => {}
         }
         if settings::CLIENT_CONVARS.contains(&name)
@@ -2319,6 +2325,7 @@ fn main() -> ExitCode {
     let config = settings::Config::load(Install::locate(setup.gmod.as_deref()).ok().map(|install| install.game_dir()).as_deref());
     if let Some(menu) = &main_menu {
         menu.runtime().set_settings(config.values(), config.binds().to_vec());
+        menu.runtime().set_convar("gmod_language", config.value("gmod_language"));
     }
     let mut app = App {
         config,

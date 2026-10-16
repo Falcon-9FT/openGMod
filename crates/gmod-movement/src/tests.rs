@@ -338,22 +338,26 @@ fn noclip_flies_through_walls_where_the_player_looks() {
     let world = world(vec![TestBrush::cuboid([100.0, -100.0, 0.0], [132.0, 100.0, 300.0])], Vec::new());
     let mut player = standing(&world, [0.0; 3]);
     let s = Settings::default();
-    // looking 45° up: up and forward alike, through the wall; speeding up by 5 × (5 × 200) a
-    // second against friction 8, the speed settles where a tick's gain (75) is what friction
-    // takes of the speed after it: v = 0.88 × (v + 75), 550
+    // looking 45° up: up and forward alike, through the wall, at once at 5 × 100 (as GMod)
     let up = Command { angles: [-45.0, 0.0, 0.0], ..forward(0) };
+    player.noclip(&s, &up, TICK);
+    let speed = |p: &Player| horizontal(p.velocity).hypot(p.velocity[2]);
+    assert!((speed(&player) - 500.0).abs() < 0.01, "{player:?}");
     for _ in 0..(2.0 / TICK) as usize {
         player.noclip(&s, &up, TICK);
     }
-    let speed = horizontal(player.velocity).hypot(player.velocity[2]);
-    assert!((speed - 550.0).abs() < 1.0, "{player:?}");
     assert!(player.origin[0] > 300.0 && (player.origin[0] - player.origin[2]).abs() < 1.0, "{player:?}");
     assert!(!player.on_ground);
-    // let go: stopped within half a second, no gravity
+    // running three times as fast, ducked a tenth; jump goes up
+    player.noclip(&s, &Command { buttons: buttons::SPEED, ..up }, TICK);
+    assert!((speed(&player) - 1500.0).abs() < 0.01);
+    player.noclip(&s, &Command { buttons: buttons::DUCK, ..up }, TICK);
+    assert!((speed(&player) - 50.0).abs() < 0.01);
+    player.noclip(&s, &Command { buttons: buttons::JUMP, ..Command::default() }, TICK);
+    assert_eq!(player.velocity, [0.0, 0.0, 500.0]);
+    // let go: stopped at once, no gravity
     let z = player.origin[2];
-    for _ in 0..(0.5 / TICK) as usize {
-        player.noclip(&s, &Command::default(), TICK);
-    }
+    player.noclip(&s, &Command::default(), TICK);
     assert_eq!(player.velocity, [0.0; 3]);
-    assert!(player.origin[2] > z, "it slows, it does not fall");
+    assert_eq!(player.origin[2], z);
 }

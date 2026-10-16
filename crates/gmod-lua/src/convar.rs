@@ -237,9 +237,18 @@ fn set(lua: &Lua, handle: ConVarHandle, value: &str) {
         if user_info {
             send_user_info(lua, &name, &new);
         }
-        // another language: its phrases from now on
+        // another language: its phrases from now on; the menu keeps it as the player's and
+        // tells its page (`LanguageChanged`), as the engine does
         if name.eq_ignore_ascii_case("gmod_language") && host(lua).realm != crate::Realm::Server {
             crate::client::load_phrases(lua);
+            if host(lua).realm == crate::Realm::Menu {
+                host(lua).menu.setting_changes.borrow_mut().push(crate::menu::SettingChange::Value("gmod_language".into(), new.clone()));
+                if let (Ok(Some(changed)), Ok(language)) =
+                    (lua.globals().get::<Option<mlua::Function>>("LanguageChanged"), lua.create_string(&new))
+                {
+                    let _ = files::call_reporting(lua, changed, mlua::MultiValue::from_iter([mlua::Value::String(language)]));
+                }
+            }
         }
         let callback = || -> mlua::Result<Option<mlua::Function>> {
             let Some(cvars) = lua.globals().get::<Option<Table>>("cvars")? else { return Ok(None) };
