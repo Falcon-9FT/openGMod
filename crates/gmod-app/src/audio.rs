@@ -51,7 +51,7 @@ impl Audio {
         {
             match output::open() {
                 Ok((mixer, stream)) => return Audio::with(vfs, mixer, Some(stream)),
-                Err(e) => println!("No sound: {e}"),
+                Err(e) => say!("No sound: {e}"),
             }
             Audio::with(vfs, Arc::new(Mutex::new(Mixer::new(48_000))), None)
         }
@@ -82,7 +82,7 @@ impl Audio {
             Ok(data) => match gmod_audio::decode(&data, &extension) {
                 Ok(clip) => Some(Arc::new(clip)),
                 Err(e) => {
-                    println!("{path}: {e}");
+                    say!("{path}: {e}");
                     None
                 }
             },
@@ -229,7 +229,7 @@ mod output {
                         }
                     }
                 },
-                |e| eprintln!("Sound: {e}"),
+                |e| say_error!("Sound: {e}"),
                 None,
             )
             .map_err(|e| e.to_string())

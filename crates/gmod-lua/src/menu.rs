@@ -56,6 +56,8 @@ pub(crate) struct Menu {
     pub addons: RefCell<Vec<Addon>>,
     /// `steamworks.ApplyAddons` was called since the program last looked.
     pub applied: Cell<bool>,
+    /// The lines typed into the console window, for the program to run.
+    pub console_typed: RefCell<Vec<String>>,
     pub games: RefCell<Vec<MountableGame>>,
     pub in_game: Cell<bool>,
     /// Addons were not mounted at all (`-noaddons`), workshop ones were not (`-noworkshop`).
@@ -251,6 +253,112 @@ end
 function permissions.AskToConnect( address )
 	if ( RequestConnectToServer ) then RequestConnectToServer( address ) end
 end
+
+-- the console (`): what the game, its Lua and the program said, and a line to type commands
+-- into, as the engine's own window; made the first time it opens, what came before kept
+OpenGMODConsole = OpenGMODConsole or { pending = {} }
+local Console = OpenGMODConsole
+
+local function MakeConsole()
+	surface.CreateFont( "OpenGMODConsole", { font = "Lucida Console", size = 13, weight = 400, antialias = true } )
+	local frame = vgui.Create( "DFrame" )
+	frame:SetTitle( "Console" )
+	frame:SetSize( math.min( ScrW() - 40, 900 ), math.min( ScrH() - 40, 560 ) )
+	frame:Center()
+	frame:SetSizable( true )
+	frame:SetScreenLock( true )
+	frame:SetDeleteOnClose( false )
+	frame:SetMinWidth( 300 )
+	frame:SetMinHeight( 160 )
+	frame.btnMaxim:SetVisible( false )
+	frame.btnMinim:SetVisible( false )
+	-- the main menu comes up with it, over the game: the console stays in front of it
+	local base = vgui.GetControlTable( "DFrame" )
+	frame.Think = function( self )
+		if ( base and base.Think ) then base.Think( self ) end
+		if ( ( self.Fronts or 0 ) > 0 ) then
+			self.Fronts = self.Fronts - 1
+			self:MoveToFront()
+		end
+	end
+
+	local bottom = frame:Add( "Panel" )
+	bottom:Dock( BOTTOM )
+	bottom:SetTall( 22 )
+	bottom:DockMargin( 0, 4, 0, 0 )
+	local submit = bottom:Add( "DButton" )
+	submit:Dock( RIGHT )
+	submit:SetWide( 80 )
+	submit:SetText( "Submit" )
+	local entry = bottom:Add( "DTextEntry" )
+	entry:Dock( FILL )
+	entry:DockMargin( 0, 0, 4, 0 )
+	entry:SetHistoryEnabled( true )
+
+	local back = frame:Add( "DPanel" )
+	back:Dock( FILL )
+	back.Paint = function( self, w, h )
+		surface.SetDrawColor( 24, 24, 24, 240 )
+		surface.DrawRect( 0, 0, w, h )
+	end
+	local log = back:Add( "RichText" )
+	log:Dock( FILL )
+	log:DockMargin( 4, 2, 2, 2 )
+	log.PerformLayout = function( self ) self:SetFontInternal( "OpenGMODConsole" ) end
+
+	local function Run()
+		local line = entry:GetText()
+		entry:SetText( "" )
+		entry:RequestFocus()
+		if ( string.Trim( line ) == "" ) then return end
+		entry:AddHistory( line )
+		Console.Print( "] " .. line .. "\n", 220, 220, 220 )
+		OpenGMOD.ConsoleCommand( line )
+	end
+	entry.OnEnter = Run
+	submit.DoClick = Run
+
+	frame.Log, frame.Entry = log, entry
+	Console.Frame = frame
+	for _, chunk in ipairs( Console.pending ) do
+		log:InsertColorChange( chunk[ 2 ], chunk[ 3 ], chunk[ 4 ], 255 )
+		log:AppendText( chunk[ 1 ] )
+	end
+	Console.pending = {}
+	return frame
+end
+
+function Console.Print( text, r, g, b )
+	text = string.Replace( text, "\t", "    " )
+	local frame = Console.Frame
+	if ( IsValid( frame ) ) then
+		frame.Log:InsertColorChange( r, g, b, 255 )
+		frame.Log:AppendText( text )
+		return
+	end
+	local pending = Console.pending
+	pending[ #pending + 1 ] = { text, r, g, b }
+	if ( #pending > 2000 ) then table.remove( pending, 1 ) end
+end
+
+function Console.Toggle()
+	local frame = Console.Frame
+	if ( !IsValid( frame ) ) then
+		frame = MakeConsole()
+	elseif ( frame:IsVisible() ) then
+		frame:Close()
+		return false
+	end
+	frame:SetVisible( true )
+	frame:MakePopup()
+	frame.Fronts = 5
+	frame.Entry:RequestFocus()
+	return true
+end
+
+function Console.IsOpen()
+	return IsValid( Console.Frame ) and Console.Frame:IsVisible()
+end
 "#;
 
 /// Where the previews of workshop items are kept, in openGMOD's folder: the menu's page
@@ -377,6 +485,14 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         }
         Ok(Value::Nil)
     })?;
+    // the console window's side of the program: what is typed into it goes to the program
+    let opengmod = library(lua, "OpenGMOD")?;
+    def(lua, &opengmod, "ConsoleCommand", |a| {
+        let line = a.string(1)?;
+        host(a.lua).menu.console_typed.borrow_mut().push(line);
+        Ok(Value::Nil)
+    })?;
+
     let gui = library(lua, "gui")?;
     def(lua, &gui, "ShowConsole", nothing)?;
 
@@ -475,6 +591,33 @@ impl crate::Runtime {
     pub fn take_addon_changes(&self) -> Option<Vec<Addon>> {
         let menu = &host(&self.lua).menu;
         menu.applied.replace(false).then(|| menu.addons.borrow().clone())
+    }
+
+    /// What the game said, for the console window (`): text, line breaks included, in a
+    /// colour; kept until the window is first opened.
+    pub fn console_print(&self, text: &str, color: [u8; 3]) {
+        let _ = self.console_call("Print", (text, color[0], color[1], color[2]));
+    }
+
+    /// Opens the console window, or closes it: whether it shows now.
+    pub fn toggle_console(&self) -> bool {
+        self.console_call("Toggle", ()).and_then(|v| v.into_iter().next()).is_some_and(|v| matches!(v, Value::Boolean(true)))
+    }
+
+    /// Whether the console window shows.
+    pub fn console_shown(&self) -> bool {
+        self.console_call("IsOpen", ()).and_then(|v| v.into_iter().next()).is_some_and(|v| matches!(v, Value::Boolean(true)))
+    }
+
+    /// The lines typed into the console window since the last call, oldest first.
+    pub fn take_console_commands(&self) -> Vec<String> {
+        std::mem::take(&mut *host(&self.lua).menu.console_typed.borrow_mut())
+    }
+
+    fn console_call(&self, name: &str, args: impl mlua::IntoLuaMulti) -> Option<MultiValue> {
+        let console: Table = self.lua.globals().raw_get("OpenGMODConsole").ok()?;
+        let f: mlua::Function = console.raw_get(name).ok()?;
+        crate::files::call_reporting(&self.lua, f, args.into_lua_multi(&self.lua).ok()?).ok()
     }
 
     /// No addons were mounted at all (`--no-addons`).

@@ -99,7 +99,7 @@ fn masters_in(folder: Option<&std::path::Path>, more: &[String]) -> Vec<SocketAd
         match resolve_at(name, gmod_net::MASTER_PORT) {
             Some(addr) if !out.contains(&addr) => out.push(addr),
             Some(_) => {}
-            None => eprintln!("master server {name}: no such address"),
+            None => say_error!("master server {name}: no such address"),
         }
     }
     out
@@ -142,7 +142,7 @@ impl Browser {
         let Some(path) = self.file(name) else { return };
         let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, list.join("\n") + "\n"));
         if let Err(e) = saved {
-            eprintln!("{}: {e}", path.display());
+            say_error!("{}: {e}", path.display());
         }
     }
 
@@ -166,7 +166,7 @@ impl Browser {
             match gmod_net::Query::open() {
                 Ok(q) => self.query = Some(q),
                 Err(e) => {
-                    eprintln!("The server browser cannot use the network: {e}");
+                    say_error!("The server browser cannot use the network: {e}");
                     return None;
                 }
             }

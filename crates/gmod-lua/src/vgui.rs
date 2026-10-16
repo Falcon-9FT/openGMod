@@ -170,6 +170,11 @@ struct Node {
     select_all_on_focus: bool,
     runs: Vec<Run>,
     run_color: [u8; 4],
+    /// Lines a rich text is scrolled back from its end (the mouse wheel).
+    scrolled: usize,
+    /// A rich text's lines as last laid out: for the width and the font they were laid out
+    /// for, until its text changes.
+    rich_cache: Option<(i32, gmod_ui::FontId, std::rc::Rc<Vec<RichLine>>)>,
     model: String,
     /// The image of a spawn icon, if the game has one.
     icon: Option<u32>,
@@ -227,6 +232,8 @@ impl Node {
             select_all_on_focus: false,
             runs: Vec::new(),
             run_color: [255; 4],
+            scrolled: 0,
+            rich_cache: None,
             model: String::new(),
             icon: None,
             url: String::new(),
@@ -1168,14 +1175,18 @@ fn draw_entry(lua: &Lua, h: PanelHandle, text_color: [u8; 4], highlight: [u8; 4]
 
 /// The lines of a rich text, wrapped to its width, the last ones showing.
 fn paint_rich(lua: &Lua, h: PanelHandle) {
-    let Some((runs, font, w, hh)) = host(lua).panels.get(h, |n| (n.runs.clone(), n.font.clone(), n.w, n.h)) else { return };
+    let Some((font, w, hh, scrolled)) = host(lua).panels.get(h, |n| (n.font.clone(), n.w, n.h, n.scrolled)) else {
+        return;
+    };
     let Some(font) = font_of(lua, font.as_deref()) else { return };
-    let lines = rich_lines(lua, font, &runs, w - 4);
+    let lines = rich_lines_of(lua, h, font, w - 4);
     let screen = &host(lua).screen;
     let tall = screen.fonts.borrow().tall(font);
     let shown = (hh / tall.max(1)).max(1) as usize;
-    let skip = lines.len().saturating_sub(shown);
-    for (i, line) in lines.iter().skip(skip).enumerate() {
+    // the end, unless the wheel took it back
+    let scrolled = scrolled.min(lines.len().saturating_sub(shown));
+    let skip = lines.len().saturating_sub(shown + scrolled);
+    for (i, line) in lines.iter().skip(skip).take(shown).enumerate() {
         let mut x = 2.0;
         for (text, color) in line {
             x += screen.text(font, x, (i as i32 * tall) as f32, text, *color);
@@ -1184,6 +1195,23 @@ fn paint_rich(lua: &Lua, h: PanelHandle) {
 }
 
 type RichLine = Vec<(String, [u8; 4])>;
+
+/// The most text a rich text keeps, in bytes: the oldest goes first.
+const RICH_TEXT_LIMIT: usize = 64 * 1024;
+
+/// A rich text's lines, laid out once for a width and a font until its text changes: a
+/// console's is long.
+fn rich_lines_of(lua: &Lua, h: PanelHandle, font: gmod_ui::FontId, width: i32) -> std::rc::Rc<Vec<RichLine>> {
+    let cached =
+        host(lua).panels.get(h, |n| n.rich_cache.as_ref().filter(|(w, f, _)| *w == width && *f == font).map(|(_, _, l)| l.clone()));
+    if let Some(Some(lines)) = cached {
+        return lines;
+    }
+    let runs = host(lua).panels.get(h, |n| n.runs.clone()).unwrap_or_default();
+    let lines = std::rc::Rc::new(rich_lines(lua, font, &runs, width));
+    host(lua).panels.with(h, |n| n.rich_cache = Some((width, font, lines.clone())));
+    lines
+}
 
 fn rich_lines(lua: &Lua, font: gmod_ui::FontId, runs: &[Run], width: i32) -> Vec<RichLine> {
     let mut lines: Vec<RichLine> = vec![Vec::new()];
@@ -1327,6 +1355,11 @@ pub(crate) fn mouse_wheel(lua: &Lua, delta: i32) -> bool {
             break;
         }
         if returned_true(&call(lua, h, "OnMouseWheeled", delta)) {
+            return true;
+        }
+        // rich text scrolls back through what it has, three lines a notch
+        if host.panels.get(h, |n| n.class == Class::RichText).unwrap_or(false) {
+            host.panels.with(h, |n| n.scrolled = n.scrolled.saturating_add_signed(delta as isize * 3));
             return true;
         }
         at = host.panels.parent(h);
@@ -1560,8 +1593,8 @@ fn four(a: &Args, position: usize) -> mlua::Result<[i32; 4]> {
 
 /// The size of a label's text, inset included.
 fn content_size(lua: &Lua, h: PanelHandle) -> (i32, i32) {
-    let Some((class, text, font, inset, runs, w, wrapped)) =
-        host(lua).panels.get(h, |n| (n.class, n.text.clone(), n.font.clone(), n.inset, n.runs.clone(), n.w, n.wrap))
+    let Some((class, text, font, inset, w, wrapped)) =
+        host(lua).panels.get(h, |n| (n.class, n.text.clone(), n.font.clone(), n.inset, n.w, n.wrap))
     else {
         return (0, 0);
     };
@@ -1579,7 +1612,7 @@ fn content_size(lua: &Lua, h: PanelHandle) -> (i32, i32) {
         }
         Class::RichText => {
             let tall = host(lua).screen.fonts.borrow().tall(font);
-            (w, rich_lines(lua, font, &runs, w - 4).len() as i32 * tall)
+            (w, rich_lines_of(lua, h, font, w - 4).len() as i32 * tall)
         }
         _ => (0, 0),
     }
@@ -1776,9 +1809,15 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             set_parent(a.lua, h, world);
         }
         {
+            // one that stays at the back (the main menu) goes behind the other popups
+            let back = panels.get(h, |n| n.stay_at_back).unwrap_or(false);
             let mut popups = panels.popups.borrow_mut();
             popups.retain(|p| *p != h);
-            popups.push(h);
+            if back {
+                popups.insert(0, h);
+            } else {
+                popups.push(h);
+            }
         }
         set_focus(a.lua, Some(h));
         Ok(Value::Nil)
@@ -2117,6 +2156,7 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             n.anchor = None;
             if n.class == Class::RichText {
                 n.runs = vec![Run { text: text.clone(), color: n.run_color }];
+                n.rich_cache = None;
             }
             n.text = text;
         })
@@ -2249,11 +2289,10 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     })?;
     def(lua, m, "GetNumLines", |a| {
         let h = this(a)?;
-        let (class, text, font, runs, w) = read(a, |n| (n.class, n.text.clone(), n.font.clone(), n.runs.clone(), n.w))?;
+        let (class, text, font, w) = read(a, |n| (n.class, n.text.clone(), n.font.clone(), n.w))?;
         let Some(font) = font_of(a.lua, font.as_deref()) else { return integer(0) };
-        let _ = h;
         integer(match class {
-            Class::RichText => rich_lines(a.lua, font, &runs, w - 4).len() as i32,
+            Class::RichText => rich_lines_of(a.lua, h, font, w - 4).len() as i32,
             _ => text.split('\n').count() as i32,
         })
     })?;
@@ -2265,9 +2304,15 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             let text = a.opt_string(2)?.unwrap_or_default();
             write(a, |n| {
                 let color = n.run_color;
+                n.rich_cache = None;
                 match n.runs.last_mut() {
                     Some(run) if run.color == color => run.text.push_str(&text),
                     _ => n.runs.push(Run { text, color }),
+                }
+                // what scrolled out long ago goes (a console that ran for hours)
+                let mut total: usize = n.runs.iter().map(|r| r.text.len()).sum();
+                while total > RICH_TEXT_LIMIT && n.runs.len() > 1 {
+                    total -= n.runs.remove(0).text.len();
                 }
             })
         })?;
@@ -2276,6 +2321,7 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
         let text = a.opt_string(2)?.unwrap_or_default();
         write(a, |n| {
             let color = n.run_color;
+            n.rich_cache = None;
             n.runs.push(Run { text, color });
         })
     })?;

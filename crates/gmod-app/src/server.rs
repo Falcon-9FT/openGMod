@@ -9,7 +9,6 @@
 //! ([`ForHost`]): that client is in the same program and sees the server's entities directly.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::SocketAddr;
 
 use std::sync::Arc;
@@ -33,12 +32,16 @@ const ANNOUNCE_EVERY: Duration = Duration::from_secs(60);
 /// in openGMOD's folder.
 pub fn runtime(realm: Realm, vfs: Arc<Vfs>) -> Result<Runtime, String> {
     let runtime = Runtime::new(realm, vfs).map_err(|e| format!("LuaJIT could not be started: {e}"))?;
-    runtime.set_output(|output| match output {
-        Output::Text(text) => {
-            print!("{text}");
-            let _ = std::io::stdout().flush();
-        }
-        Output::Error(error) => eprintln!("{error}"),
+    let error_color = if realm == Realm::Server { crate::console::SERVER_ERROR } else { crate::console::CLIENT_ERROR };
+    runtime.set_output(move |output| match output {
+        Output::Text(text) => crate::console::write(text, crate::console::TEXT),
+        Output::Error(error) => crate::console::write_error(
+            &format!(
+                "{error}
+"
+            ),
+            error_color,
+        ),
     });
     if let Some(dir) = gmod_fs::UserDir::default_root().and_then(|root| gmod_fs::UserDir::open(root, None).ok()) {
         runtime.set_data_dir(dir);
@@ -221,7 +224,7 @@ impl Server {
             if let Some(net) = &mut self.net {
                 for master in &self.masters {
                     if let Err(e) = net.announce(*master) {
-                        eprintln!("master server {master}: {e}");
+                        say_error!("master server {master}: {e}");
                     }
                 }
             }
@@ -304,7 +307,7 @@ impl Server {
         let Some(net) = &mut self.net else { return };
         let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
         let name = clean_name(&hello.name);
-        println!("{name} is connecting from {addr}");
+        say!("{name} is connecting from {addr}");
         self.remotes.push(Remote {
             id,
             addr,
@@ -382,7 +385,7 @@ impl Server {
                         if let Some(remote) = self.remote(client) {
                             remote.player = Some(player);
                         }
-                        println!("{name} joined the game");
+                        say!("{name} joined the game");
                         self.send_to(client, &FromServer::Joined { player }, true);
                     }
                     None => self.drop_client(client, "the server is full"),
@@ -457,7 +460,7 @@ impl Server {
     fn gone(&mut self, client: ClientId, reason: &str) {
         let Some(i) = self.remotes.iter().position(|r| r.id == client) else { return };
         let remote = self.remotes.remove(i);
-        println!("{} left the game ({reason})", remote.name);
+        say!("{} left the game ({reason})", remote.name);
         if let Some(player) = remote.player {
             self.runtime.leave(player);
         }

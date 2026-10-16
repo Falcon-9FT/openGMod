@@ -168,10 +168,10 @@ impl Game {
         if let Some(addr) = listen {
             match server.listen(addr, crate::keys::server_identity()) {
                 Ok(at) => {
-                    println!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port());
+                    say!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port());
                     server.set_masters(crate::browser::masters(&[]));
                 }
-                Err(e) => println!("Others cannot join: {addr}: {e}"),
+                Err(e) => say!("Others cannot join: {addr}: {e}"),
             }
         }
         let player = server.join_host(name, Some(key)).ok_or("no player could join the game")?;
@@ -179,7 +179,7 @@ impl Game {
         client.set_local_player(player);
         client.apply_snapshot(&server.runtime().snapshot());
         let errors = server.runtime().errors().len() + client.errors().len();
-        println!(
+        say!(
             "Lua: {} files, {errors} errors; type commands here (give weapon_crowbar, gm_spawn <model>)",
             server.runtime().files_loaded() + client.files_loaded()
         );
@@ -205,7 +205,7 @@ impl Game {
         let client = client(vfs, map, &welcome.gamemode, welcome.max_players, pages)?;
         let player = connection.join()?;
         client.set_local_player(player);
-        println!("Lua: {} files, {} errors", client.files_loaded(), client.errors().len());
+        say!("Lua: {} files, {} errors", client.files_loaded(), client.errors().len());
         let mut game = Game {
             link: Link::Remote(Box::new(connection)),
             client,
@@ -618,7 +618,7 @@ impl Models {
                     match gmod_world::model(&self.vfs, name, usize::try_from(*skin).unwrap_or(0), *body) {
                         Ok(model) => Some(upload(&model)),
                         Err(e) => {
-                            println!("{name}: {e}");
+                            say!("{name}: {e}");
                             None
                         }
                     }
@@ -648,7 +648,7 @@ fn angle_apart(a: f32, b: f32) -> bool {
 }
 
 /// The lines typed into the terminal since the last call, read on a thread of their own
-/// (started by the first call).
+/// (started by the first call), and into the console window.
 pub fn typed_lines() -> Vec<String> {
     static CONSOLE: OnceLock<Mutex<Receiver<String>>> = OnceLock::new();
     let console = CONSOLE.get_or_init(|| {
@@ -664,7 +664,10 @@ pub fn typed_lines() -> Vec<String> {
         Mutex::new(receive)
     });
     let console = console.lock().unwrap_or_else(|e| e.into_inner());
-    std::iter::from_fn(|| console.try_recv().ok()).collect()
+    let mut lines: Vec<String> = std::iter::from_fn(|| console.try_recv().ok()).collect();
+    // and into the console window
+    lines.extend(crate::console::take_typed());
+    lines
 }
 
 /// The title of the window while the game runs: health and the weapon in hand.

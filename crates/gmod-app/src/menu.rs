@@ -26,7 +26,7 @@ pub fn start_web(vfs: Arc<Vfs>) -> Result<Web, String> {
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    println!("Chromium's log: {}", log.display());
+    say!("Chromium's log: {}", log.display());
     let files: gmod_web::Files = Arc::new(move |host, path| asset(&vfs, host, path));
     Web::start(&root.join("cache").join("chromium"), &log, files)
 }
@@ -164,12 +164,14 @@ impl Menu {
     ) -> Result<Menu, String> {
         let runtime = Runtime::new(Realm::Menu, vfs.clone()).map_err(|e| format!("LuaJIT could not be started: {e}"))?;
         runtime.set_output(|output| match output {
-            Output::Text(text) => {
-                use std::io::Write;
-                print!("{text}");
-                let _ = std::io::stdout().flush();
-            }
-            Output::Error(error) => eprintln!("{error}"),
+            Output::Text(text) => crate::console::write(text, crate::console::TEXT),
+            Output::Error(error) => crate::console::write_error(
+                &format!(
+                    "{error}
+"
+                ),
+                crate::console::MENU_ERROR,
+            ),
         });
         if let Some(dir) = gmod_fs::UserDir::default_root().and_then(|root| gmod_fs::UserDir::open(root, None).ok()) {
             runtime.set_data_dir(dir);
@@ -230,7 +232,7 @@ impl Menu {
             return;
         }
         if let Err(e) = self.runtime.run_string(&format!("RunConsoleCommand( unpack( string.Explode( ' ', {line:?} ) ) )"), "console") {
-            eprintln!("{e}");
+            say_error!("{e}");
         }
     }
 }

@@ -22,11 +22,11 @@ const STEAM_ID64_BASE: u64 = 76561197960265728;
 /// else to servers next time.
 fn identity(file: &str) -> Identity {
     let Some(path) = UserDir::default_root().map(|root| root.join(file)) else {
-        eprintln!("There is no home folder to keep the key in: a new one for this run only");
+        say_error!("There is no home folder to keep the key in: a new one for this run only");
         return Identity::generate();
     };
     Identity::load_or_create(&path).unwrap_or_else(|e| {
-        eprintln!("{}: {e}; a key for this run only", path.display());
+        say_error!("{}: {e}; a key for this run only", path.display());
         Identity::generate()
     })
 }
@@ -107,7 +107,7 @@ impl KnownServers {
             writeln!(file, "{address} {key}")
         })();
         if let Err(e) = saved {
-            eprintln!("{}: {e}", path.display());
+            say_error!("{}: {e}", path.display());
         }
     }
 

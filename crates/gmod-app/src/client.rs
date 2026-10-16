@@ -240,7 +240,7 @@ impl Connection {
             return Ok(Vec::new());
         }
         let bytes: u64 = wanted.iter().map(|f| f.size).sum();
-        println!("Downloading {} files ({:.1} MB) from the server", wanted.len(), bytes as f64 / 1e6);
+        say!("Downloading {} files ({:.1} MB) from the server", wanted.len(), bytes as f64 / 1e6);
         self.send(&ToServer::Want(wanted.iter().map(|f| f.path.clone()).collect()), true);
         let mut files: HashMap<String, Vec<u8>> = HashMap::new();
         let mut wrong = None;
