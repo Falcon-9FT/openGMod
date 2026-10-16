@@ -905,6 +905,19 @@ fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
 /// Loads a map's entities as the server does when the map starts: the world takes the
 /// `worldspawn` key-values, every other entity is made with its key-values, parents are set
 /// (`parentname`), all are spawned, parents before their children, then activated, the
+/// Where the map's sun is, towards it: the `env_sun`'s, else the `light_environment`'s - its
+/// light shines along its angles, `pitch` (negative: down) said apart.
+fn sun_direction(entities: &[Vec<(String, String)>]) -> Option<Vector> {
+    let get = |pairs: &Vec<(String, String)>, key: &str| pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.clone());
+    let of = |class: &str| entities.iter().find(|pairs| get(pairs, "classname").is_some_and(|c| c.eq_ignore_ascii_case(class)));
+    let sun = of("env_sun").or_else(|| of("light_environment"))?;
+    let angles: Vec<f32> = get(sun, "angles").unwrap_or_default().split_whitespace().filter_map(|n| n.parse().ok()).collect();
+    let yaw = angles.get(1).copied().unwrap_or(0.0);
+    let pitch = get(sun, "pitch").and_then(|p| p.trim().parse::<f32>().ok()).map_or(angles.first().copied().unwrap_or(0.0), |p| -p);
+    let (forward, _, _) = crate::vector::Angle::new(pitch, yaw, 0.0).vectors();
+    Some(-forward)
+}
+
 /// `logic_auto`s fire, and the `InitPostEntity` hook runs.
 pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     // the map's sky, as `sv_skyname` (both realms have it)
@@ -916,6 +929,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     if let Some(sky) = sky {
         crate::convar::set_value(lua, "sv_skyname", &sky);
     }
+    host(lua).game.sun.set(sun_direction(&map.entities));
     {
         let host = host(lua);
         *host.game.map.borrow_mut() = map.name.clone();
@@ -929,7 +943,8 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     // a client has the world to trace against; the entities come from the server
     if host(lua).realm != Realm::Server {
         host(lua).entities.with_mut(world, |ent| ent.model = format!("maps/{}.bsp", map.name));
-        crate::call_hook(lua, "InitPostEntity", MultiValue::new());
+        // `InitPostEntity` comes with the entities, the client's own player among them
+        host(lua).client.awaiting_entities.set(true);
         return;
     }
     crate::physics::load_world(lua, map.collision.as_deref());

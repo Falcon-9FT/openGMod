@@ -53,6 +53,9 @@ pub fn run(vfs: Vfs, realm: &str, map: Option<&gmod_lua::Map>, all: bool, out: &
     if let Some(dir) = gmod_fs::UserDir::default_root().and_then(|root| gmod_fs::UserDir::open(root, None).ok()) {
         runtime.set_data_dir(dir);
     }
+    if let Some(map) = map {
+        runtime.set_map_name(&map.name);
+    }
     runtime.start("sandbox");
     let mut client_report = None;
     if realm == Realm::Client {
@@ -125,6 +128,9 @@ fn play_client(client: &Runtime, vfs: Arc<Vfs>, map: Option<&gmod_lua::Map>) -> 
         Err(e) => return format!("The server could not be started: {e}"),
     };
     server.set_output(|_| {});
+    if let Some(map) = map {
+        server.set_map_name(&map.name);
+    }
     server.start("sandbox");
     if let Some(map) = map {
         server.spawn_map(map);

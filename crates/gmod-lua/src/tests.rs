@@ -11,6 +11,7 @@ use mlua::Value;
 
 use super::*;
 
+mod api;
 mod bullets;
 mod chat;
 mod effects;

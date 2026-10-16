@@ -45,6 +45,8 @@ struct Keys {
 
 pub(crate) struct Client {
     pub local_player: Cell<EntityHandle>,
+    /// The map is loaded and its entities have not come yet: `InitPostEntity` waits for them.
+    pub awaiting_entities: Cell<bool>,
     pub view: Cell<View>,
     keys: RefCell<Keys>,
     pub cursor: Cell<(i32, i32)>,
@@ -72,6 +74,7 @@ impl Default for Client {
     fn default() -> Client {
         Client {
             local_player: Cell::new(EntityHandle::NULL),
+            awaiting_entities: Cell::new(false),
             view: Cell::new(View::default()),
             keys: RefCell::new(Keys::default()),
             cursor: Cell::new((0, 0)),

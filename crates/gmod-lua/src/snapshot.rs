@@ -296,6 +296,13 @@ impl crate::Runtime {
                 crate::call_hook(lua, "NotifyShouldTransmit", MultiValue::from_iter([value, Value::Boolean(sent)]));
             }
         }
+        // the first entities, the client's own player among them: `InitPostEntity`, as in GMod,
+        // where `LocalPlayer()` is valid from then on
+        let local = host(lua).client.local_player.get();
+        if host(lua).client.awaiting_entities.get() && host(lua).entities.is_valid(local) {
+            host(lua).client.awaiting_entities.set(false);
+            crate::call_hook(lua, "InitPostEntity", MultiValue::new());
+        }
     }
 }
 

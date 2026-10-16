@@ -80,6 +80,7 @@ pub mod entity;
 pub mod ents;
 pub mod files;
 pub mod filesystem;
+pub mod fire;
 pub mod gameevent;
 pub mod hitbox;
 pub mod hl2weapons;
@@ -95,6 +96,7 @@ pub mod material;
 pub mod matrix;
 pub mod menu;
 pub mod meta;
+mod models;
 pub mod movedata;
 pub mod movers;
 pub mod nav;
@@ -126,6 +128,7 @@ mod surfaceprops;
 pub mod timer;
 pub mod trace;
 pub mod triggers;
+pub mod usermessage;
 pub mod util;
 pub mod vector;
 pub mod vehicle;
@@ -321,6 +324,8 @@ pub(crate) struct Host {
     pub(crate) effects: effect::Effects,
     /// The engine's events Lua listens to (`gameevent.Listen`).
     pub(crate) game_events: gameevent::Listening,
+    /// The user message the server's Lua is writing (`umsg`).
+    pub(crate) user_messages: usermessage::Writing,
     /// The engine's HUD: where its elements go, its colours.
     pub hud: RefCell<hud::Hud>,
     /// The row of weapon slots the HUD chooses a weapon in.
@@ -436,6 +441,7 @@ impl Runtime {
             particles: particles::Particles::default(),
             effects: effect::Effects::default(),
             game_events: gameevent::Listening::default(),
+            user_messages: usermessage::Writing::default(),
             hud: RefCell::new(hud::Hud::default()),
             selection: weaponselect::Selection::default(),
             sounds: sound::Sounds::new(realm),
@@ -465,10 +471,12 @@ impl Runtime {
         entity::install(&lua, realm)?;
         util::install(&lua)?;
         anim::install_util(&lua)?;
+        models::install(&lua)?;
         trace::install(&lua)?;
         effect::install(&lua)?;
         gameevent::install(&lua)?;
         surfaceinfo::install(&lua)?;
+        fire::install(&lua)?;
         constraint::install(&lua)?;
         sound::install(&lua)?;
         if realm != Realm::Server {
@@ -485,6 +493,7 @@ impl Runtime {
         net::install(&lua, realm)?;
         if realm == Realm::Server {
             recipients::install(&lua)?;
+            usermessage::install_server(&lua)?;
             resource::install(&lua)?;
             pvs::install(&lua)?;
         }
@@ -496,6 +505,7 @@ impl Runtime {
             surface::install(&lua)?;
             client::install(&lua)?;
             particles::install(&lua)?;
+            usermessage::install_client(&lua)?;
             vgui::install(&lua)?;
             surface::load_fonts(&lua);
             client::load(&lua);
@@ -626,6 +636,7 @@ impl Runtime {
                 pickup::think(&self.lua);
                 physics::simulate(&self.lua);
                 projectiles::think(&self.lua);
+                fire::tick(&self.lua);
                 triggers::tick(&self.lua);
                 inputs::service(&self.lua);
                 logic::tick(&self.lua);
@@ -644,6 +655,7 @@ impl Runtime {
             ents::think(&self.lua);
             self.call_hook("Think", mlua::MultiValue::new());
             effect::think(&self.lua);
+            fire::flames(&self.lua, seconds as f32);
             particles::simulate(&self.lua, seconds as f32);
         }
         ents::collect(&self.lua);
@@ -667,6 +679,12 @@ impl Runtime {
     /// How many players the server takes (`game.MaxPlayers`, 1 to [`player::MAX_PLAYERS`]):
     /// entity indices 1 to this are theirs. Given before the map spawns; 1 is a single-player
     /// game.
+    /// The map the game is played on (`game.GetMap`), known to its Lua from the start, as in
+    /// GMod: before [`spawn_map`](Self::spawn_map) loads its entities.
+    pub fn set_map_name(&self, name: &str) {
+        *host(&self.lua).game.map.borrow_mut() = name.to_string();
+    }
+
     pub fn set_max_players(&self, count: u32) {
         host(&self.lua).game.max_players.set(count.clamp(1, player::MAX_PLAYERS));
     }
@@ -757,6 +775,7 @@ impl Runtime {
             player::ToClient::Print(text) => host(&self.lua).print(&format!("{text}\n")),
             player::ToClient::Effect(name, data) => effect::make(&self.lua, name, *data),
             player::ToClient::GameEvent(name, fields) => gameevent::heard(&self.lua, name, fields),
+            player::ToClient::UserMessage(name, parts) => usermessage::receive(&self.lua, name, parts),
         }
     }
 

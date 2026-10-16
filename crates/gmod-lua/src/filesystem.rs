@@ -52,7 +52,23 @@ fn data_path(lua: &Lua, name: &str) -> Option<PathBuf> {
     dir.path(&relative).ok()
 }
 
+/// In GMod the `data/` folder is in the game's folder: `GAME` and `MOD` see it as `data/...`.
+/// Here it is openGMOD's own (`DATA`), not the one of the Garry's Mod whose files are mounted.
+fn data_within(path_id: &str, name: &str) -> Option<String> {
+    if !matches!(path_id.to_ascii_uppercase().as_str(), "GAME" | "MOD") {
+        return None;
+    }
+    let normalized = normalize(name)?;
+    if normalized == "data" {
+        return Some(String::new());
+    }
+    normalized.strip_prefix("data/").map(str::to_string)
+}
+
 fn read(lua: &Lua, name: &str, path_id: &str) -> Option<Vec<u8>> {
+    if let Some(rest) = data_within(path_id, name) {
+        return read(lua, &rest, "DATA");
+    }
     match place(path_id) {
         Place::Data => std::fs::read(data_path(lua, name)?).ok(),
         Place::Game { prefixes, id } => {
@@ -64,6 +80,9 @@ fn read(lua: &Lua, name: &str, path_id: &str) -> Option<Vec<u8>> {
 
 /// `Some(is a folder)` when something is there.
 fn stat(lua: &Lua, name: &str, path_id: &str) -> Option<bool> {
+    if let Some(rest) = data_within(path_id, name) {
+        return stat(lua, &rest, "DATA");
+    }
     match place(path_id) {
         Place::Data => data_path(lua, name).and_then(|p| std::fs::metadata(p).ok()).map(|m| m.is_dir()),
         Place::Game { prefixes, id } => {
@@ -75,6 +94,9 @@ fn stat(lua: &Lua, name: &str, path_id: &str) -> Option<bool> {
 
 /// `file.Find`: names of files and folders, unsorted.
 fn find(lua: &Lua, pattern: &str, path_id: &str) -> (Vec<String>, Vec<String>) {
+    if let Some(rest) = data_within(path_id, pattern).filter(|rest| !rest.is_empty()) {
+        return find(lua, &rest, "DATA");
+    }
     match place(path_id) {
         Place::Data => {
             let Some(normalized) = normalize(pattern) else { return Default::default() };
@@ -104,6 +126,9 @@ fn find(lua: &Lua, pattern: &str, path_id: &str) -> (Vec<String>, Vec<String>) {
 }
 
 fn modified(lua: &Lua, name: &str, path_id: &str) -> u64 {
+    if let Some(rest) = data_within(path_id, name) {
+        return modified(lua, &rest, "DATA");
+    }
     let file = match place(path_id) {
         Place::Data => data_path(lua, name),
         Place::Game { prefixes, id } => {
@@ -208,7 +233,10 @@ impl mlua::UserData for LuaFile {
     }
 
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (mlua::AnyUserData, Value)| crate::meta::lookup(lua, "File", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (mlua::AnyUserData, Value)| crate::meta::index(lua, "File", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (mlua::AnyUserData, Value, Value)| {
+            crate::meta::new_index(lua, "File", ud, key, value)
+        });
         methods.add_meta_method("__tostring", |_, file, ()| Ok(format!("File [{} bytes]", file.data.len())));
     }
 }

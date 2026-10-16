@@ -152,6 +152,8 @@ pub enum ToClient {
     Effect(String, crate::effect::EffectData),
     /// An event of the engine's (`gameevent`), as clients hear it.
     GameEvent(String, Vec<(String, crate::gameevent::Field)>),
+    /// A user message (`umsg`): its name and what was written in it.
+    UserMessage(String, Vec<crate::usermessage::Part>),
 }
 
 /// Asks a player's client something. A bot has none: the server runs its console lines
@@ -2301,9 +2303,11 @@ fn install_identity(def: &entity::Def) -> mlua::Result<()> {
         let id = read(a, |_, p| p.steam_id64())?;
         integer(if id == 0 { 0 } else { i64::from(id as u32) })
     })?;
+    // a string of the number, as GMod gives it
     def("UniqueID", |a| {
         let single = max_players(a.lua) == 1;
-        integer(read(a, |_, p| p.unique_id(single))?.into())
+        let id = read(a, |_, p| p.unique_id(single))?;
+        Ok(Value::String(a.lua.create_string(id.to_string())?))
     })?;
     def("UniqueIDTable", |a| {
         let single = max_players(a.lua) == 1;

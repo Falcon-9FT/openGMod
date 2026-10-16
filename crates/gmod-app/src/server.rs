@@ -117,6 +117,7 @@ impl Server {
         let runtime = runtime(Realm::Server, vfs.clone())?;
         runtime.set_max_players(max_players);
         runtime.set_dedicated(dedicated);
+        runtime.set_map_name(&map.name);
         runtime.start(gamemode);
         runtime.spawn_map(map);
         Ok(Server {
@@ -464,6 +465,12 @@ impl Server {
         if let Some(player) = remote.player {
             self.runtime.leave(player);
         }
+    }
+
+    /// What the server has for its clients now, outside a frame: what the host's player joining
+    /// made, which its client has before its first entities, as a client of GMod does.
+    pub fn flush(&mut self) -> ForHost {
+        self.send()
     }
 
     /// What the frame made for each: snapshots, the chat, `net`, sounds, what Lua asked.

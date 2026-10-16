@@ -62,7 +62,10 @@ impl UserData for DamageInfo {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "CTakeDamageInfo", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "CTakeDamageInfo", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "CTakeDamageInfo", ud, key, value)
+        });
         methods.add_meta_function("__tostring", |_, _: AnyUserData| Ok("CTakeDamageInfo"));
     }
 }

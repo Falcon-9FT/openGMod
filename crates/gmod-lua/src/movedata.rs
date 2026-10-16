@@ -74,7 +74,10 @@ impl UserData for CmdData {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "CUserCmd", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "CUserCmd", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "CUserCmd", ud, key, value)
+        });
         methods.add_meta_function("__tostring", |_, _: AnyUserData| Ok("CUserCmd"));
     }
 }
@@ -86,7 +89,10 @@ impl UserData for MoveData {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "CMoveData", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "CMoveData", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "CMoveData", ud, key, value)
+        });
         methods.add_meta_function("__tostring", |_, _: AnyUserData| Ok("CMoveData"));
     }
 }

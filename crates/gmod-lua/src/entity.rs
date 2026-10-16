@@ -142,6 +142,9 @@ pub struct Ent {
     /// draws it ([`crate::effect`]).
     #[serde(skip)]
     pub effect: bool,
+    /// On fire (`Ignite`), the server's ([`crate::fire`]); clients see `FL_ONFIRE`.
+    #[serde(skip)]
+    pub burning: Option<crate::fire::Burning>,
     pub draw_shadow: bool,
     pub model_scale: f32,
     /// Body groups set: number and value.
@@ -276,6 +279,7 @@ impl Ent {
             motion_objects: Vec::new(),
             lua_drawn: false,
             effect: false,
+            burning: None,
             draw_shadow: true,
             model_scale: 1.0,
             body_groups: Vec::new(),
@@ -555,7 +559,10 @@ impl UserData for PhysObjHandle {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "PhysObj", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "PhysObj", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "PhysObj", ud, key, value)
+        });
         methods.add_meta_function("__tostring", |lua, ud: AnyUserData| {
             let phys = *ud.borrow::<PhysObjHandle>()?;
             if !crate::physics::valid(lua, phys) {

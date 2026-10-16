@@ -357,7 +357,10 @@ impl UserData for LuaMesh {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "IMesh", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "IMesh", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "IMesh", ud, key, value)
+        });
         methods.add_meta_method("__tostring", |_, m, ()| Ok(format!("IMesh [{:p}]", Rc::as_ptr(&m.shapes))));
     }
 }
@@ -443,6 +446,23 @@ fn install_visibility(lua: &Lua) -> mlua::Result<()> {
             let hit = crate::trace::trace(lua, &sweep);
             let length = to.length().max(1e-3);
             Ok(if hit.fraction >= 1.0 || (1.0 - hit.fraction) * length <= radius.max(1.0) { 1.0 } else { 0.0 })
+        })?,
+    )?;
+    // where the map's sun is from here, and whether the world is between it and the eyes
+    util.raw_set(
+        "GetSunInfo",
+        lua.create_function(|lua, ()| {
+            let Some(direction) = host(lua).game.sun.get() else { return Ok(Value::Nil) };
+            let view = host(lua).client.view.get();
+            let player = host(lua).client.local_player.get();
+            let sweep =
+                crate::trace::Sweep::line(view.origin, view.origin + direction * 32768.0, crate::trace::Filter::Entities(vec![player]));
+            let hit = crate::trace::trace(lua, &sweep);
+            let open = hit.fraction >= 1.0 || hit.surface_flags & gmod_bsp::surf::SKY != 0;
+            let info = lua.create_table()?;
+            info.raw_set("direction", crate::entity::vector(lua, direction)?)?;
+            info.raw_set("obstruction", if open { 0.0 } else { 1.0 })?;
+            Ok(Value::Table(info))
         })?,
     )
 }

@@ -149,7 +149,10 @@ impl UserData for ConVarHandle {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "ConVar", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "ConVar", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "ConVar", ud, key, value)
+        });
         methods.add_meta_function("__tostring", |lua, ud: AnyUserData| {
             let handle = *ud.borrow::<ConVarHandle>()?;
             Ok(format!("ConVar [{}]", host(lua).console.convars.borrow()[handle.0].name))
@@ -342,9 +345,11 @@ pub(crate) fn is_known(lua: &Lua, name: &str) -> bool {
         || crate::chat::is_command(lua, name)
 }
 
-/// Runs one command now: sets a ConVar, or calls a command of Lua.
+/// Runs one command now: sets a ConVar, or calls a command of Lua - typed into the server's
+/// console, or a client's, whose commands get its own player.
 pub(crate) fn execute(lua: &Lua, words: &[String]) {
-    execute_as(lua, words, EntityHandle::NULL);
+    let player = if host(lua).realm == crate::Realm::Client { host(lua).client.local_player.get() } else { EntityHandle::NULL };
+    execute_as(lua, words, player);
 }
 
 /// Runs a command typed by `player` (`NULL`: the server's console), whom the commands of

@@ -42,7 +42,10 @@ impl UserData for LuaMaterial {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "IMaterial", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "IMaterial", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "IMaterial", ud, key, value)
+        });
         methods.add_meta_method("__tostring", |_, m, ()| Ok(format!("Material [{}]", m.name)));
     }
 }
@@ -70,7 +73,10 @@ impl UserData for LuaTexture {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "ITexture", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "ITexture", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "ITexture", ud, key, value)
+        });
         methods.add_meta_method("__tostring", |_, t, ()| Ok(format!("ITexture [{}]", t.name)));
     }
 }

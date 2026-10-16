@@ -163,7 +163,10 @@ impl UserData for Emitter {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, EMITTER, key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, EMITTER, ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, EMITTER, ud, key, value)
+        });
         methods.add_meta_method("__tostring", |_, e, ()| {
             Ok(if e.0.borrow().finished { "CLuaEmitter [NULL]".to_string() } else { format!("CLuaEmitter [{:p}]", Rc::as_ptr(&e.0)) })
         });
@@ -180,7 +183,10 @@ impl UserData for Particle {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, PARTICLE, key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, PARTICLE, ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, PARTICLE, ud, key, value)
+        });
         methods.add_meta_method("__tostring", |_, p, ()| Ok(format!("CLuaParticle [{:p}]", Rc::as_ptr(&p.0))));
     }
 }

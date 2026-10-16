@@ -48,6 +48,8 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
 /// The game being played: map, gamemode, players.
 #[derive(Default)]
 pub(crate) struct Game {
+    /// Where the map's sun is (`env_sun`, `light_environment`), towards it.
+    pub sun: std::cell::Cell<Option<crate::vector::Vector>>,
     pub map: RefCell<String>,
     pub gamemode_name: RefCell<String>,
     /// The table of the active gamemode (`GAMEMODE`).

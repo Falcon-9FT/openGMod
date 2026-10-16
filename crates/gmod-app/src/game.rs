@@ -149,6 +149,7 @@ fn client(vfs: Arc<Vfs>, map: &Map, gamemode: &str, max_players: u32, pages: Opt
         client.set_web_pages(pages);
     }
     client.set_max_players(max_players);
+    client.set_map_name(&map.name);
     client.start(gamemode);
     client.spawn_map(map);
     Ok(client)
@@ -179,6 +180,9 @@ impl Game {
         let player = server.join_host(name, Some(key)).ok_or("no player could join the game")?;
         let client = client(vfs, map, gamemode, max_players, pages)?;
         client.set_local_player(player);
+        // what the server sent as the player joined comes before the entities, as in GMod
+        let mut sounds = Vec::new();
+        deliver(&client, server.flush(), &mut sounds);
         client.apply_snapshot(&server.runtime().snapshot());
         let errors = server.runtime().errors().len() + client.errors().len();
         say!(
@@ -196,6 +200,7 @@ impl Game {
             console_keys: 0,
             ticks: None,
         };
+        game.sounds = sounds;
         game.send_client_commands();
         Ok(game)
     }

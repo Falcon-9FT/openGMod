@@ -37,7 +37,7 @@ fn players_take_the_slots_the_server_has() {
     assert!(g.eval::<bool>(
         "local all = player.GetAll()
          return #all == 3 and all[2]:Nick() == 'Bob' and Entity(1):IsListenServerHost() and not Entity(2):IsListenServerHost()
-             and Entity(1):UniqueID() ~= 1"
+             and Entity(1):UniqueID() ~= '1'"
     ));
     // one leaves: the next to come takes the slot
     g.runtime.leave(players[1]);
