@@ -156,6 +156,8 @@ pub enum ToClient {
     UserMessage(String, Vec<crate::usermessage::Part>),
     /// `util.ScreenShake`: how hard as it is felt there, how often, how long.
     Shake(f32, f32, f32),
+    /// `ParticleEffect`: a particle system to show, where.
+    ParticleSystem(String, crate::effect::EffectData),
 }
 
 /// Asks a player's client something. A bot has none: the server runs its console lines

@@ -714,6 +714,18 @@ fn read<R>(a: &Args, f: impl FnOnce(&Ent) -> R) -> mlua::Result<R> {
     Ok(f(&ent))
 }
 
+/// Changes how an entity collides: its bodies follow - its group, and whether it is solid
+/// when that changed.
+fn write_solidity(a: &Args, f: impl FnOnce(&mut Ent)) -> mlua::Result<Value> {
+    let handle = this(a, 1)?;
+    let solid = |ent: &Ent| ent.solid != 0 && ent.solid_flags & 4 == 0;
+    let before = host(a.lua).entities.get(handle).map(|e| solid(&e));
+    host(a.lua).entities.with_mut(handle, f);
+    let after = host(a.lua).entities.get(handle).map(|e| solid(&e));
+    crate::physics::sync_collisions(a.lua, handle, before != after);
+    Ok(Value::Nil)
+}
+
 fn write(a: &Args, f: impl FnOnce(&mut Ent)) -> mlua::Result<Value> {
     let handle = this(a, 1)?;
     host(a.lua).entities.with_mut(handle, f);
@@ -1436,31 +1448,31 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("GetSolid", |a| integer(read(a, |ent| ent.solid)?))?;
     def("SetSolid", |a| {
         let solid = a.number(2)? as i64;
-        write(a, |ent| ent.solid = solid)
+        write_solidity(a, |ent| ent.solid = solid)
     })?;
     def("GetSolidFlags", |a| integer(read(a, |ent| ent.solid_flags)?))?;
     def("SetSolidFlags", |a| {
         let flags = a.number(2)? as i64;
-        write(a, |ent| ent.solid_flags = flags)
+        write_solidity(a, |ent| ent.solid_flags = flags)
     })?;
     def("AddSolidFlags", |a| {
         let flags = a.number(2)? as i64;
-        write(a, |ent| ent.solid_flags |= flags)
+        write_solidity(a, |ent| ent.solid_flags |= flags)
     })?;
     def("RemoveSolidFlags", |a| {
         let flags = a.number(2)? as i64;
-        write(a, |ent| ent.solid_flags &= !flags)
+        write_solidity(a, |ent| ent.solid_flags &= !flags)
     })?;
     def("SetNotSolid", |a| {
         let not_solid = a.boolean(2);
         // FSOLID_NOT_SOLID
-        write(a, |ent| if not_solid { ent.solid_flags |= 4 } else { ent.solid_flags &= !4 })
+        write_solidity(a, |ent| if not_solid { ent.solid_flags |= 4 } else { ent.solid_flags &= !4 })
     })?;
     def("IsSolid", |a| Ok(Value::Boolean(read(a, |ent| ent.solid != 0 && ent.solid_flags & 4 == 0)?)))?;
     def("GetCollisionGroup", |a| integer(read(a, |ent| ent.collision_group)?))?;
     def("SetCollisionGroup", |a| {
         let group = a.number(2)? as i64;
-        write(a, |ent| ent.collision_group = group)
+        write_solidity(a, |ent| ent.collision_group = group)
     })?;
     def("SetUseType", |a| {
         let use_type = a.number(2)? as i64;

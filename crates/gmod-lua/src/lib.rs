@@ -104,6 +104,7 @@ pub mod nav;
 pub mod net;
 pub mod npc;
 pub mod outputs;
+mod particle_systems;
 mod particles;
 pub mod physcannon;
 pub mod physgun;
@@ -518,6 +519,7 @@ impl Runtime {
         }
         misc::install(&lua)?;
         shake::install(&lua)?;
+        particle_systems::install(&lua)?;
         menu::install(&lua, realm)?;
         Ok(Runtime { lua })
     }
@@ -784,6 +786,7 @@ impl Runtime {
             player::ToClient::GameEvent(name, fields) => gameevent::heard(&self.lua, name, fields),
             player::ToClient::UserMessage(name, parts) => usermessage::receive(&self.lua, name, parts),
             player::ToClient::Shake(amplitude, frequency, duration) => shake::start(&self.lua, *amplitude, *frequency, *duration),
+            player::ToClient::ParticleSystem(name, data) => particle_systems::show(&self.lua, name, *data),
         }
     }
 

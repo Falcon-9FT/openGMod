@@ -251,8 +251,33 @@ fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>
     let kept = Kept { entity: handle, part: 0, material: material.clone(), mins, maxs, game_flags: 0, contents: 0, drag: true, hulls };
     host.physics.bodies.borrow_mut().insert(id, kept);
     host.entities.with_mut(handle, |ent| ent.physics = Some(id));
+    drop(host);
     set_material(lua, id, &material);
+    sync_collisions(lua, handle, false);
     true
+}
+
+/// An entity's bodies take its collision group, and - when it changed (`SetNotSolid`,
+/// `SetSolid(SOLID_NONE)`) - whether it is solid: what is not goes through everything, the
+/// world too, as in GMod. A body made for an entity marked not solid is not solid either.
+pub(crate) fn sync_collisions(lua: &Lua, handle: EntityHandle, solidity_changed: bool) {
+    let Some((solid, flagged, group)) =
+        host(lua).entities.get(handle).map(|e| (e.solid != 0 && e.solid_flags & 4 == 0, e.solid_flags & 4 != 0, e.collision_group))
+    else {
+        return;
+    };
+    let bodies: Vec<BodyId> = (0..count(lua, handle)).filter_map(|i| part_body(lua, handle, i)).collect();
+    let host = host(lua);
+    let mut physics = host.physics.physics.borrow_mut();
+    physics.set_group_rule(crate::trace::should_collide);
+    for body in bodies {
+        physics.set_collision_group(body, group);
+        if solidity_changed {
+            physics.set_collisions(body, solid);
+        } else if flagged {
+            physics.set_collisions(body, false);
+        }
+    }
 }
 
 /// The shape of an entity's model that its body has, for traces: its convex hulls in its own

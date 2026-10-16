@@ -811,9 +811,12 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     globals.raw_set("gui", gui)?;
 
     let language = lua.create_table()?;
+    // without the text (as M9K's C4 calls it) nothing is added, as in GMod
     def(lua, &language, "Add", |a| {
-        let (key, value) = (a.string(1)?, a.string(2)?);
-        host(a.lua).client.phrases.borrow_mut().insert(key.trim_start_matches('#').to_lowercase(), value);
+        let key = a.string(1)?;
+        if let Some(value) = a.opt_string(2)? {
+            host(a.lua).client.phrases.borrow_mut().insert(key.trim_start_matches('#').to_lowercase(), value);
+        }
         Ok(Value::Nil)
     })?;
     def(lua, &language, "GetPhrase", |a| {

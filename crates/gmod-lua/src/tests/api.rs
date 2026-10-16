@@ -155,3 +155,23 @@ fn a_panel_faded_out_is_still_painted() {
     g.runtime.paint(0.01);
     assert!(g.eval::<bool>("return PAINTED == true"));
 }
+
+#[test]
+fn particle_systems_go_to_players_and_language_takes_a_name_alone() {
+    let g = player_game();
+    let alice = g.runtime.join(PlayerInfo { name: "Alice".into(), ..PlayerInfo::default() }).unwrap();
+    g.runtime.take_to_clients();
+    g.runtime.run_string("ParticleEffect('nitro_main_m9k', Vector(1, 2, 3), Angle(0, 0, 0), nil)", "pcf").unwrap();
+    let sent = asked_of(&g);
+    assert!(
+        matches!(sent.as_slice(), [(to, ToClient::ParticleSystem(name, data))] if *to == alice && name == "nitro_main_m9k" && data.origin == crate::vector::Vector::new(1.0, 2.0, 3.0)),
+        "{sent:?}"
+    );
+
+    let client = client_game(&[]);
+    client.runtime.from_server(&ToClient::ParticleSystem("nitro_main_m9k".into(), crate::effect::EffectData::default()));
+    client.runtime.drawn(EntityHandle::NULL);
+    assert!(!client.runtime.take_primitives().is_empty(), "an explosion shows");
+    client.runtime.run_string("language.Add('only_a_name') language.Add('named', 'Named')", "language").unwrap();
+    assert!(client.eval::<bool>("return language.GetPhrase('named') == 'Named' and language.GetPhrase('only_a_name') == 'only_a_name'"));
+}

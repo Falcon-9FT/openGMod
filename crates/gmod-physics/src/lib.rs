@@ -45,6 +45,8 @@ pub const DEFAULT_FRICTION: f32 = 0.8;
 /// stiffness and damping per kilogram (1/s², 1/s), critically damped and far quicker than a
 /// tick.
 const ROD_STIFFNESS: f32 = 1.0e5;
+/// A ragdoll joint's limit this close to none, in radians (0.06 degrees), is none.
+const STILL_LIMIT: f32 = 1.0e-3;
 const ROD_DAMPING: f32 = 632.0;
 /// The least change of speed a contact makes to count as an [`Impact`], in units/s: less is
 /// a body at rest, or one sliding along.
@@ -215,6 +217,10 @@ pub struct Physics {
     apart: HashSet<(RigidBodyHandle, RigidBodyHandle)>,
     /// Bodies that go through every other body that moves ([`Physics::set_aloof`]).
     aloof: HashSet<RigidBodyHandle>,
+    /// The collision groups of the bodies that have one but none, and what says which two
+    /// collide ([`Physics::set_collision_group`]).
+    groups: HashMap<RigidBodyHandle, i64>,
+    group_rule: Option<fn(i64, i64) -> bool>,
     /// Impacts since they were last asked for, and when each body last made one.
     impacts: Vec<Impact>,
     last_impact: HashMap<RigidBodyHandle, f32>,
@@ -282,6 +288,8 @@ impl Physics {
             broken: Vec::new(),
             apart: HashSet::new(),
             aloof: HashSet::new(),
+            groups: HashMap::new(),
+            group_rule: None,
             impacts: Vec::new(),
             last_impact: HashMap::new(),
             limits: Vec::new(),
@@ -747,6 +755,31 @@ impl Physics {
         self.wake(id);
     }
 
+    /// What says whether bodies of two collision groups collide (the game's rules).
+    pub fn set_group_rule(&mut self, rule: fn(i64, i64) -> bool) {
+        self.group_rule = Some(rule);
+    }
+
+    /// A body's collision group from now on (`COLLISION_GROUP_*`; 0 is none): bodies of two
+    /// groups collide as [`Physics::set_group_rule`] says, and [`WORLD_ONLY`] collides with
+    /// what never moves only - the map.
+    pub fn set_collision_group(&mut self, id: BodyId, group: i64) {
+        if id.0 == self.ground {
+            return;
+        }
+        if group == 0 {
+            self.groups.remove(&id.0);
+        } else {
+            self.groups.insert(id.0, group);
+            for handle in self.colliders(id) {
+                if let Some(collider) = self.world.colliders.get_mut(handle) {
+                    collider.set_active_hooks(collider.active_hooks() | ActiveHooks::FILTER_CONTACT_PAIRS);
+                }
+            }
+        }
+        self.wake(id);
+    }
+
     /// Whether two bodies go through each other ([`Physics::set_apart`]).
     pub fn apart(&self, a: BodyId, b: BodyId) -> bool {
         self.apart.contains(&(a.0, b.0))
@@ -815,7 +848,9 @@ impl Physics {
             Joint::Ragdoll { point, angles, limits, free } => {
                 // the limits are set anew before every step ([`Physics::aim_limits`])
                 let ranges = limits.map(|[a, b]| [a.min(b), a.max(b)].map(|l| l.clamp(-180.0, 180.0).to_radians()));
-                let still = ranges.iter().all(|r| r[0].abs() < 1e-5 && r[1].abs() < 1e-5);
+                // limits of a hundredth of a degree (constraint.AdvBallsocket's way to say "not at
+                // all", as simfphys holds its wheels) hold as VPhysics holds them: fast
+                let still = ranges.iter().all(|r| r[0].abs() < STILL_LIMIT && r[1].abs() < STILL_LIMIT);
                 if !still {
                     held = Some(ranges);
                 }
@@ -876,10 +911,24 @@ impl Physics {
             }
             let (pa, pb) = (*a.position() * frame1.translation, *b.position() * frame2.translation);
             let relative = b.velocity_at_point(pb) - a.velocity_at_point(pa);
-            // what moves: a fixed body or one moved by the game takes nothing
-            let inverse = |body: &rapier3d::prelude::RigidBody| if body.is_dynamic() { 1.0 / body.mass().max(1e-6) } else { 0.0 };
-            let inverse_mass = inverse(a) + inverse(b);
-            if inverse_mass <= 0.0 || relative.length_squared() < 1e-12 {
+            if relative.length_squared() < 1e-12 {
+                continue;
+            }
+            // how much a push at the point along the way it moves changes its speed there: by
+            // the body's mass and, off its middle, its turning too - what moves, that is: a
+            // fixed body or one moved by the game takes nothing
+            let way = relative.normalize();
+            let inverse = |body: &rapier3d::prelude::RigidBody, point: Vector| {
+                if !body.is_dynamic() {
+                    return 0.0;
+                }
+                let props = body.mass_properties();
+                let arm = point - props.world_com;
+                let turn = props.effective_world_inv_inertia * arm.cross(way);
+                1.0 / body.mass().max(1e-6) + way.dot(turn.cross(arm))
+            };
+            let inverse_mass = inverse(a, pa) + inverse(b, pb);
+            if inverse_mass <= 0.0 {
                 continue;
             }
             let taken = 1.0 - (-damping * seconds * inverse_mass).exp();
@@ -1027,7 +1076,8 @@ impl Physics {
         self.world.integration_parameters.dt = seconds;
         self.aim_limits();
         self.damp_springs(seconds);
-        self.world.step_with_events(&Apart { pairs: &self.apart, aloof: &self.aloof }, &());
+        let hooks = Apart { pairs: &self.apart, aloof: &self.aloof, groups: &self.groups, rule: self.group_rule };
+        self.world.step_with_events(&hooks, &());
         self.clock += seconds;
         self.find_impacts();
         let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
@@ -1075,13 +1125,30 @@ fn split(turn: Rotation) -> [f32; 3] {
 struct Apart<'a> {
     pairs: &'a HashSet<(RigidBodyHandle, RigidBodyHandle)>,
     aloof: &'a HashSet<RigidBodyHandle>,
+    groups: &'a HashMap<RigidBodyHandle, i64>,
+    rule: Option<fn(i64, i64) -> bool>,
 }
+
+/// `COLLISION_GROUP_WORLD`: what collides with the map only.
+pub const WORLD_ONLY: i64 = 20;
 
 impl PhysicsHooks for Apart<'_> {
     fn filter_contact_pair(&self, context: &PairFilterContext) -> Option<SolverFlags> {
         let (a, b) = (context.rigid_body1, context.rigid_body2);
         let aloof = |h: Option<RigidBodyHandle>| h.is_some_and(|h| self.aloof.contains(&h));
         let moves = |h: Option<RigidBodyHandle>| h.and_then(|h| context.bodies.get(h)).is_some_and(|b| b.is_dynamic());
+        // the collision groups: what has none is the map's or `COLLISION_GROUP_NONE`
+        let group = |h: Option<RigidBodyHandle>| h.and_then(|h| self.groups.get(&h).copied()).unwrap_or(0);
+        let (ga, gb) = (group(a), group(b));
+        if ga != 0 || gb != 0 {
+            let map = |h: Option<RigidBodyHandle>| h.is_none();
+            if (ga == WORLD_ONLY && !map(b)) || (gb == WORLD_ONLY && !map(a)) {
+                return None;
+            }
+            if !map(a) && !map(b) && self.rule.is_some_and(|rule| !rule(ga, gb)) {
+                return None;
+            }
+        }
         match (a, b) {
             (Some(a), Some(b)) if self.pairs.contains(&(a, b)) => None,
             _ if aloof(a) != aloof(b) && (aloof(a) && moves(b) || aloof(b) && moves(a)) => None,

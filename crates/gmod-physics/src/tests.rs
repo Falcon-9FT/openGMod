@@ -581,3 +581,33 @@ fn a_wheel_on_rigid_ropes_goes_round_with_its_body() {
     // GMod, measured: 4 units at most (rigid ropes are rods there)
     assert!(worst < 5.0, "the wheel went {worst} units from its place");
 }
+
+/// Debris (1) collides with nothing but what has no group, as Half-Life 2's rules have it.
+fn rule(a: i64, b: i64) -> bool {
+    !(a == 1 && b == 1)
+}
+
+#[test]
+fn collision_groups_say_what_collides() {
+    let mut physics = floor();
+    physics.set_group_rule(rule);
+    let below = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    physics.set_motion(below, false);
+    let below2 = physics.add(&crate_body([200.0, 0.0, 16.0])).unwrap();
+    physics.set_motion(below2, false);
+    // the world only: through the crate, onto the floor
+    let world_only = physics.add(&crate_body([0.0, 0.0, 100.0])).unwrap();
+    physics.set_collision_group(world_only, WORLD_ONLY);
+    // debris on debris: through it as well
+    physics.set_collision_group(below2, 1);
+    let debris = physics.add(&crate_body([200.0, 0.0, 100.0])).unwrap();
+    physics.set_collision_group(debris, 1);
+    // nothing at all, not solid: through the floor too
+    let ghost = physics.add(&crate_body([400.0, 0.0, 100.0])).unwrap();
+    physics.set_collisions(ghost, false);
+    run(&mut physics, 2.0);
+    let z = |id| physics.pose(id).unwrap().0[2];
+    assert!((z(world_only) - 16.0).abs() < 2.0, "{}", z(world_only));
+    assert!((z(debris) - 16.0).abs() < 2.0, "{}", z(debris));
+    assert!(z(ghost) < -200.0, "{}", z(ghost));
+}
