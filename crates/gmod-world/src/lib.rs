@@ -93,6 +93,9 @@ pub struct Surface {
     pub base: Option<usize>,
     /// The second texture of `WorldVertexTransition`, blended in by vertex alpha.
     pub base2: Option<usize>,
+    /// `$detail`: a texture laid over the base, `scale` times as fine, mixed in as its mode
+    /// says (0: it doubles or darkens, 1: it adds) by `blend`.
+    pub detail: Option<Detail>,
     /// Texels less opaque than this are not drawn.
     pub alpha_test: Option<f32>,
     pub translucent: bool,
@@ -127,6 +130,19 @@ pub struct Surface {
     pub overlay: bool,
 }
 
+/// A texture laid over a surface's base (`$detail`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Detail {
+    /// Index into [`World::textures`].
+    pub texture: usize,
+    /// How many times finer than the base it is laid (`$detailscale`).
+    pub scale: f32,
+    /// How much of it shows (`$detailblendfactor`).
+    pub blend: f32,
+    /// How it mixes in (`$detailblendmode`): 0 doubles or darkens the base, 1 adds to it.
+    pub mode: u32,
+}
+
 /// How a surface looks at a moment, its material's proxies run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
@@ -145,6 +161,7 @@ impl Surface {
             count,
             base: None,
             base2: None,
+            detail: None,
             alpha_test: None,
             translucent: false,
             additive: false,
@@ -553,6 +570,16 @@ impl Gather<'_> {
             && let Some(texture) = m.texture("$basetexture2")
         {
             s.base2 = self.texture(&texture);
+        }
+        if let Some(texture) = m.texture("$detail")
+            && let Some(index) = self.texture(&texture)
+        {
+            s.detail = Some(Detail {
+                texture: index,
+                scale: m.float("$detailscale").unwrap_or(4.0),
+                blend: m.float("$detailblendfactor").unwrap_or(1.0).clamp(0.0, 1.0),
+                mode: m.float("$detailblendmode").unwrap_or(0.0) as u32,
+            });
         }
         if m.flag("$alphatest") {
             s.alpha_test = Some(m.float("$alphatestreference").filter(|&r| r > 0.0).unwrap_or(0.5));

@@ -46,6 +46,7 @@ fn square(proxies: &str, frames: &[Vec<[u8; 4]>]) -> World {
         count: 6,
         base: Some(0),
         base2: None,
+        detail: None,
         alpha_test: None,
         translucent: false,
         additive: false,

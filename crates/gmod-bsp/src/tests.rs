@@ -223,3 +223,15 @@ fn breakables_may_go_without_a_name() {
     assert!(entity("func_breakable").moves() && entity("func_breakable_surf").moves());
     assert!(!entity("func_wall").moves());
 }
+
+#[test]
+fn lights_that_start_dark_leave_their_styles_out() {
+    let entities = "{\n\"classname\" \"worldspawn\"\n}\n\
+        {\n\"classname\" \"light\"\n\"targetname\" \"lamp\"\n\"style\" \"32\"\n\"spawnflags\" \"1\"\n}\n\
+        {\n\"classname\" \"light_spot\"\n\"targetname\" \"sun\"\n\"style\" \"33\"\n\"spawnflags\" \"0\"\n}\n\
+        {\n\"classname\" \"light\"\n\"style\" \"5\"\n\"spawnflags\" \"1\"\n}\n";
+    let test = crate::testmap::TestMap { entities: entities.into(), ..crate::testmap::TestMap::default() };
+    let bsp = Bsp::parse("test.bsp".into(), std::sync::Arc::from(test.bytes())).unwrap();
+    // a named light switched off: out; one on, and a pattern's style below 32: in
+    assert_eq!(crate::mesh::dark_styles(&bsp), [32]);
+}

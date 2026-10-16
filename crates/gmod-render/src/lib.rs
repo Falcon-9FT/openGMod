@@ -588,6 +588,7 @@ impl Shared {
                 let surface = &pieces[draw.piece].surfaces[draw.surface];
                 let base = texture(surface.base);
                 let blend = texture(surface.base2.or(surface.base));
+                let detail = texture(surface.detail.map(|d| d.texture).or(surface.base));
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("surface"),
                     layout: &self.layouts.surface,
@@ -603,6 +604,7 @@ impl Shared {
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&base.layers) },
                         wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&blend.layers) },
                         wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[base.sampler]) },
+                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&detail.layers) },
                     ],
                 })
             })
@@ -806,6 +808,7 @@ impl Renderer {
                     view_entry(1, wgpu::TextureViewDimension::D2Array),
                     view_entry(2, wgpu::TextureViewDimension::D2Array),
                     sampler_entry(3),
+                    view_entry(4, wgpu::TextureViewDimension::D2Array),
                 ],
             }),
             texture: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

@@ -18,6 +18,7 @@ fn wall(x: f32, y: [f32; 2], z: [f32; 2], light: [f32; 3]) -> Piece {
         count: 6,
         base: None,
         base2: None,
+        detail: None,
         alpha_test: None,
         translucent: false,
         additive: false,

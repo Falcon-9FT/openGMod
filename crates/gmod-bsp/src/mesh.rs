@@ -8,8 +8,9 @@
 //!   its start position: rows run from corner 0 to corner 1, columns from that edge across to
 //!   the edge from corner 3 to corner 2. Each vertex is raised along its direction by its
 //!   distance; texture and lightmap coordinates are those of the flat base, interpolated.
-//! * Only the first lightmap of a face is used (style 0; with bump mapping the first of four
-//!   is the unbumped one). Faces without one are lit by a white luxel.
+//! * A face's light is that of its light styles added up - style 0, and those of the lights
+//!   that are switched on as the map starts ([`dark_styles`] are not); with bump mapping a
+//!   style has four lightmaps, the first unbumped. Faces without one are lit by a white luxel.
 //! * Faces flagged nodraw, sky, trigger, hint or skip are left out.
 //! * The overlays on the faces built come after them, a batch each from the lowest render
 //!   order up, lifted a little off their faces and lit by their light maps
@@ -146,6 +147,9 @@ fn pack(sizes: &[(u32, u32)]) -> (u32, u32, Vec<(u32, u32)>) {
     (width, y + shelf, positions)
 }
 
+/// How much brighter an HDR map's light shows than its lightmaps store it.
+pub const HDR_LIGHT_SCALE: f32 = 2.0;
+
 /// Builds the triangles of a brush model.
 pub fn build(bsp: &Bsp, options: Options) -> Mesh {
     build_faces(bsp, options, |_| true)
@@ -200,17 +204,33 @@ pub fn build_faces(bsp: &Bsp, options: Options, keep: impl Fn(usize) -> bool) ->
     let (width, height, positions) = pack(&sizes);
     let mut texels = vec![[0.0f32; 3]; width as usize * height as usize];
     texels[0] = [1.0, 1.0, 1.0];
+    let dark = dark_styles(bsp);
+    // an HDR map's light shows twice as bright as it is stored, an LDR map's as stored (as
+    // measured in GMod: gm_construct, gm_polye_v1)
+    let scale = if hdr { HDR_LIGHT_SCALE } else { 1.0 };
     for (k, &(_, index)) in drawn.iter().enumerate() {
         let Some(slot) = slot[k] else { continue };
         let face = &faces[index];
         let (x, y) = positions[slot];
         let (w, h) = sizes[slot];
-        let first = face.light_offset as usize;
-        for t in 0..h as usize {
-            for s in 0..w as usize {
-                let at = first + (t * w as usize + s) * 4;
-                let sample: [u8; 4] = lighting[at..at + 4].try_into().unwrap();
-                texels[(y as usize + t) * width as usize + x as usize + s] = rgbe_to_linear(sample);
+        let page = w as usize * h as usize * 4;
+        let pages = if bsp.texinfo[face.texinfo as usize].flags & surf::BUMPLIGHT != 0 { 4 } else { 1 };
+        for (n, &style) in face.styles.iter().enumerate() {
+            if style == 255 {
+                break;
+            }
+            let first = face.light_offset as usize + n * pages * page;
+            if dark.contains(&style) || first + page > lighting.len() {
+                continue;
+            }
+            for t in 0..h as usize {
+                for s in 0..w as usize {
+                    let at = first + (t * w as usize + s) * 4;
+                    let sample: [u8; 4] = lighting[at..at + 4].try_into().unwrap();
+                    let [r, g, b] = rgbe_to_linear(sample).map(|c| c * scale);
+                    let texel = &mut texels[(y as usize + t) * width as usize + x as usize + s];
+                    *texel = [texel[0] + r, texel[1] + g, texel[2] + b];
+                }
             }
         }
     }
@@ -410,4 +430,17 @@ fn displacement(bsp: &Bsp, face: &Face, info: &TexInfo, size: [f32; 2], placemen
         mesh.vertices[base + i].normal = normalize(scale(n, sign));
     }
     true
+}
+
+/// The light styles of the lights that start switched off: vrad gives each named light a
+/// style of its own, from 32 up (its `style` key); with "initially dark" (spawn flag 1) its
+/// light is not in the faces until it is turned on.
+pub fn dark_styles(bsp: &Bsp) -> Vec<u8> {
+    bsp.entities
+        .iter()
+        .filter(|e| e.class_name().starts_with("light"))
+        .filter(|e| e.get("spawnflags").and_then(|f| f.trim().parse::<i64>().ok()).is_some_and(|f| f & 1 != 0))
+        .filter_map(|e| e.get("style").and_then(|s| s.trim().parse::<u8>().ok()))
+        .filter(|&style| style >= 32)
+        .collect()
 }

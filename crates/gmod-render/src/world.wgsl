@@ -42,6 +42,9 @@ struct Surface {
     // layer of the frame that shows, of the second 1 when it modulates what is behind
     transform_u: vec4<f32>,
     transform_v: vec4<f32>,
+    // the detail texture: x how much finer, y how much of it,
+    // z how it mixes in (0 doubling or darkening, 1 adding), w 1 when there is one
+    detail: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -49,6 +52,7 @@ struct Surface {
 @group(1) @binding(1) var base_texture: texture_2d_array<f32>;
 @group(1) @binding(2) var blend_texture: texture_2d_array<f32>;
 @group(1) @binding(3) var texture_sampler: sampler;
+@group(1) @binding(4) var detail_texture: texture_2d_array<f32>;
 @group(2) @binding(0) var lightmap: texture_2d<f32>;
 @group(2) @binding(1) var lightmap_sampler: sampler;
 // the bones of the posed models of the frame: three rows of each one's matrix, in the space of
@@ -177,10 +181,21 @@ fn shade(input: VertexInput) -> VertexOutput {
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // sampled before any branch: texture lookups need every pixel of a quad to take them
     var albedo = textureSample(base_texture, texture_sampler, input.uv, i32(surface.transform_u.w));
+    let has_detail = surface.detail.w > 0.5;
     let blended = textureSample(blend_texture, texture_sampler, input.blend_uv, 0);
+    let detailed = textureSample(detail_texture, texture_sampler, input.blend_uv * surface.detail.x, 0);
     let mapped = textureSample(lightmap, lightmap_sampler, input.lightmap_uv).rgb;
     if (surface.options.z > 0.5) {
         albedo = mix(albedo, blended, clamp(input.alpha, 0.0, 1.0));
+    }
+    if (has_detail) {
+        if (surface.detail.z > 0.5 && surface.detail.z < 1.5) {
+            albedo = vec4<f32>(albedo.rgb + detailed.rgb * surface.detail.y, albedo.a);
+        } else if (surface.detail.z < 0.5) {
+            // as the game mixes it: grey (0.5 as stored) changes nothing
+            let stored = pow(max(detailed.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+            albedo = vec4<f32>(albedo.rgb * mix(vec3<f32>(1.0), 2.0 * stored, surface.detail.y), albedo.a);
+        }
     }
     if (surface.options.x > 0.0 && albedo.a < surface.options.x) {
         discard;

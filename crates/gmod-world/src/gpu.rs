@@ -227,7 +227,7 @@ pub const FOG_DARK: f32 = 1.0;
 pub const FOG_NONE: f32 = 2.0;
 
 /// How many floats a shader gets for a surface.
-pub const SURFACE_PARAMS: usize = 20;
+pub const SURFACE_PARAMS: usize = 24;
 
 /// The floats a shader gets for a surface as it `look`s at the moment: tint and alpha; water
 /// colour and whether it is water; alpha test reference (0 for none), how it is lit, whether
@@ -268,6 +268,11 @@ pub fn surface_params(surface: &Surface, look: &Look, frames: u32, has_lightmap:
         v[1],
         v[2],
         if surface.modulate { 1.0 } else { 0.0 },
+        // the detail: how much finer, how much of it, how it mixes in, and 1 when there is one
+        surface.detail.map_or(1.0, |d| d.scale),
+        surface.detail.map_or(0.0, |d| d.blend),
+        surface.detail.map_or(0.0, |d| d.mode as f32),
+        if surface.detail.is_some() { 1.0 } else { 0.0 },
     ]
 }
 
@@ -487,13 +492,18 @@ mod tests {
         s.no_fog = true;
         assert_eq!(params(&s, true)[11], FOG_NONE);
         // no transform: the identity, frame 0, not modulating
-        assert_eq!(params(&s, true)[12..], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(params(&s, true)[12..20], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // no detail
+        assert_eq!(params(&s, true)[20..], [1.0, 0.0, 0.0, 0.0]);
         // the look of the moment: its tint, alpha, transform and frame, wrapped to the frames
         let look = Look { frame: 7, transform: [[2.0, 0.0, 0.5], [0.0, 2.0, 0.25]], tint: [0.5; 3], alpha: 0.5 };
         s.modulate = true;
         let p = surface_params(&s, &look, 4, true);
         assert_eq!((p[0], p[3]), (0.5, 0.5));
-        assert_eq!(p[12..], [2.0, 0.0, 0.5, 3.0, 0.0, 2.0, 0.25, 1.0]);
+        assert_eq!(p[12..20], [2.0, 0.0, 0.5, 3.0, 0.0, 2.0, 0.25, 1.0]);
+        // a detail: how fine, how much, its mode, there
+        s.detail = Some(crate::Detail { texture: 0, scale: 8.0, blend: 0.5, mode: 1 });
+        assert_eq!(surface_params(&s, &look, 4, true)[20..], [8.0, 0.5, 1.0, 1.0]);
     }
 
     fn transform(m: &[f32; 16], p: Vec3) -> [f32; 4] {

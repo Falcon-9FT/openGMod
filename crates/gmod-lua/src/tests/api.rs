@@ -175,3 +175,28 @@ fn particle_systems_go_to_players_and_language_takes_a_name_alone() {
     client.runtime.run_string("language.Add('only_a_name') language.Add('named', 'Named')", "language").unwrap();
     assert!(client.eval::<bool>("return language.GetPhrase('named') == 'Named' and language.GetPhrase('only_a_name') == 'only_a_name'"));
 }
+
+#[test]
+fn a_fall_hurts_and_the_corpse_goes_with_the_next_life() {
+    let g = player_game();
+    g.runtime.join(PlayerInfo { name: "Alice".into(), ..PlayerInfo::default() }).unwrap();
+    g.runtime
+        .run_string(
+            "HOOKS.OnPlayerHitGround = function(ply, water, floater, speed) LANDED = speed end
+             Entity(1):SetPos(Vector(0, 0, 1000))",
+            "fall",
+        )
+        .unwrap();
+    for _ in 0..200 {
+        g.runtime.think(crate::timer::TICK_INTERVAL);
+    }
+    let (landed, health): (f64, i64) = g.eval("return LANDED, Entity(1):Health()");
+    assert!(landed > 1000.0, "{landed}");
+    assert_eq!(health, 90, "the gamemode said nothing: 10");
+    // the corpse is there while dead, and goes as the player comes back
+    g.runtime.run_string("Entity(1):Kill() Entity(1):CreateRagdoll()", "kill").unwrap();
+    assert!(g.eval::<bool>("return #ents.FindByClass('hl2mp_ragdoll') == 1"));
+    g.runtime.run_string("Entity(1):Spawn()", "spawn").unwrap();
+    g.runtime.think(crate::timer::TICK_INTERVAL);
+    assert!(g.eval::<bool>("return #ents.FindByClass('hl2mp_ragdoll') == 0 and not Entity(1):GetRagdollEntity():IsValid()"));
+}

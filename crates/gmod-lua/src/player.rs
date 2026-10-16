@@ -736,6 +736,11 @@ fn place(lua: &Lua, handle: EntityHandle, pos: Vector) {
 /// `ply:Spawn()`: alive again, with full health, standing; `PlayerSelectSpawn` says where,
 /// then `PlayerSpawn` runs.
 pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
+    // the corpse goes as the player comes back, as in GMod
+    let corpse = with_player(lua, handle, |_, p| std::mem::replace(&mut p.ragdoll, EntityHandle::NULL)).unwrap_or(EntityHandle::NULL);
+    if host(lua).entities.is_valid(corpse) {
+        crate::ents::remove(lua, corpse);
+    }
     let reset = with_player(lua, handle, |ent, p| {
         p.alive = true;
         ent.health = 100;
@@ -1010,7 +1015,8 @@ fn tick(lua: &Lua, handle: EntityHandle) {
         }
     }
 
-    // movement
+    // movement; how it was falling, for its landing
+    let (was_on_ground, falling) = state(lua, handle, |_, p| (p.moving.on_ground, -p.moving.velocity[2])).unwrap_or((true, 0.0));
     let Some(mut mv) = movedata(lua, handle, &cmd, frozen) else { return };
     let Ok(mv_ud) = lua.create_userdata(mv) else { return };
     hook(lua, "SetupMove", [Value::UserData(ply.clone()), Value::UserData(mv_ud.clone()), Value::UserData(cmd_ud)]);
@@ -1032,6 +1038,12 @@ fn tick(lua: &Lua, handle: EntityHandle) {
     let jumped = host(lua).entities.get(handle).is_some_and(|ent| ent.flags & fl::ONGROUND == 0 && ent.velocity.z > 0.0);
     if grounded && jumped && cmd.cmd.buttons & key::JUMP != 0 {
         crate::anim::animation_event(lua, handle, crate::anim::EVENT_JUMP, 0);
+        // a jump is heard as a step on what it leaves, at full volume
+        play_step(lua, handle, &ply, 1.0);
+    }
+    let landed = !was_on_ground && state(lua, handle, |_, p| p.moving.on_ground).unwrap_or(false);
+    if landed {
+        land(lua, handle, &ply, falling);
     }
     crate::anim::animate_player(lua, handle);
     footsteps(lua, handle, &ply);
@@ -1329,6 +1341,89 @@ fn finish_move(lua: &Lua, handle: EntityHandle, mv: &MoveData) {
     });
 }
 
+/// The speeds of a fall, units a second: under the first a landing is not heard; past the
+/// second it hurts (`PLAYER_MIN_BOUNCE_SPEED`, `PLAYER_MAX_SAFE_FALL_SPEED`).
+const LANDING_HEARD: f32 = 200.0;
+const SAFE_FALL: f32 = 526.5;
+/// `DMG_FALL`.
+const DMG_FALL: i64 = 32;
+
+/// A player lands, falling at `speed`: `OnPlayerHitGround`, a step on what it lands on as loud
+/// as the fall, and past a safe fall the damage the gamemode says (`GetFallDamage`, 10 when
+/// it says nothing) with `Player.FallDamage` - unless the hook returned true, or it lands in
+/// water.
+fn land(lua: &Lua, handle: EntityHandle, ply: &AnyUserData, speed: f32) {
+    let in_water = water_level(lua, handle).is_some_and(|l| l > 0);
+    let quiet = hook(
+        lua,
+        "OnPlayerHitGround",
+        [Value::UserData(ply.clone()), Value::Boolean(in_water), Value::Boolean(false), Value::Number(f64::from(speed))],
+    );
+    if speed >= LANDING_HEARD {
+        let volume = if speed > SAFE_FALL {
+            1.0
+        } else if speed > SAFE_FALL / 2.0 {
+            0.85
+        } else {
+            0.5
+        };
+        play_step(lua, handle, ply, volume);
+    }
+    if truthy(&quiet) || in_water || speed <= SAFE_FALL {
+        return;
+    }
+    let damage = match hook(lua, "GetFallDamage", [Value::UserData(ply.clone()), Value::Number(f64::from(speed))]).front() {
+        Some(Value::Number(n)) => *n as f32,
+        Some(Value::Integer(n)) => *n as f32,
+        _ => 10.0,
+    };
+    if damage > 0.0 {
+        crate::sound::emit_scaled(lua, "Player.FallDamage", handle, 1.0);
+        let world = EntityHandle::WORLD;
+        crate::damage::take(lua, handle, damage::DamageInfo::new(damage, DMG_FALL, world, world));
+    }
+}
+
+/// A step's sound on what is underfoot - or the water waded in - at `volume`, the feet taking
+/// turns; `PlayerFootstep` returning true keeps it quiet.
+fn play_step(lua: &Lua, handle: EntityHandle, ply: &AnyUserData, volume: f32) {
+    let Some((origin, water)) = with_player(lua, handle, |ent, p| (ent.local_pos, p.moving.water_level)) else { return };
+    let surface = match water {
+        2.. => crate::surfaceprops::named(lua, "wade").1,
+        1 => crate::surfaceprops::named(lua, "water").1,
+        _ => {
+            let down = Vector::new(origin.x, origin.y, origin.z - 64.0);
+            let up = Vector::new(origin.x, origin.y, origin.z + 1.0);
+            let hit = trace::trace(lua, &Sweep::line(up, down, Filter::Entities(vec![handle])));
+            trace::surface_of(lua, &hit).1
+        }
+    };
+    let right = with_player(lua, handle, |_, p| {
+        p.step_right = !p.step_right;
+        !p.step_right
+    })
+    .unwrap_or(false);
+    let sound = if right { &surface.step_right } else { &surface.step_left };
+    let pos = entity::vector(lua, origin).unwrap_or(Value::Nil);
+    let Ok(name) = lua.create_string(sound) else { return };
+    let quiet = hook(
+        lua,
+        "PlayerFootstep",
+        [
+            Value::UserData(ply.clone()),
+            pos,
+            Value::Integer(i64::from(right)),
+            Value::String(name),
+            Value::Number(f64::from(volume)),
+            Value::Nil,
+        ],
+    );
+    if !truthy(&quiet) {
+        // a script's volume is the loudest a step is; walking is quieter
+        crate::sound::emit_scaled(lua, sound, handle, volume * 2.0);
+    }
+}
+
 /// Footsteps, as Source makes them (`UpdateStepSound`): on the ground or a ladder and moving,
 /// one every `PlayerStepSoundTime` milliseconds (the gamemode's hook; 400 walking, 300
 /// running, 100 more ducked), left and right in turn, the sound of the surface underfoot -
@@ -1336,10 +1431,10 @@ fn finish_move(lua: &Lua, handle: EntityHandle, mv: &MoveData) {
 /// quiet.
 fn footsteps(lua: &Lua, handle: EntityHandle, ply: &AnyUserData) {
     const TICK_MS: f32 = (crate::timer::TICK_INTERVAL * 1000.0) as f32;
-    let Some((moving, ducked_speed, origin, wait)) = with_player(lua, handle, |ent, p| {
+    let Some((moving, ducked_speed, wait)) = with_player(lua, handle, |ent, p| {
         p.step_time = (p.step_time - TICK_MS).max(0.0);
         let walking = ent.move_type == MOVETYPE_WALK;
-        (walking.then_some(p.moving), p.moving.ducked, ent.local_pos, p.step_time)
+        (walking.then_some(p.moving), p.moving.ducked, p.step_time)
     }) else {
         return;
     };
@@ -1370,53 +1465,12 @@ fn footsteps(lua: &Lua, handle: EntityHandle, ply: &AnyUserData) {
         Some(Value::Integer(ms)) => *ms as f32,
         _ => default_time,
     } + if ducked_speed { 100.0 } else { 0.0 };
-    // the surface: the water waded in, else what is underfoot
-    let surface = match moving.water_level {
-        2.. => crate::surfaceprops::named(lua, "wade").1,
-        1 => crate::surfaceprops::named(lua, "water").1,
-        _ => {
-            let down = Vector::new(origin.x, origin.y, origin.z - 64.0);
-            let up = Vector::new(origin.x, origin.y, origin.z + 1.0);
-            let hit = trace::trace(lua, &Sweep::line(up, down, Filter::Entities(vec![handle])));
-            if hit.entity == EntityHandle::WORLD && !hit.texture.starts_with("**") {
-                crate::surfaceprops::of_material(lua, &hit.texture).1
-            } else {
-                let body = crate::physics::material_of(lua, hit.entity).unwrap_or_else(|| "default".to_string());
-                crate::surfaceprops::named(lua, &body).1
-            }
-        }
-    };
-    let right = with_player(lua, handle, |_, p| {
-        p.step_time = time;
-        p.step_right = !p.step_right;
-        !p.step_right
-    })
-    .unwrap_or(false);
-    let sound = if right { &surface.step_right } else { &surface.step_left };
+    with_player(lua, handle, |_, p| p.step_time = time);
     let mut volume = if walking { 0.2 } else { 0.5 };
     if ducked_speed {
         volume *= 0.65;
     }
-    let pos = entity::vector(lua, origin).unwrap_or(Value::Nil);
-    let quiet = hook(
-        lua,
-        "PlayerFootstep",
-        [
-            Value::UserData(ply.clone()),
-            pos,
-            Value::Integer(i64::from(right)),
-            Value::String(match lua.create_string(sound) {
-                Ok(s) => s,
-                Err(_) => return,
-            }),
-            Value::Number(f64::from(volume)),
-            Value::Nil,
-        ],
-    );
-    if !truthy(&quiet) {
-        // a script's volume is the loudest a step is; walking is quieter
-        crate::sound::emit_scaled(lua, sound, handle, volume * 2.0);
-    }
+    play_step(lua, handle, ply, volume);
 }
 
 fn set_flashlight(lua: &Lua, handle: EntityHandle, on: bool) {
@@ -2006,8 +2060,8 @@ pub(crate) fn forget(lua: &Lua, gone: EntityHandle) {
 /// The death ragdoll (`CreateRagdoll`): an `hl2mp_ragdoll` with the player's model, in place
 /// of the last one - a ragdoll ([`crate::ragdoll`]) posed as the player was drawn, falling on
 /// as the player moved. A model without the physics of one leaves the corpse unseen. In GMod
-/// the corpse is the client's alone, so here it lies on the world and on what does not move,
-/// but goes through props that move, which neither push it nor feel it.
+/// the corpse is the client's alone: it lies on the world and goes through everything else,
+/// and it goes when the player spawns again.
 fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
     let old = state(lua, handle, |_, p| p.ragdoll).unwrap_or(EntityHandle::NULL);
     if host(lua).entities.is_valid(old) {
@@ -2031,12 +2085,7 @@ fn create_ragdoll(lua: &Lua, handle: EntityHandle) -> mlua::Result<()> {
         ent.anim = anim;
     });
     if crate::ragdoll::init(lua, ragdoll, velocity) {
-        let bodies = crate::ragdoll::bodies(lua, ragdoll).unwrap_or_default();
-        let host = host(lua);
-        let mut physics = host.physics.physics.borrow_mut();
-        for id in bodies {
-            physics.set_aloof(id, true);
-        }
+        crate::ragdoll::world_only(lua, ragdoll);
     }
     with_player(lua, handle, |_, p| p.ragdoll = ragdoll);
     Ok(())

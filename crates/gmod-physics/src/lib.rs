@@ -593,6 +593,15 @@ impl Physics {
         self.wake(id);
     }
 
+    /// How slowly a body must move - units a second, at its farthest point - for half a second
+    /// to fall asleep: a ragdoll lying against its joints' limits stirs a little, and sleeps
+    /// at what VPhysics sleeps.
+    pub fn set_sleep_speed(&mut self, id: BodyId, speed: f32) {
+        if let Some(body) = self.world.bodies.get_mut(id.0) {
+            body.activation_mut().normalized_linear_threshold = speed * METRES_PER_UNIT;
+        }
+    }
+
     /// Kilograms.
     pub fn mass(&self, id: BodyId) -> f32 {
         self.world.bodies.get(id.0).map_or(0.0, |b| b.mass())

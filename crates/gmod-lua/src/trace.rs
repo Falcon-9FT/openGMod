@@ -175,6 +175,9 @@ pub(crate) struct Hit {
     /// The entity hit: the world for brushes and static props, `NULL` for nothing.
     pub entity: EntityHandle,
     pub texture: String,
+    /// The material of the world's surface hit - a displacement's too, whose `texture` is
+    /// `**displacement**` - for what it is made of; empty for anything else.
+    pub material: String,
     pub surface_flags: i32,
     pub displacement: bool,
     /// The part of a ragdoll hit; 0 for anything else.
@@ -285,6 +288,7 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
         contents: 0,
         entity: EntityHandle::NULL,
         texture: "**empty**".into(),
+        material: String::new(),
         surface_flags: 0,
         displacement: false,
         physics_bone: 0,
@@ -309,12 +313,17 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
             }
         };
         if t.hit() && (entity == EntityHandle::WORLD || allowed(lua, sweep, entity)) {
+            let material = if t.static_prop.is_some() {
+                String::new()
+            } else {
+                t.texinfo.and_then(|i| host(lua).world.textures.borrow().get(i).cloned()).unwrap_or_default()
+            };
             let texture = if t.static_prop.is_some() {
                 "**studio**".to_string()
             } else if t.displacement {
                 "**displacement**".to_string()
             } else {
-                t.texinfo.and_then(|i| host(lua).world.textures.borrow().get(i).cloned()).unwrap_or_default()
+                material.clone()
             };
             best = Hit {
                 fraction: t.fraction,
@@ -326,6 +335,7 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
                 contents: t.contents,
                 entity,
                 texture,
+                material,
                 surface_flags: t.surface_flags,
                 displacement: t.displacement,
                 physics_bone: 0,
@@ -436,6 +446,7 @@ pub(crate) fn trace(lua: &Lua, sweep: &Sweep) -> Hit {
             contents,
             entity: handle,
             texture: "**studio**".into(),
+            material: String::new(),
             surface_flags: 0,
             displacement: false,
             physics_bone: part,
@@ -470,8 +481,8 @@ pub(crate) fn surface_of(lua: &Lua, hit: &Hit) -> (usize, gmod_material::Surface
     let world = hit.entity == EntityHandle::WORLD;
     let found = if !hit.hit() {
         None
-    } else if world && !hit.texture.starts_with("**") {
-        Some(crate::surfaceprops::of_material(lua, &hit.texture))
+    } else if world && !hit.material.is_empty() {
+        Some(crate::surfaceprops::of_material(lua, &hit.material))
     } else {
         crate::physics::material_of(lua, hit.entity).map(|name| crate::surfaceprops::named(lua, &name))
     };
@@ -498,13 +509,7 @@ pub(crate) fn result(lua: &Lua, sweep: &Sweep, hit: &Hit, out: Option<Table>) ->
     t.raw_set("HitSky", hit.surface_flags & surf::SKY != 0)?;
     t.raw_set("HitTexture", hit.texture.as_str())?;
     t.raw_set("HitWorld", hit.hit() && world)?;
-    let surface = if !hit.hit() {
-        None
-    } else if world && !hit.texture.starts_with("**") {
-        Some(crate::surfaceprops::of_material(lua, &hit.texture))
-    } else {
-        crate::physics::material_of(lua, hit.entity).map(|name| crate::surfaceprops::named(lua, &name))
-    };
+    let surface = hit.hit().then(|| surface_of(lua, hit));
     let mat_type = match &surface {
         Some((_, prop)) => i64::from(prop.game_material),
         None if hit.hit() => MAT_DEFAULT,
