@@ -519,7 +519,7 @@ fn server_address(address: &str) -> Result<SocketAddr, String> {
 /// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
 /// llvmpipe), a discrete one before an integrated one, and of the same kind Direct3D 12 before
 /// Vulkan.
-fn adapter_rank(kind: wgpu::DeviceType, backend: wgpu::Backend) -> (u8, bool) {
+fn adapter_rank(kind: wgpu::DeviceType, backend: wgpu::Backend, wanted: Option<wgpu::Backend>) -> (bool, u8, bool) {
     let kind = match kind {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
@@ -527,7 +527,14 @@ fn adapter_rank(kind: wgpu::DeviceType, backend: wgpu::Backend) -> (u8, bool) {
         wgpu::DeviceType::VirtualGpu => 3,
         wgpu::DeviceType::Cpu => 4,
     };
-    (kind, backend != wgpu::Backend::Dx12)
+    (wanted.is_some_and(|w| w != backend), kind, backend != wgpu::Backend::Dx12)
+}
+
+/// The graphics APIs the player may choose (`opengmod_renderer`), as the setting names them.
+const RENDERERS: [(&str, wgpu::Backend); 2] = [("dx12", wgpu::Backend::Dx12), ("vulkan", wgpu::Backend::Vulkan)];
+
+fn renderer_name(backend: wgpu::Backend) -> &'static str {
+    RENDERERS.iter().find(|(_, b)| *b == backend).map_or("other", |(name, _)| name)
 }
 
 /// The window and what draws into it.
@@ -548,10 +555,24 @@ struct Gpu {
     overlay: gmod_render::Overlay,
     /// The main menu's, over everything.
     menu_overlay: gmod_render::Overlay,
+    /// The graphics API it draws with, the GPU's name, and the APIs the GPU could draw this
+    /// window with.
+    backend: wgpu::Backend,
+    adapter_name: String,
+    backends: Vec<wgpu::Backend>,
 }
 
 impl Gpu {
-    fn new(event_loop: &ActiveEventLoop, title: &str, vsync: bool, fullscreen: bool, size: (u32, u32)) -> Result<Gpu, String> {
+    /// A window, drawn into with the graphics API `renderer` names (`opengmod_renderer`) when
+    /// the GPU has it, else the best it has.
+    fn new(
+        event_loop: &ActiveEventLoop,
+        title: &str,
+        vsync: bool,
+        fullscreen: bool,
+        size: (u32, u32),
+        renderer: &str,
+    ) -> Result<Gpu, String> {
         let attributes = Window::default_attributes()
             .with_title(title)
             .with_inner_size(winit::dpi::PhysicalSize::new(size.0.max(320), size.1.max(240)))
@@ -563,12 +584,17 @@ impl Gpu {
         let instance = wgpu::Instance::new(descriptor);
         let surface = instance.create_surface(window.clone()).map_err(|e| format!("surface: {e}"))?;
         // chosen here and not by request_adapter, which takes Vulkan first when both drive a GPU
-        let adapter = block_on(instance.enumerate_adapters(backends))
+        let wanted = RENDERERS.iter().find(|(name, _)| renderer.eq_ignore_ascii_case(name)).map(|&(_, b)| b);
+        let adapters: Vec<wgpu::Adapter> =
+            block_on(instance.enumerate_adapters(backends)).into_iter().filter(|adapter| adapter.is_surface_supported(&surface)).collect();
+        let mut available: Vec<wgpu::Backend> = adapters.iter().map(|a| a.get_info().backend).collect();
+        available.sort_by_key(|&b| renderer_name(b));
+        available.dedup();
+        let adapter = adapters
             .into_iter()
-            .filter(|adapter| adapter.is_surface_supported(&surface))
             .min_by_key(|adapter| {
                 let info = adapter.get_info();
-                adapter_rank(info.device_type, info.backend)
+                adapter_rank(info.device_type, info.backend, wanted)
             })
             .ok_or("no graphics adapter with Direct3D 12 or Vulkan")?;
         let info = adapter.get_info();
@@ -611,6 +637,9 @@ impl Gpu {
             map_started: Instant::now(),
             overlay,
             menu_overlay,
+            backend: info.backend,
+            adapter_name: info.name.clone(),
+            backends: available,
         })
     }
 
@@ -1604,6 +1633,17 @@ impl App {
             ["quit" | "exit"] => self.quit = true,
             ["screenshot" | "jpeg"] => self.screenshot = true,
             ["toggleconsole"] => self.toggle_console(),
+            // the menu over the game, as Escape shows and hides it
+            ["gameui_activate"] => {
+                if !self.menu_open {
+                    self.toggle_menu();
+                }
+            }
+            ["gameui_hide"] => {
+                if self.menu_open {
+                    self.toggle_menu();
+                }
+            }
             ["showconsole"] => {
                 if !self.menu.as_ref().is_some_and(|menu| menu.runtime().console_shown()) {
                     self.toggle_console();
@@ -1830,8 +1870,14 @@ impl ApplicationHandler for App {
         }
         let (vsync, fullscreen) = (self.config.number("mat_vsync", 1.0) != 0.0, self.config.number("opengmod_fullscreen", 0.0) != 0.0);
         let size = (self.config.number("opengmod_width", 1280.0) as u32, self.config.number("opengmod_height", 720.0) as u32);
-        match Gpu::new(event_loop, &format!("openGMOD - {}", self.name), vsync, fullscreen, size) {
+        let renderer = self.config.value("opengmod_renderer").to_string();
+        match Gpu::new(event_loop, &format!("openGMOD - {}", self.name), vsync, fullscreen, size, &renderer) {
             Ok(mut gpu) => {
+                // what draws, for the advanced video options
+                if let Some(menu) = &self.menu {
+                    let available = gpu.backends.iter().map(|&b| renderer_name(b).to_string()).collect();
+                    menu.runtime().set_renderer(renderer_name(gpu.backend), &gpu.adapter_name, available);
+                }
                 // the screen's sizes, for the video options
                 if let (Some(menu), Some(monitor)) = (&self.menu, gpu.window.current_monitor()) {
                     let mut modes: Vec<(u32, u32)> = monitor

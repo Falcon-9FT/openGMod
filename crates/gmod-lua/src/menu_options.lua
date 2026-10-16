@@ -68,6 +68,7 @@ end
 local FALLBACK = {
 	GameUI_WindowedNoBorder = "Windowed (no border)",
 	GameUI_AspectAny = "Any/All",
+	GAMEUI_RequiresRestart = "(Requires restart)",
 }
 local function Phrase( text )
 	if ( !text or text == "" ) then return "" end
@@ -1090,7 +1091,21 @@ function Options.Advanced()
 		SimpleCombo( c.Multicore, "mat_queue_mode", Levels( { { "#gameui_disabled", "0" }, { "#gameui_enabled", "-1" } } ), "-1" )
 		SimpleCombo( c.HDR, "mat_hdr_level", Levels( { { "#GameUI_hdr_level0", "0" }, { "#GameUI_hdr_level1", "1" }, { "#GameUI_hdr_level2", "2" } } ), "2" )
 		SimpleCombo( c.D3D9Ex, "mat_disable_d3d9ex", Levels( { { "#gameui_enabled", "0" }, { "#gameui_disabled", "1" } } ), "0" )
-		JoinCombo( c.dxlabel, { { "DirectX v9.0", "90" } }, "90", function() end )
+		-- in the DirectX levels' place, what draws: the graphics API now, and the one to draw
+		-- with from the next start
+		local renderer = OpenGMOD.Renderer()
+		local names = { dx12 = "Direct3D 12", vulkan = "Vulkan" }
+		if ( IsValid( c.dxinstalledlabel ) ) then c.dxinstalledlabel:SetLabel( names[ renderer.api ] or renderer.api ) end
+		local choices = {}
+		for _, api in ipairs( renderer.available ) do
+			local text = names[ api ] or api
+			if ( api != renderer.api ) then text = text .. " " .. Phrase( "#GAMEUI_RequiresRestart" ) end
+			choices[ #choices + 1 ] = { text, api }
+		end
+		local chosen = Get( "opengmod_renderer", "auto" )
+		if ( chosen == "auto" ) then chosen = renderer.api end
+		JoinCombo( c.dxlabel, choices, chosen, function( api ) Set( "opengmod_renderer", api ) end )
+		if ( IsValid( c.dxlabel ) ) then c.dxlabel:SetEnabled( #choices > 1 ) end
 		-- OK keeps what was chosen here with the rest; Cancel forgets it
 		if ( IsValid( c.Button1 ) ) then c.Button1.DoClick = function() frame:Close() if ( Options.OnChanged ) then Options.OnChanged() end end end
 		if ( IsValid( c.Button2 ) ) then c.Button2.DoClick = function() Pending.values = saved frame:Close() end end

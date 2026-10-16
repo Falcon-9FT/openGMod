@@ -57,6 +57,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("mat_picmip", "0"),
     ("mat_reducefillrate", "0"),
     ("opengmod_water_detail", "2"),
+    // the graphics API to draw with: "dx12", "vulkan", or "auto" (the best the GPU has)
+    ("opengmod_renderer", "auto"),
     ("opengmod_shadow_detail", "2"),
     ("mat_colorcorrection", "1"),
     ("mat_antialias", "1"),

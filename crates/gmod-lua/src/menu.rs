@@ -77,6 +77,9 @@ pub(crate) struct Menu {
     pub setting_changes: RefCell<Vec<SettingChange>>,
     /// The screen's sizes the video options offer, and the screen's own.
     pub video_modes: RefCell<VideoModes>,
+    /// The graphics API it draws with (`dx12`, `vulkan`), the GPU's name, and the APIs the
+    /// player may choose.
+    pub renderer: RefCell<(String, String, Vec<String>)>,
     pub games: RefCell<Vec<MountableGame>>,
     pub in_game: Cell<bool>,
     /// Addons were not mounted at all (`-noaddons`), workshop ones were not (`-noworkshop`).
@@ -584,6 +587,15 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         list.raw_set("native", a.lua.create_sequence_from([native.0, native.1])?)?;
         Ok(Value::Table(list))
     })?;
+    // what draws: `{ api = "dx12", gpu = "...", available = { "dx12", "vulkan" } }`
+    def(lua, &opengmod, "Renderer", |a| {
+        let (api, gpu, available) = host(a.lua).menu.renderer.borrow().clone();
+        let out = a.lua.create_table()?;
+        out.raw_set("api", api)?;
+        out.raw_set("gpu", gpu)?;
+        out.raw_set("available", a.lua.create_sequence_from(available)?)?;
+        Ok(Value::Table(out))
+    })?;
     // the options window's: the player's settings and key bindings
     def(lua, &opengmod, "GetSetting", |a| {
         let name = a.string(1)?.to_ascii_lowercase();
@@ -771,6 +783,12 @@ impl crate::Runtime {
     /// The screen's sizes the video options offer, and the screen's own.
     pub fn set_video_modes(&self, modes: Vec<(u32, u32)>, native: (u32, u32)) {
         *host(&self.lua).menu.video_modes.borrow_mut() = (modes, native);
+    }
+
+    /// What draws: the graphics API (`dx12`, `vulkan`), the GPU's name, and the APIs it could
+    /// draw with, for the advanced video options.
+    pub fn set_renderer(&self, api: &str, gpu: &str, available: Vec<String>) {
+        *host(&self.lua).menu.renderer.borrow_mut() = (api.to_string(), gpu.to_string(), available);
     }
 
     /// What the options window changed since the last call, in order.
