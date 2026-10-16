@@ -172,6 +172,9 @@ struct Node {
     run_color: [u8; 4],
     /// Lines a rich text is scrolled back from its end (the mouse wheel).
     scrolled: usize,
+    /// What of a rich text the mouse selected: where it started and where it is now, in bytes
+    /// of all its text.
+    rich_selection: Option<(usize, usize)>,
     /// A rich text's lines as last laid out: for the width and the font they were laid out
     /// for, until its text changes.
     rich_cache: Option<(i32, gmod_ui::FontId, std::rc::Rc<Vec<RichLine>>)>,
@@ -233,6 +236,7 @@ impl Node {
             runs: Vec::new(),
             run_color: [255; 4],
             scrolled: 0,
+            rich_selection: None,
             rich_cache: None,
             model: String::new(),
             icon: None,
@@ -272,13 +276,16 @@ pub(crate) struct Panels {
     doomed: RefCell<Vec<PanelHandle>>,
     /// Being laid out now: `InvalidateLayout(true)` from inside does not start again.
     laying_out: RefCell<Vec<PanelHandle>>,
-    clipboard: RefCell<String>,
+    /// The rich text the mouse is selecting in, its button held; and the last one selected in,
+    /// whose selection Ctrl+C copies.
+    rich_dragging: Cell<Option<PanelHandle>>,
+    rich_selected: Cell<Option<PanelHandle>>,
 }
 
 impl Panels {
     /// Puts text on the clipboard (`SetClipboardText`), where text entries paste from.
     pub(crate) fn set_clipboard(&self, text: String) {
-        *self.clipboard.borrow_mut() = text;
+        crate::clipboard::set(&text);
     }
 
     fn get<R>(&self, h: PanelHandle, f: impl FnOnce(&Node) -> R) -> Option<R> {
@@ -328,18 +335,28 @@ impl Panels {
         self.get(h, |n| n.parent).flatten()
     }
 
-    /// Where a panel's top left corner is on the screen.
+    /// Where a panel's top left corner is on the screen. A popup is where it says on the
+    /// screen, whatever it is in, as Source places them.
     pub(crate) fn screen_pos(&self, h: PanelHandle) -> (i32, i32) {
         let (mut x, mut y) = (0, 0);
         let mut at = Some(h);
         for _ in 0..256 {
             let Some(p) = at else { break };
-            let Some((px, py, parent)) = self.get(p, |n| (n.x, n.y, n.parent)) else { break };
+            let Some((px, py, parent, popup)) = self.get(p, |n| (n.x, n.y, n.parent, n.popup)) else { break };
             x += px;
             y += py;
-            at = parent;
+            at = if popup { None } else { parent };
         }
         (x, y)
+    }
+
+    /// Where the corner of what a popup or a panel on top is placed against is on the screen:
+    /// the screen's for a popup, its parent's for the other.
+    fn layer_origin(&self, h: PanelHandle) -> (i32, i32) {
+        if self.get(h, |n| n.popup).unwrap_or(false) {
+            return (0, 0);
+        }
+        self.parent(h).map_or((0, 0), |parent| self.screen_pos(parent))
     }
 
     /// Whether a panel shows: it and its parents are visible, up to the world panel or a
@@ -466,8 +483,7 @@ impl Panels {
     fn under(&self, point: (i32, i32), screen: Clip) -> Option<PanelHandle> {
         let layers: Vec<PanelHandle> = self.on_top().into_iter().rev().chain(self.popups().into_iter().rev()).collect();
         for p in layers {
-            let parent = self.parent(p);
-            let origin = parent.map_or((0, 0), |parent| self.screen_pos(parent));
+            let origin = self.layer_origin(p);
             if let Some(found) = self.hit(p, origin, point, screen) {
                 return Some(found);
             }
@@ -1015,7 +1031,7 @@ pub(crate) fn paint(lua: &Lua) {
         if panels.get(p, |n| n.manual).unwrap_or(true) {
             continue;
         }
-        let origin = panels.parent(p).map_or((0, 0), |parent| panels.screen_pos(parent));
+        let origin = panels.layer_origin(p);
         paint_panel(lua, p, origin, screen, 1.0, 0);
     }
     leave(lua);
@@ -1197,22 +1213,87 @@ fn paint_rich(lua: &Lua, h: PanelHandle) {
     let lines = rich_lines_of(lua, h, font, w - 4);
     let screen = &host(lua).screen;
     let tall = screen.fonts.borrow().tall(font);
-    let shown = (hh / tall.max(1)).max(1) as usize;
-    // the end, unless the wheel took it back
-    let scrolled = scrolled.min(lines.len().saturating_sub(shown));
-    let skip = lines.len().saturating_sub(shown + scrolled);
+    let (skip, shown) = rich_shown(lines.len(), scrolled, hh, tall);
+    let selection = host(lua).panels.get(h, |n| n.rich_selection).flatten().map(|(a, b)| (a.min(b), a.max(b))).filter(|(a, b)| b > a);
     for (i, line) in lines.iter().skip(skip).take(shown).enumerate() {
+        let y = (i as i32 * tall) as f32;
+        // the selection behind the text, as text entries show theirs
+        if let Some((from, to)) = selection {
+            let end = line.start + line.len();
+            let (a, b) = (from.clamp(line.start, end), to.clamp(line.start, end));
+            // a selection going on past the line's end takes its line break too
+            let ends_inside = to > end && from <= end;
+            if b > a || ends_inside {
+                let x_of = |offset: usize| -> i32 {
+                    let (mut x, mut at) = (2, line.start);
+                    for (text, _) in &line.parts {
+                        let take = offset.saturating_sub(at).min(text.len());
+                        let take = (0..=take).rev().find(|&k| text.is_char_boundary(k)).unwrap_or(0);
+                        x += text_width(lua, font, &text[..take]);
+                        at += text.len();
+                        if at >= offset {
+                            break;
+                        }
+                    }
+                    x
+                };
+                let (x0, mut x1) = (x_of(a), x_of(b));
+                if ends_inside {
+                    x1 += text_width(lua, font, " ");
+                }
+                let color = screen.color([0, 120, 215, 255]);
+                screen.canvas.borrow_mut().rect(x0 as f32, y, (x1 - x0) as f32, tall as f32, color);
+            }
+        }
         let mut x = 2.0;
-        for (text, color) in line {
-            x += screen.text(font, x, (i as i32 * tall) as f32, text, *color);
+        for (text, color) in &line.parts {
+            x += screen.text(font, x, y, text, *color);
         }
     }
 }
 
-type RichLine = Vec<(String, [u8; 4])>;
+/// A line of a rich text as laid out: where it starts in all its text (bytes), and its parts
+/// of one colour each.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RichLine {
+    start: usize,
+    parts: Vec<(String, [u8; 4])>,
+}
+
+impl RichLine {
+    fn len(&self) -> usize {
+        self.parts.iter().map(|(t, _)| t.len()).sum()
+    }
+}
 
 /// The most text a rich text keeps, in bytes: the oldest goes first.
 const RICH_TEXT_LIMIT: usize = 64 * 1024;
+
+/// Leaves the newest `limit` bytes of the text or so: the oldest lines go, whole, a run of
+/// one colour holding many of them only in part. How many bytes went.
+fn trim_runs(runs: &mut Vec<Run>, limit: usize) -> usize {
+    let mut excess = runs.iter().map(|r| r.text.len()).sum::<usize>().saturating_sub(limit);
+    let mut gone = 0;
+    while excess > 0 && !runs.is_empty() {
+        let first = &mut runs[0];
+        if first.text.len() <= excess {
+            excess -= first.text.len();
+            gone += first.text.len();
+            runs.remove(0);
+            continue;
+        }
+        // up to the end of the line the cut falls in
+        let from = (excess..first.text.len()).find(|&i| first.text.is_char_boundary(i)).unwrap_or(first.text.len());
+        let cut = first.text[from..].find('\n').map_or(first.text.len(), |at| from + at + 1);
+        first.text.drain(..cut);
+        gone += cut;
+        if first.text.is_empty() {
+            runs.remove(0);
+        }
+        break;
+    }
+    gone
+}
 
 /// A rich text's lines, laid out once for a width and a font until its text changes: a
 /// console's is long.
@@ -1229,30 +1310,73 @@ fn rich_lines_of(lua: &Lua, h: PanelHandle, font: gmod_ui::FontId, width: i32) -
 }
 
 fn rich_lines(lua: &Lua, font: gmod_ui::FontId, runs: &[Run], width: i32) -> Vec<RichLine> {
-    let mut lines: Vec<RichLine> = vec![Vec::new()];
-    let mut x = 0;
+    let mut lines: Vec<RichLine> = vec![RichLine::default()];
+    let (mut x, mut offset) = (0, 0);
     for run in runs {
         for (i, part) in run.text.split('\n').enumerate() {
             if i > 0 {
-                lines.push(Vec::new());
+                offset += 1;
+                lines.push(RichLine { start: offset, parts: Vec::new() });
                 x = 0;
             }
             for word in part.split_inclusive(' ') {
                 let ww = text_width(lua, font, word);
                 if x > 0 && x + ww > width {
-                    lines.push(Vec::new());
+                    lines.push(RichLine { start: offset, parts: Vec::new() });
                     x = 0;
                 }
                 let line = lines.last_mut().expect("never empty");
-                match line.last_mut() {
+                match line.parts.last_mut() {
                     Some((text, color)) if *color == run.color => text.push_str(word),
-                    _ => line.push((word.to_string(), run.color)),
+                    _ => line.parts.push((word.to_string(), run.color)),
                 }
                 x += ww;
+                offset += word.len();
             }
         }
     }
     lines
+}
+
+/// Which lines of a rich text show: the first and how many, the end unless the wheel took it
+/// back.
+fn rich_shown(lines: usize, scrolled: usize, height: i32, tall: i32) -> (usize, usize) {
+    let shown = (height / tall.max(1)).max(1) as usize;
+    let scrolled = scrolled.min(lines.saturating_sub(shown));
+    (lines.saturating_sub(shown + scrolled), shown)
+}
+
+/// Where in a rich text's text (bytes) a point of it (`x`, `y` in the panel) falls: before
+/// the character nearest it.
+fn rich_offset_at(lua: &Lua, h: PanelHandle, x: i32, y: i32) -> Option<usize> {
+    let (font, w, hh, scrolled) = host(lua).panels.get(h, |n| (n.font.clone(), n.w, n.h, n.scrolled))?;
+    let font = font_of(lua, font.as_deref())?;
+    let lines = rich_lines_of(lua, h, font, w - 4);
+    let tall = host(lua).screen.fonts.borrow().tall(font).max(1);
+    let (skip, shown) = rich_shown(lines.len(), scrolled, hh, tall);
+    let row = (y.max(0) / tall) as usize;
+    let line = lines.get((skip + row.min(shown - 1)).min(lines.len().saturating_sub(1)))?;
+    let (mut left, mut at) = (2, line.start);
+    for (text, _) in &line.parts {
+        for (i, ch) in text.char_indices() {
+            let wide = text_width(lua, font, &text[i..i + ch.len_utf8()]);
+            if x < left + wide / 2 {
+                return Some(at + i);
+            }
+            left += wide;
+        }
+        at += text.len();
+    }
+    Some(at)
+}
+
+/// The text of a rich text's selection, if it has one.
+fn rich_selected_text(lua: &Lua, h: PanelHandle) -> Option<String> {
+    let (runs, (a, b)) = host(lua).panels.get(h, |n| Some((n.runs.clone(), n.rich_selection?)))??;
+    let (from, to) = (a.min(b), a.max(b));
+    let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+    let (from, to) = (from.min(text.len()), to.min(text.len()));
+    (to > from && text.is_char_boundary(from) && text.is_char_boundary(to)).then(|| text[from..to].to_string())
 }
 
 // --- input ---------------------------------------------------------------------------------
@@ -1277,6 +1401,12 @@ pub(crate) fn cursor_moved(lua: &Lua) {
         if let Some(new) = under {
             set_field(lua, new, "Hovered", true);
             call(lua, new, "OnCursorEntered", ());
+        }
+    }
+    if let Some(selecting) = host.panels.rich_dragging.get().filter(|&h| host.panels.is_valid(h)) {
+        let (sx, sy) = host.panels.screen_pos(selecting);
+        if let Some(at) = rich_offset_at(lua, selecting, point.0 - sx, point.1 - sy) {
+            host.panels.with(selecting, |n| n.rich_selection = n.rich_selection.map(|(anchor, _)| (anchor, at)));
         }
     }
     if let Some(target) = host.panels.capture.get().or(under) {
@@ -1335,10 +1465,25 @@ pub(crate) fn mouse_button(lua: &Lua, code: i32, down: bool) -> bool {
         if is_html(lua, target) {
             crate::html::mouse_button(lua, target, code, true);
         }
+        // the mouse selects in a rich text, dragged with the left button held
+        if code == MOUSE_LEFT && host.panels.get(target, |n| n.class == Class::RichText).unwrap_or(false) {
+            let point = host.client.cursor.get();
+            let (sx, sy) = host.panels.screen_pos(target);
+            let at = rich_offset_at(lua, target, point.0 - sx, point.1 - sy);
+            host.panels.with(target, |n| n.rich_selection = at.map(|at| (at, at)));
+            if let Some(old) = host.panels.rich_selected.get().filter(|&old| old != target) {
+                host.panels.with(old, |n| n.rich_selection = None);
+            }
+            host.panels.rich_dragging.set(Some(target));
+            host.panels.rich_selected.set(Some(target));
+        }
         bubble(lua, target, "OnMousePressed", code);
     } else {
         if is_html(lua, target) {
             crate::html::mouse_button(lua, target, code, false);
+        }
+        if code == MOUSE_LEFT {
+            host.panels.rich_dragging.set(None);
         }
         bubble(lua, target, "OnMouseReleased", code);
         let clicked = host.panels.get(target, |n| n.class == Class::Button && n.enabled).unwrap_or(false);
@@ -1401,6 +1546,20 @@ const KEY_RIGHT: i32 = 91;
 /// not get it.
 pub(crate) fn key(lua: &Lua, code: i32, down: bool) -> bool {
     let panels = &host(lua).panels;
+    // what is selected in a rich text (the console's), unless a text entry has a selection
+    // of its own
+    let control = host(lua).client.is_down(83) || host(lua).client.is_down(84);
+    if down && control && code == KEY_C {
+        let entry_selects = panels
+            .keyboard_target()
+            .is_some_and(|t| panels.get(t, |n| n.class == Class::TextEntry && n.selection().is_some()).unwrap_or(false));
+        if !entry_selects
+            && let Some(text) = panels.rich_selected.get().filter(|&h| panels.is_valid(h)).and_then(|h| rich_selected_text(lua, h))
+        {
+            crate::clipboard::set(&text);
+            return true;
+        }
+    }
     let Some(target) = panels.keyboard_target() else { return false };
     if is_html(lua, target) {
         crate::html::key(lua, target, code, down);
@@ -1478,7 +1637,7 @@ fn edit_key(lua: &Lua, h: PanelHandle, code: i32) {
     if control && (code == KEY_C || code == KEY_X) {
         let selected = host.panels.get(h, |n| n.selection().map(|(a, b)| n.text.chars().skip(a).take(b - a).collect::<String>()));
         if let Some(Some(text)) = selected {
-            *host.panels.clipboard.borrow_mut() = text;
+            crate::clipboard::set(&text);
             if code == KEY_X {
                 insert_or_delete(lua, h, None);
             }
@@ -1486,7 +1645,7 @@ fn edit_key(lua: &Lua, h: PanelHandle, code: i32) {
         return;
     }
     if control && code == KEY_V {
-        let text = host.panels.clipboard.borrow().clone();
+        let text = crate::clipboard::get();
         insert(lua, h, &text);
         return;
     }
@@ -2171,6 +2330,7 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             n.anchor = None;
             if n.class == Class::RichText {
                 n.runs = vec![Run { text: text.clone(), color: n.run_color }];
+                n.rich_selection = None;
                 n.rich_cache = None;
             }
             n.text = text;
@@ -2276,7 +2436,7 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     def(lua, m, "CopySelected", |a| {
         let selected = read(a, |n| n.selection().map(|(f, t)| n.text.chars().skip(f).take(t - f).collect::<String>()))?;
         if let Some(text) = selected {
-            *host(a.lua).panels.clipboard.borrow_mut() = text;
+            crate::clipboard::set(&text);
         }
         Ok(Value::Nil)
     })?;
@@ -2284,14 +2444,14 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
         let h = this(a)?;
         let selected = read(a, |n| n.selection().map(|(f, t)| n.text.chars().skip(f).take(t - f).collect::<String>()))?;
         if let Some(text) = selected {
-            *host(a.lua).panels.clipboard.borrow_mut() = text;
+            crate::clipboard::set(&text);
             insert_or_delete(a.lua, h, None);
         }
         Ok(Value::Nil)
     })?;
     def(lua, m, "Paste", |a| {
         let h = this(a)?;
-        let text = host(a.lua).panels.clipboard.borrow().clone();
+        let text = crate::clipboard::get();
         insert(a.lua, h, &text);
         Ok(Value::Nil)
     })?;
@@ -2324,10 +2484,11 @@ fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     Some(run) if run.color == color => run.text.push_str(&text),
                     _ => n.runs.push(Run { text, color }),
                 }
-                // what scrolled out long ago goes (a console that ran for hours)
-                let mut total: usize = n.runs.iter().map(|r| r.text.len()).sum();
-                while total > RICH_TEXT_LIMIT && n.runs.len() > 1 {
-                    total -= n.runs.remove(0).text.len();
+                // what scrolled out long ago goes (a console that ran for hours); a selection
+                // stays on its text
+                let gone = trim_runs(&mut n.runs, RICH_TEXT_LIMIT);
+                if gone > 0 {
+                    n.rich_selection = n.rich_selection.and_then(|(a, b)| Some((a.checked_sub(gone)?, b.checked_sub(gone)?)));
                 }
             })
         })?;

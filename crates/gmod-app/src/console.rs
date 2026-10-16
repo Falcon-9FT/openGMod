@@ -71,6 +71,50 @@ pub fn take_typed() -> Vec<String> {
     std::mem::take(&mut *TYPED.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
+/// The program's own commands, which no realm's Lua knows.
+const PROGRAM_COMMANDS: &[&str] = &[
+    "connect",
+    "disconnect",
+    "quit",
+    "exit",
+    "screenshot",
+    "jpeg",
+    "toggleconsole",
+    "showconsole",
+    "gameui_activate",
+    "gameui_hide",
+    "lua_run_cl",
+    "lua_run_menu",
+    "map",
+    "gamemode",
+    "maxplayers",
+    "hostname",
+    "undo",
+    "gmod_undo",
+];
+
+/// The most completions shown under a line.
+const MOST_COMPLETIONS: usize = 30;
+
+/// What the console window offers under a line typed so far: what the realms offer (`found`)
+/// and the program's own commands, each name once - with its value when one says it - by
+/// name, as many as are shown.
+pub fn completions(line: &str, found: Vec<String>) -> Vec<String> {
+    let mut list = found;
+    let arguments = line.trim_start().contains(' ');
+    let prefix = line.trim().to_ascii_lowercase();
+    if !arguments && !prefix.is_empty() {
+        list.extend(PROGRAM_COMMANDS.iter().filter(|c| c.starts_with(&prefix)).map(|c| c.to_string()));
+    }
+    let key =
+        |entry: &String| if arguments { entry.to_ascii_lowercase() } else { entry.split(' ').next().unwrap_or("").to_ascii_lowercase() };
+    // those with a value first among those of a name, which then stay
+    list.sort_by_key(|entry| (key(entry), !entry.contains(' ')));
+    list.dedup_by_key(|entry| key(entry));
+    list.truncate(MOST_COMPLETIONS);
+    list
+}
+
 /// `println!` that the console shows too.
 macro_rules! say {
     ($($arg:tt)*) => {
@@ -99,5 +143,14 @@ mod tests {
         assert!(since(&mut seen).is_empty());
         type_line("status".into());
         assert_eq!(take_typed(), ["status"]);
+    }
+
+    #[test]
+    fn completions_name_each_thing_once() {
+        let found = vec!["sv_gravity 600".to_string(), "screenshot".to_string(), "sv_cheats 0".to_string(), "sv_gravity 600".to_string()];
+        assert_eq!(completions("s", found), ["screenshot", "showconsole", "sv_cheats 0", "sv_gravity 600"]);
+        assert_eq!(completions("dis", Vec::new()), ["disconnect"]);
+        assert_eq!(completions("gm_spawn ", vec!["gm_spawn models/a.mdl".to_string()]), ["gm_spawn models/a.mdl"]);
+        assert!(completions("", Vec::new()).is_empty());
     }
 }

@@ -70,6 +70,8 @@ pub(crate) struct Menu {
     pub applied: Cell<bool>,
     /// The lines typed into the console window, for the program to run.
     pub console_typed: RefCell<Vec<String>>,
+    /// A line being typed there, whose completions the program is to give.
+    pub console_complete: RefCell<Option<String>>,
     /// The player's settings as the program has them, for the options window; and what the
     /// window changed, for the program.
     pub settings: RefCell<std::collections::BTreeMap<String, String>>,
@@ -341,6 +343,11 @@ local function MakeConsole()
 	entry:Dock( FILL )
 	entry:DockMargin( 0, 0, 4, 0 )
 	entry:SetHistoryEnabled( true )
+	-- what the line could go on as, as the program says a frame later: under the line, as
+	-- DTextEntry shows its own; up, down and Tab go through them
+	entry.GetAutoComplete = function( self, text )
+		if ( string.Trim( text ) != "" ) then OpenGMOD.ConsoleComplete( text ) end
+	end
 
 	local back = frame:Add( "DPanel" )
 	back:Dock( FILL )
@@ -354,6 +361,7 @@ local function MakeConsole()
 	log.PerformLayout = function( self ) self:SetFontInternal( "OpenGMODConsole" ) end
 
 	local function Run()
+		if ( IsValid( entry.Menu ) ) then entry.Menu:Remove() end
 		local line = entry:GetText()
 		entry:SetText( "" )
 		entry:RequestFocus()
@@ -401,6 +409,16 @@ function Console.Toggle()
 	frame.Fronts = 5
 	frame.Entry:RequestFocus()
 	return true
+end
+
+function Console.Completions( line, list )
+	local frame = Console.Frame
+	if ( !IsValid( frame ) or !frame:IsVisible() ) then return end
+	local entry = frame.Entry
+	if ( entry:GetText() != line ) then return end
+	if ( IsValid( entry.Menu ) ) then entry.Menu:Remove() end
+	if ( #list == 0 ) then return end
+	entry:OpenAutoComplete( list )
 end
 
 function Console.IsOpen()
@@ -654,6 +672,13 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         host(a.lua).menu.console_typed.borrow_mut().push(line);
         Ok(Value::Nil)
     })?;
+    // what a line typed so far could go on as: `OpenGMODConsole.Completions(line, list)` comes
+    // with the answer
+    def(lua, &opengmod, "ConsoleComplete", |a| {
+        let line = a.string(1)?;
+        *host(a.lua).menu.console_complete.borrow_mut() = Some(line);
+        Ok(Value::Nil)
+    })?;
 
     let gui = library(lua, "gui")?;
     def(lua, &gui, "ShowConsole", nothing)?;
@@ -794,6 +819,20 @@ impl crate::Runtime {
     /// What the options window changed since the last call, in order.
     pub fn take_setting_changes(&self) -> Vec<SettingChange> {
         std::mem::take(&mut *host(&self.lua).menu.setting_changes.borrow_mut())
+    }
+
+    /// The line typed into the console window whose completions it asked for since the last
+    /// call, if it did.
+    pub fn take_console_complete(&self) -> Option<String> {
+        host(&self.lua).menu.console_complete.borrow_mut().take()
+    }
+
+    /// The completions of a line typed into the console window: shown under it while it still
+    /// says that.
+    pub fn console_completions(&self, line: &str, list: Vec<String>) {
+        if let Ok(list) = self.lua.create_sequence_from(list) {
+            self.console_call("Completions", (line.to_string(), list));
+        }
     }
 
     /// The lines typed into the console window since the last call, oldest first.

@@ -270,6 +270,50 @@ pub(crate) fn set_value(lua: &Lua, name: &str, value: &str) {
     }
 }
 
+/// The engine's commands for players, which are no ConVars and no commands of Lua.
+const ENGINE_COMMANDS: &[&str] = &[
+    "noclip", "kill", "explode", "give", "use", "lastinv", "ent_fire", "invnext", "invprev", "slot1", "slot2", "slot3", "slot4", "slot5",
+    "slot6", "lua_run", "echo",
+];
+
+/// What the console offers for `line` typed so far: the ConVars (`name value`) and commands
+/// whose names start with it, by name; once the line has a command and a space, what the
+/// command's own completion (`concommand.Add`'s) gives.
+pub(crate) fn completions(lua: &Lua, line: &str) -> Vec<String> {
+    let line = line.trim_start();
+    if let Some((command, _)) = line.split_once(' ') {
+        let complete = || -> Option<Vec<String>> {
+            let concommand: Table = lua.globals().get("concommand").ok()?;
+            let auto: mlua::Function = concommand.get("AutoComplete").ok()?;
+            let arguments = &line[command.len()..];
+            let list: Table = files::call_reporting(lua, auto, mlua::IntoLuaMulti::into_lua_multi((command, arguments), lua).ok()?)
+                .ok()?
+                .into_iter()
+                .next()
+                .and_then(|v| v.as_table().cloned())?;
+            Some(list.sequence_values::<String>().flatten().collect())
+        };
+        return complete().unwrap_or_default();
+    }
+    let prefix = line.to_ascii_lowercase();
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let console = &host(lua).console;
+    let mut out: Vec<String> = console
+        .convars
+        .borrow()
+        .iter()
+        .filter(|c| c.name.to_ascii_lowercase().starts_with(&prefix))
+        .map(|c| format!("{} {}", c.name, c.value))
+        .collect();
+    out.extend(console.commands.borrow().keys().filter(|name| name.starts_with(&prefix)).cloned());
+    out.extend(ENGINE_COMMANDS.iter().filter(|name| name.starts_with(&prefix)).map(|name| name.to_string()));
+    out.sort_by_key(|entry| entry.split(' ').next().unwrap_or("").to_ascii_lowercase());
+    out.dedup_by_key(|entry| entry.split(' ').next().unwrap_or("").to_ascii_lowercase());
+    out
+}
+
 /// The value of a ConVar, if there is one of that name.
 pub(crate) fn value(lua: &Lua, name: &str) -> Option<String> {
     find(lua, name).map(|handle| with(lua, handle, |c| c.value.clone()))
@@ -377,6 +421,11 @@ pub(crate) fn execute_as(lua: &Lua, words: &[String], player: EntityHandle) {
         return;
     }
     let known = host(lua).console.commands.borrow().contains_key(&name.to_ascii_lowercase());
+    // the engine's `echo`: what follows, back into the console
+    if !known && name.eq_ignore_ascii_case("echo") {
+        host(lua).print(&format!("{}\n", arguments.join(" ")));
+        return;
+    }
     if !known && crate::chat::command(lua, player, words) {
         return;
     }

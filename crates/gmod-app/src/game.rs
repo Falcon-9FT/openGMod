@@ -357,6 +357,16 @@ impl Game {
         &self.client
     }
 
+    /// What the console offers for a line typed so far, of the client's and - when the game
+    /// runs here - the server's ConVars and commands.
+    pub fn completions(&self, line: &str) -> Vec<String> {
+        let mut list = self.client.completions(line);
+        if let Link::Local(server) = &self.link {
+            list.extend(server.runtime().completions(line));
+        }
+        list
+    }
+
     /// Runs a console command as the player: on the server in this program, or through the
     /// client's console, which sends the server what it does not know itself.
     /// A key of choosing a weapon: the client's row of slots, or the key's command to the

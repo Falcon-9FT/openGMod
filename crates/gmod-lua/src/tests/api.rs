@@ -211,3 +211,71 @@ B = x\ty
     let pairs = crate::client::properties(text);
     assert_eq!(pairs, [("Hint_A".to_string(), "При вет 😀".to_string()), ("B".to_string(), "x\ty".to_string())]);
 }
+
+#[test]
+fn the_console_offers_what_starts_as_typed_and_echoes() {
+    let g = game(Realm::Server, &[]);
+    g.runtime
+        .run_string(
+            // as GMod's module keeps commands and their completions
+            "concommand = { completes = {} }
+             function concommand.Add(name, run, complete) AddConsoleCommand(name) concommand.completes[name:lower()] = complete end
+             function concommand.AutoComplete(cmd, args) local f = concommand.completes[cmd:lower()] if f then return f(cmd, args) end end
+             CreateConVar('my_var', '5')
+             concommand.Add('my_cmd', function() end, function(cmd, args) return { cmd .. ' one', cmd .. ' two' } end)",
+            "commands",
+        )
+        .unwrap();
+    assert_eq!(g.runtime.completions("my_"), ["my_cmd", "my_var 5"]);
+    assert_eq!(g.runtime.completions("MY_V"), ["my_var 5"]);
+    assert_eq!(g.runtime.completions("my_cmd o"), ["my_cmd one", "my_cmd two"]);
+    assert!(g.runtime.completions("noc").contains(&"noclip".to_string()));
+    g.runtime.run_command("echo hi  there");
+    assert!(g.printed().contains("hi there\n"), "{}", g.printed());
+}
+
+#[test]
+fn rich_text_is_selected_with_the_mouse_and_copied() {
+    let g = client_game(&[]);
+    g.runtime
+        .run_string(
+            "surface.CreateFont('Default', { font = 'Tahoma', size = 13 })
+             R = vgui.Create('RichText') R:SetPos(0, 0) R:SetSize(400, 200) R:MakePopup()
+             R:AppendText('first line\\n') R:InsertColorChange(255, 0, 0, 255) R:AppendText('second line')",
+            "rich",
+        )
+        .unwrap();
+    g.runtime.paint(0.01);
+    // from the start of the first line to the end of the second: down, across, up
+    g.runtime.set_cursor(1, 1);
+    assert!(g.runtime.button(107, true));
+    g.runtime.set_cursor(399, 199);
+    assert!(g.runtime.button(107, false));
+    crate::clipboard::set("before");
+    assert!(g.runtime.button(83, true) && g.runtime.button(13, true));
+    g.runtime.button(13, false);
+    g.runtime.button(83, false);
+    assert_eq!(crate::clipboard::get(), "first line\nsecond line");
+    // a console long in one colour loses its oldest lines, not all it has, when another comes
+    assert!(g.eval::<bool>(
+        "local C = vgui.Create('RichText')
+         for i = 1, 2000 do C:AppendText(string.rep('a', 40) .. '\\n') end
+         C:InsertColorChange(255, 0, 0, 255) C:AppendText('typed')
+         local text = C:GetText()
+         return #text > 60000 and #text <= 65536 and text:sub(1, 1) == 'a' and text:sub(-5) == 'typed'"
+    ));
+}
+
+#[test]
+fn a_popup_is_placed_on_the_screen_whatever_it_is_in() {
+    let g = client_game(&[]);
+    // as GMod has it: 5, 7 and 105, 127
+    assert!(g.eval::<bool>(
+        "local f = vgui.Create('Panel') f:SetPos(100, 120) f:SetSize(200, 200)
+         local c = vgui.Create('Panel', f) c:SetSize(50, 50) c:MakePopup() c:SetPos(5, 7)
+         local d = vgui.Create('Panel', f) d:SetSize(50, 50) d:SetPos(5, 7)
+         local cx, cy = c:LocalToScreen(0, 0)
+         local dx, dy = d:LocalToScreen(0, 0)
+         return cx == 5 and cy == 7 and dx == 105 and dy == 127"
+    ));
+}

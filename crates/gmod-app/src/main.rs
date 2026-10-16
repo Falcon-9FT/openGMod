@@ -1539,6 +1539,11 @@ impl App {
         for line in menu.runtime().take_console_commands() {
             console::type_line(line);
         }
+        if let Some(line) = menu.runtime().take_console_complete() {
+            let mut list = self.game.as_ref().map(|game| game.completions(&line)).unwrap_or_default();
+            list.extend(menu.runtime().completions(&line));
+            menu.runtime().console_completions(&line, console::completions(&line, list));
+        }
         if self.menu_shown()
             && let Some(gpu) = &self.gpu
         {

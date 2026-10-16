@@ -69,6 +69,7 @@ pub mod breakable;
 pub mod bullets;
 pub mod chat;
 pub mod client;
+mod clipboard;
 pub mod console;
 pub mod constraint;
 pub mod convar;
@@ -799,6 +800,12 @@ impl Runtime {
     /// What to show of a player: where they see from, their health, the weapon in hand.
     pub fn view(&self, player: EntityHandle) -> Option<PlayerView> {
         player::view(&self.lua, player)
+    }
+
+    /// What the console offers for a line typed so far: ConVars (`name value`) and commands
+    /// whose names start with it; after a command and a space, what its own completion gives.
+    pub fn completions(&self, line: &str) -> Vec<String> {
+        convar::completions(&self.lua, line)
     }
 
     /// A console variable's value, if there is one of that name.
