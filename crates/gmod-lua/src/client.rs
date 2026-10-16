@@ -312,21 +312,69 @@ pub(crate) fn load(lua: &Lua) {
             }
         }
     }
+    drop(host);
+    load_phrases(lua);
+}
+
+/// The engine's name of a language GMod names by its code (`ru`: `russian`), as its token
+/// files (`gameui_russian.txt`) are named.
+fn engine_language(code: &str) -> &'static str {
+    match code.to_ascii_lowercase().as_str() {
+        "bg" => "bulgarian",
+        "cs" => "czech",
+        "da" => "danish",
+        "de" => "german",
+        "el" => "greek",
+        "es-es" | "es" => "spanish",
+        "fi" => "finnish",
+        "fr" => "french",
+        "hu" => "hungarian",
+        "it" => "italian",
+        "ja" => "japanese",
+        "ko" => "koreana",
+        "nl" => "dutch",
+        "no" => "norwegian",
+        "pl" => "polish",
+        "pt-br" => "brazilian",
+        "pt-pt" => "portuguese",
+        "ro" => "romanian",
+        "ru" => "russian",
+        "sv-se" | "sv" => "swedish",
+        "th" => "thai",
+        "tr" => "turkish",
+        "uk" => "ukrainian",
+        "zh-cn" => "schinese",
+        "zh-tw" => "tchinese",
+        _ => "english",
+    }
+}
+
+/// The phrases of the language (`gmod_language`): the engine's token files and GMod's, English
+/// first and the language over it.
+pub(crate) fn load_phrases(lua: &Lua) {
+    let host = host(lua);
+    let vfs = host.vfs.clone();
+    let language = crate::convar::value(lua, "gmod_language").filter(|l| !l.is_empty()).unwrap_or_else(|| "en".to_string());
     let mut phrases = host.client.phrases.borrow_mut();
-    // the engine's token files, then GMod's: English first, the language over it
-    for folder in ["resource", "resource/language"] {
-        for file in vfs.find(&format!("{folder}/*_english.txt"), "GAME").files {
-            let Ok(data) = vfs.read(&format!("{folder}/{file}"), "GAME") else { continue };
-            let (document, _) = gmod_kv::parse_lenient(&gmod_kv::decode_text(&data), gmod_kv::Options { escapes: true });
-            let Some(tokens) = document.root.iter().find_map(|p| p.value.as_block()).and_then(|b| b.block("Tokens")) else { continue };
-            for pair in tokens {
-                if let Some(value) = pair.value.as_str() {
-                    phrases.insert(pair.key.to_lowercase(), value.to_string());
+    phrases.clear();
+    let mut names = vec!["english"];
+    if engine_language(&language) != "english" {
+        names.push(engine_language(&language));
+    }
+    for name in names {
+        for folder in ["resource", "resource/language"] {
+            for file in vfs.find(&format!("{folder}/*_{name}.txt"), "GAME").files {
+                let Ok(data) = vfs.read(&format!("{folder}/{file}"), "GAME") else { continue };
+                let (document, _) = gmod_kv::parse_lenient(&gmod_kv::decode_text(&data), gmod_kv::Options { escapes: true });
+                let Some(tokens) = document.root.iter().find_map(|p| p.value.as_block()).and_then(|b| b.block("Tokens")) else { continue };
+                for pair in tokens {
+                    if let Some(value) = pair.value.as_str() {
+                        phrases.insert(pair.key.to_lowercase(), value.to_string());
+                    }
                 }
             }
         }
     }
-    let language = crate::convar::value(lua, "gmod_language").filter(|l| !l.is_empty()).unwrap_or_else(|| "en".to_string());
     let mut languages = vec!["en".to_string()];
     if language != "en" {
         languages.push(language);

@@ -234,6 +234,10 @@ fn set(lua: &Lua, handle: ConVarHandle, value: &str) {
         if user_info {
             send_user_info(lua, &name, &new);
         }
+        // another language: its phrases from now on
+        if name.eq_ignore_ascii_case("gmod_language") && host(lua).realm != crate::Realm::Server {
+            crate::client::load_phrases(lua);
+        }
         let callback = || -> mlua::Result<Option<mlua::Function>> {
             let Some(cvars) = lua.globals().get::<Option<Table>>("cvars")? else { return Ok(None) };
             cvars.get::<Option<mlua::Function>>("OnConVarChanged")

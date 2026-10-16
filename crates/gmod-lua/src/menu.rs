@@ -40,6 +40,9 @@ impl Addon {
     }
 }
 
+/// The screen's sizes, and its own.
+pub(crate) type VideoModes = (Vec<(u32, u32)>, (u32, u32));
+
 /// What the options window changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingChange {
@@ -72,6 +75,8 @@ pub(crate) struct Menu {
     pub settings: RefCell<std::collections::BTreeMap<String, String>>,
     pub binds: RefCell<Vec<(String, String)>>,
     pub setting_changes: RefCell<Vec<SettingChange>>,
+    /// The screen's sizes the video options offer, and the screen's own.
+    pub video_modes: RefCell<VideoModes>,
     pub games: RefCell<Vec<MountableGame>>,
     pub in_game: Cell<bool>,
     /// Addons were not mounted at all (`-noaddons`), workshop ones were not (`-noworkshop`).
@@ -91,6 +96,31 @@ fn call_back(lua: &Lua, f: mlua::Function, args: impl mlua::IntoLuaMulti) {
     if let Ok(args) = args.into_lua_multi(lua) {
         let _ = crate::files::call_reporting(lua, f, args);
     }
+}
+
+/// The words of a list of the engine's (`scripts/kb_act.lst`): quoted or not, `//` ending a
+/// line; two to a pair.
+fn list_pairs(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() || rest.starts_with("//") {
+                break;
+            }
+            if let Some(quoted) = rest.strip_prefix('"') {
+                let end = quoted.find('"').unwrap_or(quoted.len());
+                words.push(quoted[..end].to_string());
+                rest = quoted.get(end + 1..).unwrap_or("");
+            } else {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                words.push(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+        }
+    }
+    words
 }
 
 fn nothing(_: &Args) -> mlua::Result<Value> {
@@ -373,163 +403,6 @@ end
 function Console.IsOpen()
 	return IsValid( Console.Frame ) and Console.Frame:IsVisible()
 end
-
--- the options window (Options in the main menu): keys, mouse, video, sound; what is changed
--- is the player's at once, and kept
-OpenGMODOptions = OpenGMODOptions or {}
-local Options = OpenGMODOptions
-
-local PHRASES = {
-	title = { "Options", "Настройки" },
-	keyboard = { "Keyboard", "Клавиатура" }, mouse = { "Mouse", "Мышь" }, video = { "Video", "Видео" }, audio = { "Audio", "Звук" },
-	forward = { "Move forward", "Вперёд" }, back = { "Move back", "Назад" }, left = { "Move left", "Влево" }, right = { "Move right", "Вправо" },
-	jump = { "Jump", "Прыжок" }, duck = { "Duck", "Присесть" }, speed = { "Sprint", "Бег" }, walk = { "Walk", "Шаг" },
-	attack = { "Primary attack", "Основная атака" }, attack2 = { "Secondary attack", "Дополнительная атака" }, reload = { "Reload", "Перезарядка" },
-	use = { "Use", "Использовать" }, flashlight = { "Flashlight", "Фонарик" }, noclip = { "Noclip", "Noclip" }, undo = { "Undo", "Отменить" },
-	menu = { "Spawn menu", "Меню спавна" }, context = { "Context menu", "Контекстное меню" }, chat = { "Chat", "Чат" }, teamchat = { "Team chat", "Командный чат" },
-	scores = { "Scoreboard", "Таблица игроков" }, lastinv = { "Last weapon", "Прошлое оружие" }, zoom = { "Zoom", "Приближение" },
-	console = { "Console", "Консоль" }, screenshot = { "Screenshot", "Снимок экрана" }, voice = { "Voice chat", "Голосовой чат" },
-	sensitivity = { "Sensitivity", "Чувствительность" }, invert = { "Invert mouse", "Инвертировать мышь" },
-	fullscreen = { "Fullscreen", "Полный экран" }, vsync = { "Vertical sync", "Вертикальная синхронизация" },
-	fps = { "Frame rate limit (0: none)", "Ограничение FPS (0: нет)" }, fov = { "Field of view", "Поле зрения" },
-	hud = { "Draw the HUD", "Показывать HUD" }, showfps = { "Show FPS", "Показывать FPS" }, crosshair = { "Crosshair", "Прицел" },
-	viewmodel = { "Draw the weapon in hand", "Показывать оружие в руках" },
-	volume = { "Master volume", "Общая громкость" }, music = { "Music volume", "Громкость музыки" },
-	close = { "Close", "Закрыть" },
-}
-local function T( id )
-	local phrase = PHRASES[ id ] or { id, id }
-	local ok, language = pcall( function() return GetConVar( "gmod_language" ):GetString() end )
-	if ( !ok ) then language = "en" end
-	return phrase[ language == "ru" and 2 or 1 ]
-end
-
-local ACTIONS = {
-	{ "forward", "+forward" }, { "back", "+back" }, { "left", "+moveleft" }, { "right", "+moveright" },
-	{ "jump", "+jump" }, { "duck", "+duck" }, { "speed", "+speed" }, { "walk", "+walk" },
-	{ "attack", "+attack" }, { "attack2", "+attack2" }, { "reload", "+reload" }, { "use", "+use" },
-	{ "flashlight", "impulse 100" }, { "noclip", "noclip" }, { "undo", "gmod_undo" }, { "menu", "+menu" },
-	{ "context", "+menu_context" }, { "chat", "messagemode" }, { "teamchat", "messagemode2" }, { "scores", "+showscores" },
-	{ "lastinv", "lastinv" }, { "zoom", "+zoom" }, { "voice", "+voicerecord" }, { "console", "toggleconsole" },
-	{ "screenshot", "jpeg" },
-}
-
-local function Number( name, default )
-	return tonumber( OpenGMOD.GetSetting( name ) or "" ) or default
-end
-
-local function Slider( parent, label, name, min, max, decimals, default, show, store )
-	local slider = parent:Add( "DNumSlider" )
-	slider:Dock( TOP )
-	slider:DockMargin( 8, 4, 8, 0 )
-	slider:SetText( label )
-	slider:SetMinMax( min, max )
-	slider:SetDecimals( decimals )
-	slider:SetDark( true )
-	slider:SetValue( show and show( Number( name, default ) ) or Number( name, default ) )
-	slider.OnValueChanged = function( self, value )
-		OpenGMOD.SetSetting( name, store and store( value ) or value )
-	end
-	return slider
-end
-
-local function Check( parent, label, name, default, store, show )
-	local check = parent:Add( "DCheckBoxLabel" )
-	check:Dock( TOP )
-	check:DockMargin( 8, 6, 8, 0 )
-	check:SetText( label )
-	check:SetDark( true )
-	check:SetChecked( show and show( Number( name, default ) ) or Number( name, default ) != 0 )
-	check.OnChange = function( self, on )
-		OpenGMOD.SetSetting( name, store and store( on ) or ( on and "1" or "0" ) )
-	end
-	return check
-end
-
-local function KeyboardTab( sheet )
-	local list = vgui.Create( "DScrollPanel", sheet )
-	for _, action in ipairs( ACTIONS ) do
-		local row = list:Add( "Panel" )
-		row:Dock( TOP )
-		row:SetTall( 26 )
-		row:DockMargin( 8, 2, 8, 0 )
-		local label = row:Add( "DLabel" )
-		label:Dock( FILL )
-		label:SetText( T( action[ 1 ] ) )
-		label:SetDark( true )
-		-- the key and another, as GMod's keyboard options have them; the second rightmost
-		local keys = OpenGMOD.GetBindKeys( action[ 2 ] )
-		for slot = 2, 1, -1 do
-			local binder = row:Add( "DBinder" )
-			binder:Dock( RIGHT )
-			binder:DockMargin( 4, 0, 0, 0 )
-			binder:SetWide( 110 )
-			binder:SetValue( keys[ slot ] and input.GetKeyCode( keys[ slot ] ) or 0 )
-			binder.Key = keys[ slot ]
-			binder.OnChange = function( self, code )
-				if ( self.Key ) then OpenGMOD.BindKey( self.Key, nil ) end
-				local name = code and code != 0 and input.GetKeyName( code ) or nil
-				self.Key = name and string.lower( name ) or nil
-				if ( self.Key ) then OpenGMOD.BindKey( self.Key, action[ 2 ] ) end
-			end
-		end
-	end
-	return list
-end
-
-local function MouseTab( sheet )
-	local panel = vgui.Create( "Panel", sheet )
-	Slider( panel, T( "sensitivity" ), "sensitivity", 0.1, 20, 2, 3 )
-	-- the pitch factor below 0 turns the mouse upside down
-	Check( panel, T( "invert" ), "m_pitch", 0.022, function( on ) return on and "-0.022" or "0.022" end, function( value ) return value < 0 end )
-	return panel
-end
-
-local function VideoTab( sheet )
-	local panel = vgui.Create( "Panel", sheet )
-	Check( panel, T( "fullscreen" ), "opengmod_fullscreen", 0 )
-	Check( panel, T( "vsync" ), "mat_vsync", 1 )
-	Slider( panel, T( "fps" ), "fps_max", 0, 500, 0, 0 )
-	Slider( panel, T( "fov" ), "fov_desired", 75, 100, 0, 75 )
-	Check( panel, T( "hud" ), "cl_drawhud", 1 )
-	Check( panel, T( "crosshair" ), "crosshair", 1 )
-	Check( panel, T( "viewmodel" ), "r_drawviewmodel", 1 )
-	Check( panel, T( "showfps" ), "cl_showfps", 0 )
-	return panel
-end
-
-local function AudioTab( sheet )
-	local panel = vgui.Create( "Panel", sheet )
-	Slider( panel, T( "volume" ), "volume", 0, 1, 2, 1 )
-	Slider( panel, T( "music" ), "snd_musicvolume", 0, 1, 2, 1 )
-	return panel
-end
-
-function Options.Open()
-	if ( IsValid( Options.Frame ) ) then Options.Frame:Remove() end
-	local frame = vgui.Create( "DFrame" )
-	frame:SetTitle( T( "title" ) )
-	frame:SetSize( math.min( ScrW() - 40, 560 ), math.min( ScrH() - 40, 520 ) )
-	frame:Center()
-	frame:MakePopup()
-	frame.btnMaxim:SetVisible( false )
-	frame.btnMinim:SetVisible( false )
-	Options.Frame = frame
-
-	local close = frame:Add( "DButton" )
-	close:Dock( BOTTOM )
-	close:DockMargin( 0, 6, 0, 0 )
-	close:SetTall( 26 )
-	close:SetText( T( "close" ) )
-	close.DoClick = function() frame:Close() end
-
-	local sheet = frame:Add( "DPropertySheet" )
-	sheet:Dock( FILL )
-	sheet:AddSheet( T( "keyboard" ), KeyboardTab( sheet ), "icon16/keyboard.png" )
-	sheet:AddSheet( T( "mouse" ), MouseTab( sheet ), "icon16/mouse.png" )
-	sheet:AddSheet( T( "video" ), VideoTab( sheet ), "icon16/monitor.png" )
-	sheet:AddSheet( T( "audio" ), AudioTab( sheet ), "icon16/sound.png" )
-end
 "#;
 
 /// Where the previews of workshop items are kept, in openGMOD's folder: the menu's page
@@ -667,6 +540,50 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     })?;
     // the console window's side of the program: what is typed into it goes to the program
     let opengmod = library(lua, "OpenGMOD")?;
+    // the options window is laid out as the engine's: its pages' `.res` files, with what does
+    // not hold on this computer left out; and the lists of keys (`scripts/kb_act.lst`)
+    def(lua, &opengmod, "ReadResource", |a| {
+        let path = a.string(1)?;
+        let Some(text) = host(a.lua).vfs.read(&path, "GAME").ok() else { return Ok(Value::Nil) };
+        let (mut document, _) = gmod_kv::parse_lenient(&gmod_kv::decode_text(&text), gmod_kv::Options::default());
+        document.root.apply_conditions(&gmod_kv::pc_symbol);
+        let controls = a.lua.create_table()?;
+        let Some(top) = document.root.pairs.first().and_then(|p| p.value.as_block()) else { return Ok(Value::Table(controls)) };
+        for pair in top.iter() {
+            let Some(block) = pair.value.as_block() else { continue };
+            let control = a.lua.create_table()?;
+            control.raw_set("name", pair.key.as_str())?;
+            for field in block.iter() {
+                let key = field.key.to_ascii_lowercase();
+                // the first of a key, as the engine reads it
+                if let Some(value) = field.value.as_str()
+                    && control.raw_get::<Value>(key.as_str())?.is_nil()
+                {
+                    control.raw_set(key, value)?;
+                }
+            }
+            controls.raw_push(control)?;
+        }
+        Ok(Value::Table(controls))
+    })?;
+    def(lua, &opengmod, "ReadPairs", |a| {
+        let path = a.string(1)?;
+        let Some(text) = host(a.lua).vfs.read(&path, "GAME").ok() else { return Ok(Value::Nil) };
+        let pairs = a.lua.create_table()?;
+        for [key, value] in list_pairs(&gmod_kv::decode_text(&text)).as_chunks::<2>().0 {
+            pairs.raw_push(a.lua.create_sequence_from([key.as_str(), value.as_str()])?)?;
+        }
+        Ok(Value::Table(pairs))
+    })?;
+    def(lua, &opengmod, "VideoModes", |a| {
+        let (modes, native) = host(a.lua).menu.video_modes.borrow().clone();
+        let list = a.lua.create_table()?;
+        for (w, h) in modes {
+            list.raw_push(a.lua.create_sequence_from([w, h])?)?;
+        }
+        list.raw_set("native", a.lua.create_sequence_from([native.0, native.1])?)?;
+        Ok(Value::Table(list))
+    })?;
     // the options window's: the player's settings and key bindings
     def(lua, &opengmod, "GetSetting", |a| {
         let name = a.string(1)?.to_ascii_lowercase();
@@ -689,6 +606,14 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         menu.settings.borrow_mut().insert(name.clone(), value.clone());
         menu.setting_changes.borrow_mut().push(SettingChange::Value(name, value));
         Ok(Value::Nil)
+    })?;
+    // every key bound, and what it does
+    def(lua, &opengmod, "GetBinds", |a| {
+        let list = a.lua.create_table()?;
+        for (key, command) in host(a.lua).menu.binds.borrow().iter() {
+            list.raw_push(a.lua.create_sequence_from([key.as_str(), command.as_str()])?)?;
+        }
+        Ok(Value::Table(list))
     })?;
     // the keys that do a command, in the order they were bound
     def(lua, &opengmod, "GetBindKeys", |a| {
@@ -794,7 +719,9 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     crate::serverlist::install(lua, &serverlist)?;
 
     let chunk = lua.load(MENU_LUA).set_name("=[openGMOD menu]");
-    chunk.call((previews(lua)?, crate::steam::natives(lua)?))
+    chunk.call::<()>((previews(lua)?, crate::steam::natives(lua)?))?;
+    // the options dialog, as the engine's GameUI makes it
+    lua.load(include_str!("menu_options.lua")).set_name("=[openGMOD options]").exec()
 }
 
 /// The program's side of the menu.
@@ -839,6 +766,11 @@ impl crate::Runtime {
         let menu = &host(&self.lua).menu;
         *menu.settings.borrow_mut() = values;
         *menu.binds.borrow_mut() = binds;
+    }
+
+    /// The screen's sizes the video options offer, and the screen's own.
+    pub fn set_video_modes(&self, modes: Vec<(u32, u32)>, native: (u32, u32)) {
+        *host(&self.lua).menu.video_modes.borrow_mut() = (modes, native);
     }
 
     /// What the options window changed since the last call, in order.

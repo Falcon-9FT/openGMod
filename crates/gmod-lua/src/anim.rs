@@ -653,7 +653,9 @@ pub(crate) fn view_models(lua: &Lua, viewer: EntityHandle) -> (Vec<crate::Drawn>
     // none from behind (`drawviewer`), nor in a vehicle that does not let weapons in
     let seated =
         crate::vehicle::of(lua, viewer).index.is_some() && !player::state(lua, viewer, |_, p| p.allow_weapons_in_vehicle).unwrap_or(false);
-    if !show || seated || host(lua).client.draw_viewer.get() || !host(lua).entities.is_valid(active) {
+    // the player put it away (`r_drawviewmodel 0`)
+    let wanted = crate::convar::value(lua, "r_drawviewmodel").is_none_or(|v| crate::convar::atof(&v) != 0.0);
+    if !show || !wanted || seated || host(lua).client.draw_viewer.get() || !host(lua).entities.is_valid(active) {
         return (Vec::new(), fov);
     }
     let drawn = |handle: EntityHandle| -> Option<crate::Drawn> {

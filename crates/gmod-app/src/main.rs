@@ -551,10 +551,10 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new(event_loop: &ActiveEventLoop, title: &str, vsync: bool, fullscreen: bool) -> Result<Gpu, String> {
+    fn new(event_loop: &ActiveEventLoop, title: &str, vsync: bool, fullscreen: bool, size: (u32, u32)) -> Result<Gpu, String> {
         let attributes = Window::default_attributes()
             .with_title(title)
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+            .with_inner_size(winit::dpi::PhysicalSize::new(size.0.max(320), size.1.max(240)))
             .with_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
         let window = Arc::new(event_loop.create_window(attributes).map_err(|e| format!("window: {e}"))?);
         let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle()));
@@ -1063,6 +1063,15 @@ impl App {
             "opengmod_fullscreen" => {
                 if let Some(gpu) = &self.gpu {
                     gpu.window.set_fullscreen((value != "0").then_some(Fullscreen::Borderless(None)));
+                }
+            }
+            // the window's size, the video options' resolution
+            "opengmod_width" | "opengmod_height" => {
+                if let Some(gpu) = &self.gpu
+                    && gpu.window.fullscreen().is_none()
+                {
+                    let (w, h) = (self.config.number("opengmod_width", 1280.0) as u32, self.config.number("opengmod_height", 720.0) as u32);
+                    let _ = gpu.window.request_inner_size(winit::dpi::PhysicalSize::new(w.max(320), h.max(240)));
                 }
             }
             _ => {}
@@ -1656,6 +1665,7 @@ impl App {
         self.holding = shown.view.holding;
         self.camera.eye = shown.eye;
         self.look = shown.look;
+        self.camera.fov = shown.fov;
         if let Some((pitch, yaw)) = shown.turned {
             (self.camera.pitch, self.camera.yaw) = (pitch, yaw);
         }
@@ -1813,8 +1823,20 @@ impl ApplicationHandler for App {
             return;
         }
         let (vsync, fullscreen) = (self.config.number("mat_vsync", 1.0) != 0.0, self.config.number("opengmod_fullscreen", 0.0) != 0.0);
-        match Gpu::new(event_loop, &format!("openGMOD - {}", self.name), vsync, fullscreen) {
+        let size = (self.config.number("opengmod_width", 1280.0) as u32, self.config.number("opengmod_height", 720.0) as u32);
+        match Gpu::new(event_loop, &format!("openGMOD - {}", self.name), vsync, fullscreen, size) {
             Ok(mut gpu) => {
+                // the screen's sizes, for the video options
+                if let (Some(menu), Some(monitor)) = (&self.menu, gpu.window.current_monitor()) {
+                    let mut modes: Vec<(u32, u32)> = monitor
+                        .video_modes()
+                        .map(|mode| (mode.size().width, mode.size().height))
+                        .filter(|&(w, h)| w >= 640 && h >= 480)
+                        .collect();
+                    modes.sort_unstable();
+                    modes.dedup();
+                    menu.runtime().set_video_modes(modes, (monitor.size().width, monitor.size().height));
+                }
                 if let Some(world) = self.world.take() {
                     gpu.set_world(Some(&world));
                 }

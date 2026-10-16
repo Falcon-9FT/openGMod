@@ -101,7 +101,8 @@ const FSOLID_NOT_SOLID: i64 = 4;
 const EF_BONEMERGE: i64 = 1;
 const EF_DIMLIGHT: i64 = 4;
 const EF_NODRAW: i64 = 32;
-const DEFAULT_FOV: f32 = 75.0;
+/// A player's field of view when the game does not change it, in degrees.
+pub const DEFAULT_FOV: f32 = 75.0;
 /// `PrintMessage` into the chat.
 const HUD_PRINTTALK: i64 = 3;
 /// The impulse that toggles the flashlight.

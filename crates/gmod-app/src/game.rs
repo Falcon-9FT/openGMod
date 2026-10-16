@@ -110,6 +110,8 @@ pub struct Shown {
     /// The client's Lua looks elsewhere than the player does (`CalcView`): the pitch and yaw
     /// to draw with, this frame only.
     pub look: Option<(f32, f32)>,
+    /// The field of view to draw with: the player's, as the client's Lua makes the view.
+    pub fov: f32,
     pub view: PlayerView,
 }
 
@@ -466,7 +468,12 @@ impl Game {
         // says now
         let angles = if local { view.angles } else { Angle::new(pitch, yaw, 0.0) };
         // as the client's Lua makes the view of it (a vehicle's, from behind)
-        let eyes = gmod_lua::client::View { origin: Vector::new(eye[0], eye[1], eye[2]), angles, fov: view.fov };
+        // the player's own field of view (`fov_desired`) where the game leaves it as it is
+        let fov = match self.client.convar("fov_desired").and_then(|v| v.trim().parse::<f32>().ok()) {
+            Some(desired) if (view.fov - gmod_lua::player::DEFAULT_FOV).abs() < 0.01 => desired.clamp(20.0, 120.0),
+            _ => view.fov,
+        };
+        let eyes = gmod_lua::client::View { origin: Vector::new(eye[0], eye[1], eye[2]), angles, fov };
         let seen = self.client.calc_view(self.player, eyes);
         self.client.set_view(seen);
         let eye = [seen.origin.x, seen.origin.y, seen.origin.z];
@@ -478,7 +485,7 @@ impl Game {
         self.turned = Some(view.turned);
         let apart = local && (angle_apart(view.angles.p, pitch) || angle_apart(view.angles.y, yaw));
         let turned = (given || apart).then_some((view.angles.p, view.angles.y));
-        Some(Shown { eye, turned, look, view })
+        Some(Shown { eye, turned, look, fov: seen.fov, view })
     }
 
     /// The models of the entities the player sees.
