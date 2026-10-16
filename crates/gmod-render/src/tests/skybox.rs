@@ -29,6 +29,7 @@ fn wall(x: f32, y: [f32; 2], z: [f32; 2], light: [f32; 3]) -> Piece {
         tint: [1.0; 3],
         alpha: 1.0,
         water: None,
+        refraction: None,
         missing: true,
         transform: None,
         frame: 0,

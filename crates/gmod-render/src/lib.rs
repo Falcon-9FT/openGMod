@@ -243,6 +243,51 @@ struct Mesh {
     /// The parameters of its surfaces, `PARAMS_STRIDE` apart, and those that change with time.
     params: wgpu::Buffer,
     animated: Vec<Animated>,
+    /// Some surface of it shows what is behind it (`Refract` glass, water): the frame drawn so
+    /// far is copied before it ([`Behind`]).
+    refracts: bool,
+}
+
+/// What a frame drew before what shows what is behind it: a copy of its colour and its depth,
+/// as large as the picture, for `Refract` glass and water to look through.
+struct Behind {
+    color: wgpu::Texture,
+    depth: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+}
+
+impl Behind {
+    /// For a picture of `size` in `format` (its colour read as sRGB, when there is such).
+    fn new(device: &wgpu::Device, size: (u32, u32), format: wgpu::TextureFormat) -> Behind {
+        let extent = wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 };
+        let srgb = format.add_srgb_suffix();
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("behind"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: if srgb == format { &[] } else { std::slice::from_ref(&srgb) },
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("behind depth"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor { format: Some(srgb), ..Default::default() });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        Behind { color, depth, color_view, depth_view, size, format }
+    }
 }
 
 impl Mesh {
@@ -288,7 +333,9 @@ pub struct Renderer {
     bones_room: usize,
     sky_vertices: Option<wgpu::Buffer>,
     sky_groups: Vec<wgpu::BindGroup>,
-    depth: Option<(wgpu::TextureView, (u32, u32))>,
+    depth: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
+    /// What the frame drew before what shows what is behind it, as large as the picture.
+    behind: Option<Behind>,
     /// Seconds into the map, for materials that change with time.
     time: f32,
     /// Textures that could not be uploaded and are drawn as missing.
@@ -496,14 +543,26 @@ fn camera_bytes(
 }
 
 /// A bind group of one camera in a buffer of them, chosen by its offset when drawing.
-fn camera_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, buffer: &wgpu::Buffer) -> wgpu::BindGroup {
+/// The cameras in `buffer`, and what was drawn behind what they see through ([`Behind`]).
+fn camera_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffer: &wgpu::Buffer,
+    behind: &Behind,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("camera"),
         layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: 0, size: NonZeroU64::new(CAMERA_SIZE) }),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: 0, size: NonZeroU64::new(CAMERA_SIZE) }),
+            },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&behind.color_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&behind.depth_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
     })
 }
 
@@ -550,6 +609,9 @@ struct Shared {
     white: wgpu::TextureView,
     lightmap_sampler: wgpu::Sampler,
     compressed: bool,
+    /// What the cameras that see through nothing are given to see through: a texel.
+    behind_none: Behind,
+    behind_sampler: wgpu::Sampler,
 }
 
 impl Shared {
@@ -577,7 +639,8 @@ impl Shared {
             for (k, v) in values.iter().enumerate() {
                 params[at + k * 4..at + k * 4 + 4].copy_from_slice(&v.to_le_bytes());
             }
-            if surface.proxies.is_some() {
+            // what changes by itself, or scrolls (water)
+            if surface.proxies.is_some() || surface.refraction.is_some_and(|r| r.scroll != [[0.0; 2]; 2]) {
                 animated.push(Animated { draw: i, surface: surface.clone(), frames, lightmap });
             }
             let kind = match (surface.translucent, surface.additive, surface.no_cull) {
@@ -602,7 +665,14 @@ impl Shared {
                 let detail = texture(surface.detail.map(|d| d.texture).or(surface.base));
                 // bump maps, the base standing in for none
                 let bump = texture(surface.bump.map(|b| b.texture).or(surface.base));
-                let bump2 = texture(surface.bump.and_then(|b| b.second.or(Some(b.texture))).or(surface.base));
+                // a refraction's tint texture in its place
+                let bump2 = texture(
+                    surface
+                        .refraction
+                        .and_then(|r| r.tint_texture)
+                        .or(surface.bump.and_then(|b| b.second.or(Some(b.texture))))
+                        .or(surface.base),
+                );
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("surface"),
                     layout: &self.layouts.surface,
@@ -650,7 +720,8 @@ impl Shared {
         // a model that moves takes the bones of its vertices along
         let bone_count = gpu::bone_count(pieces);
         let skin = (bone_count > 0).then(|| (buffer(device, queue, "skin", wgpu::BufferUsages::VERTEX, &gpu::skin(pieces)), bone_count));
-        Mesh { vertices, indices, draws, surface_groups, lightmap_groups, skin, params: params_buffer, animated }
+        let refracts = pieces.iter().flat_map(|p| &p.surfaces).any(|s| s.refraction.is_some());
+        Mesh { vertices, indices, draws, surface_groups, lightmap_groups, skin, params: params_buffer, animated, refracts }
     }
 }
 
@@ -816,7 +887,25 @@ impl Renderer {
             count: None,
         };
         let layouts = Layouts {
-            camera: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("camera"), entries: &[camera_entry] }),
+            // the cameras, and what was drawn behind what is seen through ([`Behind`])
+            camera: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("camera"),
+                entries: &[
+                    camera_entry,
+                    texture_entry(1),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    sampler_entry(3),
+                ],
+            }),
             surface: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("surface"),
                 entries: &[
@@ -875,10 +964,12 @@ impl Renderer {
         let (bones_buffer, bones_group) = bones_buffer(device, &layouts.bones, bones_room);
 
         let camera_slots = 1;
+        let behind_none = Behind::new(device, (1, 1), wgpu::TextureFormat::Rgba8Unorm);
+        let behind_sampler = sampler(device, true, true, false);
         let sky_camera_buffer = camera_buffer(device, 2);
-        let sky_camera_group = camera_group(device, &layouts.camera, &sky_camera_buffer);
+        let sky_camera_group = camera_group(device, &layouts.camera, &sky_camera_buffer, &behind_none, &behind_sampler);
         let camera_buffer = camera_buffer(device, camera_slots);
-        let camera_group = camera_group(device, &layouts.camera, &camera_buffer);
+        let camera_group = camera_group(device, &layouts.camera, &camera_buffer, &behind_none, &behind_sampler);
 
         let effects = effects::Effects::new(device, queue, &layouts.camera, format);
         let shared = Shared {
@@ -895,6 +986,8 @@ impl Renderer {
             lightmap_sampler: sampler(device, true, true, false),
             compressed: device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
             layouts,
+            behind_none,
+            behind_sampler,
         };
 
         // textures: what cannot be uploaded is drawn as missing
@@ -960,6 +1053,7 @@ impl Renderer {
             sky_vertices,
             sky_groups,
             depth: None,
+            behind: None,
             time: 0.0,
             failed_textures,
             effects,
@@ -1055,7 +1149,7 @@ impl Renderer {
     }
 
     fn depth_view(&mut self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::TextureView {
-        if let Some((view, made)) = &self.depth
+        if let Some((_, view, made)) = &self.depth
             && *made == size
         {
             return view.clone();
@@ -1067,12 +1161,35 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.depth = Some((view.clone(), size));
+        self.depth = Some((texture, view.clone(), size));
         view
+    }
+
+    /// Copies what the frame drew so far into [`Behind`], made for the picture's size and format
+    /// when it is not, and the cameras given it to see through. False when the picture cannot
+    /// be copied from.
+    fn copy_behind(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture, size: (u32, u32)) -> bool {
+        if !target.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+            return false;
+        }
+        let Some((depth, _, _)) = &self.depth else { return false };
+        if !self.behind.as_ref().is_some_and(|b| b.size == size && b.format == target.format()) {
+            let behind = Behind::new(device, size, target.format());
+            self.camera_group =
+                camera_group(device, &self.shared.layouts.camera, &self.camera_buffer, &behind, &self.shared.behind_sampler);
+            self.behind = Some(behind);
+        }
+        let Some(behind) = &self.behind else { return false };
+        let extent = wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 };
+        let whole =
+            |texture| wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All };
+        encoder.copy_texture_to_texture(whole(target), whole(&behind.color), extent);
+        encoder.copy_texture_to_texture(whole(depth), whole(&behind.depth), extent);
+        true
     }
 
     /// Draws one model alone into `target`, `size` pixels cleared to nothing first: a spawn
@@ -1122,7 +1239,7 @@ impl Renderer {
         );
         let buffer = camera_buffer(device, 1);
         queue.write_buffer(&buffer, 0, &bytes);
-        let group = camera_group(device, &self.shared.layouts.camera, &buffer);
+        let group = camera_group(device, &self.shared.layouts.camera, &buffer, &self.shared.behind_none, &self.shared.behind_sampler);
         // every bone where it was made
         let (bones, bones_group) = bones_buffer(device, &self.shared.layouts.bones, needed.max(1));
         let rest: Vec<u8> = (0..needed.max(1))
@@ -1138,13 +1255,17 @@ impl Renderer {
         draw.mesh(&mut pass, &mut current, 0, mesh, (0..mesh.draws.len()).filter(|&i| mesh.draws[i].1.translucent()));
     }
 
-    /// Draws a frame into `target`, a view of `size` pixels.
+    /// Draws a frame into `target`, a view of `size` pixels of `texture`. What shows what is
+    /// behind it (`Refract` glass, water) sees through to what was drawn before it when the
+    /// texture can be copied from.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
+        texture: &wgpu::Texture,
         size: (u32, u32),
         camera: &Camera,
     ) {
@@ -1158,7 +1279,8 @@ impl Renderer {
         if slots > self.camera_slots {
             self.camera_slots = slots.next_power_of_two();
             self.camera_buffer = camera_buffer(device, self.camera_slots);
-            self.camera_group = camera_group(device, &self.shared.layouts.camera, &self.camera_buffer);
+            let behind = self.behind.as_ref().unwrap_or(&self.shared.behind_none);
+            self.camera_group = camera_group(device, &self.shared.layouts.camera, &self.camera_buffer, behind, &self.shared.behind_sampler);
         }
         let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let world_lights = lights_bytes(&self.points, self.spot.as_ref(), false, [0.0; 3], identity, 1.0);
@@ -1239,14 +1361,26 @@ impl Renderer {
         let effects = self.effects.prepare(device, queue, &self.textures, &self.shared.samplers);
         let mut pass = begin_pass(encoder, "world", target, &depth, wgpu::LoadOp::Load);
         let (first, translucent) = order(&self.world.draws, camera.eye);
+        let slot = |slot: usize| (slot as u64 * CAMERA_STRIDE) as u32;
+        {
+            let draw = Drawing { pipelines: &self.pipelines, camera: &self.camera_group, bones: &self.bones_group };
+            let mut current = None;
+            draw.mesh(&mut pass, &mut current, 0, &self.world, first);
+            for (i, placed) in self.entities.iter().enumerate() {
+                let mesh = &self.models[placed.model.0];
+                draw.mesh(&mut pass, &mut current, slot(1 + i), mesh, (0..mesh.draws.len()).filter(|&i| !mesh.draws[i].1.translucent()));
+            }
+        }
+        // what is seen through sees what was drawn so far: that is copied, and drawing goes on
+        let refracts = self.world.refracts
+            || self.entities.iter().chain(&self.view_models).any(|p| self.models.get(p.model.0).is_some_and(|m| m.refracts));
+        if refracts {
+            drop(pass);
+            self.copy_behind(device, encoder, texture, size);
+            pass = begin_pass_on(encoder, "world seen through", target, &depth, wgpu::LoadOp::Load, true);
+        }
         let draw = Drawing { pipelines: &self.pipelines, camera: &self.camera_group, bones: &self.bones_group };
         let mut current = None;
-        draw.mesh(&mut pass, &mut current, 0, &self.world, first);
-        let slot = |slot: usize| (slot as u64 * CAMERA_STRIDE) as u32;
-        for (i, placed) in self.entities.iter().enumerate() {
-            let mesh = &self.models[placed.model.0];
-            draw.mesh(&mut pass, &mut current, slot(1 + i), mesh, (0..mesh.draws.len()).filter(|&i| !mesh.draws[i].1.translucent()));
-        }
         draw.mesh(&mut pass, &mut current, 0, &self.world, translucent);
         for (i, placed) in self.entities.iter().enumerate() {
             let mesh = &self.models[placed.model.0];
@@ -1281,6 +1415,19 @@ fn begin_pass<'a>(
     depth: &wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
 ) -> wgpu::RenderPass<'a> {
+    begin_pass_on(encoder, label, target, depth, load, false)
+}
+
+/// The same, its depth kept when `keep_depth`: drawing goes on.
+fn begin_pass_on<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+    keep_depth: bool,
+) -> wgpu::RenderPass<'a> {
+    let depth_load = if keep_depth { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(0.0) };
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1291,7 +1438,7 @@ fn begin_pass<'a>(
         })],
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
             view: depth,
-            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+            depth_ops: Some(wgpu::Operations { load: depth_load, store: wgpu::StoreOp::Store }),
             stencil_ops: None,
         }),
         timestamp_writes: None,

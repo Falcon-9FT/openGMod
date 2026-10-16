@@ -52,9 +52,22 @@ struct Surface {
     // the bump map's transform, a row for u and one for v
     bump_u: vec4<f32>,
     bump_v: vec4<f32>,
+    // what shows what is behind it: x how (0 not at all, 1 `Refract` glass, 2 water), y how
+    // far it is bent, z 1 with a tint texture (in the second bump map's place)
+    refract: vec4<f32>,
+    // its tint, and w where water's fog starts
+    refract_tint: vec4<f32>,
+    // what water reflects (the sky), and w where its fog is thickest
+    reflection: vec4<f32>,
+    // how far water's normal map's two layers scrolled
+    scroll: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
+// what the frame drew before what is seen through, and its depth
+@group(0) @binding(1) var behind_color: texture_2d<f32>;
+@group(0) @binding(2) var behind_depth: texture_depth_2d;
+@group(0) @binding(3) var behind_sampler: sampler;
 @group(1) @binding(0) var<uniform> surface: Surface;
 @group(1) @binding(1) var base_texture: texture_2d_array<f32>;
 @group(1) @binding(2) var blend_texture: texture_2d_array<f32>;
@@ -247,8 +260,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let blended = textureSample(blend_texture, texture_sampler, input.blend_uv, 0);
     let detailed = textureSample(detail_texture, texture_sampler, input.blend_uv * surface.detail.x, 0);
     let mapped = textureSample(lightmap, lightmap_sampler, input.lightmap_uv, 0).rgb;
-    var bump = textureSample(bump_texture, texture_sampler, input.bump_uv, 0).rgb;
-    let bump2 = textureSample(bump2_texture, texture_sampler, input.bump_uv, 0).rgb;
+    // water's normal map in two layers, each scrolled; glass's tint texture where the base
+    // texture would be
+    let water = surface.refract.x > 1.5;
+    let bump_uv = select(input.bump_uv, input.bump_uv + surface.scroll.xy, water);
+    let bump2_uv = select(input.bump_uv, input.blend_uv + surface.scroll.zw, surface.refract.x > 0.5);
+    var bump = textureSample(bump_texture, texture_sampler, bump_uv, 0).rgb;
+    let bump2 = textureSample(bump2_texture, texture_sampler, bump2_uv, 0).rgb;
     if (surface.bump.y > 0.5) {
         bump = mix(bump, bump2, clamp(input.alpha, 0.0, 1.0));
     }
@@ -266,6 +284,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     if (surface.options.x > 0.0 && albedo.a < surface.options.x) {
         discard;
+    }
+    if (surface.refract.x > 0.5) {
+        return vec4<f32>(seen_through(input, bump, bump2), 1.0);
     }
     if (surface.water.w > 0.5) {
         return vec4<f32>(fogged(surface.water.rgb, input.position), 0.75);
@@ -297,6 +318,49 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         light += moment_light(input.position, n);
     }
     return vec4<f32>(fogged(albedo.rgb * surface.tint.rgb * light, input.position), albedo.a * surface.tint.a);
+}
+
+// the near plane of the world's camera: a depth is it over the distance along the view
+const NEAR: f32 = 4.0;
+
+// what is seen through glass or water: what was drawn behind it, bent by its normal map.
+// Glass tints it; water fogs it as deep as it goes behind and reflects the sky the more the
+// flatter it is looked at
+fn seen_through(input: VertexOutput, bump: vec3<f32>, bump2: vec3<f32>) -> vec3<f32> {
+    let size = vec2<f32>(textureDimensions(behind_color));
+    let here = input.clip.xy / size;
+    let n = bump * 2.0 - 1.0;
+    if (surface.refract.x < 1.5) {
+        let at = clamp(here + n.xy * surface.refract.y, vec2<f32>(0.0), vec2<f32>(0.999));
+        var color = textureSampleLevel(behind_color, behind_sampler, at, 0.0).rgb * surface.refract_tint.rgb;
+        if (surface.refract.z > 0.5) {
+            color *= bump2;
+        }
+        return fogged(color, input.position);
+    }
+    // the two layers of the normal map, and the surface facing as they say
+    let layers = n + (bump2 * 2.0 - 1.0);
+    let up = normalize(input.normal);
+    let facing = normalize(up + vec3<f32>(layers.xy, 0.0) * 0.25);
+    let to_eye = normalize(camera.eye.xyz - input.position);
+    let fresnel = 0.02 + 0.98 * pow(1.0 - clamp(dot(facing, to_eye), 0.0, 1.0), 5.0);
+    // what is under it, bent; what is before the water is not seen in it
+    var at = clamp(here + layers.xy * surface.refract.y * 0.02, vec2<f32>(0.0), vec2<f32>(0.999));
+    var depth = textureLoad(behind_depth, vec2<i32>(at * size), 0);
+    if (depth > input.clip.z) {
+        at = here;
+        depth = textureLoad(behind_depth, vec2<i32>(input.clip.xy), 0);
+    }
+    let under = textureSampleLevel(behind_color, behind_sampler, at, 0.0).rgb * surface.refract_tint.rgb;
+    // fogged by how much water it is seen through
+    let thickness = NEAR / max(depth, 1e-7) - NEAR / max(input.clip.z, 1e-7);
+    let fog_start = surface.refract_tint.w;
+    let fog = clamp((thickness - fog_start) / max(surface.reflection.w - fog_start, 1.0), 0.0, 1.0);
+    let fog_color = pow(max(surface.water.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
+    let below = mix(under, fog_color, fog);
+    // where it is shallow what is under it shows through, and its edge melts into the shore
+    let shallow = clamp(thickness / 64.0, 0.0, 1.0);
+    return fogged(mix(below, surface.reflection.rgb, fresnel * shallow), input.position);
 }
 
 // fog, linear with the distance from the eye: towards its colour, or for what adds its light

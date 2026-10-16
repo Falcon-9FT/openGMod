@@ -247,7 +247,7 @@ pub const FOG_DARK: f32 = 1.0;
 pub const FOG_NONE: f32 = 2.0;
 
 /// How many floats a shader gets for a surface.
-pub const SURFACE_PARAMS: usize = 36;
+pub const SURFACE_PARAMS: usize = 52;
 
 /// The floats a shader gets for a surface as it `look`s at the moment: tint and alpha; water
 /// colour and whether it is water; alpha test reference (0 for none), how it is lit, whether
@@ -263,7 +263,18 @@ pub fn surface_params(surface: &Surface, look: &Look, frames: u32, has_lightmap:
     let [r, g, b] = look.tint;
     let water = surface.water.unwrap_or([0.0; 3]);
     let [u, v] = look.transform;
-    let bump_transform = surface.bump.map_or(crate::IDENTITY, |b| b.transform);
+    let bump_transform = look.bump_transform.or(surface.bump.map(|b| b.transform)).unwrap_or(crate::IDENTITY);
+    let refraction = surface.refraction;
+    let refract = refraction.unwrap_or(crate::Refraction {
+        water: false,
+        amount: 0.0,
+        tint: [1.0; 3],
+        tint_texture: None,
+        fog: [0.0; 2],
+        reflection: [0.0; 3],
+        scroll: [[0.0; 2]; 2],
+    });
+    let [[s1x, s1y], [s2x, s2y]] = refract.scroll.map(|s| s.map(|v| v * look.time));
     [
         r,
         g,
@@ -300,7 +311,7 @@ pub fn surface_params(surface: &Surface, look: &Look, frames: u32, has_lightmap:
             Some(b) if b.self_shadowed => BUMP_SELF_SHADOWED,
             Some(_) => BUMP_NORMAL,
         },
-        if surface.bump.is_some_and(|b| b.second.is_some()) { 1.0 } else { 0.0 },
+        if surface.bump.is_some_and(|b| b.second.is_some()) && refraction.is_none() { 1.0 } else { 0.0 },
         0.0,
         0.0,
         // and its transform, a row for u and one for v
@@ -312,8 +323,39 @@ pub fn surface_params(surface: &Surface, look: &Look, frames: u32, has_lightmap:
         bump_transform[1][1],
         bump_transform[1][2],
         0.0,
+        // what shows what is behind it: how (none, glass, water), how far it is bent, 1 with a
+        // tint texture
+        match refraction {
+            None => REFRACT_NONE,
+            Some(r) if r.water => REFRACT_WATER,
+            Some(_) => REFRACT_GLASS,
+        },
+        refract.amount,
+        if refract.tint_texture.is_some() { 1.0 } else { 0.0 },
+        0.0,
+        // its tint, and where water's fog starts
+        refract.tint[0],
+        refract.tint[1],
+        refract.tint[2],
+        refract.fog[0],
+        // what water reflects, and where its fog is thickest
+        refract.reflection[0],
+        refract.reflection[1],
+        refract.reflection[2],
+        refract.fog[1],
+        // how far its normal map's two layers scrolled
+        s1x,
+        s1y,
+        s2x,
+        s2y,
     ]
 }
+
+/// How a surface shows what is behind it, for the shader: not at all, as `Refract` glass, as
+/// water.
+pub const REFRACT_NONE: f32 = 0.0;
+pub const REFRACT_GLASS: f32 = 1.0;
+pub const REFRACT_WATER: f32 = 2.0;
 
 /// The 8 floats a shader gets for fog: its colour and how thick it gets at most; where it
 /// starts, one over how far it thickens, and 1 when there is fog (all 0 when there is none).
@@ -535,7 +577,8 @@ mod tests {
         // no detail
         assert_eq!(params(&s, true)[20..28], [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         // the look of the moment: its tint, alpha, transform and frame, wrapped to the frames
-        let look = Look { frame: 7, transform: [[2.0, 0.0, 0.5], [0.0, 2.0, 0.25]], tint: [0.5; 3], alpha: 0.5 };
+        let look =
+            Look { frame: 7, transform: [[2.0, 0.0, 0.5], [0.0, 2.0, 0.25]], tint: [0.5; 3], alpha: 0.5, bump_transform: None, time: 2.0 };
         s.modulate = true;
         let p = surface_params(&s, &look, 4, true);
         assert_eq!((p[0], p[3]), (0.5, 0.5));
@@ -547,7 +590,21 @@ mod tests {
         s.bump = Some(crate::Bump { texture: 0, second: Some(1), self_shadowed: true, transform: [[2.0, 0.0, 0.5], [0.0, 3.0, 0.0]] });
         let p = surface_params(&s, &look, 4, true);
         assert_eq!(p[24..26], [BUMP_SELF_SHADOWED, 1.0]);
-        assert_eq!(p[28..], [2.0, 0.0, 0.5, 0.0, 0.0, 3.0, 0.0, 0.0]);
+        assert_eq!(p[28..36], [2.0, 0.0, 0.5, 0.0, 0.0, 3.0, 0.0, 0.0]);
+        assert_eq!(p[36], REFRACT_NONE);
+        // water: how it bends, tints, fogs, reflects, and its layers scrolled 2 s
+        s.refraction = Some(crate::Refraction {
+            water: true,
+            amount: 1.5,
+            tint: [0.5, 0.6, 0.7],
+            tint_texture: None,
+            fog: [10.0, 500.0],
+            reflection: [0.2, 0.3, 0.4],
+            scroll: [[0.01, 0.02], [-0.5, 1.0]],
+        });
+        let p = surface_params(&s, &look, 4, true);
+        assert_eq!(p[36..], [REFRACT_WATER, 1.5, 0.0, 0.0, 0.5, 0.6, 0.7, 10.0, 0.2, 0.3, 0.4, 500.0, 0.02, 0.04, -1.0, 2.0]);
+        assert_eq!(p[25], 0.0, "water's layers are not blended by the vertices");
     }
 
     fn transform(m: &[f32; 16], p: Vec3) -> [f32; 4] {

@@ -57,6 +57,7 @@ fn square(proxies: &str, frames: &[Vec<[u8; 4]>]) -> World {
         tint: [1.0; 3],
         alpha: 1.0,
         water: None,
+        refraction: None,
         missing: false,
         transform: None,
         frame: 0,

@@ -41,14 +41,15 @@ fn keep(text: &str, color: [u8; 3]) {
 
 /// Says something: to the terminal and the console, in a colour; line breaks as given.
 pub fn write(text: &str, color: [u8; 3]) {
-    print!("{text}");
-    let _ = std::io::stdout().flush();
+    // a program without a terminal says it to the console alone
+    let mut out = std::io::stdout();
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
     keep(text, color);
 }
 
 /// Says that something went wrong: to the terminal's errors and the console.
 pub fn write_error(text: &str, color: [u8; 3]) {
-    eprint!("{text}");
+    let _ = std::io::stderr().write_all(text.as_bytes());
     keep(text, color);
 }
 

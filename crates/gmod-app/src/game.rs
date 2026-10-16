@@ -189,7 +189,7 @@ impl Game {
         client.apply_snapshot(&server.runtime().snapshot());
         let errors = server.runtime().errors().len() + client.errors().len();
         say!(
-            "Lua: {} files, {errors} errors; type commands here (give weapon_crowbar, gm_spawn <model>)",
+            "Lua: {} files, {errors} errors; commands go in the console, ` (give weapon_crowbar, gm_spawn <model>)",
             server.runtime().files_loaded() + client.files_loaded()
         );
         let mut game = Game {

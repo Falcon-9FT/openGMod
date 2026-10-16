@@ -118,6 +118,9 @@ pub struct Surface {
     pub alpha: f32,
     /// A water surface and its fog colour.
     pub water: Option<Vec3>,
+    /// What shows what is behind it, bent by its normal map ([`Surface::bump`]): `Refract`
+    /// glass, and water.
+    pub refraction: Option<Refraction>,
     /// The material was not found: the game shows purple and black squares.
     pub missing: bool,
     /// `$basetexturetransform`: how the base texture's coordinates are scaled, turned and moved.
@@ -134,6 +137,26 @@ pub struct Surface {
     /// order of the piece (the overlays' render order), as they are all as far off their faces
     /// and only that order decides which shows over which.
     pub overlay: bool,
+}
+
+/// How a surface shows what is behind it: the `Refract` shader's, and water's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Refraction {
+    /// Water: what is behind fogs with its thickness, and the sky shows in it.
+    pub water: bool,
+    /// How far what is behind is bent (`$refractamount`).
+    pub amount: f32,
+    /// What it is seen through tinted (`$refracttint`), and by a texture (`$refracttinttexture`).
+    pub tint: Vec3,
+    pub tint_texture: Option<usize>,
+    /// Water's fog: from `$fogstart` to `$fogend` units of it what is behind goes to its fog
+    /// colour ([`Surface::water`]).
+    pub fog: [f32; 2],
+    /// What water reflects: the sky's colour ([`World::sky_colour`]), tinted (`$reflecttint`).
+    pub reflection: Vec3,
+    /// Water's normal map moving: a second layer of it, units of texture a second (`$scroll1`,
+    /// `$scroll2`).
+    pub scroll: [[f32; 2]; 2],
 }
 
 /// A surface's bump map.
@@ -171,6 +194,10 @@ pub struct Look {
     pub transform: Matrix,
     pub tint: Vec3,
     pub alpha: f32,
+    /// The bump map's transform (`$bumptransform`), where proxies move it.
+    pub bump_transform: Option<Matrix>,
+    /// Seconds into the map: how far what scrolls by itself went.
+    pub time: f32,
 }
 
 impl Surface {
@@ -192,6 +219,7 @@ impl Surface {
             tint: [1.0; 3],
             alpha: 1.0,
             water: None,
+            refraction: None,
             missing: true,
             transform: None,
             frame: 0,
@@ -204,7 +232,14 @@ impl Surface {
     /// How it looks `time` seconds into the map: as the material sets it, then as its proxies
     /// change it.
     pub fn look(&self, time: f32) -> Look {
-        let mut look = Look { frame: self.frame, transform: self.transform.unwrap_or(IDENTITY), tint: self.tint, alpha: self.alpha };
+        let mut look = Look {
+            frame: self.frame,
+            transform: self.transform.unwrap_or(IDENTITY),
+            tint: self.tint,
+            alpha: self.alpha,
+            bump_transform: None,
+            time,
+        };
         if let Some(proxies) = &self.proxies {
             let vars = proxies.at(time);
             if let Some(frame) = vars.number("$frame") {
@@ -219,6 +254,7 @@ impl Surface {
             if let Some(alpha) = vars.number("$alpha") {
                 look.alpha = alpha.clamp(0.0, 1.0);
             }
+            look.bump_transform = vars.matrix("$bumptransform");
         }
         look
     }
@@ -340,6 +376,37 @@ pub struct World {
 }
 
 impl World {
+    /// The sky's colour, linear: its sides and top, each the smallest level of its texture
+    /// (what all of it comes to); grey without a sky.
+    pub fn sky_colour(&self) -> Vec3 {
+        let mut sum = [0.0f32; 3];
+        let mut count = 0.0;
+        for face in self.sky.iter().take(5).flatten() {
+            let Some(texture) = self.textures.get(face.texture) else { continue };
+            let vtf = &texture.vtf;
+            let Some(image) = vtf.rgba8(vtf.mipmaps.saturating_sub(1), 0, 0, 0) else { continue };
+            for texel in image.rgba.as_chunks::<4>().0 {
+                for (c, v) in texel[..3].iter().enumerate() {
+                    sum[c] += (f32::from(*v) / 255.0).powf(2.2);
+                }
+                count += 1.0;
+            }
+        }
+        if count == 0.0 { [0.5; 3] } else { sum.map(|c| c / count) }
+    }
+
+    /// Water reflects the sky: its reflection's tint times the sky's colour.
+    fn sky_on_water(mut self) -> World {
+        let sky = self.sky_colour();
+        let pieces = self.pieces.iter_mut().chain(self.skybox.iter_mut().flat_map(|s| s.pieces.iter_mut()));
+        for surface in pieces.flat_map(|p| p.surfaces.iter_mut()) {
+            if let Some(refraction) = surface.refraction.as_mut().filter(|r| r.water) {
+                refraction.reflection = std::array::from_fn(|i| refraction.reflection[i] * sky[i]);
+            }
+        }
+        self
+    }
+
     /// The triangles drawn: the world's and the 3D sky box's.
     pub fn triangles(&self) -> usize {
         let pieces = self.pieces.iter().chain(self.skybox.iter().flat_map(|s| &s.pieces));
@@ -641,6 +708,37 @@ impl Gather<'_> {
             s.water = Some(m.vector("$fogcolor").unwrap_or([0.1, 0.2, 0.25]));
             s.translucent = true;
             s.lit = false;
+            // seen from above: what is under it through it, the sky on it
+            if m.float("$abovewater").is_none_or(|a| a != 0.0) {
+                let normal = m.texture("$normalmap").and_then(|t| self.normal_texture(&t));
+                let scroll = |name: &str| m.vector(name).map_or([0.0; 2], |v| [v[0], v[1]]);
+                s.refraction = Some(Refraction {
+                    water: true,
+                    amount: m.float("$refractamount").unwrap_or(1.0),
+                    tint: m.vector("$refracttint").unwrap_or([1.0; 3]),
+                    tint_texture: None,
+                    fog: [m.float("$fogstart").unwrap_or(0.0), m.float("$fogend").unwrap_or(1024.0)],
+                    reflection: m.vector("$reflecttint").unwrap_or([1.0; 3]),
+                    scroll: [scroll("$scroll1"), scroll("$scroll2")],
+                });
+                s.bump = normal.map(|texture| Bump { texture, second: Some(texture), self_shadowed: false, transform: IDENTITY });
+            }
+        }
+        if m.shader == "refract" {
+            let normal = m.texture("$normalmap").or_else(|| m.texture("$dudvmap")).and_then(|t| self.normal_texture(&t));
+            s.refraction = Some(Refraction {
+                water: false,
+                amount: m.float("$refractamount").unwrap_or(0.5),
+                tint: m.vector("$refracttint").unwrap_or([1.0; 3]),
+                tint_texture: m.texture("$refracttinttexture").and_then(|t| self.texture(&t)),
+                fog: [0.0; 2],
+                reflection: [0.0; 3],
+                scroll: [[0.0; 2]; 2],
+            });
+            let transform = m.get("$bumptransform").and_then(proxy::transform).unwrap_or(IDENTITY);
+            s.bump = normal.map(|texture| Bump { texture, second: None, self_shadowed: false, transform });
+            s.translucent = true;
+            s.lit = false;
         }
         s.transform = m.get("$basetexturetransform").and_then(proxy::transform);
         s.frame = m.float("$frame").map_or(0, |f| f.max(0.0) as u32);
@@ -694,6 +792,7 @@ fn gather_map(vfs: &Vfs, bsp: &Bsp, moving: bool) -> World {
         missing_textures: gather.missing_textures,
         missing_models,
     }
+    .sky_on_water()
 }
 
 /// The world and the brush entities, each moved to where it stands: those outside the 3D sky

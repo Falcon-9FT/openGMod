@@ -12,7 +12,9 @@
 //! with an account that owns the game. Their name is their name on Steam, the workshop items
 //! mounted those they subscribed to.
 
-#![forbid(unsafe_code)]
+// a program of windows, as the game is: no terminal of its own ([`terminal`])
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+#![deny(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -51,6 +53,7 @@ mod menu;
 mod proto;
 mod server;
 mod settings;
+mod terminal;
 mod walk;
 
 use game::{Buttons, Game, Models};
@@ -108,7 +111,10 @@ CONTROLS:
     hold Q for the spawn menu, C for the context menu: the mouse works in them
     F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)
 
-    Lines typed into this terminal are the game's console: give weapon_crowbar,
+    openGMOD opens no terminal of its own: the console is in the game (`), and what it says
+    goes there. A dedicated server's console is the terminal it runs in.
+
+    Lines typed into the console are the game's: give weapon_crowbar,
     gm_spawn models/props_c17/oildrum001.mdl, the commands of the addons; connect <address>
     joins a server, disconnect leaves it, lua_run_cl runs Lua in your client and lua_run_menu
     in the main menu.";
@@ -620,8 +626,11 @@ impl Gpu {
         let format = *capabilities.formats.first().ok_or("the window cannot be drawn into")?;
         let view_format = format.add_srgb_suffix();
         let size = window.inner_size();
+        // what is seen through (glass, water) sees the frame drawn so far: copied, where the
+        // window lets that be
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | (capabilities.usages & wgpu::TextureUsages::COPY_SRC);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage,
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
@@ -683,11 +692,18 @@ impl Gpu {
     }
 
     /// The map, or black where there is none.
-    fn draw_3d(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, size: (u32, u32), camera: &Camera) {
+    fn draw_3d(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        texture: &wgpu::Texture,
+        size: (u32, u32),
+        camera: &Camera,
+    ) {
         match &mut self.renderer {
             Some(renderer) => {
                 renderer.set_time(self.map_started.elapsed().as_secs_f32());
-                renderer.render(&self.device, &self.queue, encoder, view, size, camera);
+                renderer.render(&self.device, &self.queue, encoder, view, texture, size, camera);
             }
             None => {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -765,7 +781,7 @@ impl Gpu {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("screenshot") });
-        self.draw_3d(&mut encoder, &view, (width, height), camera);
+        self.draw_3d(&mut encoder, &view, &texture, (width, height), camera);
         self.draw_2d(&mut encoder, &view, (width, height), client, menu);
         // copies out of a texture go in rows of a multiple of 256 bytes
         let row = (width * 4).div_ceil(256) * 256;
@@ -877,7 +893,7 @@ impl Gpu {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.view_format), ..Default::default() });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let size = (self.config.width, self.config.height);
-        self.draw_3d(&mut encoder, &view, size, camera);
+        self.draw_3d(&mut encoder, &view, &frame.texture, size, camera);
         self.draw_2d(&mut encoder, &view, size, client, menu);
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
@@ -2268,6 +2284,10 @@ fn started_from_explorer() -> bool {
 }
 
 fn fail(message: &str) -> ExitCode {
+    if !terminal::has_output() {
+        terminal::message("openGMOD", message);
+        return ExitCode::FAILURE;
+    }
     say_error!("{message}");
     if started_from_explorer() {
         say_error!("\nPress Enter to close.");
@@ -2284,11 +2304,19 @@ fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(Some(args)) => args,
         Ok(None) => {
+            terminal::open();
             say!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Err(e) => return fail(&format!("{e}\n\n{USAGE}")),
+        Err(e) => {
+            terminal::open();
+            return fail(&format!("{e}\n\n{USAGE}"));
+        }
     };
+    // what has no window says what it does in a terminal
+    if args.dedicated || args.master {
+        terminal::open();
+    }
     say!("openGMOD {}", env!("CARGO_PKG_VERSION"));
     if let Some(rate) = args.tick_rate {
         gmod_lua::timer::set_tick_rate(rate);
