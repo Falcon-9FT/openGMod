@@ -506,6 +506,10 @@ fn triangle_bounds(tri: &Triangle, point: bool, surface: Surface) -> ([Bound; 26
             AXES.into_iter().for_each(|axis| crossed(e, axis));
         }
     }
+    // a little thickness behind the face (the second bound): going in and coming out of a
+    // flat solid would be the same moment, and which of the two rounded first would let a
+    // sweep through
+    out[1].dist += EPSILON;
     (out, n)
 }
 

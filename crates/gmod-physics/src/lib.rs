@@ -279,6 +279,14 @@ impl Physics {
     pub fn new() -> Physics {
         let mut world = PhysicsWorld::new();
         world.gravity = metres([0.0, 0.0, -DEFAULT_GRAVITY]);
+        // every point of a contact kept: Rapier's clustering of them takes one side and then
+        // the other of what rests across a crest (a block on a displacement's ridge), and it
+        // rocks on it for ever
+        world.integration_parameters.contact_clustering = false;
+        // the joints worked out four times a solver iteration: what is held by stiff joints
+        // against each other (a simfphys car's wheels: rods, springs, a ball joint) is left
+        // with forces that do not cancel otherwise, and creeps over the ground on its own
+        world.integration_parameters.num_internal_pgs_iterations = 4;
         let ground = world.insert_body(RigidBodyBuilder::fixed());
         Physics {
             world,
@@ -319,8 +327,13 @@ impl Physics {
                 added += 1;
             }
         }
+        // the triangles as one surface, their shared edges known: what slides or lies over
+        // an edge between two of them is not knocked by it (a contact's normal there would
+        // be the edge's), from either side
+        let flags = rapier3d::prelude::TriMeshFlags::FIX_INTERNAL_EDGES_TWO_SIDED;
         if !triangles.is_empty()
-            && let Ok(collider) = ColliderBuilder::trimesh(vertices.iter().map(|&p| metres(p)).collect(), triangles.to_vec())
+            && let Ok(collider) =
+                ColliderBuilder::trimesh_with_flags(vertices.iter().map(|&p| metres(p)).collect(), triangles.to_vec(), flags)
         {
             self.world.colliders.insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Min));
         }

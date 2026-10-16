@@ -410,3 +410,22 @@ fn shapes_for_physics() {
     let shapes = collision.solid_shapes(mask::SOLID_BRUSHONLY);
     assert!(!shapes.triangles.is_empty() && shapes.vertices.len() == shapes.triangles.len() * 3);
 }
+
+#[test]
+fn no_ray_slips_between_going_into_a_displacement_and_out() {
+    // every ray down onto the hill, of all sorts of lengths, along its triangles' edges too:
+    // a flat solid entered and left the same moment once let some through, as rounding went
+    let (_, collision) = load(&hill());
+    let mut missed = Vec::new();
+    for i in 0..40 {
+        for k in 0..25 {
+            let (x, y) = (601.0 + i as f32 * 3.17, 1.0 + (i as f32 * 3.11 + k as f32 * 0.37) % 126.0);
+            let (top, bottom) = (40.0 + k as f32 * 7.3, -300.0 - i as f32 * 41.7 - k as f32 * 13.1);
+            let ray = collision.trace_line([x, y, top], [x, y, bottom], mask::SOLID);
+            if !ray.displacement {
+                missed.push([x, y, top, bottom]);
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{} rays went through, as {:?}", missed.len(), missed.first());
+}

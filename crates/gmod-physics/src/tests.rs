@@ -611,3 +611,156 @@ fn collision_groups_say_what_collides() {
     assert!((z(debris) - 16.0).abs() < 2.0, "{}", z(debris));
     assert!(z(ghost) < -200.0, "{}", z(ghost));
 }
+
+#[test]
+fn a_concrete_barrier_lying_across_a_crest_of_the_ground_falls_asleep() {
+    // where gm_construct has it, and nearer the middle of the world
+    for at in [[-3952.0, 4100.0, -100.0], [-250.0, 250.0, -100.0], [-8000.0, 8000.0, 0.0]] {
+        let fastest = barrier_on_crest(at);
+        assert_eq!(fastest, 0.0, "at {at:?} still moving, as fast as {fastest} units/s after 5 s");
+    }
+}
+
+/// A concrete barrier lying across a crest of ground at `at`: 0 when it falls asleep, else the
+/// fastest it moved after the first 5 seconds of 20.
+fn barrier_on_crest(at: Vec3) -> f32 {
+    // gm_construct's ground at (-3952, 4100, -100): two slopes of a displacement meeting
+    let ground: [[Vec3; 3]; 12] = [
+        [[100.0, -101.29, -0.38], [0.0, -100.07, 0.0], [100.0, -27.96, -0.62]],
+        [[100.0, -27.96, -0.62], [0.0, -100.07, 0.0], [0.0, -27.05, 0.0]],
+        [[100.0, -27.96, -0.62], [0.0, -27.05, 0.0], [0.0, 45.96, 0.0]],
+        [[100.0, -27.96, -0.62], [0.0, 45.96, 0.0], [100.0, 45.36, -0.67]],
+        [[100.0, 45.36, -0.67], [0.0, 45.96, 0.0], [100.0, 118.68, -0.67]],
+        [[100.0, 118.68, -0.67], [0.0, 45.96, 0.0], [0.0, 118.98, 0.0]],
+        [[0.0, -100.07, 0.0], [-100.0, -98.86, -0.25], [-100.0, -26.14, -0.41]],
+        [[0.0, -100.07, 0.0], [-100.0, -26.14, -0.41], [0.0, -27.05, 0.0]],
+        [[0.0, -27.05, 0.0], [-100.0, -26.14, -0.41], [0.0, 45.96, 0.0]],
+        [[0.0, 45.96, 0.0], [-100.0, -26.14, -0.41], [-100.0, 46.57, -0.7]],
+        [[0.0, 45.96, 0.0], [-100.0, 46.57, -0.7], [-100.0, 119.29, -0.85]],
+        [[0.0, 45.96, 0.0], [-100.0, 119.29, -0.85], [0.0, 118.98, 0.0]],
+    ];
+    let mut physics = Physics::new();
+    let corners: Vec<Vec3> = ground.iter().flatten().map(|p| [p[0] + at[0], p[1] + at[1], p[2] + at[2]]).collect();
+    let triangles: Vec<[u32; 3]> = (0..12).map(|t| [3 * t, 3 * t + 1, 3 * t + 2]).collect();
+    physics.add_world(&[], &corners, &triangles);
+    // models/props_c17/concrete_barrier001a.mdl, as its .phy has it
+    let hulls = vec![
+        vec![
+            [-4.959, 55.995, 12.098],
+            [-2.732, -56.069, 48.072],
+            [-4.959, -56.069, 12.098],
+            [-2.732, 55.995, 48.072],
+            [2.660, 55.995, 48.072],
+            [2.660, -56.069, 48.072],
+            [4.831, -56.069, 12.098],
+            [4.831, 55.995, 12.098],
+        ],
+        vec![
+            [5.591, -56.069, 13.624],
+            [-5.581, -56.069, 13.624],
+            [6.048, 55.995, 13.624],
+            [-5.581, 55.995, 13.624],
+            [10.188, -56.069, -0.183],
+            [-10.252, -56.069, -0.183],
+            [10.188, 55.995, -0.183],
+            [-10.252, 55.995, -0.183],
+        ],
+    ];
+    let body = physics
+        .add(&Body { mass: Some(75.0), ..Body::new(Shape::Hulls(hulls), [at[0] + 2.0, at[1], at[2] + 2.0], [0.0, 75.0, 0.0]) })
+        .unwrap();
+    let mut fastest: f32 = 0.0;
+    for second in 0..20 {
+        run(&mut physics, 1.0);
+        if second >= 5 {
+            let v = physics.velocity(body);
+            fastest = fastest.max((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+        }
+    }
+    if physics.asleep(body) { 0.0 } else { fastest }
+}
+
+#[test]
+fn what_falls_fast_does_not_go_through_the_ground() {
+    for speed in [1000.0f32, 3000.0, 6000.0] {
+        for small in [4.0f32, 16.0] {
+            // ground as a displacement makes it: triangles, no thickness
+            let mut physics = Physics::new();
+            let corners = [
+                [-512.0, -512.0, 0.0],
+                [512.0, -512.0, 0.0],
+                [512.0, 512.0, 0.0],
+                [-512.0, -512.0, 0.0],
+                [512.0, 512.0, 0.0],
+                [-512.0, 512.0, 0.0],
+            ];
+            physics.add_world(&[], &corners, &[[0, 1, 2], [3, 4, 5]]);
+            // and a floor of a brush 8 units thick beside it
+            let Shape::Hulls(hulls) = Shape::cuboid([600.0, -512.0, -8.0], [1600.0, 512.0, 0.0]) else { unreachable!() };
+            physics.add_world(&hulls, &[], &[]);
+            let mut bodies = Vec::new();
+            for x in [0.0, 1100.0] {
+                let body = physics
+                    .add(&Body { mass: Some(5.0), ..Body::new(Shape::cuboid([-small; 3], [small; 3]), [x, 0.0, 300.0], [0.0; 3]) })
+                    .unwrap();
+                physics.set_velocity(body, [0.0, 0.0, -speed]);
+                bodies.push(body);
+            }
+            run(&mut physics, 2.0);
+            for body in bodies {
+                let (origin, _) = physics.pose(body).unwrap();
+                assert!(origin[2] > 0.0, "a box of {} units at {speed} units/s went through to {origin:?}", small * 2.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_car_held_on_its_wheels_by_rods_and_springs_stands_still() {
+    // simfphys' Volga as GMod joins it: a body, and four wheels each held by two rods to the
+    // far side, a rope that limits how far it hangs, a spring, and a ball joint that keeps it
+    // from turning
+    let mut physics = floor();
+    let ground = 3.39;
+    let car = physics
+        .add(&Body {
+            mass: Some(1265.0),
+            ..Body::new(Shape::cuboid([-105.7, -42.3, 0.0], [96.0, 42.6, 66.1]), [0.0, 0.0, ground], [0.0; 3])
+        })
+        .unwrap();
+    let on_car = |p: Vec3| [p[0], p[1], p[2] + ground];
+    for (x, y) in [(64.0, 34.0), (64.0, -34.0), (-55.0, 34.0), (-55.0, -34.0)] {
+        let centre = on_car([x, y, 12.0]);
+        let wheel = physics.add(&Body { mass: Some(42.19), ..Body::new(Shape::Sphere(15.4), centre, [0.0; 3]) }).unwrap();
+        physics.set_friction(wheel, 1.0);
+        let across = if y > 0.0 { -150.0 } else { 150.0 };
+        for along in [75.0, -75.0] {
+            let rod = Joint::Rope { start: on_car([x + along, y + across, 6.5]), end: centre, length: 167.7, rigid: true };
+            physics.join(car, wheel, rod, false, [0.0; 2]).unwrap();
+        }
+        let limiter = Joint::Rope { start: on_car([x, y + across * 0.4, 13.0]), end: centre, length: 60.2, rigid: false };
+        physics.join(car, wheel, limiter, false, [0.0; 2]).unwrap();
+        let spring = Joint::Spring {
+            start: [centre[0], centre[1], centre[2] + 6.5],
+            end: on_car([x, y, 6.5]),
+            length: 6.5,
+            stiffness: 25000.0,
+            damping: 1300.0,
+            relative_damping: 1300.0,
+        };
+        physics.join(wheel, car, spring, false, [0.0; 2]).unwrap();
+        let held = Joint::Ragdoll { point: centre, angles: [0.0; 3], limits: [[-0.01, 0.01]; 3], free: true };
+        physics.join(car, wheel, held, false, [0.0; 2]).unwrap();
+    }
+    run(&mut physics, 4.0);
+    let (_, angles) = physics.pose(car).unwrap();
+    run(&mut physics, 6.0);
+    let (_, later) = physics.pose(car).unwrap();
+    let v = physics.velocity(car);
+    let speed = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    assert!(
+        speed < 0.5 && (later[1] - angles[1]).abs() < 0.1,
+        "it creeps: {speed} units/s, turned {} degrees in 6 s",
+        later[1] - angles[1]
+    );
+}
