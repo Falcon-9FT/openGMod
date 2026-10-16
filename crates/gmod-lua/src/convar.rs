@@ -267,11 +267,12 @@ fn with<R>(lua: &Lua, handle: ConVarHandle, f: impl FnOnce(&ConVar) -> R) -> R {
     f(&host(lua).console.convars.borrow()[handle.0])
 }
 
-/// FCVAR flags: a number, or a table of numbers to combine; a boolean, which some addons give,
-/// is none, as GMod takes it.
+/// FCVAR flags: a number, or a table of numbers to combine; a boolean, or a string that is no
+/// number (`"FCVAR_NOTIFY"`), which some addons give, is none, as GMod takes it.
 fn flags_arg(args: &Args, position: usize) -> mlua::Result<i64> {
     match args.get(position) {
         Some(Value::Boolean(_)) => Ok(0),
+        Some(Value::String(s)) => Ok(s.to_str().ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0) as i64),
         Some(Value::Table(t)) => {
             let mut flags = 0i64;
             for flag in t.sequence_values::<f64>() {

@@ -165,6 +165,40 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     def(lua, &system, "HasFocus", |_| Ok(Value::Boolean(true)))?;
     // 255: no battery
     def(lua, &system, "BatteryPower", |_| Ok(Value::Integer(255)))?;
+    // the country Steam would say the player is in: the one of the game's language
+    def(lua, &system, "GetCountry", |a| {
+        let language = crate::convar::value(a.lua, "gmod_language").unwrap_or_default().to_ascii_lowercase();
+        let country = match language.as_str() {
+            "ru" => "RU",
+            "uk" => "UA",
+            "de" => "DE",
+            "fr" => "FR",
+            "es-es" => "ES",
+            "pt-br" => "BR",
+            "pt-pt" => "PT",
+            "pl" => "PL",
+            "it" => "IT",
+            "ja" => "JP",
+            "ko" => "KR",
+            "zh-cn" => "CN",
+            "zh-tw" => "TW",
+            "tr" => "TR",
+            "cs" => "CZ",
+            "nl" => "NL",
+            "sv-se" => "SE",
+            "fi" => "FI",
+            "da" => "DK",
+            "no" => "NO",
+            "hu" => "HU",
+            "bg" => "BG",
+            "el" => "GR",
+            "th" => "TH",
+            "vi" => "VN",
+            "en-pt" | "en" | "" => "US",
+            other => return Ok(Value::String(a.lua.create_string(other.split('-').next_back().unwrap_or("US").to_ascii_uppercase())?)),
+        };
+        Ok(Value::String(a.lua.create_string(country)?))
+    })?;
     globals.raw_set("system", system)?;
     Ok(())
 }

@@ -138,6 +138,10 @@ pub struct Ent {
     /// Its model was drawn by Lua this frame (`DrawModel`), the client's ([`crate::ents::drawn`]).
     #[serde(skip)]
     pub lua_drawn: bool,
+    /// It is an effect of Lua (`util.Effect`): it thinks and draws as one, and nothing else
+    /// draws it ([`crate::effect`]).
+    #[serde(skip)]
+    pub effect: bool,
     pub draw_shadow: bool,
     pub model_scale: f32,
     /// Body groups set: number and value.
@@ -271,6 +275,7 @@ impl Ent {
             motion_controller: false,
             motion_objects: Vec::new(),
             lua_drawn: false,
+            effect: false,
             draw_shadow: true,
             model_scale: 1.0,
             body_groups: Vec::new(),

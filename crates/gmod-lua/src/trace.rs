@@ -115,6 +115,8 @@ pub(crate) struct World {
     pub collision: RefCell<Option<Arc<Collision>>>,
     /// The material of each surface (`texinfo`).
     pub textures: RefCell<Vec<String>>,
+    /// The faces of each brush model.
+    pub surfaces: RefCell<Arc<Vec<Vec<crate::surfaceinfo::BrushSurface>>>>,
 }
 
 /// What stops a trace besides the world: which entities it may hit.

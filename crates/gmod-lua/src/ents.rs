@@ -46,6 +46,8 @@ pub struct Map {
     /// What is seen and heard from where ([`gmod_bsp::Visibility`]); without it everything is
     /// seen from everywhere.
     pub visibility: Option<std::sync::Arc<gmod_bsp::Visibility>>,
+    /// The faces of each brush model (`Entity:GetBrushSurfaces`).
+    pub surfaces: std::sync::Arc<Vec<Vec<crate::surfaceinfo::BrushSurface>>>,
 }
 
 impl Map {
@@ -59,6 +61,7 @@ impl Map {
             collision: Some(collision),
             textures: bsp.texinfo.iter().map(|info| texture(info.texdata)).collect(),
             visibility: gmod_bsp::Visibility::new(bsp).map(std::sync::Arc::new),
+            surfaces: crate::surfaceinfo::of_bsp(bsp),
         }
     }
 }
@@ -665,6 +668,7 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
                 // the brushes that may move are drawn where their entities are; the others are the map's
                 let moving_brush = crate::movers::moving_brush(&ent).is_some();
                 if ent.removed
+                    || ent.effect
                     || ent.dormant
                     || !ent.spawned
                     || !(studio || moving_brush)
@@ -715,6 +719,8 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
     // the engine's own beams, among the effects
     if client {
         crate::render3d::physgun_beams(lua, viewer);
+        crate::effect::render(lua);
+        crate::particles::draw_all(lua);
     }
     hook("PreDrawEffects", MultiValue::new());
     hook("PostDrawEffects", MultiValue::new());
@@ -917,6 +923,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
             map.brush_models.iter().map(|(lo, hi)| (Vector::new(lo[0], lo[1], lo[2]), Vector::new(hi[0], hi[1], hi[2]))).collect();
         *host.world.collision.borrow_mut() = map.collision.clone();
         *host.world.textures.borrow_mut() = map.textures.clone();
+        *host.world.surfaces.borrow_mut() = map.surfaces.clone();
     }
     let world = EntityHandle::WORLD;
     // a client has the world to trace against; the entities come from the server

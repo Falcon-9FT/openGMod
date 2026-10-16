@@ -13,6 +13,7 @@ use super::*;
 
 mod bullets;
 mod chat;
+mod effects;
 mod items;
 mod mapio;
 mod movers;
@@ -62,6 +63,12 @@ impl Game {
     fn messages(&self) -> Vec<String> {
         self.runtime.errors().into_iter().map(|e| e.message).collect()
     }
+}
+
+/// What the server asked of its players' clients, but the engine's events they hear.
+fn asked_of(g: &Game) -> Vec<(EntityHandle, crate::player::ToClient)> {
+    let all = g.runtime.take_to_clients();
+    all.into_iter().filter(|(_, what)| !matches!(what, crate::player::ToClient::GameEvent(..))).collect()
 }
 
 /// A runtime of `realm` on a game folder with these files.
@@ -1110,6 +1117,7 @@ fn player_map() -> Map {
         collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
         textures: bsp.texinfo.iter().map(texture).collect(),
         visibility: gmod_bsp::Visibility::new(&bsp).map(Arc::new),
+        surfaces: crate::surfaceinfo::of_bsp(&bsp),
     }
 }
 
@@ -1929,7 +1937,7 @@ fn what_a_players_client_would_say() {
     g.runtime.run_player_command(alice, "gmod_toolmode weld; weld_forcelimit 1000; gmod_toolmode");
     g.runtime.run_string("Entity(1):ConCommand('cl_playerskin 3; finger_0 1 2')", "concommand").unwrap();
     // the client runs it, and sends the server what it does not know
-    let asked = g.runtime.take_to_clients();
+    let asked = asked_of(&g);
     assert_eq!(asked, [(alice, ToClient::Command("cl_playerskin 3; finger_0 1 2".into()))]);
     g.runtime.run_player_command(alice, "cl_playerskin 3; finger_0 1 2");
     assert!(g.eval::<bool>(

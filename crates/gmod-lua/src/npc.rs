@@ -797,6 +797,16 @@ fn die(lua: &Lua, handle: EntityHandle, info: &DamageInfo) {
     let valid = |h: Option<EntityHandle>| h.filter(|&h| host(lua).entities.is_valid(h)).unwrap_or(EntityHandle::NULL);
     let (attacker, inflictor) = (valid(info.attacker), valid(info.inflictor));
     hook(lua, "OnNPCKilled", [value(lua, handle), value(lua, attacker), value(lua, inflictor)]);
+    {
+        use crate::gameevent::{Field, index};
+        let fields = vec![
+            ("entindex_killed", Field::Int(index(Some(handle)))),
+            ("entindex_attacker", Field::Int(index(Some(attacker)))),
+            ("entindex_inflictor", Field::Int(index(Some(inflictor)))),
+            ("damagebits", Field::Int(info.kind)),
+        ];
+        crate::gameevent::fire(lua, "entity_killed", fields);
+    }
     crate::outputs::fire(lua, handle, "OnDeath", attacker, handle, None);
     let flags = host(lua).entities.get(handle).map_or(0, |e| e.spawn_flags);
     let item = drop_weapon(lua, handle);

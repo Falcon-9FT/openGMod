@@ -214,7 +214,7 @@ fn the_engine_tells_players_things_in_the_chat() {
         )
         .unwrap();
     assert!(!server.printed().contains("welcome"));
-    assert_eq!(server.runtime.take_to_clients(), [(alice, ToClient::Print("console".into()))]);
+    assert_eq!(asked_of(&server), [(alice, ToClient::Print("console".into()))]);
     deliver(&server, &client, alice);
     assert_eq!(client.eval::<String>("return TOLD"), "none");
     // `ChatText` returning true keeps a line out
@@ -327,10 +327,10 @@ fn a_client_tells_its_own_player_and_says_through_the_server() {
     server.runtime.run_string("PrintMessage(HUD_PRINTTALK, 'to all') PrintMessage(2, 'to the console')", "print").unwrap();
     let told = ChatMessage::Text { player: 0, name: String::new(), text: "to all".into(), kind: "none".into() };
     assert_eq!(server.runtime.take_chat(), [(alice, told)]);
-    assert_eq!(server.runtime.take_to_clients(), [(alice, ToClient::Print("to the console".into()))]);
+    assert_eq!(asked_of(&server), [(alice, ToClient::Print("to the console".into()))]);
     // and `MsgAll` to every console (the base gamemode's word of a player an NPC killed)
     server.runtime.run_string("MsgAll('Alice was killed by ', 7, '\\n')", "msg").unwrap();
-    assert_eq!(server.runtime.take_to_clients(), [(alice, ToClient::Print("Alice was killed by 7\n".into()))]);
+    assert_eq!(asked_of(&server), [(alice, ToClient::Print("Alice was killed by 7\n".into()))]);
     assert!(server.messages().is_empty(), "{:?}", server.messages());
     assert!(client.messages().is_empty(), "{:?}", client.messages());
 }

@@ -6,13 +6,16 @@
 
 use mlua::{AnyUserData, Lua, MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value};
 
+use std::cell::RefCell;
+
 use crate::args::Args;
-use crate::entity::{self, EntityHandle};
+use crate::entity::{self, EntityHandle, Kind};
 use crate::meta::{self, type_id};
 use crate::vector::{Angle, Vector};
+use crate::{Realm, host};
 
 /// What an effect is made with.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EffectData {
     pub origin: Vector,
     pub start: Vector,
@@ -132,18 +135,117 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     def(&t, "GetEntIndex", |a| Ok(Value::Integer(data(a)?.entity.index.map_or(0, i64::from))))?;
     def(&t, "SetEntIndex", |a| {
         let index = a.number(2)? as i64;
-        let handle = u32::try_from(index).ok().and_then(|i| crate::host(a.lua).entities.at(i)).unwrap_or(EntityHandle::NULL);
+        let handle = u32::try_from(index).ok().and_then(|i| host(a.lua).entities.at(i)).unwrap_or(EntityHandle::NULL);
         a.change::<EffectData>(1, NAME, |d| d.entity = handle)
     })?;
 
     let util: Table = lua.globals().get("util")?;
+    // `util.Effect(name, data, allowOverride, ignorePredictionOrRecipientFilter)`
     let effect = lua.create_function(|lua, values: MultiValue| {
         let a = Args::new(lua, values, "Effect");
-        a.string(1)?;
-        a.userdata::<EffectData>(2, NAME)?;
+        let name = a.string(1)?;
+        let data = a.userdata::<EffectData>(2, NAME)?;
+        if host(lua).realm == Realm::Server {
+            send(lua, &name, data, a.get(4));
+        } else if crate::timer::first_time_predicted(lua) {
+            make(lua, &name, data);
+        }
         Ok(())
     })?;
     lua.set_named_registry_value(ENGINE, &effect)?;
     util.raw_set("Effect", effect)?;
     Ok(())
+}
+
+/// The effects of Lua a client is making, oldest first.
+#[derive(Default)]
+pub(crate) struct Effects {
+    live: RefCell<Vec<EntityHandle>>,
+}
+
+/// The server's effect goes to its players: those of a filter given, or all but the one whose
+/// command makes it - its client made it already, predicting - unless told to ignore that.
+fn send(lua: &Lua, name: &str, data: EffectData, filter: Option<&Value>) {
+    let players = match filter {
+        Some(value @ Value::UserData(_)) => crate::recipients::players_of(lua, Some(value)),
+        _ => {
+            let ignore_prediction = matches!(filter, Some(Value::Boolean(true)));
+            let commanding = if ignore_prediction { None } else { host(lua).players.commanding.get() };
+            crate::player::all(lua).into_iter().filter(|&p| Some(p) != commanding).collect()
+        }
+    };
+    for player in players {
+        crate::player::to_client(lua, player, crate::player::ToClient::Effect(name.to_string(), data));
+    }
+}
+
+/// A client makes an effect: one of Lua's (`effects.Register`) as an entity of its own that
+/// thinks and draws until it is done, else one of the engine's.
+pub(crate) fn make(lua: &Lua, name: &str, data: EffectData) {
+    let made = make_lua(lua, name, data).unwrap_or_else(|e| {
+        host(lua).report(crate::ScriptError::from_lua(&e));
+        true
+    });
+    if !made {
+        crate::engine_effects::make(lua, name, data);
+    }
+}
+
+/// An effect of Lua, if there is one by the name: `EFFECT:Init(data)`.
+fn make_lua(lua: &Lua, name: &str, data: EffectData) -> mlua::Result<bool> {
+    let Some(effects) = lua.globals().get::<Option<Table>>("effects")? else { return Ok(false) };
+    let Some(create) = effects.get::<Option<mlua::Function>>("Create")? else { return Ok(false) };
+    if create.call::<Value>(name)?.is_nil() {
+        return Ok(false);
+    }
+    let handle = {
+        let host = host(lua);
+        let mut ent =
+            entity::Ent::new(&name.to_ascii_lowercase(), Kind::Entity, host.entities.next_creation_id(), host.clock.cur_time.get());
+        ent.effect = true;
+        ent.spawned = true;
+        match host.entities.insert_client(ent) {
+            Some(handle) => handle,
+            None => return Ok(true),
+        }
+    };
+    let Value::UserData(ud) = entity::push(lua, handle)? else { return Ok(true) };
+    let table = entity::table_of(&ud)?.expect("every entity has a table");
+    create.call::<Value>((name, table.clone()))?;
+    table.raw_set("Entity", &ud)?;
+    entity::set_world_pos(lua, handle, data.origin);
+    host(lua).effects.live.borrow_mut().push(handle);
+    let data = lua.create_userdata(data)?;
+    crate::ents::call_method(lua, &ud, "Init", MultiValue::from_iter([Value::UserData(data)]));
+    Ok(true)
+}
+
+/// A client's frame: each effect of Lua thinks, and goes when it says it is done.
+pub(crate) fn think(lua: &Lua) {
+    let live: Vec<EntityHandle> = host(lua).effects.live.borrow().clone();
+    for handle in live {
+        if !host(lua).entities.is_valid(handle) {
+            continue;
+        }
+        let Ok(Value::UserData(ud)) = entity::push(lua, handle) else { continue };
+        let result = crate::ents::call_method(lua, &ud, "Think", MultiValue::new());
+        let alive = matches!(result.as_ref().and_then(|r| r.front()), Some(v) if !matches!(v, Value::Nil | Value::Boolean(false)));
+        if !alive {
+            crate::ents::remove(lua, handle);
+        }
+    }
+    host(lua).effects.live.borrow_mut().retain(|&h| host(lua).entities.get(h).is_some_and(|e| !e.removed));
+}
+
+/// The effects of Lua draw themselves (`EFFECT:Render`), among what is seen through.
+pub(crate) fn render(lua: &Lua) {
+    let live: Vec<EntityHandle> = host(lua).effects.live.borrow().clone();
+    for handle in live {
+        if host(lua).entities.get(handle).is_none_or(|e| e.removed || e.no_draw) {
+            continue;
+        }
+        if let Ok(Value::UserData(ud)) = entity::push(lua, handle) {
+            crate::ents::call_method(lua, &ud, "Render", MultiValue::new());
+        }
+    }
 }

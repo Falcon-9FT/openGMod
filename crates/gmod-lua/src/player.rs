@@ -135,6 +135,8 @@ pub(crate) struct Players {
     pub bots: Cell<u64>,
     /// What the server asks of the players' clients, oldest first.
     pub outbox: RefCell<Vec<(EntityHandle, ToClient)>>,
+    /// The player whose command the server runs now (`GetPredictionPlayer`).
+    pub commanding: Cell<Option<EntityHandle>>,
 }
 
 /// What the server asks of a player's client beside the entities, the chat and `net`.
@@ -146,6 +148,10 @@ pub enum ToClient {
     Command(String),
     /// `PrintMessage` to the console: a line for it.
     Print(String),
+    /// `util.Effect`: an effect for it to make.
+    Effect(String, crate::effect::EffectData),
+    /// An event of the engine's (`gameevent`), as clients hear it.
+    GameEvent(String, Vec<(String, crate::gameevent::Field)>),
 }
 
 /// Asks a player's client something. A bot has none: the server runs its console lines
@@ -671,6 +677,19 @@ pub(crate) fn join(lua: &Lua, info: PlayerInfo) -> Option<EntityHandle> {
     let ply = ent_value(lua, handle);
     let single = max_players(lua) == 1;
     let (bot, steam_id, unique_id) = state(lua, handle, |_, p| (p.info.bot, p.steam_id(), p.unique_id(single).to_string()))?;
+    {
+        use crate::gameevent::Field;
+        let (user_id, address) = state(lua, handle, |_, p| (p.user_id, p.info.address.clone()))?;
+        let fields = vec![
+            ("name", Field::Text(name.clone())),
+            ("networkid", Field::Text(if bot { "BOT".into() } else { steam_id.clone() })),
+            ("address", Field::Text(address)),
+            ("userid", Field::Int(user_id)),
+            ("index", Field::Int(i64::from(index) - 1)),
+            ("bot", Field::Int(i64::from(bot))),
+        ];
+        crate::gameevent::fire(lua, "player_connect", fields);
+    }
     if !bot && let (Ok(s), Ok(u)) = (lua.create_string(&steam_id), lua.create_string(&unique_id)) {
         hook(lua, "PlayerAuthed", [ply.clone(), Value::String(s), Value::String(u)]);
     }
@@ -678,6 +697,8 @@ pub(crate) fn join(lua: &Lua, info: PlayerInfo) -> Option<EntityHandle> {
     if host(lua).entities.is_valid(handle) {
         spawn(lua, handle);
     }
+    let user_id = crate::gameevent::user_id(lua, handle);
+    crate::gameevent::fire(lua, "player_activate", vec![("userid", crate::gameevent::Field::Int(user_id))]);
     Some(handle)
 }
 
@@ -751,6 +772,8 @@ pub(crate) fn spawn(lua: &Lua, handle: EntityHandle) {
         });
     }
     hook(lua, "PlayerSpawn", [ply, Value::Boolean(false)]);
+    let user_id = crate::gameevent::user_id(lua, handle);
+    crate::gameevent::fire(lua, "player_spawn", vec![("userid", crate::gameevent::Field::Int(user_id))]);
 }
 
 /// How a player dies.
@@ -789,6 +812,16 @@ pub(crate) fn kill(lua: &Lua, handle: EntityHandle, death: Death) {
         let inflictor = ent_value(lua, death.info.inflictor.unwrap_or(EntityHandle::NULL));
         hook(lua, "DoPlayerDeath", [ply.clone(), attacker.clone(), info]);
         hook(lua, "PlayerDeath", [ply.clone(), inflictor, attacker]);
+    }
+    {
+        use crate::gameevent::{Field, index};
+        let fields = vec![
+            ("entindex_killed", Field::Int(index(Some(handle)))),
+            ("entindex_attacker", Field::Int(index(death.info.attacker))),
+            ("entindex_inflictor", Field::Int(index(death.info.inflictor))),
+            ("damagebits", Field::Int(death.info.kind)),
+        ];
+        crate::gameevent::fire(lua, "entity_killed", fields);
     }
     hook(lua, "PostPlayerDeath", [ply]);
     // the active weapon falls when it should, the rest go
@@ -834,6 +867,16 @@ pub(crate) fn hurt(lua: &Lua, handle: EntityHandle, info: DamageInfo, userdata: 
     })
     .unwrap_or((0, 0));
     hook(lua, "PlayerHurt", [ply, attacker, Value::Integer(health), Value::Number(f64::from(amount.max(taken as f32)))]);
+    {
+        use crate::gameevent::{Field, user_id};
+        let fields = vec![
+            ("health", Field::Int(health.max(0))),
+            ("priority", Field::Int(50)),
+            ("userid", Field::Int(user_id(lua, handle))),
+            ("attacker", Field::Int(user_id(lua, info.attacker.unwrap_or(EntityHandle::NULL)))),
+        ];
+        crate::gameevent::fire(lua, "player_hurt", fields);
+    }
     if health <= 0 {
         kill(lua, handle, Death { info, userdata: Some(userdata.clone()), silent: false });
     }
@@ -846,6 +889,17 @@ pub(crate) fn leave(lua: &Lua, handle: EntityHandle) {
     }
     hook(lua, "PlayerDisconnected", [ent_value(lua, handle)]);
     let name = state(lua, handle, |_, p| p.info.name.clone()).unwrap_or_default();
+    if let Some((user_id, bot, steam_id)) = state(lua, handle, |_, p| (p.user_id, p.info.bot, p.steam_id())) {
+        use crate::gameevent::Field;
+        let fields = vec![
+            ("name", Field::Text(name.clone())),
+            ("networkid", Field::Text(if bot { "BOT".into() } else { steam_id })),
+            ("userid", Field::Int(user_id)),
+            ("reason", Field::Text("Disconnect by user.".into())),
+            ("bot", Field::Int(i64::from(bot))),
+        ];
+        crate::gameevent::fire(lua, "player_disconnect", fields);
+    }
     crate::chat::join_leave(lua, handle, &name, &format!("Player {name} left the game (Disconnect by user.)"));
     strip_weapons(lua, handle);
     let view_models = state(lua, handle, |_, p| p.view_models).unwrap_or([EntityHandle::NULL; 3]);
@@ -873,7 +927,9 @@ pub(crate) fn set_input(lua: &Lua, handle: EntityHandle, cmd: UserCmd) {
 /// One tick of every player.
 pub(crate) fn tick_all(lua: &Lua) {
     for handle in all(lua) {
+        host(lua).players.commanding.set(Some(handle));
         tick(lua, handle);
+        host(lua).players.commanding.set(None);
     }
 }
 
@@ -2345,6 +2401,15 @@ fn install_identity(def: &entity::Def) -> mlua::Result<()> {
     def("GetTimeoutSeconds", zero)?;
     def("IsTimingOut", no)?;
     def("IsSpeaking", no)?;
+    // voice chat and Steam's friends are not there: no one is muted, no one is a friend
+    def("IsMuted", no)?;
+    def("SetMuted", |_| Ok(Value::Nil))?;
+    def("VoiceVolume", zero)?;
+    def("IsVoiceAudible", |_| Ok(Value::Boolean(true)))?;
+    def("GetVoiceVolumeScale", |_| Ok(Value::Number(1.0)))?;
+    def("SetVoiceVolumeScale", |_| Ok(Value::Nil))?;
+    def("GetFriendStatus", |a| Ok(Value::String(a.lua.create_string("none")?)))?;
+    def("ShowProfile", |_| Ok(Value::Nil))?;
     def("IsTyping", no)?;
     def("IsPlayingTaunt", no)?;
     Ok(())

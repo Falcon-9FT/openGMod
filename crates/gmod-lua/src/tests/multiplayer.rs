@@ -184,7 +184,7 @@ fn the_server_asks_things_of_clients() {
         )
         .unwrap();
     assert_eq!(
-        g.runtime.take_to_clients(),
+        asked_of(&g),
         [
             (alice, ToClient::Lua("X = 1".into())),
             (alice, ToClient::Lua("Y = 2".into())),

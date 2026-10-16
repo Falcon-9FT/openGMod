@@ -75,10 +75,12 @@ pub mod convar;
 pub mod damage;
 pub mod effect;
 pub mod engine;
+mod engine_effects;
 pub mod entity;
 pub mod ents;
 pub mod files;
 pub mod filesystem;
+pub mod gameevent;
 pub mod hitbox;
 pub mod hl2weapons;
 pub mod html;
@@ -99,6 +101,7 @@ pub mod nav;
 pub mod net;
 pub mod npc;
 pub mod outputs;
+mod particles;
 pub mod physcannon;
 pub mod physgun;
 pub mod physics;
@@ -118,6 +121,7 @@ pub mod sql;
 mod startup;
 pub mod steam;
 pub mod surface;
+pub mod surfaceinfo;
 mod surfaceprops;
 pub mod timer;
 pub mod trace;
@@ -311,6 +315,12 @@ pub(crate) struct Host {
     pub channels: bass::Channels,
     /// What the client's Lua draws in the world this frame.
     pub render3d: render3d::Frame,
+    /// The client's particle emitters (`ParticleEmitter`).
+    pub(crate) particles: particles::Particles,
+    /// The client's effects of Lua (`util.Effect`).
+    pub(crate) effects: effect::Effects,
+    /// The engine's events Lua listens to (`gameevent.Listen`).
+    pub(crate) game_events: gameevent::Listening,
     /// The engine's HUD: where its elements go, its colours.
     pub hud: RefCell<hud::Hud>,
     /// The row of weapon slots the HUD chooses a weapon in.
@@ -423,6 +433,9 @@ impl Runtime {
             menu: menu::Menu::default(),
             channels: bass::Channels::default(),
             render3d: render3d::Frame::default(),
+            particles: particles::Particles::default(),
+            effects: effect::Effects::default(),
+            game_events: gameevent::Listening::default(),
             hud: RefCell::new(hud::Hud::default()),
             selection: weaponselect::Selection::default(),
             sounds: sound::Sounds::new(realm),
@@ -454,6 +467,8 @@ impl Runtime {
         anim::install_util(&lua)?;
         trace::install(&lua)?;
         effect::install(&lua)?;
+        gameevent::install(&lua)?;
+        surfaceinfo::install(&lua)?;
         constraint::install(&lua)?;
         sound::install(&lua)?;
         if realm != Realm::Server {
@@ -480,6 +495,7 @@ impl Runtime {
         if realm != Realm::Server {
             surface::install(&lua)?;
             client::install(&lua)?;
+            particles::install(&lua)?;
             vgui::install(&lua)?;
             surface::load_fonts(&lua);
             client::load(&lua);
@@ -627,6 +643,8 @@ impl Runtime {
         if !server {
             ents::think(&self.lua);
             self.call_hook("Think", mlua::MultiValue::new());
+            effect::think(&self.lua);
+            particles::simulate(&self.lua, seconds as f32);
         }
         ents::collect(&self.lua);
     }
@@ -737,6 +755,8 @@ impl Runtime {
             }
             player::ToClient::Command(line) => self.run_command(line),
             player::ToClient::Print(text) => host(&self.lua).print(&format!("{text}\n")),
+            player::ToClient::Effect(name, data) => effect::make(&self.lua, name, *data),
+            player::ToClient::GameEvent(name, fields) => gameevent::heard(&self.lua, name, fields),
         }
     }
 

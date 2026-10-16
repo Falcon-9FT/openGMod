@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The version of these messages: a client and a server of different ones do not play.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The port servers listen on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 27015;
