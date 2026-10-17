@@ -1692,11 +1692,12 @@ fn physics_objects() {
     // frozen, it stays; a push of 2500 kg·units/s gives its 25 kg 100 units/s
     assert!(g.eval::<bool>(
         "local stayed = CRATE:GetPos() == Vector(-300, 0, 150)
-         PHYS:EnableMotion(true) PHYS:EnableGravity(false) PHYS:Wake()
+         PHYS:EnableMotion(true) PHYS:EnableGravity(false) PHYS:EnableDrag(false) PHYS:Wake()
          PHYS:ApplyForceCenter(Vector(0, 0, 2500))
          local pushed = PHYS:GetVelocity():IsEqualTol(Vector(0, 0, 100), 0.01)
          PHYS:SetVelocity(Vector(10, 0, 0)) PHYS:SetAngleVelocity(Vector(0, 0, 90))
-         return stayed and pushed and not PHYS:IsGravityEnabled() and PHYS:GetVelocity():IsEqualTol(Vector(10, 0, 0), 0.01)
+         return stayed and pushed and not PHYS:IsGravityEnabled() and not PHYS:IsDragEnabled()
+             and PHYS:GetVelocity():IsEqualTol(Vector(10, 0, 0), 0.01)
              and PHYS:GetAngleVelocity():IsEqualTol(Vector(0, 0, 90), 0.01)"
     ));
     g.runtime.think(1.0);

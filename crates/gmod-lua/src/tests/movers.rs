@@ -342,7 +342,8 @@ fn the_use_key_carries_light_props() {
     // the attack key throws it the way the player looks
     press(side, 1);
     assert!(g.printed().contains("dropped\tmodels/light.mdl\ttrue"));
-    assert!(g.eval::<bool>("return not LIGHT:IsPlayerHolding() and LIGHT:GetPos().y > 150"));
+    // (the air holding it back a little)
+    assert!(g.eval::<bool>("return not LIGHT:IsPlayerHolding() and LIGHT:GetPos().y > 120"));
     // the heavy crate is too heavy, unless Lua says to take it
     let at_heavy = Angle::new(25.0, 0.0, 0.0);
     g.runtime.run_string("Entity(1):SetPos(Vector(40, -200, 0)) Entity(1):SetEyeAngles(Angle(25, 0, 0))", "look").unwrap();

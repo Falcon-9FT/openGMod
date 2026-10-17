@@ -1,7 +1,8 @@
 //! `physenv`: the physics' surroundings - their gravity (`sv_gravity` straight down, unless set
 //! otherwise until that changes), whether and how fast they go on, how fast anything may move
-//! (the performance settings, `MaxVelocity` and `MaxAngularVelocity`), the air's density, and
-//! surfaces added (`AddSurfaceData`). As GMod has them, measured.
+//! (the performance settings, `MaxVelocity` and `MaxAngularVelocity`), the air's density (which
+//! holds back what moves through it), and surfaces added (`AddSurfaceData`). As GMod has them,
+//! measured.
 
 use std::cell::{Cell, RefCell};
 
@@ -111,7 +112,9 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     })?;
     def(lua, &physenv, "GetAirDensity", |a| Ok(Value::Number(host(a.lua).physics.environment.air_density.get())))?;
     def(lua, &physenv, "SetAirDensity", |a| {
-        host(a.lua).physics.environment.air_density.set(a.number(1)?.max(0.0));
+        let density = a.number(1)?.max(0.0);
+        host(a.lua).physics.environment.air_density.set(density);
+        host(a.lua).physics.physics.borrow_mut().set_air_density(density as f32);
         Ok(Value::Nil)
     })?;
     def(lua, &physenv, "GetPhysicsPaused", |a| Ok(Value::Boolean(host(a.lua).physics.environment.paused.get())))?;

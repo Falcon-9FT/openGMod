@@ -242,6 +242,79 @@ impl Shape {
     }
 }
 
+/// How the air holds a body back, by its shape, as VPhysics works it out: how much of it the
+/// air meets going along each of its axes (square metres), and turning about each.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Drag {
+    area: Vector,
+    turning: Vector,
+    /// How much of that holds it back (`SetDragCoefficient`, `SetAngleDragCoefficient`).
+    coefficient: f32,
+    turning_coefficient: f32,
+}
+
+/// The area of the outline of points seen along `axis` (0, 1 or 2): of their convex hull.
+fn outline_area(points: &[Vector], axis: usize) -> f32 {
+    let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+    let mut flat: Vec<[f32; 2]> = points.iter().map(|p| [p[u], p[v]]).collect();
+    flat.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut hull: Vec<[f32; 2]> = Vec::new();
+    for pass in 0..2 {
+        let start = hull.len();
+        let points: Box<dyn Iterator<Item = &[f32; 2]>> = if pass == 0 { Box::new(flat.iter()) } else { Box::new(flat.iter().rev()) };
+        for &p in points {
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    let n = hull.len();
+    (0..n).map(|i| cross([0.0, 0.0], hull[i], hull[(i + 1) % n])).sum::<f32>().abs() / 2.0
+}
+
+impl Drag {
+    /// The drag of a shape (in metres, about the body's origin): along each axis, the area of
+    /// its outline; turning about one, VPhysics' integral of the faces of its box sweeping the
+    /// air - by half its size, as GMod's crates turn - times how much of the box's face its
+    /// outline is.
+    fn of(shape: &Shape) -> Drag {
+        let solids: Vec<Vec<Vector>> = match shape {
+            Shape::Hulls(hulls) => hulls.iter().map(|h| h.iter().map(|&p| metres(p)).collect()).collect(),
+            Shape::Sphere(_) => Vec::new(),
+        };
+        let (size, area) = match shape {
+            Shape::Sphere(radius) => {
+                let d = 2.0 * radius * METRES_PER_UNIT;
+                (Vector::splat(d), Vector::splat(std::f32::consts::FRAC_PI_4 * d * d))
+            }
+            Shape::Hulls(_) => {
+                let all = || solids.iter().flatten();
+                let lo = all().fold(Vector::splat(f32::MAX), |a, &p| a.min(p));
+                let hi = all().fold(Vector::splat(f32::MIN), |a, &p| a.max(p));
+                let size = (hi - lo).max(Vector::ZERO);
+                let face = |axis: usize| size[(axis + 1) % 3] * size[(axis + 2) % 3];
+                let outline = |axis: usize| solids.iter().map(|h| outline_area(h, axis)).sum::<f32>().min(face(axis));
+                (size, Vector::new(outline(0), outline(1), outline(2)))
+            }
+        };
+        let half = size / 2.0;
+        let sweep = |l: f32, w: f32, h: f32| (1.0 / 3.0) * w * w * l * l * l + 0.5 * w * w * w * w * l + l * w * w * h * h;
+        let turning = |axis: usize| {
+            let (i, j, k) = (axis, (axis + 1) % 3, (axis + 2) % 3);
+            let face = size[j] * size[k];
+            let fraction = if face > 0.0 { area[axis] / face } else { 0.0 };
+            fraction * (sweep(half[i], half[j], half[k]) + sweep(half[i], half[k], half[j]))
+        };
+        Drag { area, turning: Vector::new(turning(0), turning(1), turning(2)), coefficient: 1.0, turning_coefficient: 1.0 }
+    }
+}
+
+/// The density of the air, as `physenv.GetAirDensity` gives it to begin with.
+pub const AIR_DENSITY: f32 = 2.0;
+
 /// A body to add.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Body {
@@ -348,6 +421,10 @@ pub struct Physics {
     /// How fast the moving and turning of each body that has damping die away, per second,
     /// while it touches something ([`Physics::set_damping`]).
     damping: HashMap<RigidBodyHandle, (f32, f32)>,
+    /// The bodies the air holds back, and how ([`Physics::set_drag`]), and the air's density.
+    drag: HashMap<RigidBodyHandle, Drag>,
+    no_drag: HashMap<RigidBodyHandle, Drag>,
+    air_density: f32,
     /// The springs that only stretch, and how: their length (metres), stiffness and damping.
     slack: HashMap<JointId, [f32; 3]>,
     /// The bodies harder to turn than their shapes ([`Body::inertia`]), and how much.
@@ -478,6 +555,9 @@ impl Physics {
             strengths: HashMap::new(),
             dampers: HashMap::new(),
             damping: HashMap::new(),
+            drag: HashMap::new(),
+            no_drag: HashMap::new(),
+            air_density: AIR_DENSITY,
             slack: HashMap::new(),
             broken: Vec::new(),
             apart: HashSet::new(),
@@ -688,6 +768,7 @@ impl Physics {
             self.inertia.insert(handle, body.inertia);
         }
         self.set_damping(BodyId(handle), body.damping, body.rot_damping);
+        self.drag.insert(handle, Drag::of(&body.shape));
         self.weigh(handle);
         Some(BodyId(handle))
     }
@@ -1025,6 +1106,78 @@ impl Physics {
             self.damping.insert(id.0, damping);
         }
         self.damp_touching();
+    }
+
+    /// Whether the air holds a body back (`EnableDrag`): it does to begin with.
+    pub fn set_drag(&mut self, id: BodyId, on: bool) {
+        let (from, to) = if on { (&mut self.no_drag, &mut self.drag) } else { (&mut self.drag, &mut self.no_drag) };
+        if let Some(drag) = from.remove(&id.0) {
+            to.insert(id.0, drag);
+        }
+    }
+
+    pub fn drag_enabled(&self, id: BodyId) -> bool {
+        self.drag.contains_key(&id.0)
+    }
+
+    /// How much of what the air would hold a body back by, moving and turning, it does
+    /// (`SetDragCoefficient`, `SetAngleDragCoefficient`): all of it to begin with.
+    pub fn set_drag_coefficients(&mut self, id: BodyId, moving: Option<f32>, turning: Option<f32>) {
+        let Some(drag) = self.drag.get_mut(&id.0).or_else(|| self.no_drag.get_mut(&id.0)) else { return };
+        if let Some(c) = moving {
+            drag.coefficient = c.max(0.0);
+        }
+        if let Some(c) = turning {
+            drag.turning_coefficient = c.max(0.0);
+        }
+    }
+
+    /// The air's density from now on (`physenv.SetAirDensity`).
+    pub fn set_air_density(&mut self, density: f32) {
+        self.air_density = density.max(0.0);
+    }
+
+    /// Before a step of `dt` seconds: the air holds back what moves, as VPhysics' drag does -
+    /// moving, by half its density times the area it meets times the speed, over the mass;
+    /// turning, by its density times what it sweeps times the turning, over the inertia - each
+    /// no more than all of it.
+    fn drag_through_air(&mut self, dt: f32) {
+        let bodies = &self.world.bodies;
+        self.drag.retain(|&handle, _| bodies.contains(handle));
+        self.no_drag.retain(|&handle, _| bodies.contains(handle));
+        let density = self.air_density;
+        if density <= 0.0 {
+            return;
+        }
+        for (&handle, drag) in &self.drag {
+            let Some(body) = self.world.bodies.get_mut(handle) else { continue };
+            if !body.is_dynamic() || body.is_sleeping() || body.mass() <= 0.0 {
+                continue;
+            }
+            let turn = *body.rotation();
+            let (v, w) = (body.linvel(), body.angvel());
+            let local = turn.inverse() * v;
+            let met = local.abs().dot(drag.area);
+            let slowed = (0.5 * density * drag.coefficient * met / body.mass() * dt).min(1.0);
+            // the inertia about each of its own axes
+            let props = body.mass_properties().local_mprops;
+            let frame = Mat3::from_quat(props.principal_inertia_local_frame);
+            let principal = props.principal_inertia();
+            let inertia = Vector::new(
+                (0..3).map(|k| frame.row(0)[k].powi(2) * principal[k]).sum(),
+                (0..3).map(|k| frame.row(1)[k].powi(2) * principal[k]).sum(),
+                (0..3).map(|k| frame.row(2)[k].powi(2) * principal[k]).sum(),
+            );
+            let local_w = turn.inverse() * w;
+            let swept: f32 = (0..3).filter(|&i| inertia[i] > 0.0).map(|i| local_w[i].abs() * drag.turning[i] / inertia[i]).sum();
+            let stopped = (density * drag.turning_coefficient * swept * dt).min(1.0);
+            if slowed > 0.0 {
+                body.set_linvel(v * (1.0 - slowed), false);
+            }
+            if stopped > 0.0 {
+                body.set_angvel(w * (1.0 - stopped), false);
+            }
+        }
     }
 
     /// Before a step: each body with damping is damped if it touches something, and not if it
@@ -1620,6 +1773,7 @@ impl Physics {
         self.aim_limits();
         self.slacken_springs();
         self.damp_touching();
+        self.drag_through_air(seconds);
         self.damp_springs(seconds);
         let hooks = Apart {
             pairs: &self.apart,

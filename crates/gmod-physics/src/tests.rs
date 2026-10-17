@@ -888,6 +888,8 @@ fn friction_is_the_two_surfaces_multiplied() {
     let mut physics = floor();
     let body = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
     physics.set_friction(body, 0.5);
+    // as it was measured, the air holding nothing back
+    physics.set_drag(body, false);
     run(&mut physics, 0.5);
     physics.set_velocity(body, [400.0, 0.0, 0.0]);
     run(&mut physics, 3.0);
@@ -974,6 +976,7 @@ fn what_touches_the_world_touches_the_face_it_touches() {
     let body = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
     physics.set_friction(body, 0.5);
     physics.set_elasticity(body, 0.0);
+    physics.set_drag(body, false);
     run(&mut physics, 0.5);
     physics.set_velocity(body, [200.0, 0.0, 0.0]);
     run(&mut physics, 3.0);
@@ -1017,6 +1020,7 @@ fn a_surface_of_triangles_is_touched_by_the_triangle_touched() {
         let body = physics.add(&crate_body([x, 0.0, 16.0])).unwrap();
         physics.set_friction(body, 0.5);
         physics.set_elasticity(body, 0.0);
+        physics.set_drag(body, false);
         run(&mut physics, 0.5);
         physics.set_velocity(body, [200.0, 0.0, 0.0]);
         run(&mut physics, 3.0);
@@ -1067,8 +1071,9 @@ fn a_spring_that_only_stretches_pulls_and_never_pushes() {
 
 #[test]
 fn damping_holds_back_only_what_touches_something() {
-    // GMod, measured: a crate damped by 5 going 100 units/s keeps going so in the air, and on
-    // a floor without friction keeps e⁻⁵ of it a second (33 after a fifth of a second)
+    // GMod, measured: a crate damped by 5 going 100 units/s keeps going so in the air (but for
+    // the air holding it back: 98.2 after a fifth of a second), and on a floor without
+    // friction keeps e⁻⁵ of it a second (33)
     let mut physics = floor();
     let flying = physics.add(&crate_body([0.0, 0.0, 300.0])).unwrap();
     let sliding = physics.add(&crate_body([0.0, 200.0, 16.0])).unwrap();
@@ -1081,7 +1086,7 @@ fn damping_holds_back_only_what_touches_something() {
     assert_eq!(physics.damping(flying), (5.0, 0.0));
     run(&mut physics, 0.2);
     let (air, ground) = (physics.velocity(flying)[0], physics.velocity(sliding)[0]);
-    assert!((air - 100.0).abs() < 1.0, "damped in the air: {air}");
+    assert!((air - 98.2).abs() < 1.0, "damped in the air: {air}");
     assert!((ground - 36.8).abs() < 4.0, "on the ground: {ground}");
 }
 
@@ -1103,5 +1108,29 @@ fn an_impact_is_touching_again_after_being_apart() {
             let came = (down * down + 2.0 * DEFAULT_GRAVITY * lift).sqrt();
             assert!((first.speed - came).abs() < 15.0, "{} for {came}", first.speed);
         }
+    }
+}
+
+#[test]
+fn the_air_holds_back_what_moves_through_it() {
+    // GMod, measured, without gravity: a crate of 30 kg and 40.5 units sent at 1000 units/s
+    // goes at 916 after a tenth of a second and 739 after four; a ball of 150 kg and 43 units
+    // at 984 after a tenth (round, it meets less of the air than its box); without drag, at
+    // 1000 still
+    for (shape, mass, after, drag) in [
+        (Shape::cuboid([-20.25; 3], [20.25; 3]), 30.0, [916.0, 739.0], true),
+        (Shape::Sphere(21.5), 150.0, [984.0, 941.0], true),
+        (Shape::cuboid([-20.25; 3], [20.25; 3]), 30.0, [1000.0, 1000.0], false),
+    ] {
+        let mut physics = Physics::new();
+        physics.set_gravity(0.0);
+        let body = physics.add(&Body { mass: Some(mass), ..Body::new(shape, [0.0; 3], [0.0; 3]) }).unwrap();
+        physics.set_drag(body, drag);
+        physics.set_velocity(body, [1000.0, 0.0, 0.0]);
+        run(&mut physics, 0.1);
+        let first = physics.velocity(body)[0];
+        run(&mut physics, 0.3);
+        let later = physics.velocity(body)[0];
+        assert!((first - after[0]).abs() < 8.0 && (later - after[1]).abs() < 12.0, "{first} {later}, not {after:?}");
     }
 }

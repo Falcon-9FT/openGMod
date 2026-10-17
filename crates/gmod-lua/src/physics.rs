@@ -69,7 +69,6 @@ struct Kept {
     maxs: Vector,
     game_flags: i64,
     contents: i64,
-    drag: bool,
     /// The shape of its model, which traces sweep through; none for a box, a ball or hulls
     /// Lua made.
     hulls: Option<Arc<Vec<gmod_bsp::collision::Hull>>>,
@@ -152,7 +151,6 @@ fn attach_world(lua: &Lua) {
         maxs: Vector::default(),
         game_flags: 0,
         contents: 0,
-        drag: false,
         hulls: None,
     };
     host.physics.bodies.borrow_mut().insert(ground, kept);
@@ -212,7 +210,7 @@ pub(crate) fn phy(lua: &Lua, model: &str) -> Option<Arc<gmod_model::Phy>> {
 /// Keeps a body of an entity: what Lua keeps with it, the bounds of its shape in its own space.
 pub(crate) fn keep(lua: &Lua, id: BodyId, entity: EntityHandle, part: usize, shape: &Shape, material: &str) {
     let (mins, maxs) = bounds(shape);
-    let kept = Kept { entity, part, material: material.to_string(), mins, maxs, game_flags: 0, contents: 0, drag: true, hulls: None };
+    let kept = Kept { entity, part, material: material.to_string(), mins, maxs, game_flags: 0, contents: 0, hulls: None };
     host(lua).physics.bodies.borrow_mut().insert(id, kept);
     set_material(lua, id, material);
 }
@@ -263,7 +261,7 @@ fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>
     let Some(id) = host.physics.physics.borrow_mut().add(&body) else { return false };
     let material = material.or(model.map(|m| m.material.as_str())).unwrap_or("default").to_string();
     let hulls = model.map(|m| m.hulls.clone()).filter(|h| !h.is_empty());
-    let kept = Kept { entity: handle, part: 0, material: material.clone(), mins, maxs, game_flags: 0, contents: 0, drag: true, hulls };
+    let kept = Kept { entity: handle, part: 0, material: material.clone(), mins, maxs, game_flags: 0, contents: 0, hulls };
     host.physics.bodies.borrow_mut().insert(id, kept);
     host.entities.with_mut(handle, |ent| ent.physics = Some(id));
     drop(host);
@@ -744,14 +742,21 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         with(a, |p, id| p.set_collisions(id, on)).map(|_| Value::Nil)
     })?;
     def("IsCollisionEnabled", |a| Ok(Value::Boolean(with(a, |p, id| p.collisions(id))?)))?;
+    // the air holds back what moves through it ([`gmod_physics::Physics::set_drag`])
     def("EnableDrag", |a| {
         let on = a.boolean(2);
-        kept(a, |k| k.drag = on).map(|_| Value::Nil)
+        with(a, |p, id| p.set_drag(id, on)).map(|_| Value::Nil)
     })?;
-    def("IsDragEnabled", |a| Ok(Value::Boolean(kept(a, |k| k.drag)?)))?;
-    // drag and buoyancy are not simulated yet
-    def("SetDragCoefficient", |a| this(a).map(|_| Value::Nil))?;
-    def("SetAngleDragCoefficient", |a| this(a).map(|_| Value::Nil))?;
+    def("IsDragEnabled", |a| Ok(Value::Boolean(with(a, |p, id| p.drag_enabled(id))?)))?;
+    def("SetDragCoefficient", |a| {
+        let c = a.number(2)? as f32;
+        with(a, |p, id| p.set_drag_coefficients(id, Some(c), None)).map(|_| Value::Nil)
+    })?;
+    def("SetAngleDragCoefficient", |a| {
+        let c = a.number(2)? as f32;
+        with(a, |p, id| p.set_drag_coefficients(id, None, Some(c))).map(|_| Value::Nil)
+    })?;
+    // buoyancy is not simulated yet
     def("SetBuoyancyRatio", |a| this(a).map(|_| Value::Nil))?;
     def("RecheckCollisionFilter", |a| this(a).map(|_| Value::Nil))?;
     def("SetInertia", |a| this(a).map(|_| Value::Nil))?;
