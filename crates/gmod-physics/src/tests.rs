@@ -354,7 +354,6 @@ fn ragdoll_joints_turn_as_far_as_their_limits() {
         ([[0.0, 0.0], [-45.0, 45.0], [0.0, 0.0]], 45.0),
         ([[0.0, 0.0], [-30.0, 80.0], [-10.0, 10.0]], 80.0),
         ([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]], 0.0),
-        ([[-180.0, 180.0], [-180.0, 180.0], [-180.0, 180.0]], 90.0),
     ] {
         let mut physics = floor();
         let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
@@ -371,6 +370,22 @@ fn ragdoll_joints_turn_as_far_as_their_limits() {
         let down = f32::to_radians(pitch);
         assert!(near(forward, [down.cos(), 0.0, -down.sin()], 0.05) && near(left, [0.0, 1.0, 0.0], 0.05), "{limits:?}: {angles:?}");
     }
+    // free, it swings down through straight down and on: in the air nothing damps it (as in
+    // GMod), and nothing holds it back
+    let mut physics = floor();
+    let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
+    physics.set_motion(post, false);
+    let arm = physics.add(&stick([16.0, 0.0, 200.0])).unwrap();
+    let limits = [[-180.0, 180.0]; 3];
+    physics.join(post, arm, Joint::Ragdoll { point: [16.0, 0.0, 200.0], angles: [0.0; 3], limits, free: false }, false, [0.0; 2]).unwrap();
+    let mut lowest = 0.0f32;
+    for _ in 0..100 {
+        run(&mut physics, 0.04);
+        let (origin, angles) = physics.pose(arm).unwrap();
+        assert!(near(origin, [16.0, 0.0, 200.0], 1.0), "{origin:?}");
+        lowest = lowest.min(axes(angles)[0][2]);
+    }
+    assert!(lowest < -0.99, "it never hung straight down: {lowest}");
     // the frame turns the axes: about its x, which is the world's y, the stick may not turn
     let mut physics = floor();
     let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
@@ -1048,4 +1063,24 @@ fn a_spring_that_only_stretches_pulls_and_never_pushes() {
             (false, false) => assert!(apart > from + 5.0, "it did not push: {apart}"),
         }
     }
+}
+
+#[test]
+fn damping_holds_back_only_what_touches_something() {
+    // GMod, measured: a crate damped by 5 going 100 units/s keeps going so in the air, and on
+    // a floor without friction keeps e⁻⁵ of it a second (33 after a fifth of a second)
+    let mut physics = floor();
+    let flying = physics.add(&crate_body([0.0, 0.0, 300.0])).unwrap();
+    let sliding = physics.add(&crate_body([0.0, 200.0, 16.0])).unwrap();
+    physics.set_friction(sliding, 0.0);
+    run(&mut physics, 0.3);
+    for body in [flying, sliding] {
+        physics.set_damping(body, 5.0, 0.0);
+        physics.set_velocity(body, [100.0, 0.0, 0.0]);
+    }
+    assert_eq!(physics.damping(flying), (5.0, 0.0));
+    run(&mut physics, 0.2);
+    let (air, ground) = (physics.velocity(flying)[0], physics.velocity(sliding)[0]);
+    assert!((air - 100.0).abs() < 1.0, "damped in the air: {air}");
+    assert!((ground - 36.8).abs() < 4.0, "on the ground: {ground}");
 }

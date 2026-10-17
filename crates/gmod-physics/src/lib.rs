@@ -252,7 +252,8 @@ pub struct Body {
     pub origin: Vec3,
     pub angles: Vec3,
     /// How fast moving and turning die away by themselves, per second (a `.phy`'s `damping`
-    /// and `rotdamping`).
+    /// and `rotdamping`), while it touches something: as IVP's, damping holds back nothing in
+    /// the air ([`Physics::set_damping`]).
     pub damping: f32,
     pub rot_damping: f32,
     /// How much harder it is to turn than its shape makes it: a `.phy`'s `inertia`, which
@@ -342,6 +343,9 @@ pub struct Physics {
     /// The springs that hold back their two points moving apart any way, and how much:
     /// kilograms per second ([`Joint::Spring`]'s `relative_damping`).
     dampers: HashMap<JointId, f32>,
+    /// How fast the moving and turning of each body that has damping die away, per second,
+    /// while it touches something ([`Physics::set_damping`]).
+    damping: HashMap<RigidBodyHandle, (f32, f32)>,
     /// The springs that only stretch, and how: their length (metres), stiffness and damping.
     slack: HashMap<JointId, [f32; 3]>,
     /// The bodies harder to turn than their shapes ([`Body::inertia`]), and how much.
@@ -466,6 +470,7 @@ impl Physics {
             ground,
             strengths: HashMap::new(),
             dampers: HashMap::new(),
+            damping: HashMap::new(),
             slack: HashMap::new(),
             broken: Vec::new(),
             apart: HashSet::new(),
@@ -664,11 +669,8 @@ impl Physics {
             Some(mass) if mass > 0.0 && volume > 0.0 => mass / volume,
             _ => DEFAULT_DENSITY,
         };
-        let rigid = RigidBodyBuilder::dynamic()
-            .pose(Pose::from_parts(metres(body.origin), rotation(body.angles)))
-            .linear_damping(body.damping)
-            .angular_damping(body.rot_damping)
-            .user_data(u128::from(body.user));
+        let rigid =
+            RigidBodyBuilder::dynamic().pose(Pose::from_parts(metres(body.origin), rotation(body.angles))).user_data(u128::from(body.user));
         let handle = self.world.insert_body(rigid);
         for (shape, _) in shapes {
             let collider = of_default_surface(ColliderBuilder::new(shape).density(density));
@@ -677,6 +679,7 @@ impl Physics {
         if body.inertia > 0.0 && body.inertia != 1.0 {
             self.inertia.insert(handle, body.inertia);
         }
+        self.set_damping(BodyId(handle), body.damping, body.rot_damping);
         self.weigh(handle);
         Some(BodyId(handle))
     }
@@ -972,15 +975,43 @@ impl Physics {
         self.world.bodies.get(id.0).map_or([0.0; 3], |b| units(b.local_center_of_mass()))
     }
 
-    /// How fast moving and turning die away, per second.
+    /// How fast moving and turning die away, per second, while the body touches something.
     pub fn damping(&self, id: BodyId) -> (f32, f32) {
-        self.world.bodies.get(id.0).map_or((0.0, 0.0), |b| (b.linear_damping(), b.angular_damping()))
+        self.damping.get(&id.0).copied().unwrap_or((0.0, 0.0))
     }
 
+    /// How fast moving and turning die away from now on, per second: as IVP damps, only while
+    /// the body touches something (in GMod a crate in the air damped by 100 turns on as one not
+    /// damped; one sliding on the ground damped by 5 keeps e⁻⁵ of its speed a second).
     pub fn set_damping(&mut self, id: BodyId, linear: f32, angular: f32) {
-        if let Some(body) = self.world.bodies.get_mut(id.0) {
-            body.set_linear_damping(linear.max(0.0));
-            body.set_angular_damping(angular.max(0.0));
+        if !self.world.bodies.contains(id.0) {
+            return;
+        }
+        let damping = (linear.max(0.0), angular.max(0.0));
+        if damping == (0.0, 0.0) {
+            self.damping.remove(&id.0);
+        } else {
+            self.damping.insert(id.0, damping);
+        }
+        self.damp_touching();
+    }
+
+    /// Before a step: each body with damping is damped if it touches something, and not if it
+    /// does not.
+    fn damp_touching(&mut self) {
+        let bodies = &mut self.world.bodies;
+        self.damping.retain(|&handle, _| bodies.contains(handle));
+        for (&handle, &(linear, angular)) in &self.damping {
+            let Some(body) = self.world.bodies.get(handle) else { continue };
+            let narrow = &self.world.narrow_phase;
+            let touches = body.colliders().iter().any(|&c| narrow.contact_pairs_with(c).any(|pair| pair.has_any_active_contact()));
+            let (linear, angular) = if touches { (linear, angular) } else { (0.0, 0.0) };
+            if let Some(body) = self.world.bodies.get_mut(handle)
+                && (body.linear_damping(), body.angular_damping()) != (linear, angular)
+            {
+                body.set_linear_damping(linear);
+                body.set_angular_damping(angular);
+            }
         }
     }
 
@@ -1522,6 +1553,7 @@ impl Physics {
         self.world.integration_parameters.dt = seconds;
         self.aim_limits();
         self.slacken_springs();
+        self.damp_touching();
         self.damp_springs(seconds);
         let hooks = Apart {
             pairs: &self.apart,
