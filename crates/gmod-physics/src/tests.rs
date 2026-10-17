@@ -270,7 +270,15 @@ fn ropes_hinges_springs_and_sliders() {
         .join(
             spring,
             ground,
-            Joint::Spring { start: [0.0, 500.0, 16.0], end: [0.0, 500.0, 100.0], length: 50.0, stiffness, damping, relative_damping: 0.0 },
+            Joint::Spring {
+                start: [0.0, 500.0, 16.0],
+                end: [0.0, 500.0, 100.0],
+                length: 50.0,
+                stiffness,
+                damping,
+                relative_damping: 0.0,
+                stretch_only: false,
+            },
             true,
             [0.0; 2],
         )
@@ -582,8 +590,15 @@ fn a_wheel_on_rigid_ropes_goes_round_with_its_body() {
         physics.join(wheel, body, joint, false, [0.0; 2]).unwrap();
     }
     for _ in 0..6 {
-        let spring =
-            Joint::Spring { start: wheel_at, end: wheel_at, length: 0.0, stiffness: 50000.0, damping: 1300.0, relative_damping: 1300.0 };
+        let spring = Joint::Spring {
+            start: wheel_at,
+            end: wheel_at,
+            length: 0.0,
+            stiffness: 50000.0,
+            damping: 1300.0,
+            relative_damping: 1300.0,
+            stretch_only: false,
+        };
         physics.join(wheel, body, spring, false, [0.0; 2]).unwrap();
     }
     let local = |physics: &Physics| {
@@ -782,6 +797,7 @@ fn car_stands_still() {
             stiffness: 25000.0,
             damping: 1300.0,
             relative_damping: 1300.0,
+            stretch_only: false,
         };
         physics.join(wheel, car, spring, false, [0.0; 2]).unwrap();
         let held = Joint::Ragdoll { point: centre, angles: [0.0; 3], limits: [[-0.01, 0.01]; 3], free: true };
@@ -993,4 +1009,43 @@ fn a_surface_of_triangles_is_touched_by_the_triangle_touched() {
     }
     // on ice 333 units, on rough ground 83
     assert!((slid[0] - 333.0).abs() < 30.0 && (slid[1] - 83.0).abs() < 15.0, "slid {slid:?}");
+}
+
+#[test]
+fn a_spring_that_only_stretches_pulls_and_never_pushes() {
+    // two cans without gravity on a spring 100 long (GMod's constraint.Elastic, measured: put
+    // 50 apart, one that only stretches leaves them there; put 150 apart, it pulls them in)
+    for (stretch_only, from, nearer) in [(false, 50.0f32, false), (true, 50.0, false), (false, 150.0, true), (true, 150.0, true)] {
+        let mut physics = Physics::new();
+        physics.set_gravity(0.0);
+        let anchor = physics.add(&Body { mass: Some(1.0), ..Body::new(Shape::Sphere(2.0), [0.0, 0.0, 0.0], [0.0; 3]) }).unwrap();
+        physics.set_motion(anchor, false);
+        let can = physics.add(&Body { mass: Some(1.0), ..Body::new(Shape::Sphere(2.0), [0.0, 0.0, -100.0], [0.0; 3]) }).unwrap();
+        let spring = Joint::Spring {
+            start: [0.0; 3],
+            end: [0.0, 0.0, -100.0],
+            length: 100.0,
+            stiffness: 100.0,
+            damping: 0.0,
+            relative_damping: 0.0,
+            stretch_only,
+        };
+        physics.join(anchor, can, spring, true, [0.0; 2]).unwrap();
+        physics.set_pose(can, [0.0, 0.0, -from], [0.0; 3]);
+        run(&mut physics, 0.1);
+        let apart = -physics.pose(can).unwrap().0[2];
+        let moved = (apart - from).abs() > 5.0;
+        match (stretch_only, nearer) {
+            (true, false) => assert!(!moved, "only stretching, it pushed: {apart}"),
+            (false, true) => assert!(apart < from - 5.0, "it did not pull: {apart}"),
+            (true, true) => {
+                assert!(apart < from - 5.0, "it did not pull: {apart}");
+                // and nearer than its length, it lets the can go on (GMod: 71.6 at 0.2 s)
+                run(&mut physics, 0.1);
+                let later = -physics.pose(can).unwrap().0[2];
+                assert!(later < 85.0, "it held the can back: {later}");
+            }
+            (false, false) => assert!(apart > from + 5.0, "it did not push: {apart}"),
+        }
+    }
 }

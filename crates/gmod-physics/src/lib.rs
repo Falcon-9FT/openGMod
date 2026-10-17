@@ -300,8 +300,9 @@ pub enum Joint {
     /// A point of each pulled towards `length` units apart, with `stiffness` (kilograms per
     /// second squared) and `damping` (kilograms per second) along the line between them; and
     /// `relative_damping` (kilograms per second) against their moving apart any way at all,
-    /// as VPhysics' springs have it (measured in GMod).
-    Spring { start: Vec3, end: Vec3, length: f32, stiffness: f32, damping: f32, relative_damping: f32 },
+    /// as VPhysics' springs have it (measured in GMod). Only stretching, it does nothing while
+    /// they are nearer than `length`: it pulls, and never pushes.
+    Spring { start: Vec3, end: Vec3, length: f32, stiffness: f32, damping: f32, relative_damping: f32, stretch_only: bool },
     /// Nothing held: the two only go through each other.
     NoCollide,
     /// Turning about `point`, the second no farther from how it is now to the first than
@@ -341,6 +342,8 @@ pub struct Physics {
     /// The springs that hold back their two points moving apart any way, and how much:
     /// kilograms per second ([`Joint::Spring`]'s `relative_damping`).
     dampers: HashMap<JointId, f32>,
+    /// The springs that only stretch, and how: their length (metres), stiffness and damping.
+    slack: HashMap<JointId, [f32; 3]>,
     /// The bodies harder to turn than their shapes ([`Body::inertia`]), and how much.
     inertia: HashMap<RigidBodyHandle, f32>,
     /// Seconds stepped.
@@ -463,6 +466,7 @@ impl Physics {
             ground,
             strengths: HashMap::new(),
             dampers: HashMap::new(),
+            slack: HashMap::new(),
             broken: Vec::new(),
             apart: HashSet::new(),
             aloof: HashSet::new(),
@@ -1217,6 +1221,9 @@ impl Physics {
         {
             self.dampers.insert(id, relative_damping);
         }
+        if let Joint::Spring { length, stiffness, damping, stretch_only: true, .. } = joint {
+            self.slack.insert(id, [(length * METRES_PER_UNIT).max(0.0), stiffness.max(0.0), damping.max(0.0)]);
+        }
         // the weight of a kilogram as the game falls, on a lever of a unit
         let weight = DEFAULT_GRAVITY * METRES_PER_UNIT;
         let [force, torque] = strength;
@@ -1231,7 +1238,32 @@ impl Physics {
         self.world.remove_impulse_joint(id.0);
         self.strengths.remove(&id);
         self.dampers.remove(&id);
+        self.slack.remove(&id);
         self.limits.retain(|limit| limit.joint != id);
+    }
+
+    /// How far apart the two points of a joint are, metres.
+    fn joint_length(&self, id: JointId) -> Option<f32> {
+        let joint = self.world.impulse_joints.get(id.0)?;
+        let (a, b) = (self.world.bodies.get(joint.body1())?, self.world.bodies.get(joint.body2())?);
+        Some(((*a.position() * joint.data.local_frame1.translation) - (*b.position() * joint.data.local_frame2.translation)).length())
+    }
+
+    /// Before a step: the springs that only stretch do nothing while their points are nearer
+    /// than their length.
+    fn slacken_springs(&mut self) {
+        let joints = &self.world.impulse_joints;
+        self.slack.retain(|id, _| joints.get(id.0).is_some());
+        let slack: Vec<(JointId, [f32; 3])> = self.slack.iter().map(|(&id, &how)| (id, how)).collect();
+        for (id, [length, stiffness, damping]) in slack {
+            let Some(now) = self.joint_length(id) else { continue };
+            // a motor of no stiffness still holds its speed: one of no force holds nothing
+            let force = if now < length { 0.0 } else { f32::MAX };
+            if let Some(joint) = self.world.impulse_joints.get_mut(id.0, false) {
+                joint.data.set_motor_position(JointAxis::LinX, length, stiffness, damping);
+                joint.data.set_motor_max_force(JointAxis::LinX, force);
+            }
+        }
     }
 
     /// Before a step: each spring's relative damping takes from how fast its two points move
@@ -1240,6 +1272,10 @@ impl Physics {
         let joints = &self.world.impulse_joints;
         self.dampers.retain(|id, _| joints.get(id.0).is_some());
         for (id, &damping) in &self.dampers {
+            // slack, it holds nothing back
+            if self.slack.get(id).is_some_and(|&[length, ..]| self.joint_length(*id).is_some_and(|now| now < length)) {
+                continue;
+            }
             let Some(joint) = self.world.impulse_joints.get(id.0) else { continue };
             let (one, two) = (joint.body1(), joint.body2());
             let (frame1, frame2) = (joint.data.local_frame1, joint.data.local_frame2);
@@ -1485,6 +1521,7 @@ impl Physics {
         }
         self.world.integration_parameters.dt = seconds;
         self.aim_limits();
+        self.slacken_springs();
         self.damp_springs(seconds);
         let hooks = Apart {
             pairs: &self.apart,
