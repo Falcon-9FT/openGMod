@@ -598,9 +598,10 @@ impl Runtime {
     }
 
     /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
-    /// answers to `HTTP` requests that came in, the timers that are due, for every tick that
-    /// passed the players' commands and movement, the `Tick` and `Think` hooks (the server's
-    /// frame is a tick: the gamemode thinks at its start, as in Source), the bodies of physics,
+    /// answers to `HTTP` requests that came in, the timers that are due (a client's each frame,
+    /// a server's each tick), for every tick that passed the players' commands and movement,
+    /// the `Tick` and `Think` hooks (the server's frame is a tick: the gamemode thinks at its
+    /// start, as in Source), the bodies of physics,
     /// the inputs fired, the scripted entities that think, each at its own `CurTime`; the
     /// entities removed go when the players' commands have run and at the end of the tick (a
     /// client's at the end of its frame).
@@ -626,9 +627,12 @@ impl Runtime {
         convar::run_buffer(&self.lua);
         http::deliver(&self.lua);
         bass::deliver(&self.lua);
-        timer::run_timers(&self.lua);
         // a client does not simulate: what moves comes from the server
         let server = self.realm() == Realm::Server;
+        // a client's timers go by its frames; a server's by its ticks
+        if !server {
+            timer::run_timers(&self.lua);
+        }
         for tick in 1..=ticks {
             host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::tick_interval()).min(end));
             if server {
@@ -637,9 +641,10 @@ impl Runtime {
                 ents::collect(&self.lua);
             }
             // the gamemode thinks first in a frame of the server's, before the entities do:
-            // `Think`, then `Tick` (as measured in GMod)
+            // `Think`, the timers that are due, then `Tick` (as measured in GMod)
             if server {
                 self.call_hook("Think", mlua::MultiValue::new());
+                timer::run_timers(&self.lua);
             }
             self.call_hook("Tick", mlua::MultiValue::new());
             if server {
