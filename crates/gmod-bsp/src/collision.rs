@@ -299,9 +299,14 @@ struct Static {
 pub struct SolidShapes {
     /// Convex solids by their corners: each brush, and each hull of a static prop.
     pub hulls: Vec<Vec<Vec3>>,
+    /// The faces of each of `hulls`: the normal facing out of each, and its surface (its
+    /// `texinfo` in the map). None for a static prop's, which is of its model's surface.
+    pub faces: Vec<Vec<(Vec3, Option<usize>)>>,
     /// The displacements' triangles, as indices of `vertices`.
     pub vertices: Vec<Vec3>,
     pub triangles: Vec<[u32; 3]>,
+    /// The surface of each of `triangles`.
+    pub triangle_surfaces: Vec<Option<usize>>,
 }
 
 /// The corners of the solid behind all of `sides`: where three of their planes meet, inside the
@@ -683,9 +688,14 @@ impl Collision {
                         if std::mem::replace(&mut seen[b as usize], true) || brush.contents & mask == 0 {
                             continue;
                         }
-                        let corners = corners(&self.sides[brush.first_side as usize..(brush.first_side + brush.sides) as usize]);
+                        let sides = &self.sides[brush.first_side as usize..(brush.first_side + brush.sides) as usize];
+                        let corners = corners(sides);
                         if corners.len() >= 4 {
                             out.hulls.push(corners.into_iter().map(|p| placement.frame.world_point(p)).collect());
+                            let faces = sides.iter().filter(|s| !s.bevel);
+                            out.faces.push(
+                                faces.map(|s| (placement.frame.world_direction(s.normal), s.surface.texinfo.map(|t| t as usize))).collect(),
+                            );
                         }
                     }
                     continue;
@@ -698,11 +708,13 @@ impl Collision {
                 let first = out.vertices.len() as u32;
                 out.vertices.extend(triangle.points);
                 out.triangles.push([first, first + 1, first + 2]);
+                out.triangle_surfaces.push(displacement.surface.texinfo.map(|t| t as usize));
             }
         }
         for prop in &self.statics {
             for hull in self.shapes.get(prop.shape).into_iter().flatten() {
                 out.hulls.push(hull.points.iter().map(|&p| prop.frame.world_point(p)).collect());
+                out.faces.push(Vec::new());
             }
         }
         out

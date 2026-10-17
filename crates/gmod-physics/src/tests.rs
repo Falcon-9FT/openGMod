@@ -65,13 +65,15 @@ fn a_crate_falls_and_comes_to_rest_on_the_floor() {
     run(&mut physics, 0.3);
     let v = physics.velocity(body);
     assert!((v[2] + DEFAULT_GRAVITY * 0.3).abs() < 15.0, "{v:?}");
-    // then it lies on the floor, its bottom on the top, and falls asleep
+    // then it lies on the floor, its bottom on the top, and falls asleep; it bounced, and went
+    // a little aside (GMod's crates dropped so: 2 to 20 units, a few degrees)
     run(&mut physics, 3.0);
     let (origin, angles) = physics.pose(body).unwrap();
-    assert!(near(origin, [0.0, 0.0, 16.0], 0.5) && near(angles, [0.0; 3], 0.5), "{origin:?} {angles:?}");
+    assert!(near(origin, [0.0, 0.0, 16.0], 15.0) && (origin[2] - 16.0).abs() < 0.5, "{origin:?}");
+    assert!(angles[0].abs() < 0.5 && angles[2].abs() < 0.5 && angles[1].abs() < 20.0, "{angles:?}");
     assert!(physics.asleep(body) && physics.awake().is_empty());
     let (mins, maxs) = physics.bounds(body).unwrap();
-    assert!(near(mins, [-16.0, -16.0, 0.0], 0.5) && near(maxs, [16.0, 16.0, 32.0], 0.5), "{mins:?} {maxs:?}");
+    assert!((mins[2] - 0.0).abs() < 0.5 && (maxs[2] - 32.0).abs() < 0.5, "{mins:?} {maxs:?}");
 }
 
 #[test]
@@ -447,7 +449,7 @@ fn bodies_set_apart_go_through_each_other() {
     assert!(physics.apart(a, b) && physics.apart(b, a));
     run(&mut physics, 3.0);
     let (pa, pb) = (physics.pose(a).unwrap().0, physics.pose(b).unwrap().0);
-    assert!(near(pa, [0.0, 0.0, 16.0], 1.0) && near(pb, [8.0, 0.0, 16.0], 1.0), "{pa:?} {pb:?}");
+    assert!(near(pa, [0.0, 0.0, 16.0], 6.0) && near(pb, [8.0, 0.0, 16.0], 6.0), "{pa:?} {pb:?}");
     // together again, they push each other apart
     physics.set_apart(a, b, false);
     assert!(!physics.apart(a, b));
@@ -470,12 +472,16 @@ fn aloof_bodies_go_through_what_moves() {
     physics.set_aloof(aloof, true);
     run(&mut physics, 2.0);
     let (pa, pb) = (physics.pose(aloof).unwrap().0, physics.pose(below).unwrap().0);
-    assert!(near(pa, [0.0, 0.0, 16.0], 1.0) && near(pb, [0.0, 0.0, 16.0], 0.5), "{pa:?} {pb:?}");
+    assert!(near(pa, [0.0, 0.0, 16.0], 6.0) && near(pb, [0.0, 0.0, 16.0], 0.5), "{pa:?} {pb:?}");
     // one that does not move holds it, and so does another aloof one
     physics.set_motion(below, false);
     physics.set_pose(aloof, [0.0, 0.0, 100.0], [0.0; 3]);
     let other = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
     physics.set_aloof(other, true);
+    // bouncing as little as anything does, which may still tip them over the edge (GMod's
+    // crates dropped on crates mostly fall off)
+    physics.set_elasticity(aloof, 0.0);
+    physics.set_elasticity(other, 0.0);
     run(&mut physics, 3.0);
     let (pa, po) = (physics.pose(aloof).unwrap().0, physics.pose(other).unwrap().0);
     assert!(near(pa, [0.0, 0.0, 48.0], 1.0) && near(po, [0.0, 0.0, 80.0], 2.0), "{pa:?} {po:?}");
@@ -889,4 +895,102 @@ fn what_slides_over_the_seams_of_brushes_does_not_trip_on_them() {
             }
         }
     });
+}
+
+#[test]
+fn what_falls_bounces_by_both_surfaces() {
+    // a ball dropped on the floor (0.25) goes back up by √(e₁ e₂) of the speed it hit at, no
+    // less than 0.2 and no more than all of it (GMod: a ball on concrete, 0.2, at 0.25 0.228,
+    // at 0.5 0.321, at 1000 1.0; of dirt, 0.01, 0.204, on grass too)
+    at_tick_rates(|| {
+        for (elasticity, ratio) in [(0.0f32, 0.2f32), (0.01, 0.2), (0.25, 0.25), (0.5, 0.354), (2.0, 0.707), (1000.0, 1.0)] {
+            let mut physics = floor();
+            let ball = Body { mass: Some(20.0), ..Body::new(Shape::Sphere(12.0), [0.0, 0.0, 212.0], [0.0; 3]) };
+            let ball = physics.add(&ball).unwrap();
+            physics.set_elasticity(ball, elasticity);
+            let (mut hit, mut back) = (0.0f32, 0.0f32);
+            let step = STEP.with(std::cell::Cell::get);
+            let mut last = 0.0;
+            for _ in 0..(1.5 / step) as usize {
+                physics.step(step);
+                let v = physics.velocity(ball)[2];
+                if last < -50.0 && v >= 0.0 && hit == 0.0 {
+                    hit = -last;
+                }
+                if hit > 0.0 {
+                    back = back.max(v);
+                }
+                last = v;
+            }
+            let got = if hit > 0.0 { back / hit } else { 0.0 };
+            assert!((got - ratio).abs() < 0.06, "at {elasticity} it bounced by {got} (hit at {hit})");
+        }
+    });
+}
+
+#[test]
+fn what_touches_the_world_touches_the_face_it_touches() {
+    // a floor whose top is slippery (0.2) and sides are not, as a brush of ice: a crate of
+    // glass (0.5) pushed along the top at 200 units/s slides as 0.1 does, v² / (2 μ g), 333
+    // units; and the top is bouncy as its surface says
+    let Shape::Hulls(hulls) = Shape::cuboid([-1024.0, -1024.0, -64.0], [1024.0, 1024.0, 0.0]) else { unreachable!() };
+    let rough = Surface { friction: 0.8, elasticity: 0.0 };
+    let top = Surface { friction: 0.2, elasticity: 1.0 };
+    let mut faces = vec![([0.0, 0.0, 1.0], top), ([0.0, 0.0, -1.0], rough)];
+    faces.extend([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0]].map(|n| (n, rough)));
+    let mut physics = Physics::new();
+    physics.add_world_made_of(&hulls, &[faces], &[], &[], &[]);
+    let body = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    physics.set_friction(body, 0.5);
+    physics.set_elasticity(body, 0.0);
+    run(&mut physics, 0.5);
+    physics.set_velocity(body, [200.0, 0.0, 0.0]);
+    run(&mut physics, 3.0);
+    let slid = physics.pose(body).unwrap().0[0];
+    assert!((slid - 333.0).abs() < 25.0, "slid {slid}");
+    // a ball of 0.25 off a top of 1 bounces by 0.5
+    let ball = Body { mass: Some(20.0), ..Body::new(Shape::Sphere(12.0), [-500.0, 0.0, 212.0], [0.0; 3]) };
+    let ball = physics.add(&ball).unwrap();
+    let (mut hit, mut back, mut last) = (0.0f32, 0.0f32, 0.0f32);
+    for _ in 0..100 {
+        run(&mut physics, 0.015);
+        let v = physics.velocity(ball)[2];
+        if last < -50.0 && v >= 0.0 && hit == 0.0 {
+            hit = -last;
+        }
+        if hit > 0.0 {
+            back = back.max(v);
+        }
+        last = v;
+    }
+    assert!((back / hit - 0.5).abs() < 0.06, "bounced by {} ({hit})", back / hit);
+}
+
+#[test]
+fn a_surface_of_triangles_is_touched_by_the_triangle_touched() {
+    // two triangles of a ground of ice (0.2), two of rough ground (0.8)
+    let vertices = vec![
+        [-1024.0, -1024.0, 0.0],
+        [0.0, -1024.0, 0.0],
+        [0.0, 1024.0, 0.0],
+        [-1024.0, 1024.0, 0.0],
+        [1024.0, -1024.0, 0.0],
+        [1024.0, 1024.0, 0.0],
+    ];
+    let triangles = vec![[0, 2, 1], [0, 3, 2], [1, 5, 4], [1, 2, 5]];
+    let (ice, rough) = (Surface { friction: 0.2, elasticity: 0.0 }, Surface { friction: 0.8, elasticity: 0.0 });
+    let mut slid = Vec::new();
+    for x in [-500.0f32, 300.0] {
+        let mut physics = Physics::new();
+        physics.add_world_made_of(&[], &[], &vertices, &triangles, &[ice, ice, rough, rough]);
+        let body = physics.add(&crate_body([x, 0.0, 16.0])).unwrap();
+        physics.set_friction(body, 0.5);
+        physics.set_elasticity(body, 0.0);
+        run(&mut physics, 0.5);
+        physics.set_velocity(body, [200.0, 0.0, 0.0]);
+        run(&mut physics, 3.0);
+        slid.push(physics.pose(body).unwrap().0[0] - x);
+    }
+    // on ice 333 units, on rough ground 83
+    assert!((slid[0] - 333.0).abs() < 30.0 && (slid[1] - 83.0).abs() < 15.0, "slid {slid:?}");
 }

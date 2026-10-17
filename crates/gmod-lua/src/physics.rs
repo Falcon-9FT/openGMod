@@ -109,7 +109,20 @@ pub(crate) fn load_world(lua: &Lua, collision: Option<&gmod_bsp::Collision>) {
     let mut physics = Physics::new();
     if let Some(collision) = collision {
         let shapes = collision.solid_shapes(gmod_bsp::mask::SOLID_BRUSHONLY);
-        physics.add_world(&shapes.hulls, &shapes.vertices, &shapes.triangles);
+        // each surface of the map of the surface property of its material
+        let textures = host(lua).world.textures.borrow().clone();
+        let surfaces: Vec<gmod_physics::Surface> = textures
+            .iter()
+            .map(|material| {
+                let (_, prop) = crate::surfaceprops::of_material(lua, material);
+                gmod_physics::Surface { friction: prop.friction, elasticity: prop.elasticity }
+            })
+            .collect();
+        let surface = |texinfo: Option<usize>| texinfo.and_then(|t| surfaces.get(t).copied()).unwrap_or_default();
+        let faces: Vec<Vec<([f32; 3], gmod_physics::Surface)>> =
+            shapes.faces.iter().map(|faces| faces.iter().map(|&(normal, t)| (normal, surface(t))).collect()).collect();
+        let triangles: Vec<gmod_physics::Surface> = shapes.triangle_surfaces.iter().map(|&t| surface(t)).collect();
+        physics.add_world_made_of(&shapes.hulls, &faces, &shapes.vertices, &shapes.triangles, &triangles);
     }
     {
         let host = host(lua);
@@ -321,14 +334,18 @@ pub(crate) fn init_shape(lua: &Lua, handle: EntityHandle, shape: Shape, material
 }
 
 /// A body is of a surface property from now on (`PhysObj:SetMaterial`): it holds back what
-/// slides along it as that does (`friction_00` not at all).
+/// slides along it and bounces as that does (`friction_00` not at all, `metal_bouncy` back as
+/// fast as it came).
 pub(crate) fn set_material(lua: &Lua, id: BodyId, material: &str) {
-    let friction = crate::surfaceprops::with(lua, |props| props.get(material).map(|p| p.friction));
+    let found = crate::surfaceprops::with(lua, |props| props.get(material).map(|p| (p.friction, p.elasticity)));
+    let (friction, elasticity) = found.unwrap_or((gmod_physics::DEFAULT_FRICTION, gmod_physics::DEFAULT_ELASTICITY));
     let host = host(lua);
     if let Some(kept) = host.physics.bodies.borrow_mut().get_mut(&id) {
         kept.material = material.to_string();
     }
-    host.physics.physics.borrow_mut().set_friction(id, friction.unwrap_or(gmod_physics::DEFAULT_FRICTION));
+    let mut physics = host.physics.physics.borrow_mut();
+    physics.set_friction(id, friction);
+    physics.set_elasticity(id, elasticity);
 }
 
 /// Takes an entity's bodies away: its own, a ragdoll's parts. The world keeps its own.

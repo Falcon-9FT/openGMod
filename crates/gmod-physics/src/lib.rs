@@ -43,6 +43,116 @@ pub const DEFAULT_DENSITY: f32 = 2000.0;
 /// as 0.4): a body of `friction_00` slides on anything.
 pub const DEFAULT_FRICTION: f32 = 0.8;
 
+/// How much of its speed into a surface something keeps bouncing off it, of the `default`
+/// surface, and of the world's: two together bounce by the square root of the product of
+/// theirs, no less than [`LEAST_BOUNCE`] and no more than all of it (as GMod, measured).
+pub const DEFAULT_ELASTICITY: f32 = 0.25;
+
+/// The least two bodies bounce off each other, whatever they are made of: in GMod a ball of
+/// dirt (0.01) bounces off grass (0.01) as one of concrete (0.2) off concrete, by 0.2 of its
+/// speed.
+pub const LEAST_BOUNCE: f32 = 0.2;
+
+/// How much two surfaces bounce off each other, of the elasticity of each.
+fn bounce(elasticity1: f32, elasticity2: f32) -> f32 {
+    (elasticity1.max(0.0) * elasticity2.max(0.0)).sqrt().clamp(LEAST_BOUNCE, 1.0)
+}
+
+/// Which of the points where two faces touch are corners of where they touch: those inside
+/// the others (seen along `normal`) hold nothing the corners do not, and pushing on one of
+/// them, off the middle, would set what lands flat turning.
+fn corners(points: &[Vector], normal: Vector) -> Vec<bool> {
+    let side = if normal.x.abs() < 0.9 { Vector::X } else { Vector::Y };
+    let u = normal.cross(side).normalize();
+    let v = normal.cross(u);
+    let flat: Vec<[f32; 2]> = points.iter().map(|p| [p.dot(u), p.dot(v)]).collect();
+    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    // well inside a triangle of three others
+    let margin = 0.5 * METRES_PER_UNIT;
+    let inside = |p: [f32; 2], [a, b, c]: [[f32; 2]; 3]| {
+        let area = cross(a, b, c);
+        if area.abs() < 1e-6 {
+            return false;
+        }
+        let sign = area.signum();
+        [(a, b), (b, c), (c, a)].iter().all(|&(x, y)| {
+            let edge = ((y[0] - x[0]).powi(2) + (y[1] - x[1]).powi(2)).sqrt();
+            sign * cross(x, y, p) > margin * edge
+        })
+    };
+    (0..flat.len())
+        .map(|i| {
+            let others: Vec<[f32; 2]> = (0..flat.len()).filter(|&j| j != i).map(|j| flat[j]).collect();
+            let n = others.len();
+            !(0..n).any(|a| (a + 1..n).any(|b| (b + 1..n).any(|c| inside(flat[i], [others[a], others[b], others[c]]))))
+        })
+        .collect()
+}
+
+/// Slower than this into each other, units a second, two bodies do not bounce: they rest.
+const LEAST_BOUNCING_SPEED: f32 = 10.0;
+
+/// What a contact of two colliders is made of: the friction of a solid of the world of many
+/// surfaces with the other (none for others, whose own combine), and how much the two bounce.
+/// A solid of many surfaces touches by the one touched: the face most facing what touches it
+/// (`normal` goes from the first collider to the second), the triangle touched.
+fn contact_material(
+    made_of: &HashMap<ColliderHandle, MadeOf>,
+    colliders: &rapier3d::prelude::ColliderSet,
+    pair: [ColliderHandle; 2],
+    normal: Vector,
+    subshapes: [u32; 2],
+) -> (Option<f32>, f32) {
+    let (Some(a), Some(b)) = (colliders.get(pair[0]), colliders.get(pair[1])) else { return (None, LEAST_BOUNCE) };
+    let made = [(pair[0], b, normal, subshapes[0]), (pair[1], a, -normal, subshapes[1])]
+        .into_iter()
+        .find_map(|(solid, other, out, subshape)| made_of.get(&solid).map(|m| (m, other, out, subshape)));
+    if let Some((made, other, out, subshape)) = made {
+        let surface = match made {
+            MadeOf::Faces(faces) => faces.iter().max_by(|a, b| a.0.dot(out).total_cmp(&b.0.dot(out))).map(|&(_, s)| s),
+            MadeOf::Triangles(surfaces) => surfaces.get(subshape as usize).copied(),
+        };
+        if let Some(surface) = surface {
+            return (Some(surface.friction.max(0.0) * other.friction()), bounce(surface.elasticity, other.restitution()));
+        }
+    }
+    (None, bounce(a.restitution(), b.restitution()))
+}
+
+/// What a surface is made of, as far as what touches it goes: how much it holds back what
+/// slides along it, and how bouncy it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Surface {
+    pub friction: f32,
+    pub elasticity: f32,
+}
+
+impl Default for Surface {
+    fn default() -> Surface {
+        Surface { friction: DEFAULT_FRICTION, elasticity: DEFAULT_ELASTICITY }
+    }
+}
+
+/// What the parts of a solid of the world are made of, when they are not all one surface: a
+/// brush's faces by the normal facing out of each, a surface of triangles by triangle.
+enum MadeOf {
+    Faces(Vec<(Vector, Surface)>),
+    Triangles(Vec<Surface>),
+}
+
+/// A collider of the `default` surface, its friction and bounce with another's as GMod's: the
+/// product of the two frictions, the square root of the product of the two elasticities.
+/// Its contacts are looked at, for their bounce to be no less nor more than it can be
+/// ([`bounce`]).
+fn of_default_surface(collider: ColliderBuilder) -> ColliderBuilder {
+    collider
+        .friction(DEFAULT_FRICTION)
+        .friction_combine_rule(CoefficientCombineRule::Multiply)
+        .restitution(DEFAULT_ELASTICITY)
+        .restitution_combine_rule(CoefficientCombineRule::GeometricMean)
+        .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
+}
+
 /// How hard a rigid rope holds its length against being pushed shorter: a spring of this
 /// stiffness and damping per kilogram (1/s², 1/s), critically damped and far quicker than a
 /// tick.
@@ -238,6 +348,8 @@ pub struct Physics {
     /// The most a body moves and turns: units and degrees a second (`physenv`'s performance
     /// settings, `MaxVelocity` and `MaxAngularVelocity`).
     speed_limits: [f32; 2],
+    /// The solids of the world of more than one surface ([`Physics::add_world_made_of`]).
+    made_of: HashMap<ColliderHandle, MadeOf>,
     /// The solids of the world that touch others, and those they touch ([`Physics::add_world`]).
     seams: HashMap<ColliderHandle, Vec<ColliderHandle>>,
     /// The solids of the world, convex.
@@ -363,6 +475,7 @@ impl Physics {
             clock: 0.0,
             speed_limits: [MAX_VELOCITY, MAX_ANGULAR_VELOCITY],
             seams: HashMap::new(),
+            made_of: HashMap::new(),
             solids: Vec::new(),
         }
     }
@@ -477,15 +590,28 @@ impl Physics {
     /// Adds what never moves, in the world's space: convex solids by their corners, and
     /// triangles. Returns how many solids could be made of `hulls`; the rest had no volume.
     pub fn add_world(&mut self, hulls: &[Vec<Vec3>], vertices: &[Vec3], triangles: &[[u32; 3]]) -> usize {
+        self.add_world_made_of(hulls, &[], vertices, triangles, &[])
+    }
+
+    /// The same as [`Physics::add_world`], of surfaces: each face of each hull, by the normal
+    /// facing out of it, and each triangle; of the `default` surface where none is given. What
+    /// touches a solid is touched by the face it touches, as VPhysics' world is made.
+    pub fn add_world_made_of(
+        &mut self,
+        hulls: &[Vec<Vec3>],
+        faces: &[Vec<(Vec3, Surface)>],
+        vertices: &[Vec3],
+        triangles: &[[u32; 3]],
+        triangle_surfaces: &[Surface],
+    ) -> usize {
         let mut added = Vec::new();
-        for corners in hulls {
+        for (i, corners) in hulls.iter().enumerate() {
             let points: Vec<Vector> = corners.iter().map(|&p| metres(p)).collect();
             if let Some(collider) = ColliderBuilder::convex_hull(&points) {
-                added.push(
-                    self.world
-                        .colliders
-                        .insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Multiply)),
-                );
+                let handle = self.world.colliders.insert(of_default_surface(collider));
+                let faces = faces.get(i).map(|f| f.iter().map(|&(normal, surface)| (Vector::from(normal), surface)).collect());
+                self.made_of_parts(handle, MadeOf::Faces(faces.unwrap_or_default()));
+                added.push(handle);
             }
         }
         self.solids.extend(&added);
@@ -499,9 +625,27 @@ impl Physics {
             && let Ok(collider) =
                 ColliderBuilder::trimesh_with_flags(vertices.iter().map(|&p| metres(p)).collect(), triangles.to_vec(), flags)
         {
-            self.world.colliders.insert(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Multiply));
+            let handle = self.world.colliders.insert(of_default_surface(collider));
+            self.made_of_parts(handle, MadeOf::Triangles(triangle_surfaces.to_vec()));
         }
         added
+    }
+
+    /// A solid of the world is made of `parts`: of one surface, it is all of it; of more, each
+    /// contact with it is of the part touched ([`Apart::modify_solver_contacts`]).
+    fn made_of_parts(&mut self, handle: ColliderHandle, parts: MadeOf) {
+        let surfaces: Vec<Surface> = match &parts {
+            MadeOf::Faces(faces) => faces.iter().map(|&(_, s)| s).collect(),
+            MadeOf::Triangles(surfaces) => surfaces.clone(),
+        };
+        let Some(collider) = self.world.colliders.get_mut(handle) else { return };
+        let Some(&first) = surfaces.first() else { return };
+        collider.set_friction(first.friction.max(0.0));
+        collider.set_restitution(first.elasticity.max(0.0));
+        if surfaces.iter().any(|&s| s != first) {
+            collider.set_active_hooks(collider.active_hooks() | ActiveHooks::MODIFY_SOLVER_CONTACTS);
+            self.made_of.insert(handle, parts);
+        }
     }
 
     /// Adds a body, awake and moving; none when its shape has no volume.
@@ -523,10 +667,7 @@ impl Physics {
             .user_data(u128::from(body.user));
         let handle = self.world.insert_body(rigid);
         for (shape, _) in shapes {
-            let collider = ColliderBuilder::new(shape)
-                .density(density)
-                .friction(DEFAULT_FRICTION)
-                .friction_combine_rule(CoefficientCombineRule::Multiply);
+            let collider = of_default_surface(ColliderBuilder::new(shape).density(density));
             self.world.insert_collider(collider, Some(handle));
         }
         if body.inertia > 0.0 && body.inertia != 1.0 {
@@ -542,6 +683,16 @@ impl Physics {
         for &collider in body.colliders() {
             if let Some(collider) = self.world.colliders.get_mut(collider) {
                 collider.set_friction(friction.max(0.0));
+            }
+        }
+    }
+
+    /// How bouncy a body is: its material's elasticity ([`DEFAULT_ELASTICITY`]).
+    pub fn set_elasticity(&mut self, id: BodyId, elasticity: f32) {
+        let Some(body) = self.world.bodies.get(id.0) else { return };
+        for &collider in body.colliders() {
+            if let Some(collider) = self.world.colliders.get_mut(collider) {
+                collider.set_restitution(elasticity.max(0.0));
             }
         }
     }
@@ -583,8 +734,7 @@ impl Physics {
             .user_data(u128::from(user));
         let handle = self.world.insert_body(rigid);
         for collider in colliders {
-            self.world
-                .insert_collider(collider.friction(DEFAULT_FRICTION).friction_combine_rule(CoefficientCombineRule::Multiply), Some(handle));
+            self.world.insert_collider(of_default_surface(collider), Some(handle));
         }
         Some(BodyId(handle))
     }
@@ -1256,6 +1406,78 @@ impl Physics {
         self.last_impact.retain(|handle, _| bodies.get(*handle).is_some());
     }
 
+    /// How each body that moves is going: its speed, its turning, and where its mass is.
+    fn speeds(&self) -> HashMap<RigidBodyHandle, (Vector, Vector, Vector)> {
+        self.world.active_bodies().map(|(handle, b)| (handle, (b.linvel(), b.angvel(), b.center_of_mass()))).collect()
+    }
+
+    /// Bounces what hit something in the last step, as IVP does an impact: the solver stopped
+    /// it, and one push in the middle of where they touch sends the two apart as fast as they
+    /// came together times how much they bounce. A flat face landing flat bounces flat (the
+    /// solver's own bounce, point by point, would set it turning).
+    fn bounce_impacts(&mut self, before: &HashMap<RigidBodyHandle, (Vector, Vector, Vector)>) {
+        let least = LEAST_BOUNCING_SPEED * METRES_PER_UNIT;
+        let mut pushes = Vec::new();
+        for pair in self.world.narrow_phase.contact_pairs() {
+            if !pair.has_any_active_contact() {
+                continue;
+            }
+            let Some(collider1) = self.world.colliders.get(pair.collider1) else { continue };
+            for manifold in pair.manifolds() {
+                // where they touch: the points of the face that touches, all of them (not only
+                // those the solver pushed on, which may be one side of it)
+                if manifold.points.iter().all(|p| p.data.impulse <= 0.0) {
+                    continue;
+                }
+                let nearest = manifold.points.iter().map(|p| p.dist).fold(f32::MAX, f32::min);
+                let face = manifold.points.iter().filter(|p| p.dist <= nearest + 0.1 * METRES_PER_UNIT);
+                let touching: Vec<Vector> = face.map(|p| collider1.position() * p.local_p1).collect();
+                let normal = manifold.data.normal;
+                let keep = corners(&touching, normal);
+                let touching: Vec<Vector> = touching.iter().zip(keep).filter(|&(_, k)| k).map(|(&p, _)| p).collect();
+                let point = touching.iter().copied().sum::<Vector>() / touching.len().max(1) as f32;
+                let bodies = [manifold.data.rigid_body1, manifold.data.rigid_body2];
+                // how fast they came together, and how fast they part now
+                let speed_at = |handle: Option<RigidBodyHandle>, then: bool| -> Vector {
+                    let Some(handle) = handle else { return Vector::ZERO };
+                    match (then, before.get(&handle)) {
+                        (true, Some(&(v, w, com))) => v + w.cross(point - com),
+                        _ => self.world.bodies.get(handle).map_or(Vector::ZERO, |b| b.velocity_at_point(point)),
+                    }
+                };
+                let came = normal.dot(speed_at(bodies[1], true) - speed_at(bodies[0], true));
+                if came > -least {
+                    continue;
+                }
+                let parts = normal.dot(speed_at(bodies[1], false) - speed_at(bodies[0], false));
+                let subshapes = [manifold.subshape1, manifold.subshape2];
+                let (_, e) = contact_material(&self.made_of, &self.world.colliders, [pair.collider1, pair.collider2], normal, subshapes);
+                let more = -e * came - parts;
+                if more <= 0.0 {
+                    continue;
+                }
+                // how much a push there along the normal changes that
+                let give = |handle: Option<RigidBodyHandle>| -> f32 {
+                    let Some(b) = handle.and_then(|h| self.world.bodies.get(h)).filter(|b| b.is_dynamic()) else { return 0.0 };
+                    let props = b.mass_properties();
+                    let arm = (point - b.center_of_mass()).cross(normal);
+                    normal.dot(props.effective_inv_mass * normal) + arm.dot(props.effective_world_inv_inertia * arm)
+                };
+                let k = give(bodies[0]) + give(bodies[1]);
+                if k > 0.0 {
+                    pushes.push((bodies, normal * (more / k), point));
+                }
+            }
+        }
+        for ([one, two], impulse, point) in pushes {
+            for (handle, impulse) in [(one, -impulse), (two, impulse)] {
+                if let Some(b) = handle.and_then(|h| self.world.bodies.get_mut(h)).filter(|b| b.is_dynamic()) {
+                    b.apply_impulse_at_point(impulse, point, true);
+                }
+            }
+        }
+    }
+
     /// Moves time on by `seconds`. Joints pulled harder than they take break.
     pub fn step(&mut self, seconds: f32) {
         if seconds <= 0.0 {
@@ -1264,9 +1486,18 @@ impl Physics {
         self.world.integration_parameters.dt = seconds;
         self.aim_limits();
         self.damp_springs(seconds);
-        let hooks = Apart { pairs: &self.apart, aloof: &self.aloof, groups: &self.groups, rule: self.group_rule, seams: &self.seams };
+        let hooks = Apart {
+            pairs: &self.apart,
+            aloof: &self.aloof,
+            groups: &self.groups,
+            rule: self.group_rule,
+            seams: &self.seams,
+            made_of: &self.made_of,
+        };
+        let before = self.speeds();
         self.world.step_with_events(&hooks, &());
         self.clock += seconds;
+        self.bounce_impacts(&before);
         self.limit_speeds();
         self.find_impacts();
         let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
@@ -1336,6 +1567,7 @@ struct Apart<'a> {
     groups: &'a HashMap<RigidBodyHandle, i64>,
     rule: Option<fn(i64, i64) -> bool>,
     seams: &'a HashMap<ColliderHandle, Vec<ColliderHandle>>,
+    made_of: &'a HashMap<ColliderHandle, MadeOf>,
 }
 
 /// `COLLISION_GROUP_WORLD`: what collides with the map only.
@@ -1365,18 +1597,33 @@ impl PhysicsHooks for Apart<'_> {
         }
     }
 
-    /// A contact with a solid of the world on a face it shares with a neighbour - one a step
-    /// out of it along the contact is inside that neighbour - is no contact: the face is inside
-    /// the world, between two brushes, and what slides over their seam would trip on its edge.
+    /// A contact with a solid of the world of many surfaces is of the one touched. A contact
+    /// with a solid of the world on a face it shares with a neighbour - one a step out of it
+    /// along the contact is inside that neighbour - is no contact: the face is inside the
+    /// world, between two brushes, and what slides over their seam would trip on its edge.
     /// IVP's world is one surface and has no such faces.
     fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+        let colliders = context.colliders;
+        if let ModifiableContacts::Rigid(manifold) = &mut context.contacts {
+            let pair = [context.collider1, context.collider2];
+            let subshapes = [manifold.manifold.subshape1, manifold.manifold.subshape2];
+            if let (Some(friction), _) = contact_material(self.made_of, colliders, pair, *manifold.normal, subshapes) {
+                *manifold.friction = friction;
+            }
+            // the solver stops what hits; it bounces after ([`Physics::bounce_impacts`])
+            *manifold.restitution = 0.0;
+            if manifold.solver_contacts.len() > 3 {
+                let points: Vec<Vector> = manifold.solver_contacts.iter().map(|c| c.anchor1).collect();
+                let mut keep = corners(&points, *manifold.normal).into_iter();
+                manifold.solver_contacts.retain(|_| keep.next().unwrap_or(true));
+            }
+        }
         let (solid, first) = match (self.seams.get(&context.collider1), self.seams.get(&context.collider2)) {
             (Some(_), _) => (context.collider1, true),
             (None, Some(_)) => (context.collider2, false),
             _ => return,
         };
         let Some(neighbours) = self.seams.get(&solid) else { return };
-        let colliders = context.colliders;
         let ModifiableContacts::Rigid(manifold) = &mut context.contacts else { return };
         let out = if first { *manifold.normal } else { -*manifold.normal };
         manifold.solver_contacts.retain(|c| {

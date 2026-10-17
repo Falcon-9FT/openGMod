@@ -1611,10 +1611,13 @@ fn props_fall_and_come_to_rest() {
     // a third of a second in it falls as gravity says, v = g t; it then lies on the floor
     g.runtime.think(1.0 / 3.0);
     assert!(g.eval::<bool>("return math.abs(CRATE:GetVelocity().z + 200) < 15 and CRATE:GetPos().z < 100"));
+    // it bounced, and turned and went aside a little (GMod's crates dropped so: up to 16° and
+    // 20 units)
     g.runtime.think(4.0);
     assert!(g.eval::<bool>(
-        "local phys = CRATE:GetPhysicsObject()
-         return math.abs(CRATE:GetPos().z) < 0.5 and CRATE:GetAngles():IsEqualTol(Angle(0, 0, 0), 0.5) and phys:IsAsleep()"
+        "local phys = CRATE:GetPhysicsObject() local a = CRATE:GetAngles()
+         return math.abs(CRATE:GetPos().z) < 0.5 and math.abs(a.p) < 0.5 and math.abs(a.r) < 0.5 and math.abs(a.y) < 20
+             and CRATE:GetPos():Distance(Vector(-200, 0, 0)) < 20 and phys:IsAsleep()"
     ));
     // the server's gravity
     assert!(g.eval::<bool>(
@@ -1758,7 +1761,7 @@ fn props_of_the_map() {
         "local frozen, asleep, falls = ents.FindByName('frozen')[1], ents.FindByName('asleep')[1], ents.FindByName('falls')[1]
          return frozen:GetPos() == Vector(-200, 0, 100) and not frozen:GetPhysicsObject():IsMotionEnabled()
              and asleep:GetPos() == Vector(-300, 0, 100) and asleep:GetPhysicsObject():IsAsleep()
-             and math.abs(falls:GetPos().z) < 0.5 and math.abs(falls:GetAngles().y - 45) < 0.5"
+             and math.abs(falls:GetPos().z) < 0.5 and math.abs(falls:GetAngles().y - 45) < 20"
     ));
     // woken, it falls too
     g.runtime.run_string("ents.FindByName('asleep')[1]:GetPhysicsObject():Wake()", "wake").unwrap();
@@ -3792,10 +3795,12 @@ fn the_gravity_gun_punts_takes_and_launches() {
     // what it does not hold, the first key punts: into the wall a little way off
     g.runtime.set_input(alice, UserCmd::default());
     g.runtime.think(1.5);
-    // back before the gun, upright (thrown, it turned over: its origin is at its bottom)
+    // back before the gun, upright (thrown, it turned over: its origin is at its bottom), and
+    // the player back where they were (it bounced off the wall into them)
     g.runtime
         .run_string(
-            "C:SetPos(P:EyePos() + Vector(80, 0, -8)) C:SetAngles(Angle(0, 0, 0)) C:GetPhysicsObject():SetVelocity(Vector(0, 0, 0))",
+            "P:SetPos(Vector(0, 0, 0)) C:SetPos(P:EyePos() + Vector(80, 0, -8)) C:SetAngles(Angle(0, 0, 0))
+             C:GetPhysicsObject():SetVelocity(Vector(0, 0, 0)) C:GetPhysicsObject():SetAngleVelocity(Vector(0, 0, 0))",
             "back",
         )
         .unwrap();
