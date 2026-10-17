@@ -82,10 +82,25 @@ impl Block {
     }
 }
 
+/// How a solid's mass lies, as its compact surface was built with it: where its mass is, in
+/// the model's units, and its inertia about each of the model's axes per kilogram (kg·m²) -
+/// which VPhysics turns it by, not that of a solid of its shape (IVP's own reckoning: of a
+/// box, about x, the square root of the sum of the squares of its second moments along y
+/// and z, not their sum). And how much of its box each side of it meets of the air, 0 to 1,
+/// by the axis it faces along.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MassShape {
+    pub centre: [f32; 3],
+    pub inertia: [f32; 3],
+    pub drag_areas: Option<[f32; 3]>,
+}
+
 /// One solid: the shape of a prop, or of one part of a ragdoll.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Solid {
     pub convexes: Vec<Convex>,
+    /// How its mass lies, as its collision data says.
+    pub mass_shape: Option<MassShape>,
     /// Its `solid` block of the text: `name` (its bone), `mass`, `surfaceprop`, `damping`,
     /// `rotdamping`, `inertia`, `volume` ...; empty when the text has none for it.
     pub keys: Block,
@@ -146,7 +161,7 @@ impl Phy {
             let size = r.count(at, "solid byte")?;
             let bytes = r.bytes(at + 4, size)?;
             let convexes = convexes(bytes).map_err(|e| invalid(format!("solid {i}: {e}")))?;
-            solids.push(Solid { convexes, keys: Block::default() });
+            solids.push(Solid { convexes, mass_shape: mass_shape(bytes), keys: Block::default() });
             at += 4 + size;
         }
         let mut blocks = Vec::new();
@@ -200,6 +215,24 @@ impl Phy {
         });
         Some(pairs.collect())
     }
+}
+
+/// The mass centre, inertia and drag areas of one solid's collision data (its surface's first
+/// 24 bytes, and the header before it): IVP's axes turned to the model's.
+fn mass_shape(data: &[u8]) -> Option<MassShape> {
+    let r = Reader::new(data, "collision data");
+    let header = data.starts_with(b"VPHY");
+    let surface = if header { VPHY_HEADER_SIZE } else { 0 };
+    let three = |at: usize| -> Option<[f32; 3]> { Some([r.f32(at).ok()?, r.f32(at + 4).ok()?, r.f32(at + 8).ok()?]) };
+    let centre = from_ivp(three(surface)?);
+    let [x, y, z] = three(surface + 12)?;
+    // IVP's (x, y, z) is the model's (x, z, -y): its inertia about y is about the model's z
+    let inertia = [x, z, y];
+    // the drag areas are in the model's axes already
+    let drag_areas = if header { three(12) } else { None };
+    // a surface built without them (none of its inertia) says nothing
+    let known = inertia.iter().all(|i| i.is_finite() && *i >= 0.0) && inertia.iter().any(|&i| i > 0.0);
+    (known && centre.iter().all(|c| c.is_finite())).then_some(MassShape { centre, inertia, drag_areas })
 }
 
 /// The convex pieces of one solid's collision data.

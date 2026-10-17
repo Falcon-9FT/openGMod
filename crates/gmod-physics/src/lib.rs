@@ -59,15 +59,15 @@ fn bounce(elasticity1: f32, elasticity2: f32) -> f32 {
 }
 
 /// Which of the points where two faces touch are corners of where they touch: those inside
-/// the others (seen along `normal`) hold nothing the corners do not, and pushing on one of
-/// them, off the middle, would set what lands flat turning.
+/// the others or on an edge between two (seen along `normal`) hold nothing the corners do
+/// not, and pushing on one of them, off the middle, would set what lands flat turning.
 fn corners(points: &[Vector], normal: Vector) -> Vec<bool> {
     let side = if normal.x.abs() < 0.9 { Vector::X } else { Vector::Y };
     let u = normal.cross(side).normalize();
     let v = normal.cross(u);
     let flat: Vec<[f32; 2]> = points.iter().map(|p| [p.dot(u), p.dot(v)]).collect();
     let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-    // well inside a triangle of three others
+    // inside a triangle of three others, or no farther out of it than half a unit
     let margin = 0.5 * METRES_PER_UNIT;
     let inside = |p: [f32; 2], [a, b, c]: [[f32; 2]; 3]| {
         let area = cross(a, b, c);
@@ -77,12 +77,17 @@ fn corners(points: &[Vector], normal: Vector) -> Vec<bool> {
         let sign = area.signum();
         [(a, b), (b, c), (c, a)].iter().all(|&(x, y)| {
             let edge = ((y[0] - x[0]).powi(2) + (y[1] - x[1]).powi(2)).sqrt();
-            sign * cross(x, y, p) > margin * edge
+            sign * cross(x, y, p) > -margin * edge
         })
     };
+    // a point where another before it is, is that one again
+    let same = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) < margin * margin;
     (0..flat.len())
         .map(|i| {
-            let others: Vec<[f32; 2]> = (0..flat.len()).filter(|&j| j != i).map(|j| flat[j]).collect();
+            if (0..i).any(|j| same(flat[i], flat[j])) {
+                return false;
+            }
+            let others: Vec<[f32; 2]> = (0..flat.len()).filter(|&j| j != i && !same(flat[i], flat[j])).map(|j| flat[j]).collect();
             let n = others.len();
             !(0..n).any(|a| (a + 1..n).any(|b| (b + 1..n).any(|c| inside(flat[i], [others[a], others[b], others[c]]))))
         })
@@ -279,8 +284,8 @@ impl Drag {
     /// The drag of a shape (in metres, about the body's origin): along each axis, the area of
     /// its outline; turning about one, VPhysics' integral of the faces of its box sweeping the
     /// air - by half its size, as GMod's crates turn - times how much of the box's face its
-    /// outline is.
-    fn of(shape: &Shape) -> Drag {
+    /// outline is: as its model says ([`MassShape::drag_areas`]), or as its outline is.
+    fn of(shape: &Shape, fractions: Option<Vec3>) -> Drag {
         let solids: Vec<Vec<Vector>> = match shape {
             Shape::Hulls(hulls) => hulls.iter().map(|h| h.iter().map(|&p| metres(p)).collect()).collect(),
             Shape::Sphere(_) => Vec::new(),
@@ -296,7 +301,10 @@ impl Drag {
                 let hi = all().fold(Vector::splat(f32::MIN), |a, &p| a.max(p));
                 let size = (hi - lo).max(Vector::ZERO);
                 let face = |axis: usize| size[(axis + 1) % 3] * size[(axis + 2) % 3];
-                let outline = |axis: usize| solids.iter().map(|h| outline_area(h, axis)).sum::<f32>().min(face(axis));
+                let outline = |axis: usize| match fractions {
+                    Some(f) => f[axis].clamp(0.0, 1.0) * face(axis),
+                    None => solids.iter().map(|h| outline_area(h, axis)).sum::<f32>().min(face(axis)),
+                };
                 (size, Vector::new(outline(0), outline(1), outline(2)))
             }
         };
@@ -312,8 +320,59 @@ impl Drag {
     }
 }
 
+/// The inertia of a body about each of its own axes, through where its mass is: kg·m².
+fn own_inertia(body: &rapier3d::prelude::RigidBody) -> Vector {
+    let props = body.mass_properties().local_mprops;
+    let frame = Mat3::from_quat(props.principal_inertia_local_frame);
+    let principal = props.principal_inertia();
+    Vector::new(
+        (0..3).map(|k| frame.row(0)[k].powi(2) * principal[k]).sum(),
+        (0..3).map(|k| frame.row(1)[k].powi(2) * principal[k]).sum(),
+        (0..3).map(|k| frame.row(2)[k].powi(2) * principal[k]).sum(),
+    )
+}
+
 /// The density of the air, as `physenv.GetAirDensity` gives it to begin with.
 pub const AIR_DENSITY: f32 = 2.0;
+
+/// How a body's mass lies, as its model says (a `.phy`'s compact surface): where its mass is
+/// in its own space (units), its inertia about each of its axes per kilogram (kg·m²), and how
+/// much of its box each side meets of the air.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MassShape {
+    pub centre: Vec3,
+    pub inertia: Vec3,
+    pub drag_areas: Option<Vec3>,
+}
+
+/// The least a body's inertia about an axis is of the most about another, as VPhysics keeps
+/// it (measured in GMod: a plank 64 units long turns about its length as one of 0.0707 of
+/// its inertia across).
+const LEAST_INERTIA: f32 = 0.0707;
+
+/// How a body's mass lies, kept to work its mass properties out ([`Physics::weigh`]).
+#[derive(Debug, Clone, Copy)]
+struct Weight {
+    mass: f32,
+    /// Where its mass is in its own space, metres.
+    centre: Vector,
+    /// Its inertia about each of its own axes per kilogram, kg·m².
+    per_kg: Vector,
+    /// How much harder to turn ([`Body::inertia`]).
+    scale: f32,
+    /// Its inertia set outright (`SetInertia`), kg·m².
+    set: Option<Vector>,
+}
+
+/// The inertia about each axis of a body of convex solids per kilogram, as IVP reckons it of
+/// the second moments of its mass along each axis (`moments`, kg·m²): about x the square root
+/// of the sum of the squares of those along y and z, where a solid's is their sum. Measured in
+/// GMod: a box made in Lua 2 by 1 by 1 turns about its long axis as this says, to a
+/// thousandth (`PhysicsInitBox`).
+fn ivp_inertia(moments: Vector, mass: f32) -> Vector {
+    let about = |j: usize, k: usize| (moments[j] * moments[j] + moments[k] * moments[k]).sqrt() / mass.max(1e-6);
+    Vector::new(about(1, 2), about(0, 2), about(0, 1))
+}
 
 /// A body to add.
 #[derive(Debug, Clone, PartialEq)]
@@ -331,13 +390,15 @@ pub struct Body {
     /// How much harder it is to turn than its shape makes it: a `.phy`'s `inertia`, which
     /// ragdolls set to keep their light parts from spinning on their joints.
     pub inertia: f32,
+    /// How its mass lies, as its model says; none to work it out of its shape as IVP does.
+    pub mass_shape: Option<MassShape>,
     /// Whatever the caller keeps with it: its entity.
     pub user: u64,
 }
 
 impl Body {
     pub fn new(shape: Shape, origin: Vec3, angles: Vec3) -> Body {
-        Body { shape, mass: None, origin, angles, damping: 0.0, rot_damping: 0.0, inertia: 1.0, user: 0 }
+        Body { shape, mass: None, origin, angles, damping: 0.0, rot_damping: 0.0, inertia: 1.0, mass_shape: None, user: 0 }
     }
 }
 
@@ -428,7 +489,7 @@ pub struct Physics {
     /// The springs that only stretch, and how: their length (metres), stiffness and damping.
     slack: HashMap<JointId, [f32; 3]>,
     /// The bodies harder to turn than their shapes ([`Body::inertia`]), and how much.
-    inertia: HashMap<RigidBodyHandle, f32>,
+    weights: HashMap<RigidBodyHandle, Weight>,
     /// Seconds stepped.
     clock: f32,
     /// The most a body moves and turns: units and degrees a second (`physenv`'s performance
@@ -568,7 +629,7 @@ impl Physics {
             together: HashSet::new(),
             last_impacts: HashMap::new(),
             limits: Vec::new(),
-            inertia: HashMap::new(),
+            weights: HashMap::new(),
             clock: 0.0,
             speed_limits: [MAX_VELOCITY, MAX_ANGULAR_VELOCITY],
             seams: HashMap::new(),
@@ -760,15 +821,36 @@ impl Physics {
         let rigid =
             RigidBodyBuilder::dynamic().pose(Pose::from_parts(metres(body.origin), rotation(body.angles))).user_data(u128::from(body.user));
         let handle = self.world.insert_body(rigid);
-        for (shape, _) in shapes {
-            let collider = of_default_surface(ColliderBuilder::new(shape).density(density));
-            self.world.insert_collider(collider, Some(handle));
+        let colliders: Vec<ColliderHandle> = shapes
+            .into_iter()
+            .map(|(shape, _)| self.world.insert_collider(of_default_surface(ColliderBuilder::new(shape).density(density)), Some(handle)))
+            .collect();
+        // how its mass lies: as its model says, or as IVP works it out of its shape (a ball's
+        // as a ball's is); then it is all the body's own, none its colliders'
+        let weight = {
+            let rb = &mut self.world.bodies[handle];
+            rb.recompute_mass_properties_from_colliders(&self.world.colliders);
+            let own = rb.mass_properties().local_mprops;
+            let mass = own.mass();
+            let solid = own_inertia(rb);
+            let (centre, per_kg) = match (&body.mass_shape, &body.shape) {
+                (Some(shape), _) => (metres(shape.centre), Vector::from(shape.inertia)),
+                (None, Shape::Sphere(_)) => (own.local_com, solid / mass.max(1e-6)),
+                (None, Shape::Hulls(_)) => {
+                    let moments = Vector::new(solid.y + solid.z - solid.x, solid.x + solid.z - solid.y, solid.x + solid.y - solid.z) / 2.0;
+                    (own.local_com, ivp_inertia(moments.max(Vector::ZERO), mass))
+                }
+            };
+            Weight { mass, centre, per_kg, scale: if body.inertia > 0.0 { body.inertia } else { 1.0 }, set: None }
+        };
+        for collider in colliders {
+            if let Some(collider) = self.world.colliders.get_mut(collider) {
+                collider.set_density(0.0);
+            }
         }
-        if body.inertia > 0.0 && body.inertia != 1.0 {
-            self.inertia.insert(handle, body.inertia);
-        }
+        self.weights.insert(handle, weight);
         self.set_damping(BodyId(handle), body.damping, body.rot_damping);
-        self.drag.insert(handle, Drag::of(&body.shape));
+        self.drag.insert(handle, Drag::of(&body.shape, body.mass_shape.and_then(|m| m.drag_areas)));
         self.weigh(handle);
         Some(BodyId(handle))
     }
@@ -803,14 +885,24 @@ impl Physics {
     /// should ([`Body::inertia`]): its inertia, scaled, about where its mass is.
     fn weigh(&mut self, handle: RigidBodyHandle) {
         let Some(body) = self.world.bodies.get_mut(handle) else { return };
-        body.set_additional_mass_properties(MassProperties::default(), false);
+        let Some(w) = self.weights.get(&handle) else {
+            body.set_additional_mass_properties(MassProperties::default(), false);
+            body.recompute_mass_properties_from_colliders(&self.world.colliders);
+            return;
+        };
+        // its inertia, no axis less than a part of the most ([`LEAST_INERTIA`])
+        let inertia = w.set.unwrap_or(w.per_kg * w.mass * w.scale);
+        let inertia = inertia.max(Vector::splat(inertia.max_element() * LEAST_INERTIA));
+        body.set_additional_mass_properties(MassProperties::new(w.centre, w.mass, inertia), false);
         body.recompute_mass_properties_from_colliders(&self.world.colliders);
-        let Some(&scale) = self.inertia.get(&handle) else { return };
-        let own = body.mass_properties().local_mprops;
-        let more = own.inv_principal_inertia.map(|i| if i > 0.0 { (scale - 1.0) / i } else { 0.0 });
-        let extra = MassProperties::with_principal_inertia_frame(own.local_com, 0.0, more, own.principal_inertia_local_frame);
-        body.set_additional_mass_properties(extra, false);
-        body.recompute_mass_properties_from_colliders(&self.world.colliders);
+    }
+
+    /// Sets how hard a body is to turn about each of its axes, kg·m² (`SetInertia`).
+    pub fn set_inertia(&mut self, id: BodyId, inertia: Vec3) {
+        let Some(w) = self.weights.get_mut(&id.0) else { return };
+        w.set = Some(Vector::from(inertia).max(Vector::splat(1e-6)));
+        self.weigh(id.0);
+        self.wake(id);
     }
 
     /// Adds a brush that moves as the game moves it (a door, a platform): convex solids by
@@ -856,7 +948,7 @@ impl Physics {
             self.world.remove_body(id.0);
             self.apart.retain(|&(a, b)| a != id.0 && b != id.0);
             self.aloof.remove(&id.0);
-            self.inertia.remove(&id.0);
+            self.weights.remove(&id.0);
         }
     }
 
@@ -1025,6 +1117,20 @@ impl Physics {
         self.world.bodies.get(id.0).map_or_else(Vec::new, |b| b.colliders().to_vec())
     }
 
+    /// The convex solids of a body, each as triangles - three corners a triangle, in the body's
+    /// own space, units (`GetMeshConvexes`). A ball is none.
+    pub fn convexes(&self, id: BodyId) -> Vec<Vec<Vec3>> {
+        let mut out = Vec::new();
+        for handle in self.colliders(id) {
+            let Some(collider) = self.world.colliders.get(handle) else { continue };
+            let Some(polyhedron) = collider.shape().as_convex_polyhedron() else { continue };
+            let local = collider.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
+            let (vertices, triangles) = polyhedron.to_trimesh();
+            out.push(triangles.iter().flat_map(|t| t.map(|i| units(local * vertices[i as usize]))).collect());
+        }
+        out
+    }
+
     /// Whether it hits anything.
     pub fn collisions(&self, id: BodyId) -> bool {
         self.colliders(id).iter().any(|&c| self.world.colliders.get(c).is_some_and(|c| c.collision_groups() != InteractionGroups::none()))
@@ -1055,17 +1161,20 @@ impl Physics {
         self.world.bodies.get(id.0).map_or(0.0, |b| b.mass())
     }
 
+    /// How hard a body is to turn about each of its own axes, through where its mass is:
+    /// kg·m², as `GetInertia` gives it.
+    pub fn inertia(&self, id: BodyId) -> Vec3 {
+        self.world.bodies.get(id.0).map_or([0.0; 3], |b| own_inertia(b).to_array())
+    }
+
     /// Makes a body this heavy, its mass spread as before.
     pub fn set_mass(&mut self, id: BodyId, mass: f32) {
-        let now = self.mass(id);
-        if !(mass > 0.0 && now > 0.0) {
-            return;
+        let Some(w) = self.weights.get_mut(&id.0).filter(|_| mass > 0.0) else { return };
+        // its inertia set outright goes with its mass
+        if let Some(set) = &mut w.set {
+            *set *= mass / w.mass.max(1e-6);
         }
-        for handle in self.colliders(id) {
-            if let Some(collider) = self.world.colliders.get_mut(handle) {
-                collider.set_density(collider.density() * mass / now);
-            }
-        }
+        w.mass = mass;
         self.weigh(id.0);
         self.wake(id);
     }
@@ -1159,15 +1268,7 @@ impl Physics {
             let local = turn.inverse() * v;
             let met = local.abs().dot(drag.area);
             let slowed = (0.5 * density * drag.coefficient * met / body.mass() * dt).min(1.0);
-            // the inertia about each of its own axes
-            let props = body.mass_properties().local_mprops;
-            let frame = Mat3::from_quat(props.principal_inertia_local_frame);
-            let principal = props.principal_inertia();
-            let inertia = Vector::new(
-                (0..3).map(|k| frame.row(0)[k].powi(2) * principal[k]).sum(),
-                (0..3).map(|k| frame.row(1)[k].powi(2) * principal[k]).sum(),
-                (0..3).map(|k| frame.row(2)[k].powi(2) * principal[k]).sum(),
-            );
+            let inertia = own_inertia(body);
             let local_w = turn.inverse() * w;
             let swept: f32 = (0..3).filter(|&i| inertia[i] > 0.0).map(|i| local_w[i].abs() * drag.turning[i] / inertia[i]).sum();
             let stopped = (density * drag.turning_coefficient * swept * dt).min(1.0);
@@ -1703,6 +1804,18 @@ impl Physics {
     /// solver's own bounce, point by point, would set it turning).
     fn bounce_impacts(&mut self, before: &HashMap<RigidBodyHandle, (Vector, Vector, Vector)>) {
         let least = LEAST_BOUNCING_SPEED * METRES_PER_UNIT;
+        // how many manifolds push on each body
+        let mut touches: HashMap<RigidBodyHandle, usize> = HashMap::new();
+        for pair in self.world.narrow_phase.contact_pairs() {
+            for manifold in pair.manifolds() {
+                if manifold.points.iter().any(|p| p.data.impulse > 0.0) {
+                    for body in [manifold.data.rigid_body1, manifold.data.rigid_body2].into_iter().flatten() {
+                        *touches.entry(body).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut alone = Vec::new();
         let mut pushes = Vec::new();
         for pair in self.world.narrow_phase.contact_pairs() {
             if !pair.has_any_active_contact() {
@@ -1735,9 +1848,32 @@ impl Physics {
                 if came > -least {
                     continue;
                 }
-                let parts = normal.dot(speed_at(bodies[1], false) - speed_at(bodies[0], false));
                 let subshapes = [manifold.subshape1, manifold.subshape2];
-                let (_, e) = contact_material(&self.made_of, &self.world.colliders, [pair.collider1, pair.collider2], normal, subshapes);
+                let pair_of = [pair.collider1, pair.collider2];
+                let (friction, e) = contact_material(&self.made_of, &self.world.colliders, pair_of, normal, subshapes);
+                let colliders = &self.world.colliders;
+                let friction = friction.unwrap_or_else(|| {
+                    colliders.get(pair.collider1).zip(colliders.get(pair.collider2)).map_or(0.0, |(a, b)| a.friction() * b.friction())
+                });
+                // a body hitting what is not pushed back, touching nothing else and held by
+                // nothing, is hit as IVP hits it ([`Physics::impact_alone`])
+                let free = |me: Option<RigidBodyHandle>, other: Option<RigidBodyHandle>| {
+                    let Some(me) = me else { return false };
+                    let pushed_back = other.and_then(|o| self.world.bodies.get(o)).is_some_and(|b| b.is_dynamic());
+                    !pushed_back
+                        && touches.get(&me) == Some(&1)
+                        && self.world.bodies.get(me).is_some_and(|b| b.is_dynamic())
+                        && self.world.impulse_joints.attached_joints(me).next().is_none()
+                };
+                if free(bodies[1], bodies[0]) {
+                    alone.push((bodies[1], bodies[0], point, normal, e, friction));
+                    continue;
+                }
+                if free(bodies[0], bodies[1]) {
+                    alone.push((bodies[0], bodies[1], point, -normal, e, friction));
+                    continue;
+                }
+                let parts = normal.dot(speed_at(bodies[1], false) - speed_at(bodies[0], false));
                 let more = -e * came - parts;
                 if more <= 0.0 {
                     continue;
@@ -1755,6 +1891,11 @@ impl Physics {
                 }
             }
         }
+        for (me, other, point, normal, e, friction) in alone {
+            if let Some(me) = me {
+                self.impact_alone(me, other, point, normal, e, friction, before);
+            }
+        }
         for ([one, two], impulse, point) in pushes {
             for (handle, impulse) in [(one, -impulse), (two, impulse)] {
                 if let Some(b) = handle.and_then(|h| self.world.bodies.get_mut(h)).filter(|b| b.is_dynamic()) {
@@ -1762,6 +1903,56 @@ impl Physics {
                 }
             }
         }
+    }
+
+    /// A body that hit what is not pushed back (the world, what is frozen or moved by the game)
+    /// goes on as IVP's impact sends it: one push in the middle of where they touch (`point`,
+    /// `normal` towards the body), that leaves it going away as fast as it came times how much
+    /// they bounce, and holds back what slides there by the friction - no more than the push
+    /// times it. What it was going before the step and gravity in it decide; the solver's own
+    /// pushes at the corners, which are never quite even, are not kept. A crate dropped flat
+    /// lands flat.
+    #[allow(clippy::too_many_arguments)]
+    fn impact_alone(
+        &mut self,
+        me: RigidBodyHandle,
+        other: Option<RigidBodyHandle>,
+        point: Vector,
+        normal: Vector,
+        bounce: f32,
+        friction: f32,
+        before: &HashMap<RigidBodyHandle, (Vector, Vector, Vector)>,
+    ) {
+        let other_speed = other.and_then(|o| self.world.bodies.get(o)).map_or(Vector::ZERO, |b| b.velocity_at_point(point));
+        let Some(&(v, w, centre)) = before.get(&me) else { return };
+        let gravity = self.world.gravity;
+        let dt = self.world.integration_parameters.dt;
+        let Some(body) = self.world.bodies.get_mut(me) else { return };
+        let v = v + gravity * body.gravity_scale() * dt;
+        let arm = point - centre;
+        let came = v + w.cross(arm) - other_speed;
+        let into = came.dot(normal);
+        if into >= 0.0 {
+            return;
+        }
+        let props = body.mass_properties();
+        let (inv_mass, inv_inertia) = (props.effective_inv_mass, props.effective_world_inv_inertia);
+        // how a push there changes how fast it goes there
+        let give = |push: Vector| inv_mass * push + (inv_inertia * arm.cross(push)).cross(arm);
+        let k = Mat3::from_cols(give(Vector::X), give(Vector::Y), give(Vector::Z));
+        // stopped along the surface and bounced off it; sliding if friction cannot stop it
+        let mut push = k.inverse() * (normal * (-bounce * into) - came);
+        let along = push.dot(normal);
+        let across = push - normal * along;
+        if across.length() > friction * along {
+            let sliding = came - normal * into;
+            let way = if sliding.length_squared() > 1e-12 { sliding.normalize() } else { -across.normalize_or_zero() };
+            let direction = normal - way * friction;
+            let amount = (-bounce * into - into) / normal.dot(give(direction)).max(1e-9);
+            push = direction * amount;
+        }
+        body.set_linvel(v + inv_mass * push, true);
+        body.set_angvel(w + inv_inertia * arm.cross(push), true);
     }
 
     /// Moves time on by `seconds`. Joints pulled harder than they take break.
@@ -1786,7 +1977,9 @@ impl Physics {
         let before = self.speeds();
         self.world.step_with_events(&hooks, &());
         self.clock += seconds;
-        self.bounce_impacts(&before);
+        if std::env::var_os("OG_NO_BOUNCE").is_none() {
+            self.bounce_impacts(&before);
+        }
         self.limit_speeds();
         self.find_impacts(&before);
         let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
@@ -1901,11 +2094,6 @@ impl PhysicsHooks for Apart<'_> {
             }
             // the solver stops what hits; it bounces after ([`Physics::bounce_impacts`])
             *manifold.restitution = 0.0;
-            if manifold.solver_contacts.len() > 3 {
-                let points: Vec<Vector> = manifold.solver_contacts.iter().map(|c| c.anchor1).collect();
-                let mut keep = corners(&points, *manifold.normal).into_iter();
-                manifold.solver_contacts.retain(|_| keep.next().unwrap_or(true));
-            }
         }
         let (solid, first) = match (self.seams.get(&context.collider1), self.seams.get(&context.collider2)) {
             (Some(_), _) => (context.collider1, true),

@@ -50,6 +50,9 @@ struct PhysModel {
     mass: Option<f32>,
     damping: f32,
     rot_damping: f32,
+    /// How much harder to turn than its shape (its `inertia`), and how its mass lies.
+    inertia: f32,
+    mass_shape: Option<gmod_physics::MassShape>,
     material: String,
     /// All of it: the solids of a ragdoll, how they hang together.
     phy: Arc<gmod_model::Phy>,
@@ -186,6 +189,12 @@ fn phys_model(lua: &Lua, model: &str) -> Option<PhysModel> {
             mass: solid.mass(),
             damping: solid.keys.number("damping").unwrap_or(0.0),
             rot_damping: solid.keys.number("rotdamping").unwrap_or(0.0),
+            inertia: solid.keys.number("inertia").unwrap_or(1.0),
+            mass_shape: solid.mass_shape.map(|m| gmod_physics::MassShape {
+                centre: m.centre,
+                inertia: m.inertia,
+                drag_areas: m.drag_areas,
+            }),
             material: solid.surface_prop().unwrap_or("default").to_string(),
             phy: phy.clone(),
             hulls: Arc::new(hulls),
@@ -256,6 +265,8 @@ fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>
         mass: model.and_then(|m| m.mass),
         damping: model.map_or(0.0, |m| m.damping),
         rot_damping: model.map_or(0.0, |m| m.rot_damping),
+        inertia: model.map_or(1.0, |m| m.inertia),
+        mass_shape: model.and_then(|m| m.mass_shape),
         ..Body::new(shape, array(pos), turn(angles))
     };
     let Some(id) = host.physics.physics.borrow_mut().add(&body) else { return false };
@@ -759,9 +770,31 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     // buoyancy is not simulated yet
     def("SetBuoyancyRatio", |a| this(a).map(|_| Value::Nil))?;
     def("RecheckCollisionFilter", |a| this(a).map(|_| Value::Nil))?;
-    def("SetInertia", |a| this(a).map(|_| Value::Nil))?;
+    def("SetInertia", |a| {
+        let i = a.userdata::<Vector>(2, "Vector")?;
+        with(a, |p, id| p.set_inertia(id, array(i))).map(|_| Value::Nil)
+    })?;
+    def("GetInertia", |a| {
+        let i = with(a, |p, id| p.inertia(id))?;
+        entity::vector(a.lua, vector(i))
+    })?;
     def("IsPenetrating", |a| this(a).map(|_| Value::Boolean(false)))?;
     def("GetMass", |a| Ok(Value::Number(f64::from(with(a, |p, id| p.mass(id))?))))?;
+    // each solid a list of the corners of its triangles, as `{ pos = Vector }`
+    def("GetMeshConvexes", |a| {
+        let solids = with(a, |p, id| p.convexes(id))?;
+        let out = a.lua.create_table()?;
+        for (i, solid) in solids.iter().enumerate() {
+            let corners = a.lua.create_table()?;
+            for (j, &corner) in solid.iter().enumerate() {
+                let vertex = a.lua.create_table()?;
+                vertex.raw_set("pos", entity::vector(a.lua, vector(corner))?)?;
+                corners.raw_set(j + 1, vertex)?;
+            }
+            out.raw_set(i + 1, corners)?;
+        }
+        Ok(Value::Table(out))
+    })?;
     def("GetInvMass", |a| {
         let mass = with(a, |p, id| p.mass(id))?;
         Ok(Value::Number(if mass > 0.0 { 1.0 / f64::from(mass) } else { 0.0 }))

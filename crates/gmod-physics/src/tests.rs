@@ -1134,3 +1134,69 @@ fn the_air_holds_back_what_moves_through_it() {
         assert!((first - after[0]).abs() < 8.0 && (later - after[1]).abs() < 12.0, "{first} {later}, not {after:?}");
     }
 }
+
+#[test]
+fn bodies_turn_as_hard_as_ivp_reckons() {
+    // GMod, measured with boxes made in Lua (PhysicsInitBox) of 10 kg: 47.95 units a side,
+    // 1.748 about each axis; 95.4 by 47.95 by 47.95, 1.748 about the long one and 5.047 across
+    // (a solid's would be 2.472 and 6.129)
+    let mut physics = Physics::new();
+    physics.set_gravity(0.0);
+    let cube = Body { mass: Some(10.0), ..Body::new(Shape::cuboid([-23.975; 3], [23.975; 3]), [0.0; 3], [0.0; 3]) };
+    let cube = physics.add(&cube).unwrap();
+    let long = Body {
+        mass: Some(10.0),
+        ..Body::new(Shape::cuboid([-47.7, -23.975, -23.975], [47.7, 23.975, 23.975]), [0.0, 200.0, 0.0], [0.0; 3])
+    };
+    let long = physics.add(&long).unwrap();
+    let near = |a: Vec3, b: Vec3| (0..3).all(|i| (a[i] - b[i]).abs() < 0.01 * b[i]);
+    assert!(near(physics.inertia(cube), [1.748; 3]), "{:?}", physics.inertia(cube));
+    assert!(near(physics.inertia(long), [1.748, 5.047, 5.047]), "{:?}", physics.inertia(long));
+    // as heavy again, as hard again to turn
+    physics.set_mass(cube, 20.0);
+    assert!(near(physics.inertia(cube), [3.496; 3]), "{:?}", physics.inertia(cube));
+    // a model's own, but no axis less than 0.0707 of the most (a plank: 2.587 across, 0.183
+    // about its length in GMod, where its model says 0.04)
+    let plank = Body {
+        mass: Some(11.75),
+        mass_shape: Some(MassShape { centre: [0.0; 3], inertia: [0.22024, 0.22021, 0.00345], drag_areas: None }),
+        ..Body::new(Shape::cuboid([-1.3, -4.3, -32.3], [1.3, 4.3, 32.3]), [0.0, 400.0, 0.0], [0.0; 3])
+    };
+    let plank = physics.add(&plank).unwrap();
+    assert!(near(physics.inertia(plank), [2.588, 2.587, 0.183]), "{:?}", physics.inertia(plank));
+    // set outright
+    physics.set_inertia(plank, [1.0, 2.0, 3.0]);
+    assert!(near(physics.inertia(plank), [1.0, 2.0, 3.0]), "{:?}", physics.inertia(plank));
+    // and it turns so: a push of 1000 kg·units/s 10 units off its middle (GMod's crate of 3.62
+    // turns at 102 degrees a second)
+    physics.set_inertia(cube, [3.62; 3]);
+    physics.apply_impulse_at(cube, [0.0, 1000.0, 0.0], [10.0, 0.0, 0.0]);
+    let w = physics.angular_velocity(cube);
+    assert!((w[2] - 102.1).abs() < 1.0, "{w:?}");
+}
+
+#[test]
+fn a_crate_dropped_flat_lands_flat() {
+    // however it is turned about the up: the push of the floor is in the middle of its face
+    // (in GMod, crates and cubes dropped so land flat, turning no faster than 240 degrees a
+    // second as they do)
+    at_tick_rates(|| {
+        for yaw in [0.0f32, 30.0, 45.0] {
+            let mut physics = floor();
+            let body = Body {
+                mass: Some(25.0),
+                ..Body::new(Shape::cuboid([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]), [0.0, 0.0, 100.0], [0.0, yaw, 0.0])
+            };
+            let body = physics.add(&body).unwrap();
+            physics.set_elasticity(body, 0.1);
+            let mut spun = 0.0f32;
+            for _ in 0..(3.0 / STEP.with(std::cell::Cell::get)) as usize {
+                run(&mut physics, STEP.with(std::cell::Cell::get));
+                let w = physics.angular_velocity(body);
+                spun = spun.max((w[0] * w[0] + w[1] * w[1]).sqrt());
+            }
+            let (_, angles) = physics.pose(body).unwrap();
+            assert!(spun < 100.0 && angles[0].abs() < 1.0 && angles[2].abs() < 1.0, "turned {yaw}: spun {spun}, {angles:?}");
+        }
+    });
+}
