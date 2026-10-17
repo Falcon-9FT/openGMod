@@ -404,8 +404,13 @@ struct Collision {
     speed: f32,
     point: Vector,
     normal: Vector,
+    /// How the two go now, and went before.
     velocity: Vector,
     other_velocity: Vector,
+    old_velocity: Vector,
+    other_old_velocity: Vector,
+    /// Seconds since the two last hit each other, no more than 1.
+    since: f32,
 }
 
 /// One tick: the bodies move on, gravity as `sv_gravity` says, and the entities of those awake
@@ -461,6 +466,9 @@ pub(crate) fn simulate(lua: &Lua) {
                     normal: vector(impact.normal),
                     velocity: vector(physics.velocity(impact.body)),
                     other_velocity: other.map_or(Vector::default(), |(id, _)| vector(physics.velocity(id))),
+                    old_velocity: vector(impact.velocity),
+                    other_old_velocity: vector(impact.other_velocity),
+                    since: impact.since,
                 })
             })
             .collect();
@@ -597,11 +605,12 @@ fn physics_updates(lua: &Lua) {
     }
 }
 
-/// An impact: the body's surface sounds it, as Source does - from 70 units/s, as loud as the
-/// square of the speed up to 320, hard from 300 - and Lua hears of it: `ENT:PhysicsCollide`
-/// and the entity's `PhysicsCollide` callbacks.
+/// An impact: the body's surface sounds it, as Source does - from 70 units/s and a twentieth
+/// of a second after the two last hit each other, as loud as the square of the speed up to
+/// 320, hard from 300 - and Lua hears of it: `ENT:PhysicsCollide` and the entity's
+/// `PhysicsCollide` callbacks.
 fn collided(lua: &Lua, c: &Collision) {
-    if c.speed >= 70.0 {
+    if c.speed >= 70.0 && c.since >= 0.05 {
         let (_, surface) = crate::surfaceprops::named(lua, &c.material);
         let name = if c.speed >= 300.0 { &surface.impact_hard } else { &surface.impact_soft };
         let volume = (c.speed * c.speed / (320.0 * 320.0)).min(1.0);
@@ -617,16 +626,15 @@ fn collided(lua: &Lua, c: &Collision) {
         t.raw_set("HitNormal", entity::vector(lua, c.normal)?)?;
         t.raw_set("Speed", c.speed)?;
         t.raw_set("HitSpeed", entity::vector(lua, c.normal * c.speed)?)?;
-        // before the impact it went into what it hit as fast as the impact took away
-        t.raw_set("OurOldVelocity", entity::vector(lua, c.velocity + c.normal * c.speed)?)?;
+        t.raw_set("OurOldVelocity", entity::vector(lua, c.old_velocity)?)?;
         t.raw_set("OurNewVelocity", entity::vector(lua, c.velocity)?)?;
-        t.raw_set("TheirOldVelocity", entity::vector(lua, c.other_velocity)?)?;
+        t.raw_set("TheirOldVelocity", entity::vector(lua, c.other_old_velocity)?)?;
         t.raw_set("TheirNewVelocity", entity::vector(lua, c.other_velocity)?)?;
         t.raw_set("PhysObject", push_part(lua, c.entity, c.part)?)?;
         t.raw_set("HitObject", push_part(lua, c.other, c.other_part)?)?;
         t.raw_set("OurSurfaceProps", our as i64)?;
         t.raw_set("TheirSurfaceProps", their as i64)?;
-        t.raw_set("DeltaTime", timer::tick_interval())?;
+        t.raw_set("DeltaTime", c.since)?;
         Ok(t)
     })();
     let Ok(data) = data else { return };

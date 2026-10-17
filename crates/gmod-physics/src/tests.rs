@@ -1084,3 +1084,24 @@ fn damping_holds_back_only_what_touches_something() {
     assert!((air - 100.0).abs() < 1.0, "damped in the air: {air}");
     assert!((ground - 36.8).abs() < 4.0, "on the ground: {ground}");
 }
+
+#[test]
+fn an_impact_is_touching_again_after_being_apart() {
+    // GMod, measured: a crate lying on the floor lifted 0.55 and sent down at 120 units/s makes
+    // no impact; lifted 0.65 and sent down at 5, it makes one, at about the speed it came
+    for (lift, down, impact) in [(0.4f32, 120.0f32, false), (0.8, 5.0, true), (0.8, 60.0, true), (2.0, 0.0, true)] {
+        let mut physics = floor();
+        let body = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+        run(&mut physics, 1.0);
+        physics.impacts();
+        physics.set_pose(body, [0.0, 0.0, 16.0 + lift], [0.0; 3]);
+        physics.set_velocity(body, [0.0, 0.0, -down]);
+        run(&mut physics, 0.1);
+        let impacts = physics.impacts();
+        assert_eq!(impacts.is_empty(), !impact, "lifted {lift}, sent down at {down}: {impacts:?}");
+        if let Some(first) = impacts.first() {
+            let came = (down * down + 2.0 * DEFAULT_GRAVITY * lift).sqrt();
+            assert!((first.speed - came).abs() < 15.0, "{} for {came}", first.speed);
+        }
+    }
+}

@@ -160,11 +160,10 @@ const ROD_STIFFNESS: f32 = 1.0e5;
 /// A ragdoll joint's limit this close to none, in radians (0.06 degrees), is none.
 const STILL_LIMIT: f32 = 1.0e-3;
 const ROD_DAMPING: f32 = 632.0;
-/// The least change of speed a contact makes to count as an [`Impact`], in units/s: less is
-/// a body at rest, or one sliding along.
-pub const MIN_IMPACT_SPEED: f32 = 50.0;
-/// How long, in seconds, after an impact a body makes no other.
-const IMPACT_PAUSE: f32 = 0.08;
+/// How far apart two bodies are to have been, units, for their touching again to be an
+/// [`Impact`], however slow: in GMod a crate lifted 0.55 off the floor and sent down at 120
+/// units/s makes none, one lifted 0.65 and sent down at 5 makes one.
+const IMPACT_SEPARATION: f32 = 0.6;
 
 fn metres(v: Vec3) -> Vector {
     Vector::new(v[0], v[1], v[2]) * METRES_PER_UNIT
@@ -335,9 +334,12 @@ pub struct Physics {
     /// collide ([`Physics::set_collision_group`]).
     groups: HashMap<RigidBodyHandle, i64>,
     group_rule: Option<fn(i64, i64) -> bool>,
-    /// Impacts since they were last asked for, and when each body last made one.
+    /// Impacts since they were last asked for, and the colliders that have touched since they
+    /// were last apart ([`IMPACT_SEPARATION`]).
     impacts: Vec<Impact>,
-    last_impact: HashMap<RigidBodyHandle, f32>,
+    together: HashSet<(ColliderHandle, ColliderHandle)>,
+    /// When each two bodies (none: the world) last hit each other, for a second.
+    last_impacts: HashMap<(Option<RigidBodyHandle>, Option<RigidBodyHandle>), f32>,
     /// The ragdoll joints and their limits.
     limits: Vec<Limit>,
     /// The springs that hold back their two points moving apart any way, and how much:
@@ -423,12 +425,17 @@ pub struct Impact {
     pub other_body: Option<BodyId>,
     /// And its caller value.
     pub other: Option<u64>,
-    /// How much the contact changed its speed, in units/s: how fast it went into what it hit.
+    /// How fast it went into what it hit, along the normal, in units/s.
     pub speed: f32,
     /// Where, in the world.
     pub point: Vec3,
     /// From the body towards what it hit.
     pub normal: Vec3,
+    /// How the two were going before it, units/s: the body, and what it hit.
+    pub velocity: Vec3,
+    pub other_velocity: Vec3,
+    /// Seconds since the two last hit each other, no more than 1.
+    pub since: f32,
 }
 
 /// A body touching something now (`GetFrictionSnapshot`).
@@ -478,7 +485,8 @@ impl Physics {
             groups: HashMap::new(),
             group_rule: None,
             impacts: Vec::new(),
-            last_impact: HashMap::new(),
+            together: HashSet::new(),
+            last_impacts: HashMap::new(),
             limits: Vec::new(),
             inertia: HashMap::new(),
             clock: 0.0,
@@ -793,6 +801,29 @@ impl Physics {
         }
         if let Some(body) = self.world.bodies.get_mut(id.0) {
             body.set_position(Pose::from_parts(metres(origin), rotation(angles)), true);
+        }
+        self.part_moved(id);
+    }
+
+    /// A body put somewhere has parted from what it is now far enough from: touching it again
+    /// is an impact ([`Physics::find_impacts`]).
+    fn part_moved(&mut self, id: BodyId) {
+        let apart = IMPACT_SEPARATION * METRES_PER_UNIT;
+        let mine = self.colliders(id);
+        let colliders = &self.world.colliders;
+        let parted: Vec<(ColliderHandle, ColliderHandle)> = self
+            .together
+            .iter()
+            .filter(|(a, b)| mine.contains(a) || mine.contains(b))
+            .filter(|&&(a, b)| {
+                let (Some(a), Some(b)) = (colliders.get(a), colliders.get(b)) else { return true };
+                let (pa, pb) = (self.collider_pose(a), self.collider_pose(b));
+                rapier3d::parry::query::distance(&pa, a.shape(), &pb, b.shape()).map_or(true, |d| d.distance > apart)
+            })
+            .copied()
+            .collect();
+        for pair in parted {
+            self.together.remove(&pair);
         }
     }
 
@@ -1426,35 +1457,66 @@ impl Physics {
         std::mem::take(&mut self.impacts)
     }
 
-    /// The impacts of the step just made: what the contacts pushed apart, as the change of
-    /// speed of each body that moves (the impulse over its mass).
-    fn find_impacts(&mut self) {
+    /// The impacts of the step just made, as IVP makes them: two colliders that had been apart
+    /// touching again, however slowly; touching, they make no other until they part. Each of
+    /// the two bodies that moves has one, at how fast they came together.
+    fn find_impacts(&mut self, before: &HashMap<RigidBodyHandle, (Vector, Vector, Vector)>) {
         let world = &self.world;
+        let apart = IMPACT_SEPARATION * METRES_PER_UNIT;
+        let mut near = HashSet::new();
+        // the world is one: what touches two of its solids at once hits it once
+        let mut hit = HashSet::new();
         for pair in world.narrow_phase.contact_pairs() {
-            if !pair.has_any_active_contact() {
+            let key = (pair.collider1, pair.collider2);
+            let (Some(collider1), Some(collider2)) = (world.colliders.get(pair.collider1), world.colliders.get(pair.collider2)) else {
+                continue;
+            };
+            let touching = pair.has_any_active_contact() && pair.total_impulse_magnitude() > 0.0;
+            if self.together.contains(&key) {
+                // touching still, or not yet far enough apart
+                let parted = !touching
+                    && rapier3d::parry::query::distance(collider1.position(), collider1.shape(), collider2.position(), collider2.shape())
+                        .map_or(true, |d| d.distance > apart);
+                if !parted {
+                    near.insert(key);
+                }
                 continue;
             }
-            let impulse = pair.total_impulse_magnitude();
-            if impulse <= 0.0 {
+            if !touching {
                 continue;
             }
+            near.insert(key);
             let (_, normal) = pair.max_impulse();
-            let point = pair
-                .find_deepest_contact()
-                .and_then(|(_, contact)| world.colliders.get(pair.collider1).map(|c| units(c.position() * contact.local_p1)));
-            let body = |collider| world.colliders.get(collider).and_then(|c| c.parent());
-            let (one, two) = (body(pair.collider1), body(pair.collider2));
+            let point = pair.find_deepest_contact().map(|(_, contact)| collider1.position() * contact.local_p1);
+            let body = |collider: &Collider| collider.parent();
+            let (one, two) = (body(collider1), body(collider2));
+            let at = point.unwrap_or_else(|| collider1.position().translation);
+            // how fast they came together there
+            let speed_at = |handle: Option<RigidBodyHandle>| -> Vector {
+                let Some(handle) = handle else { return Vector::ZERO };
+                match before.get(&handle) {
+                    Some(&(v, w, com)) => v + w.cross(at - com),
+                    None => world.bodies.get(handle).map_or(Vector::ZERO, |b| b.velocity_at_point(at)),
+                }
+            };
+            let speed = (normal.dot(speed_at(one) - speed_at(two)) / METRES_PER_UNIT).max(0.0);
+            let bodies =
+                if one.map(RigidBodyHandle::into_raw_parts) <= two.map(RigidBodyHandle::into_raw_parts) { (one, two) } else { (two, one) };
+            if !hit.insert(bodies) {
+                continue;
+            }
+            let since = self.last_impacts.insert(bodies, self.clock).map_or(1.0, |t| (self.clock - t).min(1.0));
+            let going = |handle: Option<RigidBodyHandle>| match handle.map(|h| (h, before.get(&h))) {
+                Some((_, Some(&(v, _, _)))) => units(v),
+                Some((h, None)) => world.bodies.get(h).map_or([0.0; 3], |b| units(b.linvel())),
+                None => [0.0; 3],
+            };
             for (me, other, towards) in [(one, two, normal), (two, one, -normal)] {
                 let Some(handle) = me else { continue };
                 let Some(rb) = world.bodies.get(handle) else { continue };
                 if !rb.is_dynamic() || rb.mass() <= 0.0 {
                     continue;
                 }
-                let speed = impulse / rb.mass() / METRES_PER_UNIT;
-                if speed < MIN_IMPACT_SPEED || self.last_impact.get(&handle).is_some_and(|&t| self.clock - t < IMPACT_PAUSE) {
-                    continue;
-                }
-                self.last_impact.insert(handle, self.clock);
                 // the world's solids have no body; joints' ground is no thing to hit
                 let other = other.filter(|&h| h != self.ground);
                 self.impacts.push(Impact {
@@ -1463,14 +1525,18 @@ impl Physics {
                     other_body: other.map(BodyId),
                     other: other.and_then(|h| world.bodies.get(h)).map(|b| b.user_data as u64),
                     speed,
-                    point: point.unwrap_or_else(|| units(rb.translation())),
+                    point: units(at),
                     normal: towards.to_array(),
+                    velocity: going(me),
+                    other_velocity: going(other),
+                    since,
                 });
             }
         }
-        // bodies gone make no more impacts
-        let bodies = &world.bodies;
-        self.last_impact.retain(|handle, _| bodies.get(*handle).is_some());
+        // what is no longer near anything has parted
+        self.together = near;
+        let clock = self.clock;
+        self.last_impacts.retain(|_, t| clock - *t < 1.0);
     }
 
     /// How each body that moves is going: its speed, its turning, and where its mass is.
@@ -1568,7 +1634,7 @@ impl Physics {
         self.clock += seconds;
         self.bounce_impacts(&before);
         self.limit_speeds();
-        self.find_impacts();
+        self.find_impacts(&before);
         let substep = seconds / self.world.integration_parameters.num_solver_iterations.max(1) as f32;
         let joints = &self.world.impulse_joints;
         let mut snapped = Vec::new();
