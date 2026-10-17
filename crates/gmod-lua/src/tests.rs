@@ -2843,8 +2843,15 @@ fn the_view_model_plays_the_weapon_in_hand() {
              and CHANGED[1] == 'models/weapons/v_test.mdl' and Entity(1):GetActiveWeapon():GetActivity() == ACT_VM_DRAW
              and vm:ViewModelIndex() == 0"
     ));
-    g.runtime.think(0.2);
-    assert!(g.eval::<bool>("return VM:GetSequence() == 0 and VM:GetCycle() > 0.4"), "still drawing");
+    // four times as fast as it was made, as GMod draws every weapon (`sv_defaultdeployspeed`)
+    g.runtime.think(0.05);
+    assert!(
+        g.eval::<bool>(
+            "return VM:GetSequence() == 0 and VM:GetCycle() > 0.3 and VM:GetPlaybackRate() == 4
+                 and Entity(1):GetActiveWeapon():GetDeploySpeed() == 4"
+        ),
+        "still drawing"
+    );
     g.runtime.think(0.3);
     assert!(g.eval::<bool>("return VM:GetSequence() == 1 and Entity(1):GetActiveWeapon():GetActivity() == ACT_VM_IDLE"), "idle");
 

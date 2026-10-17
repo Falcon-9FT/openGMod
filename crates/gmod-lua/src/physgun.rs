@@ -126,14 +126,11 @@ pub(crate) fn command(lua: &Lua, player: EntityHandle, weapon: EntityHandle, cmd
     if !is_gun {
         return;
     }
-    // the claws open while it holds something, and close again
-    let open = if held(lua, player).is_some() { 1.0 } else { 0.0 };
-    crate::anim::approach_view_model_pose(lua, player, "active", open, 4.0);
     if cmd.buttons & IN_ATTACK == 0 {
         host(lua).physgun.waiting.borrow_mut().retain(|&p| p != player);
     }
-    // as Half-Life 2's physics gun: the key going down plays its firing, which stays at its
-    // end while the key is held; let go, it goes back to idle ([`crate::anim::weapon_idle`])
+    // as GMod's: the key going down plays its firing once, which stays at its end, held or let
+    // go - it has no idle, and its claws do not open (measured)
     if pressed & IN_ATTACK != 0 {
         crate::anim::send_weapon_anim(lua, weapon, crate::anim::ACT_VM_PRIMARYATTACK);
     }

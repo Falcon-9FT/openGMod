@@ -791,7 +791,8 @@ pub(crate) fn approach_view_model_pose(lua: &Lua, owner: EntityHandle, name: &st
     change(lua, vm, |anim| anim.set_pose(index, next));
 }
 
-/// A weapon comes out: its owner's view model shows it and plays drawing it.
+/// A weapon comes out: its owner's view model shows it and plays drawing it, at the weapon's
+/// deploy speed (`SetDeploySpeed`; in GMod 4 times as fast, every weapon's).
 pub(crate) fn deploy(lua: &Lua, owner: EntityHandle, weapon: EntityHandle) {
     let vm = view_model(lua, owner, 0);
     if !host(lua).entities.is_valid(vm) {
@@ -799,7 +800,15 @@ pub(crate) fn deploy(lua: &Lua, owner: EntityHandle, weapon: EntityHandle) {
     }
     let model = crate::weapon::data(lua, weapon).map(|d| d.view_model).unwrap_or_default();
     set_weapon_model(lua, vm, &model, weapon);
-    send_weapon_anim(lua, weapon, ACT_VM_DRAW);
+    if !send_weapon_anim(lua, weapon, ACT_VM_DRAW) {
+        return;
+    }
+    let speed = host(lua).entities.get(weapon).and_then(|e| e.weapon.as_ref().map(|w| w.deploy_speed)).unwrap_or(1.0);
+    if speed > 0.0 && speed != 1.0 {
+        change(lua, vm, |anim| anim.playback_rate = speed);
+        let duration = view_model_duration(lua, weapon);
+        crate::weapon::set_idle_time(lua, weapon, now(lua) + duration / f64::from(speed));
+    }
 }
 
 /// `SendWeaponAnim`: the weapon's activity; the view model of its owner plays a sequence of it,
@@ -839,9 +848,10 @@ pub(crate) fn view_model_duration(lua: &Lua, weapon: EntityHandle) -> f64 {
 }
 
 /// An engine weapon goes back to idle once what it sent has played and nothing is pressed, as
-/// the engine's weapons do; a scripted one says for itself.
+/// the engine's weapons do; a scripted one says for itself, and GMod's physics gun has no idle:
+/// it stays as its drawing or firing ended (measured).
 pub(crate) fn weapon_idle(lua: &Lua, weapon: EntityHandle, busy: bool) {
-    let scripted = host(lua).entities.get(weapon).is_none_or(|e| e.scripted);
+    let scripted = host(lua).entities.get(weapon).is_none_or(|e| e.scripted || e.class.eq_ignore_ascii_case(crate::physgun::CLASS));
     let Some((activity, idle)) = crate::weapon::activity_and_idle(lua, weapon) else { return };
     if scripted || busy || activity == ACT_VM_IDLE || now(lua) < idle {
         return;

@@ -20,6 +20,7 @@ use crate::{ScriptError, files, host};
 const ENGINE_CONVARS: &[(&str, &str, &str)] = &[
     ("sv_cheats", "0", "Allow cheats on server"),
     ("sv_gravity", "600", "World gravity."),
+    ("sv_defaultdeployspeed", "4", "Default weapon deploy speed"),
     ("sv_friction", "8", "World friction."),
     ("sv_stopspeed", "10", "Minimum stopping speed when on ground."),
     ("sv_accelerate", "10", "Linear acceleration amount (old value is 5.6)"),
