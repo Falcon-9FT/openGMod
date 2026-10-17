@@ -1147,6 +1147,16 @@ impl crate::Runtime {
         host.panels.cursor_visible(host.client.screen_clicker.get()) || crate::chat::is_open(&self.lua)
     }
 
+    /// The keys and buttons held down that `which` names go up: the program no longer has
+    /// them - its window lost the keyboard, the system took their going up (Alt+Shift changing
+    /// the keyboard's language), another menu has the keys now.
+    pub fn release_keys(&self, which: impl Fn(i32) -> bool) {
+        let down: Vec<i32> = host(&self.lua).client.keys.borrow().down.iter().copied().filter(|&code| which(code)).collect();
+        for code in down {
+            self.button(code, false);
+        }
+    }
+
     /// A key or mouse button (`KEY_*`, `MOUSE_*`) went down or up. The open chat box has the
     /// keys going down first ([`crate::chat`]), then the panels; then `PlayerBindPress` hears
     /// of the command bound to it, and a command of the client's own runs (`+menu` with the
@@ -1154,6 +1164,10 @@ impl crate::Runtime {
     /// has the rest (`+attack`, `noclip` ...).
     pub fn button(&self, code: i32, down: bool) -> bool {
         let lua = &self.lua;
+        // a key that is not down does not go up (it went up already: [`Runtime::release_keys`])
+        if !down && !host(lua).client.is_down(code) {
+            return false;
+        }
         // a key held down repeats: for the text entries, not the binds
         let repeat = down && host(lua).client.is_down(code);
         host(lua).client.set_key(code, down);

@@ -313,6 +313,11 @@ impl Game {
         self.client.button(code, down)
     }
 
+    /// The keys held down that `which` names go up ([`gmod_lua::Runtime::release_keys`]).
+    pub fn release_keys(&self, which: impl Fn(i32) -> bool) {
+        self.client.release_keys(which);
+    }
+
     /// Text typed, for the chat box or the text entry that has the keyboard: whether one took it.
     pub fn type_text(&self, text: &str) -> bool {
         self.client.type_text(text)

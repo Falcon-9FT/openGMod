@@ -2119,6 +2119,14 @@ fn panels_are_laid_out_painted_and_clicked() {
          return lw > 60 and ww <= 60 and wh >= 3 * lh"
     ));
 
+    // Shift held, its going up taken by the system: the program lets it go, and a click on an
+    // icon is no longer the start of a box of selection (the spawn menu would not spawn)
+    g.runtime.button(79, true);
+    assert!(g.eval::<bool>("return input.IsShiftDown() and input.IsKeyDown(KEY_LSHIFT)"));
+    g.runtime.release_keys(|code| code == 79);
+    assert!(g.eval::<bool>("return not input.IsShiftDown() and not input.IsKeyDown(KEY_LSHIFT) and input.WasKeyReleased(KEY_LSHIFT)"));
+    assert!(!g.runtime.button(79, false));
+
     // a click on the button, one beside the panels, which goes to the world
     g.runtime.set_cursor(50, 50);
     assert!(g.eval::<bool>("return vgui.GetHoveredPanel() == B and B.Hovered"));

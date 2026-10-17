@@ -1260,8 +1260,22 @@ impl App {
         if self.menu_open {
             self.capture(false);
             self.keys.clear();
+            // the menu has the keys now: what the game had held goes up for it
+            if let Some(game) = &self.game {
+                game.release_keys(|_| true);
+            }
         } else if self.focused && !self.ui_cursor {
             self.capture(true);
+        }
+    }
+
+    /// The keys held down that `which` names go up, for the game and the menu.
+    fn release_keys(&self, which: impl Fn(i32) -> bool) {
+        if let Some(game) = &self.game {
+            game.release_keys(&which);
+        }
+        if let Some(menu) = &self.menu {
+            menu.runtime().release_keys(&which);
         }
     }
 
@@ -1946,7 +1960,27 @@ impl ApplicationHandler for App {
                 if !focused {
                     self.keys.clear();
                     self.capture(false);
+                    // what was held goes up: its going up comes to another window
+                    self.release_keys(|_| true);
                 }
+            }
+            // the modifiers as the system has them: one it says is up is up, though its going
+            // up never came (Alt+Shift changing the keyboard's language takes it)
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let state = modifiers.state();
+                let (shift, control, alt) = (state.shift_key(), state.control_key(), state.alt_key());
+                self.keys.retain(|key| match key {
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => shift,
+                    KeyCode::AltLeft | KeyCode::AltRight => alt,
+                    KeyCode::ControlLeft | KeyCode::ControlRight => control,
+                    _ => true,
+                });
+                self.release_keys(|code| match code {
+                    79 | 80 => !shift,
+                    81 | 82 => !alt,
+                    83 | 84 => !control,
+                    _ => false,
+                });
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(menu) = self.menu.as_ref().filter(|_| self.menu_shown()) {
