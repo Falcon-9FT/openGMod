@@ -1141,7 +1141,11 @@ fn engine_move(lua: &Lua, handle: EntityHandle, mv: &mut MoveData) {
     mv.velocity = vector(moving.velocity);
     with_player(lua, handle, |_, p| p.moving = moving);
     if move_type == MOVETYPE_WALK {
-        push_props(lua, mv, &space.touched.borrow());
+        if let Some(velocity) = push_props(lua, mv, &space.touched.borrow()) {
+            mv.velocity = velocity;
+            moving.velocity = array(velocity);
+            with_player(lua, handle, |_, p| p.moving.velocity = moving.velocity);
+        }
         find_ground(lua, handle, &moving, &settings);
     } else {
         with_player(lua, handle, |_, p| (p.ground, p.ground_at) = (EntityHandle::NULL, None));
@@ -1241,13 +1245,39 @@ fn predict_tick(lua: &Lua, handle: EntityHandle, cmd: &UserCmd) -> bool {
     host(lua).entities.is_valid(handle)
 }
 
-/// How heavy a player is to what they push, in kilograms.
-const PLAYER_MASS: f32 = 85.0;
+/// How fast a player going into a prop at full speed (200 units/s) pushes it along, by how
+/// hard it holds to the ground: its mass times its friction with it, as kilograms. Measured
+/// in GMod, wooden crates on concrete (0.64 together): of 5 and 15 kg at 87 units/s, 30 kg 77,
+/// 60 kg 55, 120 kg 43, 250 and 400 kg 35, of 600 kg not at all - and the player goes along
+/// as fast as the crate, no faster.
+const PUSH_SPEEDS: [(f32, f32); 8] =
+    [(0.0, 87.0), (9.6, 87.0), (19.2, 77.0), (38.4, 55.0), (76.8, 43.0), (160.0, 35.0), (300.0, 35.0), (320.0, 0.0)];
 
-/// A player walking into props pushes them: a prop that may move is given at least the speed
-/// the player means to go into it - all of it if it is no heavier than a player, less as it is
-/// heavier. What the player stands on or bumps from above is not pushed.
-fn push_props(lua: &Lua, mv: &MoveData, touched: &[(EntityHandle, Vector)]) {
+/// The full speed of walking that [`PUSH_SPEEDS`] are for.
+const PUSHING_SPEED: f32 = 200.0;
+
+/// How fast a prop holding to the ground with `load` (mass times friction) is pushed along.
+fn push_speed(load: f32) -> f32 {
+    let mut last = PUSH_SPEEDS[0];
+    for &(at, speed) in &PUSH_SPEEDS[1..] {
+        if load <= at {
+            let t = if at > last.0 { (load - last.0) / (at - last.0) } else { 1.0 };
+            return last.1 + (speed - last.1) * t;
+        }
+        last = (at, speed);
+    }
+    0.0
+}
+
+/// A player walking into props pushes them: a prop that may move goes along the way the
+/// player goes into it, as fast as GMod's player pushes one of its weight ([`PUSH_SPEEDS`]),
+/// slower as they go into it slower. The player, held back by it, goes along with it: what
+/// they hit took their speed into it, and they get as much of it back as the prop goes - the
+/// player's speed then, if it changed. What the player stands on or bumps from above is not
+/// pushed.
+fn push_props(lua: &Lua, mv: &MoveData, touched: &[(EntityHandle, Vector)]) -> Option<Vector> {
+    let mut velocity = mv.velocity;
+    let mut changed = false;
     let (forward, right, _) = Angle::new(0.0, mv.angles.y, 0.0).vectors();
     let wish = forward * mv.forward + right * mv.side;
     let wish = if wish.length() > mv.max_speed && wish.length() > 0.0 { wish * (mv.max_speed / wish.length()) } else { wish };
@@ -1267,8 +1297,13 @@ fn push_props(lua: &Lua, mv: &MoveData, touched: &[(EntityHandle, Vector)]) {
             continue;
         }
         pushed.push(prop);
-        let mass = physics.mass(id).max(1.0);
-        let speed = into * (PLAYER_MASS / mass).min(1.0);
+        // held to the ground by its weight and its friction with it (the ground's taken as
+        // GMod's concrete, 0.8)
+        let load = physics.mass(id).max(0.0) * physics.friction(id) * 0.8;
+        let speed = push_speed(load) * into / PUSHING_SPEED;
+        if speed <= 0.0 {
+            continue;
+        }
         let v = physics.velocity(id);
         let direction = normal * -1.0;
         let along = v[0] * direction.x + v[1] * direction.y + v[2] * direction.z;
@@ -1277,7 +1312,13 @@ fn push_props(lua: &Lua, mv: &MoveData, touched: &[(EntityHandle, Vector)]) {
             physics.set_velocity(id, [v[0] + add.x, v[1] + add.y, v[2] + add.z]);
             physics.wake(id);
         }
+        let mine = velocity.dot(direction);
+        if mine < speed {
+            velocity = velocity + direction * (speed - mine);
+            changed = true;
+        }
     }
+    changed.then_some(velocity)
 }
 
 /// What a player on the ground stands on, and where it is now.
