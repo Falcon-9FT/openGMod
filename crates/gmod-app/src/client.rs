@@ -112,6 +112,7 @@ impl Connection {
                 max_players: 1,
                 allow_cs_lua: false,
                 loading_url: String::new(),
+                tick_interval: gmod_lua::timer::DEFAULT_TICK_INTERVAL,
             },
             listed_lua: Vec::new(),
             snapshots: SnapshotReceiver::default(),
@@ -129,6 +130,8 @@ impl Connection {
         loop {
             if let Some(welcome) = connection.receive() {
                 connection.welcome = proto::decode::<Welcome>(&welcome).ok_or("the server is not an openGMOD server")?;
+                // the server's ticks are the game's
+                gmod_lua::timer::set_tick_interval(connection.welcome.tick_interval);
                 if let Some(key) = connection.key {
                     known.remember(&address, key);
                 }
@@ -240,7 +243,7 @@ impl Connection {
             return Ok(Vec::new());
         }
         let bytes: u64 = wanted.iter().map(|f| f.size).sum();
-        println!("Downloading {} files ({:.1} MB) from the server", wanted.len(), bytes as f64 / 1e6);
+        say!("Downloading {} files ({:.1} MB) from the server", wanted.len(), bytes as f64 / 1e6);
         self.send(&ToServer::Want(wanted.iter().map(|f| f.path.clone()).collect()), true);
         let mut files: HashMap<String, Vec<u8>> = HashMap::new();
         let mut wrong = None;
@@ -283,7 +286,7 @@ impl Connection {
         }
         // the download folder, read while looking for what to fetch, has more in it now
         if let Some(dir) = download {
-            for mount in vfs.mounts() {
+            for mount in vfs.mounts().iter() {
                 if let gmod_fs::Backing::Dir(folder) = &mount.backing
                     && folder.root() == dir
                 {

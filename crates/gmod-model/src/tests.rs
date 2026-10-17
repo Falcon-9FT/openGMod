@@ -386,6 +386,31 @@ fn reads_physics_models() {
 }
 
 #[test]
+fn physics_models_say_how_their_mass_lies() {
+    // as written by studiomdl: the surface's mass centre and inertia per kilogram in IVP's
+    // metres and axes, the drag areas in the model's (a plank lying along y: IVP's x, y, z
+    // are the model's x, z, -y)
+    let mut data = phy_bytes(false);
+    // the first solid: its size, then its "VPHY" header, then its surface
+    let (header, surface) = (16 + 4, 16 + 4 + 28);
+    let put = |data: &mut Vec<u8>, at: usize, values: [f32; 3]| {
+        for (i, v) in values.iter().enumerate() {
+            data[at + 4 * i..at + 4 * i + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    };
+    put(&mut data, surface, [0.0254, -0.0508, 0.0]);
+    put(&mut data, surface + 12, [0.22, 0.0035, 0.21]);
+    put(&mut data, header + 12, [1.0, 0.75, 0.5]);
+    let phy = Phy::parse(&data).unwrap();
+    let shape = phy.solids[0].mass_shape.expect("what its surface says");
+    assert!(near(shape.centre, [1.0, 0.0, 2.0]), "{:?}", shape.centre);
+    assert!(near(shape.inertia, [0.22, 0.21, 0.0035]), "{:?}", shape.inertia);
+    assert_eq!(shape.drag_areas, Some([1.0, 0.75, 0.5]));
+    // a surface without them says nothing
+    assert_eq!(Phy::parse(&phy_bytes(false)).unwrap().solids[0].mass_shape, None);
+}
+
+#[test]
 fn the_text_of_physics_models_is_read_leniently() {
     let text = "garbage solid { \"index\" \"0\" \"name\" \"a\" nested { \"x\" \"1\" } \"mass\" \"3\" } { stray } break { \"model\" \"gibs/a.mdl\" }";
     let solids = vec![vec![testmodel::TestConvex::cuboid([0.0; 3], [1.0; 3])]];

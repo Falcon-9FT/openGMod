@@ -40,6 +40,7 @@ pub const MAX_LAYERS: usize = 15;
 const EF_BONEMERGE: i64 = 1;
 const ACT_VM_DRAW: i64 = 172;
 const ACT_VM_IDLE: i64 = 174;
+pub(crate) const ACT_VM_PRIMARYATTACK: i64 = 181;
 const ACT_MP_STAND_IDLE: i64 = 990;
 /// Player animation events (`PLAYERANIMEVENT_*`) the engine raises itself.
 pub(crate) const EVENT_ATTACK_PRIMARY: i64 = 0;
@@ -161,7 +162,7 @@ impl AnimState {
 /// Rigs of the models entities have, each read once, and the activities models name.
 #[derive(Default)]
 pub(crate) struct Anims {
-    rigs: RefCell<HashMap<String, Option<Arc<Rig>>>>,
+    pub(crate) rigs: RefCell<HashMap<String, Option<Arc<Rig>>>>,
     /// Activities of models that the game's enumerations do not have, in the order they came.
     private: RefCell<Vec<String>>,
     /// For choosing among sequences of an activity.
@@ -169,6 +170,9 @@ pub(crate) struct Anims {
     /// The bones of entities whose `BuildBonePositions` callbacks run now, in their models'
     /// space: what `GetBoneMatrix` reads and `SetBoneMatrix` changes while they do.
     building: RefCell<HashMap<EntityHandle, Vec<BoneMatrix>>>,
+    /// What moves the vertices of models that do not move to where their bones rest, by
+    /// model; empty for those whose bones rest where the vertices were made with them.
+    still: RefCell<HashMap<String, Vec<BoneMatrix>>>,
 }
 
 /// The rig of a studio model (with the models it includes and its `.ani`), read once.
@@ -609,13 +613,28 @@ fn to_vmatrix(m: &BoneMatrix) -> Matrix {
     Matrix { m: [m[0], m[1], m[2], [0.0, 0.0, 0.0, 1.0]] }
 }
 
+/// A model that does not move, as Source draws it: through its bones, where they rest - which
+/// is not always where its vertices were made with them (a root bone the model's compile
+/// turned): worked out once for each model; none when it changes nothing.
+fn still_skinning(lua: &Lua, handle: EntityHandle) -> Vec<BoneMatrix> {
+    let Some(model) = host(lua).entities.get(handle).map(|e| e.model.to_ascii_lowercase()) else { return Vec::new() };
+    if let Some(known) = host(lua).anims.still.borrow().get(&model) {
+        return known.clone();
+    }
+    let skinning = model_bones(lua, handle).map(|(rig, bones)| rig.skinning(&bones)).unwrap_or_default();
+    let identity = |m: &BoneMatrix| (0..3).all(|r| (0..4).all(|c| (m[r][c] - if r == c { 1.0 } else { 0.0 }).abs() < 1e-4));
+    let skinning = if skinning.iter().all(identity) { Vec::new() } else { skinning };
+    host(lua).anims.still.borrow_mut().insert(model, skinning.clone());
+    skinning
+}
+
 /// What moves the vertices of an entity's model to where it is posed: none for a model that
 /// does not move (one bone, no sequences, nothing moved by Lua).
 pub(crate) fn skinning(lua: &Lua, handle: EntityHandle) -> Vec<[[f32; 4]; 3]> {
     let still = animated(lua, handle).is_none_or(|(rig, _)| rig.bones().len() <= 1 && rig.sequence_count() <= 1);
     let manipulated = host(lua).entities.get(handle).is_some_and(|e| !e.bone_manipulations.is_empty() || e.effects & EF_BONEMERGE != 0);
     if still && !manipulated && bone_callbacks(lua, handle).is_empty() {
-        return Vec::new();
+        return still_skinning(lua, handle);
     }
     model_bones(lua, handle).map(|(rig, bones)| rig.skinning(&bones)).unwrap_or_default()
 }
@@ -635,7 +654,9 @@ pub(crate) fn view_models(lua: &Lua, viewer: EntityHandle) -> (Vec<crate::Drawn>
     // none from behind (`drawviewer`), nor in a vehicle that does not let weapons in
     let seated =
         crate::vehicle::of(lua, viewer).index.is_some() && !player::state(lua, viewer, |_, p| p.allow_weapons_in_vehicle).unwrap_or(false);
-    if !show || seated || host(lua).client.draw_viewer.get() || !host(lua).entities.is_valid(active) {
+    // the player put it away (`r_drawviewmodel 0`)
+    let wanted = crate::convar::value(lua, "r_drawviewmodel").is_none_or(|v| crate::convar::atof(&v) != 0.0);
+    if !show || !wanted || seated || host(lua).client.draw_viewer.get() || !host(lua).entities.is_valid(active) {
         return (Vec::new(), fov);
     }
     let drawn = |handle: EntityHandle| -> Option<crate::Drawn> {
@@ -765,12 +786,13 @@ pub(crate) fn approach_view_model_pose(lua: &Lua, owner: EntityHandle, name: &st
     let Some(index) = rig.pose_parameters().iter().position(|p| p.name.eq_ignore_ascii_case(name)) else { return };
     let goal = rig.pose_parameters()[index].normalize(target);
     let now = anim.parameters(&rig).get(index).copied().unwrap_or(goal);
-    let step = rate * crate::timer::TICK_INTERVAL as f32;
+    let step = rate * crate::timer::tick_interval() as f32;
     let next = if (goal - now).abs() <= step { goal } else { now + step * (goal - now).signum() };
     change(lua, vm, |anim| anim.set_pose(index, next));
 }
 
-/// A weapon comes out: its owner's view model shows it and plays drawing it.
+/// A weapon comes out: its owner's view model shows it and plays drawing it, at the weapon's
+/// deploy speed (`SetDeploySpeed`; in GMod 4 times as fast, every weapon's).
 pub(crate) fn deploy(lua: &Lua, owner: EntityHandle, weapon: EntityHandle) {
     let vm = view_model(lua, owner, 0);
     if !host(lua).entities.is_valid(vm) {
@@ -778,7 +800,15 @@ pub(crate) fn deploy(lua: &Lua, owner: EntityHandle, weapon: EntityHandle) {
     }
     let model = crate::weapon::data(lua, weapon).map(|d| d.view_model).unwrap_or_default();
     set_weapon_model(lua, vm, &model, weapon);
-    send_weapon_anim(lua, weapon, ACT_VM_DRAW);
+    if !send_weapon_anim(lua, weapon, ACT_VM_DRAW) {
+        return;
+    }
+    let speed = host(lua).entities.get(weapon).and_then(|e| e.weapon.as_ref().map(|w| w.deploy_speed)).unwrap_or(1.0);
+    if speed > 0.0 && speed != 1.0 {
+        change(lua, vm, |anim| anim.playback_rate = speed);
+        let duration = view_model_duration(lua, weapon);
+        crate::weapon::set_idle_time(lua, weapon, now(lua) + duration / f64::from(speed));
+    }
 }
 
 /// `SendWeaponAnim`: the weapon's activity; the view model of its owner plays a sequence of it,
@@ -818,9 +848,10 @@ pub(crate) fn view_model_duration(lua: &Lua, weapon: EntityHandle) -> f64 {
 }
 
 /// An engine weapon goes back to idle once what it sent has played and nothing is pressed, as
-/// the engine's weapons do; a scripted one says for itself.
+/// the engine's weapons do; a scripted one says for itself, and GMod's physics gun has no idle:
+/// it stays as its drawing or firing ended (measured).
 pub(crate) fn weapon_idle(lua: &Lua, weapon: EntityHandle, busy: bool) {
-    let scripted = host(lua).entities.get(weapon).is_none_or(|e| e.scripted);
+    let scripted = host(lua).entities.get(weapon).is_none_or(|e| e.scripted || e.class.eq_ignore_ascii_case(crate::physgun::CLASS));
     let Some((activity, idle)) = crate::weapon::activity_and_idle(lua, weapon) else { return };
     if scripted || busy || activity == ACT_VM_IDLE || now(lua) < idle {
         return;
@@ -866,7 +897,7 @@ pub(crate) fn animate_player(lua: &Lua, handle: EntityHandle) {
     let ground_speed = sequence_of(&rig, sequence).map_or(0.0, |s| rig.ground_speed(s, &parameters));
     crate::call_hook(lua, "UpdateAnimation", MultiValue::from_iter([ply, v, Value::Number(f64::from(ground_speed))]));
     aim_and_move(lua, handle, &rig, velocity, ground_speed);
-    frame_advance(lua, handle, Some(crate::timer::TICK_INTERVAL));
+    frame_advance(lua, handle, Some(crate::timer::tick_interval()));
 }
 
 /// The pose parameters the engine sets on a player: the legs turning after the eyes, `move_x`

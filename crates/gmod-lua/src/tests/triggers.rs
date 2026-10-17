@@ -31,6 +31,7 @@ fn trigger_map(entities: Vec<Vec<(String, String)>>) -> Map {
         collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
         textures: Vec::new(),
         visibility: None,
+        surfaces: Default::default(),
     }
 }
 

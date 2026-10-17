@@ -39,13 +39,26 @@ fn array(v: Vector) -> [f32; 3] {
 }
 
 impl Audio {
+    /// How loud everything is (`volume`), 0 to 1.
+    pub fn set_master(&mut self, volume: f32) {
+        if let Ok(mut mixer) = self.mixer.lock() {
+            mixer.master = volume.clamp(0.0, 1.0);
+        }
+    }
+
+    /// The game's files changed (an addon came or went): the sounds that were not there are
+    /// looked for again.
+    pub fn forget_missing(&mut self) {
+        self.clips.retain(|_, clip| clip.is_some());
+    }
+
     /// Opens the sound card. Without one the game runs silent.
     pub fn new(vfs: Arc<Vfs>) -> Audio {
         #[cfg(windows)]
         {
             match output::open() {
                 Ok((mixer, stream)) => return Audio::with(vfs, mixer, Some(stream)),
-                Err(e) => println!("No sound: {e}"),
+                Err(e) => say!("No sound: {e}"),
             }
             Audio::with(vfs, Arc::new(Mutex::new(Mixer::new(48_000))), None)
         }
@@ -76,7 +89,7 @@ impl Audio {
             Ok(data) => match gmod_audio::decode(&data, &extension) {
                 Ok(clip) => Some(Arc::new(clip)),
                 Err(e) => {
-                    println!("{path}: {e}");
+                    say!("{path}: {e}");
                     None
                 }
             },
@@ -223,7 +236,7 @@ mod output {
                         }
                     }
                 },
-                |e| eprintln!("Sound: {e}"),
+                |e| say_error!("Sound: {e}"),
                 None,
             )
             .map_err(|e| e.to_string())

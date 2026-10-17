@@ -79,6 +79,9 @@ pub struct Vertex {
     pub alpha: f32,
     /// Linear light at the vertex, for props; 1 for brushes, lit by their light map.
     pub light: Vec3,
+    /// A model's: the direction the texture's u runs along (x y z), and w the side of the
+    /// bitangent (its v), for its bump map; all 0 for none.
+    pub tangent: [f32; 4],
 }
 
 /// Triangles that share a material, and how to draw them.
@@ -93,6 +96,12 @@ pub struct Surface {
     pub base: Option<usize>,
     /// The second texture of `WorldVertexTransition`, blended in by vertex alpha.
     pub base2: Option<usize>,
+    /// `$detail`: a texture laid over the base, `scale` times as fine, mixed in as its mode
+    /// says (0: it doubles or darkens, 1: it adds) by `blend`.
+    pub detail: Option<Detail>,
+    /// `$bumpmap`: which way the surface faces at each texel, to light it by its bumped
+    /// lightmaps.
+    pub bump: Option<Bump>,
     /// Texels less opaque than this are not drawn.
     pub alpha_test: Option<f32>,
     pub translucent: bool,
@@ -109,6 +118,9 @@ pub struct Surface {
     pub alpha: f32,
     /// A water surface and its fog colour.
     pub water: Option<Vec3>,
+    /// What shows what is behind it, bent by its normal map ([`Surface::bump`]): `Refract`
+    /// glass, and water.
+    pub refraction: Option<Refraction>,
     /// The material was not found: the game shows purple and black squares.
     pub missing: bool,
     /// `$basetexturetransform`: how the base texture's coordinates are scaled, turned and moved.
@@ -127,6 +139,53 @@ pub struct Surface {
     pub overlay: bool,
 }
 
+/// How a surface shows what is behind it: the `Refract` shader's, and water's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Refraction {
+    /// Water: what is behind fogs with its thickness, and the sky shows in it.
+    pub water: bool,
+    /// How far what is behind is bent (`$refractamount`).
+    pub amount: f32,
+    /// What it is seen through tinted (`$refracttint`), and by a texture (`$refracttinttexture`).
+    pub tint: Vec3,
+    pub tint_texture: Option<usize>,
+    /// Water's fog: from `$fogstart` to `$fogend` units of it what is behind goes to its fog
+    /// colour ([`Surface::water`]).
+    pub fog: [f32; 2],
+    /// What water reflects: the sky's colour ([`World::sky_colour`]), tinted (`$reflecttint`).
+    pub reflection: Vec3,
+    /// Water's normal map moving: a second layer of it, units of texture a second (`$scroll1`,
+    /// `$scroll2`).
+    pub scroll: [[f32; 2]; 2],
+}
+
+/// A surface's bump map.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bump {
+    /// Index into [`World::textures`], a [`Texture::normal`] one.
+    pub texture: usize,
+    /// `$bumpmap2` of `WorldVertexTransition`: blended in as the second base texture is.
+    pub second: Option<usize>,
+    /// `$ssbump`: its texels say how much of the light along each direction of the bumped
+    /// lightmaps reaches them, not which way they face.
+    pub self_shadowed: bool,
+    /// `$bumptransform`: how its coordinates are scaled, turned and moved.
+    pub transform: Matrix,
+}
+
+/// A texture laid over a surface's base (`$detail`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Detail {
+    /// Index into [`World::textures`].
+    pub texture: usize,
+    /// How many times finer than the base it is laid (`$detailscale`).
+    pub scale: f32,
+    /// How much of it shows (`$detailblendfactor`).
+    pub blend: f32,
+    /// How it mixes in (`$detailblendmode`): 0 doubles or darkens the base, 1 adds to it.
+    pub mode: u32,
+}
+
 /// How a surface looks at a moment, its material's proxies run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
@@ -135,6 +194,10 @@ pub struct Look {
     pub transform: Matrix,
     pub tint: Vec3,
     pub alpha: f32,
+    /// The bump map's transform (`$bumptransform`), where proxies move it.
+    pub bump_transform: Option<Matrix>,
+    /// Seconds into the map: how far what scrolls by itself went.
+    pub time: f32,
 }
 
 impl Surface {
@@ -145,6 +208,8 @@ impl Surface {
             count,
             base: None,
             base2: None,
+            detail: None,
+            bump: None,
             alpha_test: None,
             translucent: false,
             additive: false,
@@ -154,6 +219,7 @@ impl Surface {
             tint: [1.0; 3],
             alpha: 1.0,
             water: None,
+            refraction: None,
             missing: true,
             transform: None,
             frame: 0,
@@ -166,7 +232,14 @@ impl Surface {
     /// How it looks `time` seconds into the map: as the material sets it, then as its proxies
     /// change it.
     pub fn look(&self, time: f32) -> Look {
-        let mut look = Look { frame: self.frame, transform: self.transform.unwrap_or(IDENTITY), tint: self.tint, alpha: self.alpha };
+        let mut look = Look {
+            frame: self.frame,
+            transform: self.transform.unwrap_or(IDENTITY),
+            tint: self.tint,
+            alpha: self.alpha,
+            bump_transform: None,
+            time,
+        };
         if let Some(proxies) = &self.proxies {
             let vars = proxies.at(time);
             if let Some(frame) = vars.number("$frame") {
@@ -181,6 +254,7 @@ impl Surface {
             if let Some(alpha) = vars.number("$alpha") {
                 look.alpha = alpha.clamp(0.0, 1.0);
             }
+            look.bump_transform = vars.matrix("$bumptransform");
         }
         look
     }
@@ -212,6 +286,9 @@ pub struct Texture {
     /// As materials name it (`concrete/concretefloor001a`).
     pub name: String,
     pub vtf: Arc<Vtf>,
+    /// It holds directions or amounts, not colour: its texels are taken as they are, not as
+    /// sRGB (bump maps).
+    pub normal: bool,
 }
 
 /// A texture coordinate transform (`$basetexturetransform`): `center`, `scale`, `rotate`
@@ -299,6 +376,37 @@ pub struct World {
 }
 
 impl World {
+    /// The sky's colour, linear: its sides and top, each the smallest level of its texture
+    /// (what all of it comes to); grey without a sky.
+    pub fn sky_colour(&self) -> Vec3 {
+        let mut sum = [0.0f32; 3];
+        let mut count = 0.0;
+        for face in self.sky.iter().take(5).flatten() {
+            let Some(texture) = self.textures.get(face.texture) else { continue };
+            let vtf = &texture.vtf;
+            let Some(image) = vtf.rgba8(vtf.mipmaps.saturating_sub(1), 0, 0, 0) else { continue };
+            for texel in image.rgba.as_chunks::<4>().0 {
+                for (c, v) in texel[..3].iter().enumerate() {
+                    sum[c] += (f32::from(*v) / 255.0).powf(2.2);
+                }
+                count += 1.0;
+            }
+        }
+        if count == 0.0 { [0.5; 3] } else { sum.map(|c| c / count) }
+    }
+
+    /// Water reflects the sky: its reflection's tint times the sky's colour.
+    fn sky_on_water(mut self) -> World {
+        let sky = self.sky_colour();
+        let pieces = self.pieces.iter_mut().chain(self.skybox.iter_mut().flat_map(|s| s.pieces.iter_mut()));
+        for surface in pieces.flat_map(|p| p.surfaces.iter_mut()) {
+            if let Some(refraction) = surface.refraction.as_mut().filter(|r| r.water) {
+                refraction.reflection = std::array::from_fn(|i| refraction.reflection[i] * sky[i]);
+            }
+        }
+        self
+    }
+
     /// The triangles drawn: the world's and the 3D sky box's.
     pub fn triangles(&self) -> usize {
         let pieces = self.pieces.iter().chain(self.skybox.iter().flat_map(|s| &s.pieces));
@@ -456,6 +564,9 @@ pub fn place(vertices: &mut [Vertex], origin: Vec3, angles: Vec3) {
     for vertex in vertices {
         vertex.position = add(origin, turn(axes, vertex.position));
         vertex.normal = turn(axes, vertex.normal);
+        let [x, y, z, w] = vertex.tangent;
+        let [x, y, z] = turn(axes, [x, y, z]);
+        vertex.tangent = [x, y, z, w];
     }
 }
 
@@ -507,12 +618,22 @@ impl Gather<'_> {
     }
 
     fn texture(&mut self, name: &str) -> Option<usize> {
-        if let Some(&known) = self.by_name.get(name) {
+        self.texture_as(name, false)
+    }
+
+    /// A texture of directions or amounts ([`Texture::normal`]).
+    fn normal_texture(&mut self, name: &str) -> Option<usize> {
+        self.texture_as(name, true)
+    }
+
+    fn texture_as(&mut self, name: &str, normal: bool) -> Option<usize> {
+        let key = if normal { format!("{name} (normal)") } else { name.to_string() };
+        if let Some(&known) = self.by_name.get(&key) {
             return known;
         }
         let index = match self.library.texture(self.vfs, name) {
             Ok(vtf) => {
-                self.textures.push(Texture { name: name.to_string(), vtf });
+                self.textures.push(Texture { name: name.to_string(), vtf, normal });
                 Some(self.textures.len() - 1)
             }
             Err(_) => {
@@ -520,7 +641,7 @@ impl Gather<'_> {
                 None
             }
         };
-        self.by_name.insert(name.to_string(), index);
+        self.by_name.insert(key, index);
         index
     }
 
@@ -541,6 +662,11 @@ impl Gather<'_> {
         let mut s = Surface::plain(name, first, count);
         let Some(m) = material else { return s };
         s.missing = false;
+        // `$no_draw`: there, and not drawn (models hide their parts so)
+        if m.flag("$no_draw") {
+            s.count = 0;
+            return s;
+        }
         if let Some(texture) = m.texture("$basetexture") {
             s.base = self.texture(&texture);
         }
@@ -548,6 +674,25 @@ impl Gather<'_> {
             && let Some(texture) = m.texture("$basetexture2")
         {
             s.base2 = self.texture(&texture);
+        }
+        if let Some(texture) = m.texture("$detail")
+            && let Some(index) = self.texture(&texture)
+        {
+            s.detail = Some(Detail {
+                texture: index,
+                scale: m.float("$detailscale").unwrap_or(4.0),
+                blend: m.float("$detailblendfactor").unwrap_or(1.0).clamp(0.0, 1.0),
+                mode: m.float("$detailblendmode").unwrap_or(0.0) as u32,
+            });
+        }
+        // a model's is lit by the light around it, texel by texel
+        if m.shader.starts_with("lightmappedgeneric") || m.shader.starts_with("worldvertextransition") || m.shader == "vertexlitgeneric" {
+            s.bump = m.texture("$bumpmap").and_then(|t| self.normal_texture(&t)).map(|texture| Bump {
+                texture,
+                second: s.base2.and(m.texture("$bumpmap2")).and_then(|t| self.normal_texture(&t)),
+                self_shadowed: m.flag("$ssbump") && m.shader != "vertexlitgeneric",
+                transform: m.get("$bumptransform").and_then(proxy::transform).unwrap_or(IDENTITY),
+            });
         }
         if m.flag("$alphatest") {
             s.alpha_test = Some(m.float("$alphatestreference").filter(|&r| r > 0.0).unwrap_or(0.5));
@@ -561,6 +706,37 @@ impl Gather<'_> {
         s.lit = !m.shader.starts_with("unlit");
         if m.shader == "water" {
             s.water = Some(m.vector("$fogcolor").unwrap_or([0.1, 0.2, 0.25]));
+            s.translucent = true;
+            s.lit = false;
+            // seen from above: what is under it through it, the sky on it
+            if m.float("$abovewater").is_none_or(|a| a != 0.0) {
+                let normal = m.texture("$normalmap").and_then(|t| self.normal_texture(&t));
+                let scroll = |name: &str| m.vector(name).map_or([0.0; 2], |v| [v[0], v[1]]);
+                s.refraction = Some(Refraction {
+                    water: true,
+                    amount: m.float("$refractamount").unwrap_or(1.0),
+                    tint: m.vector("$refracttint").unwrap_or([1.0; 3]),
+                    tint_texture: None,
+                    fog: [m.float("$fogstart").unwrap_or(0.0), m.float("$fogend").unwrap_or(1024.0)],
+                    reflection: m.vector("$reflecttint").unwrap_or([1.0; 3]),
+                    scroll: [scroll("$scroll1"), scroll("$scroll2")],
+                });
+                s.bump = normal.map(|texture| Bump { texture, second: Some(texture), self_shadowed: false, transform: IDENTITY });
+            }
+        }
+        if m.shader == "refract" {
+            let normal = m.texture("$normalmap").or_else(|| m.texture("$dudvmap")).and_then(|t| self.normal_texture(&t));
+            s.refraction = Some(Refraction {
+                water: false,
+                amount: m.float("$refractamount").unwrap_or(0.5),
+                tint: m.vector("$refracttint").unwrap_or([1.0; 3]),
+                tint_texture: m.texture("$refracttinttexture").and_then(|t| self.texture(&t)),
+                fog: [0.0; 2],
+                reflection: [0.0; 3],
+                scroll: [[0.0; 2]; 2],
+            });
+            let transform = m.get("$bumptransform").and_then(proxy::transform).unwrap_or(IDENTITY);
+            s.bump = normal.map(|texture| Bump { texture, second: None, self_shadowed: false, transform });
             s.translucent = true;
             s.lit = false;
         }
@@ -616,6 +792,7 @@ fn gather_map(vfs: &Vfs, bsp: &Bsp, moving: bool) -> World {
         missing_textures: gather.missing_textures,
         missing_models,
     }
+    .sky_on_water()
 }
 
 /// The world and the brush entities, each moved to where it stands: those outside the 3D sky
@@ -667,7 +844,15 @@ fn brush_piece(bsp: &Bsp, gather: &mut Gather, materials: &mut HashMap<usize, Op
     let vertices: Vec<Vertex> = mesh
         .vertices
         .iter()
-        .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: v.lightmap_uv, alpha: v.alpha, light: [1.0; 3] })
+        .map(|v| Vertex {
+            position: v.position,
+            normal: v.normal,
+            uv: v.uv,
+            lightmap_uv: v.lightmap_uv,
+            alpha: v.alpha,
+            light: [1.0; 3],
+            tangent: [0.0; 4],
+        })
         .collect();
     let mut surfaces = Vec::new();
     for batch in &mesh.batches {
@@ -743,6 +928,7 @@ fn static_props(bsp: &Bsp, gather: &mut Gather, sky_area: Option<u16>, [world, s
                 lightmap_uv: [0.0; 2],
                 alpha: 0.0,
                 light: mesh.light.as_ref().map_or([1.0; 3], |light| light[i]),
+                tangent: mesh.tangents.get(i).copied().unwrap_or_default(),
             })
             .collect();
         place(&mut vertices, prop.origin, prop.angles);
@@ -815,7 +1001,16 @@ pub fn model(vfs: &Vfs, name: &str, skin: usize, body: usize) -> io::Result<Worl
     let vertices = mesh
         .vertices
         .iter()
-        .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv, lightmap_uv: [0.0; 2], alpha: 0.0, light: [1.0; 3] })
+        .zip(mesh.tangents.iter().copied().chain(std::iter::repeat([0.0; 4])))
+        .map(|(v, tangent)| Vertex {
+            position: v.position,
+            normal: v.normal,
+            uv: v.uv,
+            lightmap_uv: [0.0; 2],
+            alpha: 0.0,
+            light: [1.0; 3],
+            tangent,
+        })
         .collect();
     let bones = mesh.vertices.iter().map(weights).collect();
     let surfaces = model_surfaces(&mut gather, &model, &mesh);

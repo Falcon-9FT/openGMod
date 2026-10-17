@@ -22,7 +22,7 @@
 //! weapon falls (unless `SF_NPC_NO_WEAPON_DROP`), a health vial with `SF_NPC_DROP_HEALTHKIT`,
 //! and the NPC goes, leaving a corpse: a ragdoll of its model posed as it was drawn and pushed
 //! by the killing blow ([`crate::ragdoll`]). As in GMod the corpse is the client's by default -
-//! it lies on the world and what does not move, nothing traces or walks into it - and a
+//! it lies on the world and goes through everything else, nothing traces or walks into it - and a
 //! `prop_ragdoll` of the server's with `ai_serverragdolls 1` (and `CreateEntityRagdoll`). A
 //! model that cannot be a ragdoll leaves none; with `SF_NPC_FADE_CORPSE`, which sandbox
 //! always sets, the corpse fades a while later, and of the client's there are 32 at most, the
@@ -797,6 +797,16 @@ fn die(lua: &Lua, handle: EntityHandle, info: &DamageInfo) {
     let valid = |h: Option<EntityHandle>| h.filter(|&h| host(lua).entities.is_valid(h)).unwrap_or(EntityHandle::NULL);
     let (attacker, inflictor) = (valid(info.attacker), valid(info.inflictor));
     hook(lua, "OnNPCKilled", [value(lua, handle), value(lua, attacker), value(lua, inflictor)]);
+    {
+        use crate::gameevent::{Field, index};
+        let fields = vec![
+            ("entindex_killed", Field::Int(index(Some(handle)))),
+            ("entindex_attacker", Field::Int(index(Some(attacker)))),
+            ("entindex_inflictor", Field::Int(index(Some(inflictor)))),
+            ("damagebits", Field::Int(info.kind)),
+        ];
+        crate::gameevent::fire(lua, "entity_killed", fields);
+    }
     crate::outputs::fire(lua, handle, "OnDeath", attacker, handle, None);
     let flags = host(lua).entities.get(handle).map_or(0, |e| e.spawn_flags);
     let item = drop_weapon(lua, handle);
@@ -860,10 +870,10 @@ fn corpse(lua: &Lua, handle: EntityHandle, info: &DamageInfo, fades: bool) -> ml
     {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
-        // the client's corpse is pushed by nothing that moves on the server
+        // the client's corpse lies on the world and goes through everything else
         if !server {
             for &id in &parts {
-                physics.set_aloof(id, true);
+                physics.set_collision_group(id, gmod_physics::WORLD_ONLY);
             }
         }
     }
@@ -1012,7 +1022,7 @@ fn think(lua: &Lua, handle: EntityHandle, now: f64) {
             });
         }
     }
-    crate::ai::think(lua, handle, timer::TICK_INTERVAL);
+    crate::ai::think(lua, handle, timer::tick_interval());
 }
 
 /// Where an NPC's eyes are: near the top of its box.

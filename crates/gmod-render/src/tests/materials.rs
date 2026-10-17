@@ -46,6 +46,8 @@ fn square(proxies: &str, frames: &[Vec<[u8; 4]>]) -> World {
         count: 6,
         base: Some(0),
         base2: None,
+        detail: None,
+        bump: None,
         alpha_test: None,
         translucent: false,
         additive: false,
@@ -55,6 +57,7 @@ fn square(proxies: &str, frames: &[Vec<[u8; 4]>]) -> World {
         tint: [1.0; 3],
         alpha: 1.0,
         water: None,
+        refraction: None,
         missing: false,
         transform: None,
         frame: 0,
@@ -65,7 +68,7 @@ fn square(proxies: &str, frames: &[Vec<[u8; 4]>]) -> World {
     let vtf = Vtf::parse(vtf_bytes(4, frames)).unwrap();
     World {
         pieces: vec![Piece { vertices, indices: vec![0, 1, 2, 0, 2, 3], lightmap: None, surfaces: vec![surface], skin: Vec::new() }],
-        textures: vec![gmod_world::Texture { name: "square".to_string(), vtf: Arc::new(vtf) }],
+        textures: vec![gmod_world::Texture { name: "square".to_string(), vtf: Arc::new(vtf), normal: false }],
         sky: Default::default(),
         skybox: None,
         fog: None,

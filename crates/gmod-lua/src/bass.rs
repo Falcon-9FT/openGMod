@@ -45,7 +45,10 @@ impl UserData for Channel {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| crate::meta::lookup(lua, NAME, key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| crate::meta::index(lua, NAME, ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            crate::meta::new_index(lua, NAME, ud, key, value)
+        });
         methods.add_meta_method("__tostring", |lua, this, ()| {
             Ok(format!("{NAME} [{}]", with(lua, *this, |c| c.file.clone()).unwrap_or_default()))
         });

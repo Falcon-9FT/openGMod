@@ -73,11 +73,15 @@ fn draw(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, camera: &Came
 
 /// Draws what `renderer` has from `camera` into a 64 x 64 picture, rows of 256 bytes.
 fn picture(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut Renderer, camera: &Camera) -> Vec<u8> {
-    read_back(device, queue, |encoder, view| renderer.render(device, queue, encoder, view, (64, 64), camera))
+    read_back(device, queue, |encoder, view, texture| renderer.render(device, queue, encoder, view, texture, (64, 64), camera))
 }
 
 /// A 64 x 64 picture of what `draw` draws, rows of 256 bytes.
-fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, draw: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView)) -> Vec<u8> {
+fn read_back(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    draw: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView, &wgpu::Texture),
+) -> Vec<u8> {
     let (width, height) = (64u32, 64u32);
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("picture"),
@@ -91,7 +95,7 @@ fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, draw: impl FnOnce(&mut 
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test") });
-    draw(&mut encoder, &view);
+    draw(&mut encoder, &view, &target);
     // rows of 256 bytes: what copies out of a texture need
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -151,6 +155,8 @@ fn square_model() -> World {
         count: 6,
         base: None,
         base2: None,
+        detail: None,
+        bump: None,
         alpha_test: None,
         translucent: false,
         additive: false,
@@ -160,6 +166,7 @@ fn square_model() -> World {
         tint: [1.0; 3],
         alpha: 1.0,
         water: None,
+        refraction: None,
         missing: true,
         transform: None,
         frame: 0,
@@ -282,6 +289,8 @@ fn square(bone: Option<u8>) -> World {
         count: 6,
         base: None,
         base2: None,
+        detail: None,
+        bump: None,
         alpha_test: None,
         translucent: false,
         additive: false,
@@ -291,6 +300,7 @@ fn square(bone: Option<u8>) -> World {
         tint: [1.0; 3],
         alpha: 1.0,
         water: None,
+        refraction: None,
         missing: true,
         transform: None,
         frame: 0,
@@ -408,7 +418,7 @@ fn draws_the_2d_over_the_picture() {
     overlay.set_image(&device, &queue, 7, Some((1, 1, &[0, 0, 255, 255])));
     assert!(overlay.missing_images(&canvas).is_empty());
 
-    let pixels = read_back(&device, &queue, |encoder, view| {
+    let pixels = read_back(&device, &queue, |encoder, view, _| {
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -443,10 +453,39 @@ fn draws_a_model_alone_for_its_icon() {
     let model = renderer.add_model(&device, &queue, &square_model());
     // from above its middle: the square fills the middle, nothing of the map around it
     let above = Camera::looking_at([32.0, 32.0, 200.0], [32.0, 32.1, 0.0], 30.0);
-    let pixels = read_back(&device, &queue, |encoder, view| renderer.render_model(&device, &queue, encoder, view, (64, 64), &above, model));
+    let pixels =
+        read_back(&device, &queue, |encoder, view, _| renderer.render_model(&device, &queue, encoder, view, (64, 64), &above, model));
     let middle = at(&pixels, 32, 32);
     // the missing texture's purple or black, however a GPU lights it (WARP: darker)
     assert!(middle[3] == 255 && middle[1] < 40 && middle[0].abs_diff(middle[2]) < 40, "{middle:?}");
     assert_eq!(at(&pixels, 0, 0)[3], 0, "nothing where the model is not");
     assert!((0..64 * 64).all(|i| !red(at(&pixels, i % 64, i / 64))), "none of the map's red floor");
+}
+
+#[test]
+fn glass_shows_what_is_behind_it_tinted() {
+    let Some((device, queue)) = device_or_skip() else { return };
+    let above = Camera::looking_at([64.0, 64.0, 200.0], [64.0, 64.1, 0.0], 75.0);
+    // a `Refract` square over the red floor: no texture of its own, the floor seen through it,
+    // half as red
+    let mut glass = square(None);
+    let surface = &mut glass.pieces[0].surfaces[0];
+    surface.refraction = Some(gmod_world::Refraction {
+        water: false,
+        amount: 0.0,
+        tint: [0.5, 1.0, 1.0],
+        tint_texture: None,
+        fog: [0.0; 2],
+        reflection: [0.0; 3],
+        scroll: [[0.0; 2]; 2],
+    });
+    (surface.translucent, surface.lit, surface.missing) = (true, false, false);
+    let mut renderer = Renderer::new(&device, &queue, FORMAT, &test_map());
+    let model = renderer.add_model(&device, &queue, &glass);
+    renderer.set_entities(vec![Placed { model, origin: [32.0, 32.0, 32.0], scale: 1.0, ..Placed::default() }]);
+    let pixels = picture(&device, &queue, &mut renderer, &above);
+    let purple = |p: &[u8]| p[0] > 120 && p[2] > 120 && p[1] < 40;
+    let dimmed = |p: &[u8]| (150..230).contains(&p[0]) && p[1] < 40 && p[2] < 40;
+    assert_eq!(middle(&pixels, purple), 0, "the missing texture on glass");
+    assert!(middle(&pixels, dimmed) > 16 * 16 / 4, "the floor is not seen through it: {:?}", at(&pixels, 32, 32));
 }

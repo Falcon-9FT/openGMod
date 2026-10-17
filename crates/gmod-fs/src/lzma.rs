@@ -1,5 +1,6 @@
 //! LZMA decoding: old workshop downloads are LZMA streams around a GMA file (`.bin`), and
-//! map lumps may be LZMA-compressed too.
+//! map lumps may be LZMA-compressed too. And encoding, of the "alone" container, as GMod's
+//! `util.Compress` makes it: [`compress_alone`].
 //!
 //! Written from the LZMA specification that comes with the LZMA SDK (public domain). The
 //! output is kept in memory as a whole and serves as the dictionary, so no window is needed.
@@ -332,6 +333,298 @@ fn decode(input: &[u8], lc: u32, lp: u32, pb: u32, size: Option<u64>, max_output
     Ok(out)
 }
 
+/// The properties byte of what [`compress_alone`] makes: `lc` 3, `lp` 0, `pb` 2.
+const PROPERTIES: u8 = (2 * 5) * 9 + 3;
+/// How far back a match may be: the dictionary the header names.
+const WINDOW: usize = 1 << 20;
+/// The longest match LZMA has.
+const MATCH_MAX_LEN: usize = 273;
+/// How many earlier places of the same three bytes are tried for a match.
+const CHAIN: usize = 48;
+
+/// Compresses data into an "alone" stream (`.lzma`), its size in the header, without an end
+/// marker - what GMod's `util.Compress` gives and `util.Decompress` takes. Literals and
+/// matches found greedily along chains of three-byte hashes, the last distance tried first.
+pub fn compress_alone(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13 + data.len() / 2);
+    out.push(PROPERTIES);
+    out.extend_from_slice(&(WINDOW as u32).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    let mut encoder = Encoder::new(out);
+    encoder.encode(data);
+    encoder.rc.finish()
+}
+
+struct RangeEncoder {
+    out: Vec<u8>,
+    low: u64,
+    range: u32,
+    cache: u8,
+    cache_size: u64,
+}
+
+impl RangeEncoder {
+    fn shift_low(&mut self) {
+        if (self.low as u32) < 0xFF00_0000 || (self.low >> 32) != 0 {
+            let carry = (self.low >> 32) as u8;
+            let mut byte = self.cache;
+            loop {
+                self.out.push(byte.wrapping_add(carry));
+                byte = 0xFF;
+                self.cache_size -= 1;
+                if self.cache_size == 0 {
+                    break;
+                }
+            }
+            self.cache = (self.low >> 24) as u8;
+        }
+        self.cache_size += 1;
+        self.low = (self.low & 0x00FF_FFFF) << 8;
+    }
+
+    fn bit(&mut self, prob: &mut u16, bit: usize) {
+        let bound = (self.range >> BIT_MODEL_TOTAL_BITS) * *prob as u32;
+        if bit == 0 {
+            self.range = bound;
+            *prob += (BIT_MODEL_TOTAL - *prob) >> MOVE_BITS;
+        } else {
+            self.low += u64::from(bound);
+            self.range -= bound;
+            *prob -= *prob >> MOVE_BITS;
+        }
+        while self.range < TOP_VALUE {
+            self.range <<= 8;
+            self.shift_low();
+        }
+    }
+
+    fn direct_bits(&mut self, value: u32, count: u32) {
+        for i in (0..count).rev() {
+            self.range >>= 1;
+            if (value >> i) & 1 != 0 {
+                self.low += u64::from(self.range);
+            }
+            while self.range < TOP_VALUE {
+                self.range <<= 8;
+                self.shift_low();
+            }
+        }
+    }
+
+    fn tree(&mut self, probs: &mut [u16], bits: u32, symbol: u32) {
+        let mut m = 1usize;
+        for i in (0..bits).rev() {
+            let bit = ((symbol >> i) & 1) as usize;
+            self.bit(&mut probs[m], bit);
+            m = (m << 1) | bit;
+        }
+    }
+
+    fn tree_reverse(&mut self, probs: &mut [u16], bits: u32, symbol: u32) {
+        let mut m = 1usize;
+        for i in 0..bits {
+            let bit = ((symbol >> i) & 1) as usize;
+            self.bit(&mut probs[m], bit);
+            m = (m << 1) | bit;
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        for _ in 0..5 {
+            self.shift_low();
+        }
+        self.out
+    }
+}
+
+struct LenEncoder {
+    probs: LenDecoder,
+}
+
+impl LenEncoder {
+    /// A match length, less [`MATCH_MIN_LEN`].
+    fn encode(&mut self, rc: &mut RangeEncoder, len: usize, pos_state: usize) {
+        let p = &mut self.probs;
+        if len < 8 {
+            rc.bit(&mut p.choice, 0);
+            rc.tree(&mut p.low[pos_state], 3, len as u32);
+        } else if len < 16 {
+            rc.bit(&mut p.choice, 1);
+            rc.bit(&mut p.choice2, 0);
+            rc.tree(&mut p.mid[pos_state], 3, (len - 8) as u32);
+        } else {
+            rc.bit(&mut p.choice, 1);
+            rc.bit(&mut p.choice2, 1);
+            rc.tree(&mut p.high, 8, (len - 16) as u32);
+        }
+    }
+}
+
+/// The models of the decoder, kept by the encoder as the decoder will.
+struct Encoder {
+    rc: RangeEncoder,
+    literal: Vec<u16>,
+    is_match: [u16; STATES * POS_STATES_MAX],
+    is_rep: [u16; STATES],
+    is_rep_g0: [u16; STATES],
+    is_rep0_long: [u16; STATES * POS_STATES_MAX],
+    pos_slot: [[u16; 64]; LEN_TO_POS_STATES],
+    pos_encoders: [u16; 1 + FULL_DISTANCES - END_POS_MODEL_INDEX as usize],
+    align: [u16; 1 << ALIGN_BITS],
+    len: LenEncoder,
+    rep_len: LenEncoder,
+    state: usize,
+    reps: [u32; 4],
+}
+
+const LC: u32 = 3;
+const PB_MASK: usize = 3;
+
+impl Encoder {
+    fn new(out: Vec<u8>) -> Encoder {
+        Encoder {
+            rc: RangeEncoder { out, low: 0, range: u32::MAX, cache: 0, cache_size: 1 },
+            literal: vec![PROB_INIT; 0x300 << LC],
+            is_match: [PROB_INIT; STATES * POS_STATES_MAX],
+            is_rep: [PROB_INIT; STATES],
+            is_rep_g0: [PROB_INIT; STATES],
+            is_rep0_long: [PROB_INIT; STATES * POS_STATES_MAX],
+            pos_slot: [[PROB_INIT; 64]; LEN_TO_POS_STATES],
+            pos_encoders: [PROB_INIT; 1 + FULL_DISTANCES - END_POS_MODEL_INDEX as usize],
+            align: [PROB_INIT; 1 << ALIGN_BITS],
+            len: LenEncoder { probs: LenDecoder::new() },
+            rep_len: LenEncoder { probs: LenDecoder::new() },
+            state: 0,
+            reps: [0; 4],
+        }
+    }
+
+    fn encode(&mut self, data: &[u8]) {
+        const HASH_BITS: u32 = 16;
+        let hash = |i: usize| -> usize {
+            let v = u32::from(data[i]) | u32::from(data[i + 1]) << 8 | u32::from(data[i + 2]) << 16;
+            (v.wrapping_mul(2_654_435_761) >> (32 - HASH_BITS)) as usize
+        };
+        let mut head = vec![usize::MAX; 1 << HASH_BITS];
+        let mut prev = vec![usize::MAX; data.len()];
+        let insert = |i: usize, head: &mut [usize], prev: &mut [usize]| {
+            if i + 2 < data.len() {
+                let h = hash(i);
+                prev[i] = head[h];
+                head[h] = i;
+            }
+        };
+        let same = |a: usize, b: usize, most: usize| (0..most).take_while(|&k| data[a + k] == data[b + k]).count();
+        let mut pos = 0;
+        while pos < data.len() {
+            let most = (data.len() - pos).min(MATCH_MAX_LEN);
+            // the last distance again, then the earlier places of these three bytes
+            let rep_at = pos.checked_sub(self.reps[0] as usize + 1);
+            let rep_len = rep_at.map_or(0, |at| same(at, pos, most));
+            let (mut best_len, mut best_at) = (0, 0);
+            if most >= 3 {
+                let mut candidate = head[hash(pos)];
+                for _ in 0..CHAIN {
+                    if candidate == usize::MAX || pos - candidate > WINDOW {
+                        break;
+                    }
+                    let len = same(candidate, pos, most);
+                    if len > best_len {
+                        (best_len, best_at) = (len, candidate);
+                        if len == most {
+                            break;
+                        }
+                    }
+                    candidate = prev[candidate];
+                }
+            }
+            let taken = if rep_len >= 2 && rep_len + 1 >= best_len {
+                self.rep0(pos, rep_len);
+                rep_len
+            } else if best_len >= 3 {
+                self.matched(pos, best_len, (pos - best_at - 1) as u32);
+                best_len
+            } else {
+                self.literal(data, pos);
+                1
+            };
+            for i in pos..pos + taken {
+                insert(i, &mut head, &mut prev);
+            }
+            pos += taken;
+        }
+    }
+
+    fn literal(&mut self, data: &[u8], pos: usize) {
+        let pos_state = pos & PB_MASK;
+        self.rc.bit(&mut self.is_match[(self.state << 4) + pos_state], 0);
+        let previous = if pos > 0 { data[pos - 1] as usize } else { 0 };
+        let lit_state = previous >> (8 - LC);
+        let probs = &mut self.literal[lit_state * 0x300..(lit_state + 1) * 0x300];
+        let byte = data[pos] as usize;
+        let mut symbol = 1usize;
+        // after a match, the byte at the last distance guides the first bits
+        let mut matching = self.state >= 7;
+        let match_byte = if matching { data[pos - self.reps[0] as usize - 1] as usize } else { 0 };
+        for i in (0..8).rev() {
+            let bit = (byte >> i) & 1;
+            if matching {
+                let match_bit = (match_byte >> i) & 1;
+                self.rc.bit(&mut probs[((1 + match_bit) << 8) + symbol], bit);
+                matching = match_bit == bit;
+            } else {
+                self.rc.bit(&mut probs[symbol], bit);
+            }
+            symbol = (symbol << 1) | bit;
+        }
+        self.state = match self.state {
+            0..=3 => 0,
+            4..=9 => self.state - 3,
+            _ => self.state - 6,
+        };
+    }
+
+    /// A match at the last distance (`rep0`), `len` long.
+    fn rep0(&mut self, pos: usize, len: usize) {
+        let pos_state = pos & PB_MASK;
+        self.rc.bit(&mut self.is_match[(self.state << 4) + pos_state], 1);
+        self.rc.bit(&mut self.is_rep[self.state], 1);
+        self.rc.bit(&mut self.is_rep_g0[self.state], 0);
+        self.rc.bit(&mut self.is_rep0_long[(self.state << 4) + pos_state], 1);
+        self.rep_len.encode(&mut self.rc, len - MATCH_MIN_LEN, pos_state);
+        self.state = if self.state < 7 { 8 } else { 11 };
+    }
+
+    /// A match `distance + 1` back, `len` long.
+    fn matched(&mut self, pos: usize, len: usize, distance: u32) {
+        let pos_state = pos & PB_MASK;
+        self.rc.bit(&mut self.is_match[(self.state << 4) + pos_state], 1);
+        self.rc.bit(&mut self.is_rep[self.state], 0);
+        let len = len - MATCH_MIN_LEN;
+        self.len.encode(&mut self.rc, len, pos_state);
+        self.state = if self.state < 7 { 7 } else { 10 };
+        let slot = if distance < 4 {
+            distance
+        } else {
+            let n = 31 - distance.leading_zeros();
+            (n << 1) | ((distance >> (n - 1)) & 1)
+        };
+        self.rc.tree(&mut self.pos_slot[len.min(LEN_TO_POS_STATES - 1)], 6, slot);
+        if slot >= 4 {
+            let direct = (slot >> 1) - 1;
+            let base = (2 | (slot & 1)) << direct;
+            let reduced = distance - base;
+            if slot < END_POS_MODEL_INDEX {
+                self.rc.tree_reverse(&mut self.pos_encoders[(base - slot) as usize..], direct, reduced);
+            } else {
+                self.rc.direct_bits(reduced >> ALIGN_BITS, direct - ALIGN_BITS);
+                self.rc.tree_reverse(&mut self.align, ALIGN_BITS, reduced & ((1 << ALIGN_BITS) - 1));
+            }
+        }
+        self.reps = [distance, self.reps[0], self.reps[1], self.reps[2]];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +657,31 @@ mod tests {
     fn unhex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn what_is_compressed_comes_back() {
+        let mut long = Vec::new();
+        for i in 0..200_000u32 {
+            long.push((i.wrapping_mul(2_654_435_761) >> 13) as u8 % 7);
+        }
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"a".to_vec(),
+            b"hello hello hello".to_vec(),
+            vec![0; 5000],
+            sample(),
+            (0..=255u8).cycle().take(70_000).collect(),
+            long,
+        ];
+        for data in cases {
+            let packed = compress_alone(&data);
+            assert_eq!(decompress_alone(&packed, 1 << 24).unwrap(), data, "{} bytes", data.len());
+        }
+        // what repeats becomes small
+        let text = sample();
+        assert!(compress_alone(&text).len() < text.len() / 2, "{}", compress_alone(&text).len());
+        assert!(compress_alone(&[0; 5000]).len() < 100);
     }
 
     #[test]

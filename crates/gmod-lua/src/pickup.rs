@@ -193,7 +193,7 @@ pub(crate) fn think(lua: &Lua) {
             continue;
         }
         let origin = target - c.middle.rotated(angles);
-        let seconds = (crate::timer::TICK_INTERVAL as f32) * 4.0;
+        let seconds = (crate::timer::tick_interval() as f32) * 4.0;
         host(lua).physics.physics.borrow_mut().steer(
             body,
             [origin.x, origin.y, origin.z],

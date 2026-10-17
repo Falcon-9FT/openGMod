@@ -358,6 +358,15 @@ const MATERIAL: &str = r#"
     {
         "$basetexture" "dx8"
     }
+    "LightmappedGeneric_DX9"
+    {
+        "$detailblendfactor" ".5"
+        "$reflectivity" "[1 1 1]"
+    }
+    "LightmappedGeneric_HDR_DX9"
+    {
+        "$reflectivity" "[.5 .5 .5]"
+    }
     "Proxies"
     {
         "AnimatedTexture" { "animatedtexturevar" "$basetexture" }
@@ -387,6 +396,10 @@ fn material_parameters() {
     assert!(m.flag("$translucent") && !m.flag("$alphatest") && !m.flag("$nocull"));
     assert_eq!(m.texture("$detail").as_deref(), Some("detail/noise"));
     assert_eq!(m.get("$detailscale"), None);
+    assert_eq!(m.vector("$reflectivity"), Some([0.5; 3]), "the shader's HDR block for DirectX 9 counts");
+    assert_eq!(m.get("$detailblendfactor"), None, "and the plain one not with it");
+    let plain = material("\"LightmappedGeneric\" { \"$basetexture\" a \"LightmappedGeneric_DX9\" { \"$bumpmap\" b } }");
+    assert_eq!(plain.texture("$bumpmap").as_deref(), Some("b"));
     assert!(m.proxies().is_some_and(|p| p.block("animatedtexture").is_some()));
     assert_eq!(m.params().first().map(|(n, _)| n.as_str()), Some("$basetexture"));
 

@@ -157,6 +157,16 @@ pub(crate) fn say(lua: &Lua, speaker: EntityHandle, text: &str, team: bool) {
     if text.is_empty() {
         return;
     }
+    if player {
+        use crate::gameevent::Field;
+        let fields = vec![
+            ("priority", Field::Int(1)),
+            ("userid", Field::Int(crate::gameevent::user_id(lua, speaker))),
+            ("text", Field::Text(text.clone())),
+            ("teamonly", Field::Int(i64::from(team))),
+        ];
+        crate::gameevent::fire(lua, "player_say", fields);
+    }
     let dead = player && !crate::player::state(lua, speaker, |_, p| p.alive).unwrap_or(true);
     let speaker_team = crate::player::state(lua, speaker, |_, p| p.team);
     for listener in crate::player::all(lua) {

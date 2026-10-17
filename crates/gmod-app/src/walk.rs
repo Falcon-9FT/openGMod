@@ -5,7 +5,10 @@ use gmod_bsp::Collision;
 use gmod_movement::{Command, FULL_MOVE, Player, Settings, buttons};
 
 /// A tick: 66⅔ a second, as Garry's Mod runs by default.
-pub const TICK: f32 = 0.015;
+/// A tick of the game's.
+fn tick() -> f32 {
+    gmod_lua::timer::tick_interval() as f32
+}
 
 /// The keys that move a player, held or not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -50,13 +53,13 @@ impl Walker {
     /// last two ticks, so that the picture moves smoothly at any frame rate.
     pub fn advance(&mut self, world: &Collision, settings: &Settings, command: &Command, seconds: f32) -> [f32; 3] {
         self.lag += seconds;
-        while self.lag >= TICK {
+        while self.lag >= tick() {
             self.last_eye = self.player.eye();
-            self.player.tick(world, settings, command, TICK);
-            self.lag -= TICK;
+            self.player.tick(world, settings, command, tick());
+            self.lag -= tick();
         }
         let (from, to) = (self.last_eye, self.player.eye());
-        let t = self.lag / TICK;
+        let t = self.lag / tick();
         std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t)
     }
 }
@@ -96,7 +99,7 @@ mod tests {
         let mut player = Player::spawn(&world, &settings, [0.0, 0.0, 100.0]).unwrap();
         let ticks: Vec<f32> = (0..2)
             .map(|_| {
-                player.tick(&world, &settings, &still, TICK);
+                player.tick(&world, &settings, &still, tick());
                 player.eye()[2]
             })
             .collect();

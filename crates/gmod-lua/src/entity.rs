@@ -111,6 +111,10 @@ pub struct Ent {
     pub vehicle_class: String,
     pub use_type: i64,
     pub trigger: bool,
+    /// Lua asked to be asked whether it collides (`SetCustomCollisionCheck`): kept, though the
+    /// `ShouldCollide` hook is not asked yet.
+    #[serde(default)]
+    pub custom_collision_check: bool,
     pub custom_collisions: bool,
     /// Kept across map loads by sandbox (`SetPersistent`).
     pub persistent: bool,
@@ -134,6 +138,13 @@ pub struct Ent {
     /// Its model was drawn by Lua this frame (`DrawModel`), the client's ([`crate::ents::drawn`]).
     #[serde(skip)]
     pub lua_drawn: bool,
+    /// It is an effect of Lua (`util.Effect`): it thinks and draws as one, and nothing else
+    /// draws it ([`crate::effect`]).
+    #[serde(skip)]
+    pub effect: bool,
+    /// On fire (`Ignite`), the server's ([`crate::fire`]); clients see `FL_ONFIRE`.
+    #[serde(skip)]
+    pub burning: Option<crate::fire::Burning>,
     pub draw_shadow: bool,
     pub model_scale: f32,
     /// Body groups set: number and value.
@@ -255,6 +266,7 @@ impl Ent {
             vehicle_class: String::new(),
             use_type: 0,
             trigger: false,
+            custom_collision_check: false,
             custom_collisions: false,
             persistent: false,
             transmit_with_parent: false,
@@ -266,6 +278,8 @@ impl Ent {
             motion_controller: false,
             motion_objects: Vec::new(),
             lua_drawn: false,
+            effect: false,
+            burning: None,
             draw_shadow: true,
             model_scale: 1.0,
             body_groups: Vec::new(),
@@ -489,7 +503,7 @@ pub fn rotated_bounds(mins: Vector, maxs: Vector, angles: Angle) -> (Vector, Vec
 
 const CACHE: &str = "gmod-lua.entities";
 /// `SOLID_VPHYSICS`: the entity collides as its physics body.
-const SOLID_VPHYSICS: i64 = 6;
+pub(crate) const SOLID_VPHYSICS: i64 = 6;
 const NULL_ENTITY: &str = "gmod-lua.null-entity";
 
 /// The engine's types that are not entities: name, type ID, and whether only clients have it.
@@ -545,7 +559,10 @@ impl UserData for PhysObjHandle {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "PhysObj", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "PhysObj", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "PhysObj", ud, key, value)
+        });
         methods.add_meta_function("__tostring", |lua, ud: AnyUserData| {
             let phys = *ud.borrow::<PhysObjHandle>()?;
             if !crate::physics::valid(lua, phys) {
@@ -697,6 +714,18 @@ fn read<R>(a: &Args, f: impl FnOnce(&Ent) -> R) -> mlua::Result<R> {
     Ok(f(&ent))
 }
 
+/// Changes how an entity collides: its bodies follow - its group, and whether it is solid
+/// when that changed.
+fn write_solidity(a: &Args, f: impl FnOnce(&mut Ent)) -> mlua::Result<Value> {
+    let handle = this(a, 1)?;
+    let solid = |ent: &Ent| ent.solid != 0 && ent.solid_flags & 4 == 0;
+    let before = host(a.lua).entities.get(handle).map(|e| solid(&e));
+    host(a.lua).entities.with_mut(handle, f);
+    let after = host(a.lua).entities.get(handle).map(|e| solid(&e));
+    crate::physics::sync_collisions(a.lua, handle, before != after);
+    Ok(Value::Nil)
+}
+
 fn write(a: &Args, f: impl FnOnce(&mut Ent)) -> mlua::Result<Value> {
     let handle = this(a, 1)?;
     host(a.lua).entities.with_mut(handle, f);
@@ -773,8 +802,10 @@ pub(crate) fn set_model(lua: &Lua, handle: EntityHandle, model: &str) {
 }
 
 /// `IsPlayer` and the like: whether an entity is of a kind.
+/// `IsPlayer` and the like: false for NULL, as in GMod, rather than an error.
 fn is_kind(a: &Args, kind: Kind) -> mlua::Result<Value> {
-    Ok(Value::Boolean(read(a, |ent| ent.kind == kind)?))
+    let handle = a.userdata::<EntityHandle>(1, "Entity")?;
+    Ok(Value::Boolean(host(a.lua).entities.get(handle).is_some_and(|ent| ent.kind == kind)))
 }
 
 fn color_part(a: &Args, position: usize) -> mlua::Result<u8> {
@@ -808,6 +839,7 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     }
 
     crate::physics::install(lua)?;
+    crate::physenv::install(lua)?;
 
     let def = |name: &'static str, f: fn(&Args) -> mlua::Result<Value>| -> mlua::Result<()> {
         entity.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
@@ -900,7 +932,10 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("IsWeapon", |a| is_kind(a, Kind::Weapon))?;
     def("IsVehicle", |a| is_kind(a, Kind::Vehicle))?;
     def("IsNextBot", |a| is_kind(a, Kind::NextBot))?;
-    def("IsRagdoll", |a| Ok(Value::Boolean(read(a, |ent| ent.class.eq_ignore_ascii_case("prop_ragdoll"))?)))?;
+    def("IsRagdoll", |a| {
+        let handle = a.userdata::<EntityHandle>(1, "Entity")?;
+        Ok(Value::Boolean(host(a.lua).entities.get(handle).is_some_and(|ent| ent.class.eq_ignore_ascii_case("prop_ragdoll"))))
+    })?;
     def("IsScripted", |a| Ok(Value::Boolean(read(a, |ent| ent.scripted)?)))?;
     def("CreatedByMap", |a| Ok(Value::Boolean(read(a, |ent| ent.map_creation_id.is_some())?)))?;
     def("MapCreationID", |a| integer(read(a, |ent| ent.map_creation_id.unwrap_or(-1))?.into()))?;
@@ -1414,31 +1449,31 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
     def("GetSolid", |a| integer(read(a, |ent| ent.solid)?))?;
     def("SetSolid", |a| {
         let solid = a.number(2)? as i64;
-        write(a, |ent| ent.solid = solid)
+        write_solidity(a, |ent| ent.solid = solid)
     })?;
     def("GetSolidFlags", |a| integer(read(a, |ent| ent.solid_flags)?))?;
     def("SetSolidFlags", |a| {
         let flags = a.number(2)? as i64;
-        write(a, |ent| ent.solid_flags = flags)
+        write_solidity(a, |ent| ent.solid_flags = flags)
     })?;
     def("AddSolidFlags", |a| {
         let flags = a.number(2)? as i64;
-        write(a, |ent| ent.solid_flags |= flags)
+        write_solidity(a, |ent| ent.solid_flags |= flags)
     })?;
     def("RemoveSolidFlags", |a| {
         let flags = a.number(2)? as i64;
-        write(a, |ent| ent.solid_flags &= !flags)
+        write_solidity(a, |ent| ent.solid_flags &= !flags)
     })?;
     def("SetNotSolid", |a| {
         let not_solid = a.boolean(2);
         // FSOLID_NOT_SOLID
-        write(a, |ent| if not_solid { ent.solid_flags |= 4 } else { ent.solid_flags &= !4 })
+        write_solidity(a, |ent| if not_solid { ent.solid_flags |= 4 } else { ent.solid_flags &= !4 })
     })?;
     def("IsSolid", |a| Ok(Value::Boolean(read(a, |ent| ent.solid != 0 && ent.solid_flags & 4 == 0)?)))?;
     def("GetCollisionGroup", |a| integer(read(a, |ent| ent.collision_group)?))?;
     def("SetCollisionGroup", |a| {
         let group = a.number(2)? as i64;
-        write(a, |ent| ent.collision_group = group)
+        write_solidity(a, |ent| ent.collision_group = group)
     })?;
     def("SetUseType", |a| {
         let use_type = a.number(2)? as i64;
@@ -1462,6 +1497,13 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
         write(a, |ent| ent.transmit_with_parent = with_parent)
     })?;
     def("GetTrigger", |a| Ok(Value::Boolean(read(a, |ent| ent.trigger)?)))?;
+    def("SetCustomCollisionCheck", |a| {
+        let on = a.boolean(2);
+        write(a, |ent| ent.custom_collision_check = on)
+    })?;
+    def("GetCustomCollisionCheck", |a| Ok(Value::Boolean(read(a, |ent| ent.custom_collision_check)?)))?;
+    // the rules are read at every sweep and step: nothing to tell
+    def("CollisionRulesChanged", |a| this(a, 1).map(|_| Value::Nil))?;
     def("IsOnGround", |a| Ok(Value::Boolean(read(a, |ent| ent.flags & 1 != 0)?)))?;
     def("OnGround", |a| Ok(Value::Boolean(read(a, |ent| ent.flags & 1 != 0)?)))?;
     def("WaterLevel", |a| {
@@ -1507,7 +1549,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             ent.move_type = 6;
         })?;
         let shape = gmod_physics::Shape::cuboid([mins.x, mins.y, mins.z], [maxs.x, maxs.y, maxs.z]);
-        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, shape)))
+        let material = a.opt_string(4)?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, shape, material.as_deref())))
     })?;
     def("PhysicsInitSphere", |a| {
         let radius = a.number(2)? as f32;
@@ -1516,7 +1559,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             ent.solid = SOLID_VPHYSICS;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Sphere(radius))))
+        let material = a.opt_string(3)?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Sphere(radius), material.as_deref())))
     })?;
     def("PhysicsInitConvex", |a| {
         let points = convex(&a.table(2)?)?;
@@ -1524,7 +1568,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             ent.solid = SOLID_VPHYSICS;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(vec![points]))))
+        let material = a.opt_string(3)?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(vec![points]), material.as_deref())))
     })?;
     def("PhysicsInitMultiConvex", |a| {
         let hulls = a.table(2)?.sequence_values::<Table>().map(|t| convex(&t?)).collect::<mlua::Result<Vec<_>>>()?;
@@ -1532,7 +1577,8 @@ fn install_methods(def: &Def) -> mlua::Result<()> {
             ent.solid = SOLID_VPHYSICS;
             ent.move_type = 6;
         })?;
-        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(hulls))))
+        let material = a.opt_string(3)?;
+        Ok(Value::Boolean(crate::physics::init_shape(a.lua, this(a, 1)?, gmod_physics::Shape::Hulls(hulls), material.as_deref())))
     })?;
     def("PhysicsDestroy", |a| {
         crate::physics::destroy(a.lua, this(a, 1)?);

@@ -9,7 +9,6 @@
 //! ([`ForHost`]): that client is in the same program and sees the server's entities directly.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::SocketAddr;
 
 use std::sync::Arc;
@@ -33,12 +32,16 @@ const ANNOUNCE_EVERY: Duration = Duration::from_secs(60);
 /// in openGMOD's folder.
 pub fn runtime(realm: Realm, vfs: Arc<Vfs>) -> Result<Runtime, String> {
     let runtime = Runtime::new(realm, vfs).map_err(|e| format!("LuaJIT could not be started: {e}"))?;
-    runtime.set_output(|output| match output {
-        Output::Text(text) => {
-            print!("{text}");
-            let _ = std::io::stdout().flush();
-        }
-        Output::Error(error) => eprintln!("{error}"),
+    let error_color = if realm == Realm::Server { crate::console::SERVER_ERROR } else { crate::console::CLIENT_ERROR };
+    runtime.set_output(move |output| match output {
+        Output::Text(text) => crate::console::write(text, crate::console::TEXT),
+        Output::Error(error) => crate::console::write_error(
+            &format!(
+                "{error}
+"
+            ),
+            error_color,
+        ),
     });
     if let Some(dir) = gmod_fs::UserDir::default_root().and_then(|root| gmod_fs::UserDir::open(root, None).ok()) {
         runtime.set_data_dir(dir);
@@ -114,6 +117,7 @@ impl Server {
         let runtime = runtime(Realm::Server, vfs.clone())?;
         runtime.set_max_players(max_players);
         runtime.set_dedicated(dedicated);
+        runtime.set_map_name(&map.name);
         runtime.start(gamemode);
         runtime.spawn_map(map);
         Ok(Server {
@@ -221,7 +225,7 @@ impl Server {
             if let Some(net) = &mut self.net {
                 for master in &self.masters {
                     if let Err(e) = net.announce(*master) {
-                        eprintln!("master server {master}: {e}");
+                        say_error!("master server {master}: {e}");
                     }
                 }
             }
@@ -300,11 +304,12 @@ impl Server {
             max_players: max as u32,
             allow_cs_lua,
             loading_url,
+            tick_interval: gmod_lua::timer::tick_interval(),
         };
         let Some(net) = &mut self.net else { return };
         let Some(id) = net.accept(addr, &proto::encode(&welcome), now) else { return };
         let name = clean_name(&hello.name);
-        println!("{name} is connecting from {addr}");
+        say!("{name} is connecting from {addr}");
         self.remotes.push(Remote {
             id,
             addr,
@@ -382,7 +387,7 @@ impl Server {
                         if let Some(remote) = self.remote(client) {
                             remote.player = Some(player);
                         }
-                        println!("{name} joined the game");
+                        say!("{name} joined the game");
                         self.send_to(client, &FromServer::Joined { player }, true);
                     }
                     None => self.drop_client(client, "the server is full"),
@@ -414,6 +419,11 @@ impl Server {
             ToServer::Net { name, data } => {
                 if let Some(player) = player {
                     self.runtime.receive_net_message(&name, &data, player);
+                }
+            }
+            ToServer::Button(code, down) => {
+                if let Some(player) = player {
+                    self.runtime.player_button_of(player, code, down);
                 }
             }
         }
@@ -452,10 +462,16 @@ impl Server {
     fn gone(&mut self, client: ClientId, reason: &str) {
         let Some(i) = self.remotes.iter().position(|r| r.id == client) else { return };
         let remote = self.remotes.remove(i);
-        println!("{} left the game ({reason})", remote.name);
+        say!("{} left the game ({reason})", remote.name);
         if let Some(player) = remote.player {
             self.runtime.leave(player);
         }
+    }
+
+    /// What the server has for its clients now, outside a frame: what the host's player joining
+    /// made, which its client has before its first entities, as a client of GMod does.
+    pub fn flush(&mut self) -> ForHost {
+        self.send()
     }
 
     /// What the frame made for each: snapshots, the chat, `net`, sounds, what Lua asked.
@@ -519,7 +535,7 @@ impl Server {
             };
         }
         // the entities, once a tick has passed
-        let tick = (self.runtime.cur_time() / gmod_lua::timer::TICK_INTERVAL).floor() as i64;
+        let tick = (self.runtime.cur_time() / gmod_lua::timer::tick_interval()).floor() as i64;
         if tick != self.last_tick && !joined.is_empty() {
             self.last_tick = tick;
             let snapshot = self.runtime.snapshot();

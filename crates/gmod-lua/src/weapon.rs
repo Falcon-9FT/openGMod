@@ -260,7 +260,7 @@ pub(crate) fn translate_activity(lua: &Lua, player: EntityHandle, act: i64) -> i
 /// Weapon scripts and ammo types, kept with the [`crate::Host`].
 #[derive(Default)]
 pub(crate) struct Weapons {
-    scripts: RefCell<HashMap<String, Option<WeaponData>>>,
+    pub(crate) scripts: RefCell<HashMap<String, Option<WeaponData>>>,
     /// The ammo types once the game has started; until then they are built when asked for.
     ammo: RefCell<Option<Vec<AmmoType>>>,
     /// The skill settings of the game's `cfg/skill.cfg` (`sk_plr_dmg_pistol` ...), read when
@@ -429,7 +429,9 @@ pub(crate) fn data(lua: &Lua, handle: EntityHandle) -> Option<WeaponData> {
 pub(crate) fn setup(lua: &Lua, handle: EntityHandle) {
     let data = data(lua, handle).unwrap_or_default();
     let clip = |i: usize| if data.clip_size[i] >= 0 { data.default_clip[i] } else { -1 };
-    let state = WeaponState { clip: [clip(0), clip(1)], hold_type: data.hold_type.clone(), deploy_speed: 1.0, ..WeaponState::default() };
+    // it comes out as fast as `sv_defaultdeployspeed` says (4 in GMod) until `SetDeploySpeed`
+    let deploy_speed = crate::convar::value(lua, "sv_defaultdeployspeed").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(4.0);
+    let state = WeaponState { clip: [clip(0), clip(1)], hold_type: data.hold_type.clone(), deploy_speed, ..WeaponState::default() };
     host(lua).entities.with_mut(handle, |ent| {
         ent.weapon = Some(state);
         ent.collision_group = crate::trace::group::WEAPON;

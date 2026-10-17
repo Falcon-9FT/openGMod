@@ -39,6 +39,8 @@ pub(crate) struct World {
     models: RefCell<HashMap<String, Option<PhysModel>>>,
     /// The ragdolls, by the number of their entity.
     pub ragdolls: RefCell<HashMap<u32, crate::ragdoll::Ragdoll>>,
+    /// Their surroundings: gravity, pace, limits (`physenv`).
+    pub environment: crate::physenv::Environment,
 }
 
 /// What a physics model gives a body.
@@ -48,6 +50,9 @@ struct PhysModel {
     mass: Option<f32>,
     damping: f32,
     rot_damping: f32,
+    /// How much harder to turn than its shape (its `inertia`), and how its mass lies.
+    inertia: f32,
+    mass_shape: Option<gmod_physics::MassShape>,
     material: String,
     /// All of it: the solids of a ragdoll, how they hang together.
     phy: Arc<gmod_model::Phy>,
@@ -67,7 +72,6 @@ struct Kept {
     maxs: Vector,
     game_flags: i64,
     contents: i64,
-    drag: bool,
     /// The shape of its model, which traces sweep through; none for a box, a ball or hulls
     /// Lua made.
     hulls: Option<Arc<Vec<gmod_bsp::collision::Hull>>>,
@@ -107,7 +111,20 @@ pub(crate) fn load_world(lua: &Lua, collision: Option<&gmod_bsp::Collision>) {
     let mut physics = Physics::new();
     if let Some(collision) = collision {
         let shapes = collision.solid_shapes(gmod_bsp::mask::SOLID_BRUSHONLY);
-        physics.add_world(&shapes.hulls, &shapes.vertices, &shapes.triangles);
+        // each surface of the map of the surface property of its material
+        let textures = host(lua).world.textures.borrow().clone();
+        let surfaces: Vec<gmod_physics::Surface> = textures
+            .iter()
+            .map(|material| {
+                let (_, prop) = crate::surfaceprops::of_material(lua, material);
+                gmod_physics::Surface { friction: prop.friction, elasticity: prop.elasticity }
+            })
+            .collect();
+        let surface = |texinfo: Option<usize>| texinfo.and_then(|t| surfaces.get(t).copied()).unwrap_or_default();
+        let faces: Vec<Vec<([f32; 3], gmod_physics::Surface)>> =
+            shapes.faces.iter().map(|faces| faces.iter().map(|&(normal, t)| (normal, surface(t))).collect()).collect();
+        let triangles: Vec<gmod_physics::Surface> = shapes.triangle_surfaces.iter().map(|&t| surface(t)).collect();
+        physics.add_world_made_of(&shapes.hulls, &faces, &shapes.vertices, &shapes.triangles, &triangles);
     }
     {
         let host = host(lua);
@@ -137,11 +154,15 @@ fn attach_world(lua: &Lua) {
         maxs: Vector::default(),
         game_flags: 0,
         contents: 0,
-        drag: false,
         hulls: None,
     };
     host.physics.bodies.borrow_mut().insert(ground, kept);
     host.entities.with_mut(world, |ent| ent.physics = Some(ground));
+}
+
+/// The models that had no physics model are looked for again (an addon was mounted).
+pub(crate) fn forget_missing(lua: &Lua) {
+    host(lua).physics.models.borrow_mut().retain(|_, model| model.is_some());
 }
 
 /// The physics model of a studio model, read once.
@@ -168,6 +189,12 @@ fn phys_model(lua: &Lua, model: &str) -> Option<PhysModel> {
             mass: solid.mass(),
             damping: solid.keys.number("damping").unwrap_or(0.0),
             rot_damping: solid.keys.number("rotdamping").unwrap_or(0.0),
+            inertia: solid.keys.number("inertia").unwrap_or(1.0),
+            mass_shape: solid.mass_shape.map(|m| gmod_physics::MassShape {
+                centre: m.centre,
+                inertia: m.inertia,
+                drag_areas: m.drag_areas,
+            }),
             material: solid.surface_prop().unwrap_or("default").to_string(),
             phy: phy.clone(),
             hulls: Arc::new(hulls),
@@ -192,8 +219,9 @@ pub(crate) fn phy(lua: &Lua, model: &str) -> Option<Arc<gmod_model::Phy>> {
 /// Keeps a body of an entity: what Lua keeps with it, the bounds of its shape in its own space.
 pub(crate) fn keep(lua: &Lua, id: BodyId, entity: EntityHandle, part: usize, shape: &Shape, material: &str) {
     let (mins, maxs) = bounds(shape);
-    let kept = Kept { entity, part, material: material.to_string(), mins, maxs, game_flags: 0, contents: 0, drag: true, hulls: None };
+    let kept = Kept { entity, part, material: material.to_string(), mins, maxs, game_flags: 0, contents: 0, hulls: None };
     host(lua).physics.bodies.borrow_mut().insert(id, kept);
+    set_material(lua, id, material);
 }
 
 /// Takes a body away, with what Lua keeps with it.
@@ -228,7 +256,7 @@ pub(crate) fn body(lua: &Lua, handle: EntityHandle) -> Option<BodyId> {
 
 /// Gives an entity a body of `shape` where it stands, in place of the one it had. Whether it
 /// got one.
-fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>) -> bool {
+fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>, material: Option<&str>) -> bool {
     destroy(lua, handle);
     let host = host(lua);
     let Some((pos, angles)) = host.entities.transform(handle) else { return false };
@@ -237,15 +265,43 @@ fn init(lua: &Lua, handle: EntityHandle, shape: Shape, model: Option<&PhysModel>
         mass: model.and_then(|m| m.mass),
         damping: model.map_or(0.0, |m| m.damping),
         rot_damping: model.map_or(0.0, |m| m.rot_damping),
+        inertia: model.map_or(1.0, |m| m.inertia),
+        mass_shape: model.and_then(|m| m.mass_shape),
         ..Body::new(shape, array(pos), turn(angles))
     };
     let Some(id) = host.physics.physics.borrow_mut().add(&body) else { return false };
-    let material = model.map_or("default", |m| &m.material).to_string();
+    let material = material.or(model.map(|m| m.material.as_str())).unwrap_or("default").to_string();
     let hulls = model.map(|m| m.hulls.clone()).filter(|h| !h.is_empty());
-    let kept = Kept { entity: handle, part: 0, material, mins, maxs, game_flags: 0, contents: 0, drag: true, hulls };
+    let kept = Kept { entity: handle, part: 0, material: material.clone(), mins, maxs, game_flags: 0, contents: 0, hulls };
     host.physics.bodies.borrow_mut().insert(id, kept);
     host.entities.with_mut(handle, |ent| ent.physics = Some(id));
+    drop(host);
+    set_material(lua, id, &material);
+    sync_collisions(lua, handle, false);
     true
+}
+
+/// An entity's bodies take its collision group, and - when it changed (`SetNotSolid`,
+/// `SetSolid(SOLID_NONE)`) - whether it is solid: what is not goes through everything, the
+/// world too, as in GMod. A body made for an entity marked not solid is not solid either.
+pub(crate) fn sync_collisions(lua: &Lua, handle: EntityHandle, solidity_changed: bool) {
+    let Some((solid, flagged, group)) =
+        host(lua).entities.get(handle).map(|e| (e.solid != 0 && e.solid_flags & 4 == 0, e.solid_flags & 4 != 0, e.collision_group))
+    else {
+        return;
+    };
+    let bodies: Vec<BodyId> = (0..count(lua, handle)).filter_map(|i| part_body(lua, handle, i)).collect();
+    let host = host(lua);
+    let mut physics = host.physics.physics.borrow_mut();
+    physics.set_group_rule(crate::trace::should_collide);
+    for body in bodies {
+        physics.set_collision_group(body, group);
+        if solidity_changed {
+            physics.set_collisions(body, solid);
+        } else if flagged {
+            physics.set_collisions(body, false);
+        }
+    }
 }
 
 /// The shape of an entity's model that its body has, for traces: its convex hulls in its own
@@ -258,11 +314,21 @@ pub(crate) fn shape(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Vec<gmod_bsp
     Some((kept.hulls.clone()?, kept.mins, kept.maxs))
 }
 
+/// The shape of an entity's model for traces when it has no body of it - a client's copy of
+/// the server's entity, one whose body was taken away - but is solid by it
+/// (`SOLID_VPHYSICS`), as the engine traces the model's collision model where it stands.
+pub(crate) fn model_shape(lua: &Lua, handle: EntityHandle) -> Option<(Arc<Vec<gmod_bsp::collision::Hull>>, Vector, Vector)> {
+    let model = host(lua).entities.get(handle).filter(|ent| ent.solid == crate::entity::SOLID_VPHYSICS).map(|ent| ent.model.clone())?;
+    let found = phys_model(lua, &model).filter(|m| !m.hulls.is_empty())?;
+    let (mins, maxs) = bounds(&found.shape);
+    Some((found.hulls, mins, maxs))
+}
+
 /// `PhysicsInit(SOLID_VPHYSICS)`: a body of the entity's model. Whether it got one.
 pub(crate) fn init_model(lua: &Lua, handle: EntityHandle) -> bool {
     let model = host(lua).entities.get(handle).map(|ent| ent.model.clone()).unwrap_or_default();
     match phys_model(lua, &model) {
-        Some(found) => init(lua, handle, found.shape.clone(), Some(&found)),
+        Some(found) => init(lua, handle, found.shape.clone(), Some(&found), None),
         None => {
             destroy(lua, handle);
             false
@@ -270,9 +336,25 @@ pub(crate) fn init_model(lua: &Lua, handle: EntityHandle) -> bool {
     }
 }
 
-/// A body of a box, a ball or convex hulls by their corners.
-pub(crate) fn init_shape(lua: &Lua, handle: EntityHandle, shape: Shape) -> bool {
-    init(lua, handle, shape, None)
+/// A body of a box, a ball or convex hulls by their corners, of a surface property (`default`
+/// when none is given).
+pub(crate) fn init_shape(lua: &Lua, handle: EntityHandle, shape: Shape, material: Option<&str>) -> bool {
+    init(lua, handle, shape, None, material)
+}
+
+/// A body is of a surface property from now on (`PhysObj:SetMaterial`): it holds back what
+/// slides along it and bounces as that does (`friction_00` not at all, `metal_bouncy` back as
+/// fast as it came).
+pub(crate) fn set_material(lua: &Lua, id: BodyId, material: &str) {
+    let found = crate::surfaceprops::with(lua, |props| props.get(material).map(|p| (p.friction, p.elasticity)));
+    let (friction, elasticity) = found.unwrap_or((gmod_physics::DEFAULT_FRICTION, gmod_physics::DEFAULT_ELASTICITY));
+    let host = host(lua);
+    if let Some(kept) = host.physics.bodies.borrow_mut().get_mut(&id) {
+        kept.material = material.to_string();
+    }
+    let mut physics = host.physics.physics.borrow_mut();
+    physics.set_friction(id, friction);
+    physics.set_elasticity(id, elasticity);
 }
 
 /// Takes an entity's bodies away: its own, a ragdoll's parts. The world keeps its own.
@@ -331,8 +413,13 @@ struct Collision {
     speed: f32,
     point: Vector,
     normal: Vector,
+    /// How the two go now, and went before.
     velocity: Vector,
     other_velocity: Vector,
+    old_velocity: Vector,
+    other_old_velocity: Vector,
+    /// Seconds since the two last hit each other, no more than 1.
+    since: f32,
 }
 
 /// One tick: the bodies move on, gravity as `sv_gravity` says, and the entities of those awake
@@ -340,13 +427,22 @@ struct Collision {
 /// constraints that broke go, and the bodies that hit something make their sounds and tell
 /// Lua.
 pub(crate) fn simulate(lua: &Lua) {
-    let gravity = crate::convar::value(lua, "sv_gravity").and_then(|g| g.trim().parse::<f32>().ok()).unwrap_or(600.0);
+    // paused, or with time stopped, nothing moves (`physenv.SetPhysicsPaused`, `SetTimeScale`)
+    let env = &host(lua).physics.environment;
+    let seconds = timer::tick_interval() * env.time_scale.get();
+    if env.paused.get() || seconds <= 0.0 {
+        return;
+    }
+    let sv_gravity = crate::convar::value(lua, "sv_gravity").and_then(|g| g.trim().parse::<f32>().ok()).unwrap_or(600.0);
+    let gravity = crate::physenv::gravity(lua, sv_gravity);
     motion_controllers(lua);
     let (broken, collisions) = {
         let host = host(lua);
         let mut physics = host.physics.physics.borrow_mut();
-        physics.set_gravity(gravity);
-        physics.step(timer::TICK_INTERVAL as f32);
+        physics.set_gravity_vector([gravity.x, gravity.y, gravity.z]);
+        let started = std::time::Instant::now();
+        physics.step(seconds as f32);
+        host.physics.environment.last_simulation.set(started.elapsed().as_secs_f64());
         let bodies = host.physics.bodies.borrow();
         for id in physics.awake() {
             // a ragdoll's entity follows its first part
@@ -379,6 +475,9 @@ pub(crate) fn simulate(lua: &Lua) {
                     normal: vector(impact.normal),
                     velocity: vector(physics.velocity(impact.body)),
                     other_velocity: other.map_or(Vector::default(), |(id, _)| vector(physics.velocity(id))),
+                    old_velocity: vector(impact.velocity),
+                    other_old_velocity: vector(impact.other_velocity),
+                    since: impact.since,
                 })
             })
             .collect();
@@ -438,7 +537,7 @@ fn motion_controllers(lua: &Lua) {
             })
             .collect()
     };
-    let dt = timer::TICK_INTERVAL as f32;
+    let dt = timer::tick_interval() as f32;
     for (handle, objects) in controllers {
         let Ok(Value::UserData(ud)) = entity::push(lua, handle) else { continue };
         let Ok(Value::Function(simulate)) = ud.get::<Value>("PhysicsSimulate") else { continue };
@@ -515,11 +614,12 @@ fn physics_updates(lua: &Lua) {
     }
 }
 
-/// An impact: the body's surface sounds it, as Source does - from 70 units/s, as loud as the
-/// square of the speed up to 320, hard from 300 - and Lua hears of it: `ENT:PhysicsCollide`
-/// and the entity's `PhysicsCollide` callbacks.
+/// An impact: the body's surface sounds it, as Source does - from 70 units/s and a twentieth
+/// of a second after the two last hit each other, as loud as the square of the speed up to
+/// 320, hard from 300 - and Lua hears of it: `ENT:PhysicsCollide` and the entity's
+/// `PhysicsCollide` callbacks.
 fn collided(lua: &Lua, c: &Collision) {
-    if c.speed >= 70.0 {
+    if c.speed >= 70.0 && c.since >= 0.05 {
         let (_, surface) = crate::surfaceprops::named(lua, &c.material);
         let name = if c.speed >= 300.0 { &surface.impact_hard } else { &surface.impact_soft };
         let volume = (c.speed * c.speed / (320.0 * 320.0)).min(1.0);
@@ -535,16 +635,15 @@ fn collided(lua: &Lua, c: &Collision) {
         t.raw_set("HitNormal", entity::vector(lua, c.normal)?)?;
         t.raw_set("Speed", c.speed)?;
         t.raw_set("HitSpeed", entity::vector(lua, c.normal * c.speed)?)?;
-        // before the impact it went into what it hit as fast as the impact took away
-        t.raw_set("OurOldVelocity", entity::vector(lua, c.velocity + c.normal * c.speed)?)?;
+        t.raw_set("OurOldVelocity", entity::vector(lua, c.old_velocity)?)?;
         t.raw_set("OurNewVelocity", entity::vector(lua, c.velocity)?)?;
-        t.raw_set("TheirOldVelocity", entity::vector(lua, c.other_velocity)?)?;
+        t.raw_set("TheirOldVelocity", entity::vector(lua, c.other_old_velocity)?)?;
         t.raw_set("TheirNewVelocity", entity::vector(lua, c.other_velocity)?)?;
         t.raw_set("PhysObject", push_part(lua, c.entity, c.part)?)?;
         t.raw_set("HitObject", push_part(lua, c.other, c.other_part)?)?;
         t.raw_set("OurSurfaceProps", our as i64)?;
         t.raw_set("TheirSurfaceProps", their as i64)?;
-        t.raw_set("DeltaTime", timer::TICK_INTERVAL)?;
+        t.raw_set("DeltaTime", c.since)?;
         Ok(t)
     })();
     let Ok(data) = data else { return };
@@ -654,19 +753,48 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         with(a, |p, id| p.set_collisions(id, on)).map(|_| Value::Nil)
     })?;
     def("IsCollisionEnabled", |a| Ok(Value::Boolean(with(a, |p, id| p.collisions(id))?)))?;
+    // the air holds back what moves through it ([`gmod_physics::Physics::set_drag`])
     def("EnableDrag", |a| {
         let on = a.boolean(2);
-        kept(a, |k| k.drag = on).map(|_| Value::Nil)
+        with(a, |p, id| p.set_drag(id, on)).map(|_| Value::Nil)
     })?;
-    def("IsDragEnabled", |a| Ok(Value::Boolean(kept(a, |k| k.drag)?)))?;
-    // drag and buoyancy are not simulated yet
-    def("SetDragCoefficient", |a| this(a).map(|_| Value::Nil))?;
-    def("SetAngleDragCoefficient", |a| this(a).map(|_| Value::Nil))?;
+    def("IsDragEnabled", |a| Ok(Value::Boolean(with(a, |p, id| p.drag_enabled(id))?)))?;
+    def("SetDragCoefficient", |a| {
+        let c = a.number(2)? as f32;
+        with(a, |p, id| p.set_drag_coefficients(id, Some(c), None)).map(|_| Value::Nil)
+    })?;
+    def("SetAngleDragCoefficient", |a| {
+        let c = a.number(2)? as f32;
+        with(a, |p, id| p.set_drag_coefficients(id, None, Some(c))).map(|_| Value::Nil)
+    })?;
+    // buoyancy is not simulated yet
     def("SetBuoyancyRatio", |a| this(a).map(|_| Value::Nil))?;
     def("RecheckCollisionFilter", |a| this(a).map(|_| Value::Nil))?;
-    def("SetInertia", |a| this(a).map(|_| Value::Nil))?;
+    def("SetInertia", |a| {
+        let i = a.userdata::<Vector>(2, "Vector")?;
+        with(a, |p, id| p.set_inertia(id, array(i))).map(|_| Value::Nil)
+    })?;
+    def("GetInertia", |a| {
+        let i = with(a, |p, id| p.inertia(id))?;
+        entity::vector(a.lua, vector(i))
+    })?;
     def("IsPenetrating", |a| this(a).map(|_| Value::Boolean(false)))?;
     def("GetMass", |a| Ok(Value::Number(f64::from(with(a, |p, id| p.mass(id))?))))?;
+    // each solid a list of the corners of its triangles, as `{ pos = Vector }`
+    def("GetMeshConvexes", |a| {
+        let solids = with(a, |p, id| p.convexes(id))?;
+        let out = a.lua.create_table()?;
+        for (i, solid) in solids.iter().enumerate() {
+            let corners = a.lua.create_table()?;
+            for (j, &corner) in solid.iter().enumerate() {
+                let vertex = a.lua.create_table()?;
+                vertex.raw_set("pos", entity::vector(a.lua, vector(corner))?)?;
+                corners.raw_set(j + 1, vertex)?;
+            }
+            out.raw_set(i + 1, corners)?;
+        }
+        Ok(Value::Table(out))
+    })?;
     def("GetInvMass", |a| {
         let mass = with(a, |p, id| p.mass(id))?;
         Ok(Value::Number(if mass > 0.0 { 1.0 / f64::from(mass) } else { 0.0 }))
@@ -789,7 +917,8 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     def("GetMaterial", |a| Ok(Value::String(a.lua.create_string(kept(a, |k| k.material.clone())?)?)))?;
     def("SetMaterial", |a| {
         let material = a.string(2)?;
-        kept(a, |k| k.material = material).map(|_| Value::Nil)
+        set_material(a.lua, this(a)?.1, &material);
+        Ok(Value::Nil)
     })?;
     def("GetContents", |a| Ok(Value::Integer(kept(a, |k| k.contents)?)))?;
     def("SetContents", |a| {

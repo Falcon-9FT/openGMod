@@ -46,6 +46,8 @@ pub struct Map {
     /// What is seen and heard from where ([`gmod_bsp::Visibility`]); without it everything is
     /// seen from everywhere.
     pub visibility: Option<std::sync::Arc<gmod_bsp::Visibility>>,
+    /// The faces of each brush model (`Entity:GetBrushSurfaces`).
+    pub surfaces: std::sync::Arc<Vec<Vec<crate::surfaceinfo::BrushSurface>>>,
 }
 
 impl Map {
@@ -59,6 +61,7 @@ impl Map {
             collision: Some(collision),
             textures: bsp.texinfo.iter().map(|info| texture(info.texdata)).collect(),
             visibility: gmod_bsp::Visibility::new(bsp).map(std::sync::Arc::new),
+            surfaces: crate::surfaceinfo::of_bsp(bsp),
         }
     }
 }
@@ -68,7 +71,7 @@ impl Map {
 #[derive(Default)]
 pub(crate) struct Models {
     brush: RefCell<Vec<(Vector, Vector)>>,
-    studio: RefCell<HashMap<String, Option<Studio>>>,
+    pub(crate) studio: RefCell<HashMap<String, Option<Studio>>>,
 }
 
 /// What the engine takes from a studio model (`.mdl`).
@@ -665,6 +668,7 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
                 // the brushes that may move are drawn where their entities are; the others are the map's
                 let moving_brush = crate::movers::moving_brush(&ent).is_some();
                 if ent.removed
+                    || ent.effect
                     || ent.dormant
                     || !ent.spawned
                     || !(studio || moving_brush)
@@ -715,6 +719,8 @@ pub(crate) fn drawn(lua: &Lua, viewer: EntityHandle) -> Vec<Drawn> {
     // the engine's own beams, among the effects
     if client {
         crate::render3d::physgun_beams(lua, viewer);
+        crate::effect::render(lua);
+        crate::particles::draw_all(lua);
     }
     hook("PreDrawEffects", MultiValue::new());
     hook("PostDrawEffects", MultiValue::new());
@@ -899,6 +905,19 @@ fn apply_key_value(lua: &Lua, handle: EntityHandle, key: &str, value: &str) {
 /// Loads a map's entities as the server does when the map starts: the world takes the
 /// `worldspawn` key-values, every other entity is made with its key-values, parents are set
 /// (`parentname`), all are spawned, parents before their children, then activated, the
+/// Where the map's sun is, towards it: the `env_sun`'s, else the `light_environment`'s - its
+/// light shines along its angles, `pitch` (negative: down) said apart.
+fn sun_direction(entities: &[Vec<(String, String)>]) -> Option<Vector> {
+    let get = |pairs: &Vec<(String, String)>, key: &str| pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.clone());
+    let of = |class: &str| entities.iter().find(|pairs| get(pairs, "classname").is_some_and(|c| c.eq_ignore_ascii_case(class)));
+    let sun = of("env_sun").or_else(|| of("light_environment"))?;
+    let angles: Vec<f32> = get(sun, "angles").unwrap_or_default().split_whitespace().filter_map(|n| n.parse().ok()).collect();
+    let yaw = angles.get(1).copied().unwrap_or(0.0);
+    let pitch = get(sun, "pitch").and_then(|p| p.trim().parse::<f32>().ok()).map_or(angles.first().copied().unwrap_or(0.0), |p| -p);
+    let (forward, _, _) = crate::vector::Angle::new(pitch, yaw, 0.0).vectors();
+    Some(-forward)
+}
+
 /// `logic_auto`s fire, and the `InitPostEntity` hook runs.
 pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     // the map's sky, as `sv_skyname` (both realms have it)
@@ -910,6 +929,7 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
     if let Some(sky) = sky {
         crate::convar::set_value(lua, "sv_skyname", &sky);
     }
+    host(lua).game.sun.set(sun_direction(&map.entities));
     {
         let host = host(lua);
         *host.game.map.borrow_mut() = map.name.clone();
@@ -917,12 +937,14 @@ pub(crate) fn spawn_map(lua: &Lua, map: &Map) {
             map.brush_models.iter().map(|(lo, hi)| (Vector::new(lo[0], lo[1], lo[2]), Vector::new(hi[0], hi[1], hi[2]))).collect();
         *host.world.collision.borrow_mut() = map.collision.clone();
         *host.world.textures.borrow_mut() = map.textures.clone();
+        *host.world.surfaces.borrow_mut() = map.surfaces.clone();
     }
     let world = EntityHandle::WORLD;
     // a client has the world to trace against; the entities come from the server
     if host(lua).realm != Realm::Server {
         host(lua).entities.with_mut(world, |ent| ent.model = format!("maps/{}.bsp", map.name));
-        crate::call_hook(lua, "InitPostEntity", MultiValue::new());
+        // `InitPostEntity` comes with the entities, the client's own player among them
+        host(lua).client.awaiting_entities.set(true);
         return;
     }
     crate::physics::load_world(lua, map.collision.as_deref());

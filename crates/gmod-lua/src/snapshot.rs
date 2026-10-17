@@ -89,9 +89,15 @@ impl Snapshot {
             to.local_pos = lerp(from.local_pos, to.local_pos, t);
             to.local_angles = lerp_angle(from.local_angles, to.local_angles, t);
             if from.anim.sequence == to.anim.sequence {
-                // a cycle that went round goes on from the end
-                let end = if to.anim.cycle < from.anim.cycle { to.anim.cycle + 1.0 } else { to.anim.cycle };
-                to.anim.cycle = (from.anim.cycle + (end - from.anim.cycle) * t).fract();
+                // a cycle that went round goes on from the end; one that played to its end
+                // stays there (1, not 0)
+                let cycle = if to.anim.cycle < from.anim.cycle {
+                    let went = from.anim.cycle + (to.anim.cycle + 1.0 - from.anim.cycle) * t;
+                    if went >= 1.0 { went - 1.0 } else { went }
+                } else {
+                    from.anim.cycle + (to.anim.cycle - from.anim.cycle) * t
+                };
+                to.anim.cycle = cycle;
             }
             if let (Some(from), Some(to)) = (&from.player, &mut to.player) {
                 to.eye_angles = lerp_angle(from.eye_angles, to.eye_angles, t);
@@ -219,10 +225,11 @@ impl crate::Runtime {
     /// A client takes what the server sent: entities gone from the server go (`OnRemove`,
     /// `EntityRemoved`), those out of sight are kept dormant, the others are as the server has
     /// them, and those new to the client come into being (`OnEntityCreated`, `Initialize`).
-    /// `CurTime` is the server's.
+    /// `CurTime` is the server's, the client's next frame ending there.
     pub fn apply_snapshot(&self, snapshot: &Snapshot) {
         let lua = &self.lua;
         host(lua).clock.cur_time.set(snapshot.time);
+        host(lua).clock.given.set(true);
         let wanted: std::collections::HashMap<u32, u32> =
             snapshot.entities.iter().map(|e| (e.index, e.serial)).chain(snapshot.dormant.iter().copied()).collect();
         let gone: Vec<EntityHandle> = host(lua)
@@ -261,9 +268,18 @@ impl crate::Runtime {
                 if entities.get(handle).is_some_and(|e| e.dormant) {
                     woke.push(handle);
                 }
-                entities.with_mut(handle, |ent| *ent = state.ent.clone());
+                entities.with_mut(handle, |ent| {
+                    // what is the client's own stays: when its `Think` runs (every frame here,
+                    // or as `SetNextClientThink` asks - not as the server's ticks do), the
+                    // bounds it is drawn in, whether Lua drew it
+                    let own = (ent.next_think, ent.think_request, ent.render_bounds, ent.lua_drawn);
+                    *ent = state.ent.clone();
+                    (ent.next_think, ent.think_request, ent.render_bounds, ent.lua_drawn) = own;
+                });
             } else {
-                entities.put(state.index, state.serial, state.ent.clone());
+                let mut ent = state.ent.clone();
+                (ent.next_think, ent.think_request) = (0.0, None);
+                entities.put(state.index, state.serial, ent);
                 new.push(handle);
             }
             handles.push(handle);
@@ -285,6 +301,13 @@ impl crate::Runtime {
             if let Ok(value) = entity::push(lua, handle) {
                 crate::call_hook(lua, "NotifyShouldTransmit", MultiValue::from_iter([value, Value::Boolean(sent)]));
             }
+        }
+        // the first entities, the client's own player among them: `InitPostEntity`, as in GMod,
+        // where `LocalPlayer()` is valid from then on
+        let local = host(lua).client.local_player.get();
+        if host(lua).client.awaiting_entities.get() && host(lua).entities.is_valid(local) {
+            host(lua).client.awaiting_entities.set(false);
+            crate::call_hook(lua, "InitPostEntity", MultiValue::new());
         }
     }
 }

@@ -12,7 +12,9 @@
 //! with an account that owns the game. Their name is their name on Steam, the workshop items
 //! mounted those they subscribed to.
 
-#![forbid(unsafe_code)]
+// a program of windows, as the game is: no terminal of its own ([`terminal`])
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+#![deny(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -38,6 +40,8 @@ use gmod_render::block_on;
 use gmod_world::World;
 use gmod_world::gpu::Camera;
 
+#[macro_use]
+mod console;
 mod audio;
 mod browser;
 mod client;
@@ -48,6 +52,8 @@ mod keys;
 mod menu;
 mod proto;
 mod server;
+mod settings;
+mod terminal;
 mod walk;
 
 use game::{Buttons, Game, Models};
@@ -87,6 +93,8 @@ OPTIONS:
     --master             a master server: the list of the servers that tell it they are
                          here, for the browsers of those who name it in their masters.txt
                          (UDP port 27011 unless --port says otherwise)
+    --tickrate <N>       ticks a second of a game started here (also -tickrate); GMod's 66
+                         by default. Joined, a server's are taken
     -h, --help           this text
 
     Playing takes Steam running, signed in to an account that owns Garry's Mod: the player's
@@ -103,13 +111,14 @@ CONTROLS:
     hold Q for the spawn menu, C for the context menu: the mouse works in them
     F11 full screen, F12 a screenshot (saved in ~/.opengmod/screenshots)
 
-    Lines typed into this terminal are the game's console: give weapon_crowbar,
+    openGMOD opens no terminal of its own: the console is in the game (`), and what it says
+    goes there. A dedicated server's console is the terminal it runs in.
+
+    Lines typed into the console are the game's: give weapon_crowbar,
     gm_spawn models/props_c17/oildrum001.mdl, the commands of the addons; connect <address>
     joins a server, disconnect leaves it, lua_run_cl runs Lua in your client and lua_run_menu
     in the main menu.";
 
-/// Degrees the view turns per pixel the mouse moves.
-const MOUSE_DEGREES: f32 = 0.12;
 /// Units a second flying; Shift makes it four times as much.
 const SPEED: f32 = 400.0;
 /// The game's field of view, across a 4:3 picture.
@@ -134,6 +143,8 @@ struct Args {
     /// Master servers a server here tells it is here.
     announce: Vec<String>,
     master: bool,
+    /// Ticks a second (`-tickrate`); none: GMod's 66.
+    tick_rate: Option<f64>,
 }
 
 fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
@@ -151,6 +162,7 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
         hostname: None,
         announce: Vec::new(),
         master: false,
+        tick_rate: None,
     };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
@@ -170,6 +182,10 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
             "--hostname" => args.hostname = Some(raw.next().ok_or("--hostname needs a name")?),
             "--announce" => args.announce.push(raw.next().ok_or("--announce needs a master server's address")?),
             "--master" => args.master = true,
+            "--tickrate" | "-tickrate" => {
+                let rate = raw.next().and_then(|n| n.parse::<f64>().ok()).filter(|n| (10.0..=1000.0).contains(n));
+                args.tick_rate = Some(rate.ok_or("--tickrate needs a number of ticks a second, 10 to 1000")?);
+            }
             "-h" | "--help" => return Ok(None),
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if args.map.is_none() => args.map = Some(arg),
@@ -202,17 +218,21 @@ struct Setup {
 }
 
 impl Setup {
-    /// The game's files as Garry's Mod mounts them, the addons switched off left out.
-    fn mount(&self, install: &Install) -> Vfs {
+    /// How Garry's Mod's files are mounted: the addons switched off left out.
+    fn mount_options(&self) -> MountOptions {
         let unpack_dir = UserDir::default_root().map(|root| root.join("cache").join("workshop"));
-        let options = MountOptions {
+        MountOptions {
             addons: self.addons,
             unpack_dir,
             disabled: self.disabled.clone(),
             subscribed: self.subscribed.clone(),
             ..MountOptions::default()
-        };
-        mount_install(install, &options).0
+        }
+    }
+
+    /// The game's files as Garry's Mod mounts them, the addons switched off left out.
+    fn mount(&self, install: &Install) -> Vfs {
+        mount_install(install, &self.mount_options()).0
     }
 }
 
@@ -291,7 +311,7 @@ fn prepare_join_telling(
     say(&format!("Connecting to {addr}"));
     let mut connection = client::Connection::open(addr, &setup.name, &setup.identity, &keys::KnownServers::open())?;
     let welcome = connection.welcome.clone();
-    println!("{}: {} ({}, {} players)", welcome.server, welcome.map, welcome.gamemode, welcome.max_players);
+    say!("{}: {} ({}, {} players)", welcome.server, welcome.map, welcome.gamemode, welcome.max_players);
     let install = Install::locate(setup.gmod.as_deref()).map_err(|e| e.to_string())?;
     let mut vfs = setup.mount(&install);
     // what servers had downloaded is kept, behind the game's own files
@@ -336,7 +356,7 @@ fn load(setup: &Setup, map: &str) -> Result<Loaded, String> {
         Ok(install) => (setup.mount(&install), true),
         // a map file can be shown without the game, only not with its materials
         Err(e) if on_disk => {
-            println!("{e}\nThe map is drawn without the game's materials.");
+            say!("{e}\nThe map is drawn without the game's materials.");
             (gmod_fs::Vfs::new(), false)
         }
         Err(e) => return Err(e.to_string()),
@@ -366,7 +386,7 @@ fn load_from(mut vfs: Vfs, map: &str, lua: bool) -> Result<Loaded, String> {
     let (bsp, path) = read_map(&mut vfs, map)?;
     let world = gmod_world::load(&vfs, &bsp);
     let (collision, unread_physics) = gmod_world::collision(&vfs, &bsp);
-    println!("{path}: {} triangles, {} textures, in {:.1} s", world.triangles(), world.textures.len(), started.elapsed().as_secs_f64());
+    say!("{path}: {} triangles, {} textures, in {:.1} s", world.triangles(), world.textures.len(), started.elapsed().as_secs_f64());
     let lists = [
         ("Missing materials", &world.missing_materials),
         ("Missing textures", &world.missing_textures),
@@ -377,7 +397,7 @@ fn load_from(mut vfs: Vfs, map: &str, lua: bool) -> Result<Loaded, String> {
         if !names.is_empty() {
             let shown: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
             let more = if names.len() > 3 { format!(" and {} more", names.len() - 3) } else { String::new() };
-            println!("{what} ({}): {}{more}", names.len(), shown.join(", "));
+            say!("{what} ({}): {}{more}", names.len(), shown.join(", "));
         }
     }
     let (eye, target) = gmod_world::default_view(&bsp);
@@ -414,7 +434,7 @@ fn load_from(mut vfs: Vfs, map: &str, lua: bool) -> Result<Loaded, String> {
 /// Lines typed are its console: `status` lists the servers, `quit` stops it.
 fn master(port: u16) -> Result<(), String> {
     let mut master = gmod_net::Master::bind(SocketAddr::from(([0, 0, 0, 0], port))).map_err(|e| format!("port {port}: {e}"))?;
-    println!("openGMOD master server on UDP port {port}; type status or quit");
+    say!("openGMOD master server on UDP port {port}; type status or quit");
     loop {
         master.poll(Instant::now());
         for line in game::typed_lines() {
@@ -422,13 +442,13 @@ fn master(port: u16) -> Result<(), String> {
                 "quit" | "exit" => return Ok(()),
                 "status" => {
                     let servers = master.servers();
-                    println!("{} servers", servers.len());
+                    say!("{} servers", servers.len());
                     for server in servers {
-                        println!("  {server}");
+                        say!("  {server}");
                     }
                 }
                 "" => {}
-                other => println!("{other}: status or quit"),
+                other => say!("{other}: status or quit"),
             }
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -437,12 +457,12 @@ fn master(port: u16) -> Result<(), String> {
 
 fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
     let install = Install::locate(setup.gmod.as_deref()).map_err(|e| e.to_string())?;
-    println!("Garry's Mod: {}", install.root.display());
+    say!("Garry's Mod: {}", install.root.display());
     let mut vfs = setup.mount(&install);
     let (bsp, path) = read_map(&mut vfs, map)?;
     let (collision, unread_physics) = gmod_world::collision(&vfs, &bsp);
     if !unread_physics.is_empty() {
-        println!("Physics models that could not be read, their props not solid: {}", unread_physics.len());
+        say!("Physics models that could not be read, their props not solid: {}", unread_physics.len());
     }
     let name = Path::new(&path).file_stem().map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned());
     let lua_map = gmod_lua::Map::from_bsp(&name, &bsp, Arc::new(collision));
@@ -453,18 +473,18 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
     let key = identity.public();
     let at = server.listen(SocketAddr::from(([0, 0, 0, 0], setup.port)), identity).map_err(|e| format!("port {}: {e}", setup.port))?;
     server.set_masters(browser::masters(&setup.announce));
-    println!(
+    say!(
         "{hostname}: {name} ({}) for {} players, started in {:.1} s, on UDP port {}; type status, quit or the server's commands",
         setup.gamemode,
         setup.max_players,
         started.elapsed().as_secs_f64(),
         at.port()
     );
-    println!("Its key, which players know it by: {key}");
-    let tick = Duration::from_secs_f64(gmod_lua::timer::TICK_INTERVAL);
+    say!("Its key, which players know it by: {key}");
+    let tick = Duration::from_secs_f64(gmod_lua::timer::tick_interval());
     let mut next = Instant::now();
     loop {
-        server.frame(gmod_lua::timer::TICK_INTERVAL);
+        server.frame(gmod_lua::timer::tick_interval());
         for line in game::typed_lines() {
             match line.trim() {
                 "quit" | "exit" => {
@@ -473,9 +493,9 @@ fn dedicated(setup: &Setup, map: &str, hostname: &str) -> Result<(), String> {
                 }
                 "status" => {
                     let players = server.remote_players();
-                    println!("{} of {} players", players.len(), setup.max_players);
+                    say!("{} of {} players", players.len(), setup.max_players);
                     for (name, steam_id, rtt) in players {
-                        println!("  {name} ({steam_id}): {} ms", rtt.map_or(0, |r| r.as_millis()));
+                        say!("  {name} ({steam_id}): {} ms", rtt.map_or(0, |r| r.as_millis()));
                     }
                 }
                 text => match text.strip_prefix("lua_run ") {
@@ -514,7 +534,7 @@ fn server_address(address: &str) -> Result<SocketAddr, String> {
 /// How much a graphics adapter is wanted, lowest first: a real GPU before a software one (WARP,
 /// llvmpipe), a discrete one before an integrated one, and of the same kind Direct3D 12 before
 /// Vulkan.
-fn adapter_rank(kind: wgpu::DeviceType, backend: wgpu::Backend) -> (u8, bool) {
+fn adapter_rank(kind: wgpu::DeviceType, backend: wgpu::Backend, wanted: Option<wgpu::Backend>) -> (bool, u8, bool) {
     let kind = match kind {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
@@ -522,7 +542,14 @@ fn adapter_rank(kind: wgpu::DeviceType, backend: wgpu::Backend) -> (u8, bool) {
         wgpu::DeviceType::VirtualGpu => 3,
         wgpu::DeviceType::Cpu => 4,
     };
-    (kind, backend != wgpu::Backend::Dx12)
+    (wanted.is_some_and(|w| w != backend), kind, backend != wgpu::Backend::Dx12)
+}
+
+/// The graphics APIs the player may choose (`opengmod_renderer`), as the setting names them.
+const RENDERERS: [(&str, wgpu::Backend); 2] = [("dx12", wgpu::Backend::Dx12), ("vulkan", wgpu::Backend::Vulkan)];
+
+fn renderer_name(backend: wgpu::Backend) -> &'static str {
+    RENDERERS.iter().find(|(_, b)| *b == backend).map_or("other", |(name, _)| name)
 }
 
 /// The window and what draws into it.
@@ -543,11 +570,28 @@ struct Gpu {
     overlay: gmod_render::Overlay,
     /// The main menu's, over everything.
     menu_overlay: gmod_render::Overlay,
+    /// The graphics API it draws with, the GPU's name, and the APIs the GPU could draw this
+    /// window with.
+    backend: wgpu::Backend,
+    adapter_name: String,
+    backends: Vec<wgpu::Backend>,
 }
 
 impl Gpu {
-    fn new(event_loop: &ActiveEventLoop, title: &str) -> Result<Gpu, String> {
-        let attributes = Window::default_attributes().with_title(title).with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+    /// A window, drawn into with the graphics API `renderer` names (`opengmod_renderer`) when
+    /// the GPU has it, else the best it has.
+    fn new(
+        event_loop: &ActiveEventLoop,
+        title: &str,
+        vsync: bool,
+        fullscreen: bool,
+        size: (u32, u32),
+        renderer: &str,
+    ) -> Result<Gpu, String> {
+        let attributes = Window::default_attributes()
+            .with_title(title)
+            .with_inner_size(winit::dpi::PhysicalSize::new(size.0.max(320), size.1.max(240)))
+            .with_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
         let window = Arc::new(event_loop.create_window(attributes).map_err(|e| format!("window: {e}"))?);
         let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle()));
         let backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
@@ -555,16 +599,21 @@ impl Gpu {
         let instance = wgpu::Instance::new(descriptor);
         let surface = instance.create_surface(window.clone()).map_err(|e| format!("surface: {e}"))?;
         // chosen here and not by request_adapter, which takes Vulkan first when both drive a GPU
-        let adapter = block_on(instance.enumerate_adapters(backends))
+        let wanted = RENDERERS.iter().find(|(name, _)| renderer.eq_ignore_ascii_case(name)).map(|&(_, b)| b);
+        let adapters: Vec<wgpu::Adapter> =
+            block_on(instance.enumerate_adapters(backends)).into_iter().filter(|adapter| adapter.is_surface_supported(&surface)).collect();
+        let mut available: Vec<wgpu::Backend> = adapters.iter().map(|a| a.get_info().backend).collect();
+        available.sort_by_key(|&b| renderer_name(b));
+        available.dedup();
+        let adapter = adapters
             .into_iter()
-            .filter(|adapter| adapter.is_surface_supported(&surface))
             .min_by_key(|adapter| {
                 let info = adapter.get_info();
-                adapter_rank(info.device_type, info.backend)
+                adapter_rank(info.device_type, info.backend, wanted)
             })
             .ok_or("no graphics adapter with Direct3D 12 or Vulkan")?;
         let info = adapter.get_info();
-        println!("GPU: {} ({:?})", info.name, info.backend);
+        say!("GPU: {} ({:?})", info.name, info.backend);
         let features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("opengmod"),
@@ -577,13 +626,16 @@ impl Gpu {
         let format = *capabilities.formats.first().ok_or("the window cannot be drawn into")?;
         let view_format = format.add_srgb_suffix();
         let size = window.inner_size();
+        // what is seen through (glass, water) sees the frame drawn so far: copied, where the
+        // window lets that be
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | (capabilities.usages & wgpu::TextureUsages::COPY_SRC);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage,
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync },
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![view_format],
@@ -603,6 +655,9 @@ impl Gpu {
             map_started: Instant::now(),
             overlay,
             menu_overlay,
+            backend: info.backend,
+            adapter_name: info.name.clone(),
+            backends: available,
         })
     }
 
@@ -614,12 +669,18 @@ impl Gpu {
         let Some(world) = world else { return };
         let started = Instant::now();
         let renderer = gmod_render::Renderer::new(&self.device, &self.queue, self.view_format, world);
-        println!("Uploaded to the GPU in {:.1} s", started.elapsed().as_secs_f64());
+        say!("Uploaded to the GPU in {:.1} s", started.elapsed().as_secs_f64());
         if !renderer.failed_textures.is_empty() {
-            println!("Textures that could not be shown: {}", renderer.failed_textures.len());
+            say!("Textures that could not be shown: {}", renderer.failed_textures.len());
         }
         self.renderer = Some(renderer);
         self.map_started = Instant::now();
+    }
+
+    /// Waits for the screen to show each frame, or not (`mat_vsync`).
+    fn set_vsync(&mut self, vsync: bool) {
+        self.config.present_mode = if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+        self.surface.configure(&self.device, &self.config);
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -631,11 +692,18 @@ impl Gpu {
     }
 
     /// The map, or black where there is none.
-    fn draw_3d(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, size: (u32, u32), camera: &Camera) {
+    fn draw_3d(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        texture: &wgpu::Texture,
+        size: (u32, u32),
+        camera: &Camera,
+    ) {
         match &mut self.renderer {
             Some(renderer) => {
                 renderer.set_time(self.map_started.elapsed().as_secs_f32());
-                renderer.render(&self.device, &self.queue, encoder, view, size, camera);
+                renderer.render(&self.device, &self.queue, encoder, view, texture, size, camera);
             }
             None => {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -665,7 +733,20 @@ impl Gpu {
         menu: Option<&gmod_lua::Runtime>,
     ) {
         if let Some(client) = client {
-            draw_2d(&self.device, &self.queue, &mut self.overlay, encoder, view, size, client);
+            let changed = draw_2d(&self.device, &self.queue, &mut self.overlay, encoder, view, size, client);
+            // the pages of glyphs that text drawn in the world is cut from: the renderer's too,
+            // when they change and the first time
+            if let Some(renderer) = &mut self.renderer {
+                client.with_canvas(|_, fonts| {
+                    for (page, glyphs) in fonts.pages().iter().enumerate() {
+                        let name = format!("{}{page}", gmod_lua::render3d::GLYPHS);
+                        if changed.contains(&(page as u32)) || !renderer.has_texture(&name) {
+                            let side = gmod_ui::font::PAGE_SIZE;
+                            renderer.set_effect_pixels(&self.device, &self.queue, &name, side, side, glyphs.pixels.clone());
+                        }
+                    }
+                });
+            }
         }
         if let Some(menu) = menu {
             draw_2d(&self.device, &self.queue, &mut self.menu_overlay, encoder, view, size, menu);
@@ -700,7 +781,7 @@ impl Gpu {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("screenshot") });
-        self.draw_3d(&mut encoder, &view, (width, height), camera);
+        self.draw_3d(&mut encoder, &view, &texture, (width, height), camera);
         self.draw_2d(&mut encoder, &view, (width, height), client, menu);
         // copies out of a texture go in rows of a multiple of 256 bytes
         let row = (width * 4).div_ceil(256) * 256;
@@ -812,7 +893,7 @@ impl Gpu {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.view_format), ..Default::default() });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let size = (self.config.width, self.config.height);
-        self.draw_3d(&mut encoder, &view, size, camera);
+        self.draw_3d(&mut encoder, &view, &frame.texture, size, camera);
         self.draw_2d(&mut encoder, &view, size, client, menu);
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
@@ -827,7 +908,7 @@ impl Gpu {
 }
 
 /// Draws what a realm painted in 2D: the pages' new pictures, the atlas's new glyphs and the
-/// new images go to the GPU first.
+/// new images go to the GPU first. The pages of glyphs that changed.
 fn draw_2d(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -836,19 +917,18 @@ fn draw_2d(
     view: &wgpu::TextureView,
     size: (u32, u32),
     runtime: &gmod_lua::Runtime,
-) {
+) -> Vec<u32> {
     for (id, picture) in runtime.take_page_pictures() {
         overlay.update_image(device, queue, id, picture.width, picture.height, &picture.pixels);
     }
-    let missing = runtime.with_canvas(|canvas, fonts| {
-        overlay.update_glyphs(device, queue, fonts);
-        overlay.missing_images(canvas)
-    });
+    let (changed, missing) =
+        runtime.with_canvas(|canvas, fonts| (overlay.update_glyphs(device, queue, fonts), overlay.missing_images(canvas)));
     for id in missing {
         let pixels = runtime.image(id).and_then(|(_, pixels)| pixels);
         overlay.set_image(device, queue, id, pixels.as_ref().map(|p| (p.width, p.height, p.pixels.as_slice())));
     }
     runtime.with_canvas(|canvas, _| overlay.render(device, queue, encoder, view, size, canvas));
+    changed
 }
 
 struct App {
@@ -906,6 +986,12 @@ struct App {
     setup: Setup,
     menu: Option<menu::Menu>,
     menu_open: bool,
+    /// The player's settings and key bindings.
+    config: settings::Config,
+    /// The console window opened the main menu over the game: it closes it again.
+    console_menu: bool,
+    /// How much of what the console said the console window has.
+    console_seen: usize,
     /// Chromium, for the menu and the game's HTML panels.
     web: Option<Rc<gmod_web::Web>>,
     /// A map the menu asked for, loaded on the next frame (after one that says so).
@@ -972,35 +1058,123 @@ impl App {
         let [x, y, z] = self.camera.eye;
         self.walker = self.stand([x, y, z - self.settings.view_height]);
         if self.walker.is_none() {
-            println!("No room to stand here");
+            say!("No room to stand here");
         }
     }
 
     /// The keys that move a walking player.
     fn movement_keys(&self) -> Keys {
-        let held = |key: KeyCode| self.keys.contains(&key);
         Keys {
-            forward: held(KeyCode::KeyW),
-            back: held(KeyCode::KeyS),
-            left: held(KeyCode::KeyA),
-            right: held(KeyCode::KeyD),
-            jump: held(KeyCode::Space),
-            duck: held(KeyCode::ControlLeft) || held(KeyCode::ControlRight),
-            run: held(KeyCode::ShiftLeft) || held(KeyCode::ShiftRight),
+            forward: self.bound("+forward"),
+            back: self.bound("+back"),
+            left: self.bound("+moveleft"),
+            right: self.bound("+moveright"),
+            jump: self.bound("+jump"),
+            duck: self.bound("+duck"),
+            run: self.bound("+speed"),
         }
     }
 
     /// The buttons held besides the walking keys.
     fn buttons(&self) -> Buttons {
-        let held = |key: KeyCode| self.keys.contains(&key);
         Buttons {
-            attack: self.mouse[0],
-            attack2: self.mouse[1],
-            reload: held(KeyCode::KeyR),
-            using: held(KeyCode::KeyE),
-            walk: held(KeyCode::AltLeft) || held(KeyCode::AltRight),
+            attack: self.bound("+attack"),
+            attack2: self.bound("+attack2"),
+            reload: self.bound("+reload"),
+            using: self.bound("+use"),
+            walk: self.bound("+walk"),
             ..Buttons::default()
         }
+    }
+
+    /// Whether a key or mouse button held does `command` (`+forward`), as the player bound them.
+    fn bound(&self, command: &str) -> bool {
+        let does = |name: &str| self.config.command(name).is_some_and(|c| c.eq_ignore_ascii_case(command));
+        self.keys.iter().filter_map(|&key| key_name(key)).any(does)
+            || (self.mouse[0] && does("mouse1"))
+            || (self.mouse[1] && does("mouse2"))
+    }
+
+    /// Whether a key does `command`, as the player bound it.
+    fn key_does(&self, key: KeyCode, command: &str) -> bool {
+        key_name(key).and_then(|name| self.config.command(name)).is_some_and(|c| c.eq_ignore_ascii_case(command))
+    }
+
+    /// A setting changed, or a game came: what it is for follows it.
+    fn apply_setting(&mut self, name: &str) {
+        let value = self.config.value(name).to_string();
+        match name {
+            "volume" => {
+                if let Some(audio) = &mut self.audio {
+                    audio.set_master(value.parse().unwrap_or(1.0));
+                }
+            }
+            "mat_vsync" => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.set_vsync(value != "0");
+                }
+            }
+            "opengmod_fullscreen" => {
+                if let Some(gpu) = &self.gpu {
+                    gpu.window.set_fullscreen((value != "0").then_some(Fullscreen::Borderless(None)));
+                }
+            }
+            // the window's size, the video options' resolution
+            "opengmod_width" | "opengmod_height" => {
+                if let Some(gpu) = &self.gpu
+                    && gpu.window.fullscreen().is_none()
+                {
+                    let (w, h) = (self.config.number("opengmod_width", 1280.0) as u32, self.config.number("opengmod_height", 720.0) as u32);
+                    let _ = gpu.window.request_inner_size(winit::dpi::PhysicalSize::new(w.max(320), h.max(240)));
+                }
+            }
+            // the menu speaks it too
+            "gmod_language" => {
+                if let Some(menu) = &self.menu {
+                    menu.runtime().set_convar(name, &value);
+                }
+            }
+            _ => {}
+        }
+        if settings::CLIENT_CONVARS.contains(&name)
+            && let Some(game) = &self.game
+        {
+            game.client().set_convar(name, &value);
+        }
+    }
+
+    /// A game came: the player's settings and key bindings are its client's.
+    fn apply_to_game(&mut self) {
+        for name in settings::CLIENT_CONVARS {
+            self.apply_setting(name);
+        }
+        if let Some(game) = &self.game {
+            game.client().set_binds(self.config.binds().to_vec());
+        }
+    }
+
+    /// What the options window changed: kept, and followed at once.
+    fn apply_setting_changes(&mut self, changes: Vec<gmod_lua::SettingChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut rebound = false;
+        for change in changes {
+            match change {
+                gmod_lua::SettingChange::Value(name, value) => {
+                    self.config.set(&name, &value);
+                    self.apply_setting(&name);
+                }
+                gmod_lua::SettingChange::Bind(key, command) => {
+                    self.config.bind(&key, command.as_deref());
+                    rebound = true;
+                }
+            }
+        }
+        if rebound && let Some(game) = &self.game {
+            game.client().set_binds(self.config.binds().to_vec());
+        }
+        self.config.save();
     }
 
     /// Moves the camera by the keys held, for the time since the last frame: the game runs
@@ -1062,6 +1236,22 @@ impl App {
     }
 
     /// Shows the menu over the game (Esc), or goes back to the game.
+    /// Opens the console window, over the main menu, or closes it - and the menu, when it
+    /// opened it over the game.
+    fn toggle_console(&mut self) {
+        let Some(menu) = &self.menu else { return };
+        let shown = menu.runtime().toggle_console();
+        if shown && !self.menu_shown() {
+            self.toggle_menu();
+            self.console_menu = self.menu_open;
+        } else if !shown && self.console_menu {
+            if self.menu_open {
+                self.toggle_menu();
+            }
+            self.console_menu = false;
+        }
+    }
+
     fn toggle_menu(&mut self) {
         if self.menu.is_none() || self.collision.is_none() {
             return;
@@ -1070,8 +1260,22 @@ impl App {
         if self.menu_open {
             self.capture(false);
             self.keys.clear();
+            // the menu has the keys now: what the game had held goes up for it
+            if let Some(game) = &self.game {
+                game.release_keys(|_| true);
+            }
         } else if self.focused && !self.ui_cursor {
             self.capture(true);
+        }
+    }
+
+    /// The keys held down that `which` names go up, for the game and the menu.
+    fn release_keys(&self, which: impl Fn(i32) -> bool) {
+        if let Some(game) = &self.game {
+            game.release_keys(&which);
+        }
+        if let Some(menu) = &self.menu {
+            menu.runtime().release_keys(&which);
         }
     }
 
@@ -1079,10 +1283,10 @@ impl App {
     /// line asked, before there is a window to show the loading in.
     fn enter_map(&mut self, map: &str) {
         self.leave_map();
-        println!("Loading {map}");
+        say!("Loading {map}");
         match load(&self.setup, map) {
             Ok(loaded) => self.start_game(loaded),
-            Err(e) => eprintln!("{e}"),
+            Err(e) => say_error!("{e}"),
         }
     }
 
@@ -1098,11 +1302,11 @@ impl App {
             let player = (setup.name.as_str(), setup.identity.public());
             match Game::start(vfs.clone(), map, &setup.gamemode, pages, setup.max_players, listen, player) {
                 Ok(game) => {
-                    println!("The game started in {:.1} s", started.elapsed().as_secs_f64());
+                    say!("The game started in {:.1} s", started.elapsed().as_secs_f64());
                     Some(game)
                 }
                 Err(e) => {
-                    println!("{e}\nThe map is walked without the game's Lua.");
+                    say!("{e}\nThe map is walked without the game's Lua.");
                     None
                 }
             }
@@ -1114,9 +1318,9 @@ impl App {
     /// to have is fetched, its map loaded, and the player plays there.
     fn connect(&mut self, address: &str) {
         self.leave_map();
-        let joined = prepare_join(&self.setup, address, &|status| println!("{status}")).and_then(|j| self.join_game(j));
+        let joined = prepare_join(&self.setup, address, &|status| say!("{status}")).and_then(|j| self.join_game(j));
         if let Err(e) = joined {
-            eprintln!("Could not join {address}: {e}");
+            say_error!("Could not join {address}: {e}");
         }
     }
 
@@ -1149,7 +1353,7 @@ impl App {
         };
         std::thread::spawn(move || {
             let say = |text: &str| {
-                println!("{text}");
+                say!("{text}");
                 if let Ok(mut status) = said.lock() {
                     *status = text.to_string();
                 }
@@ -1206,7 +1410,7 @@ impl App {
             menu.runtime().end_loading();
         }
         if let Err(e) = started {
-            eprintln!("{name}: {e}");
+            say_error!("{name}: {e}");
         }
     }
 
@@ -1215,6 +1419,7 @@ impl App {
         self.game = game;
         self.models = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| Models::new(vfs.clone()).with_brushes(loaded.brushes));
         self.audio = self.game.as_ref().and(loaded.lua.as_ref()).map(|(vfs, _)| audio::Audio::new(vfs.clone()));
+        self.apply_to_game();
         self.collision = Some(loaded.collision);
         self.light = Some(loaded.light);
         self.lit.clear();
@@ -1238,7 +1443,7 @@ impl App {
             // walking from the player start, as the game begins
             self.respawn();
             if self.walker.is_none() {
-                println!("No player start with room to stand: flying (V walks from where you are)");
+                say!("No player start with room to stand: flying (V walks from where you are)");
             }
         }
         if self.focused && self.gpu.is_some() {
@@ -1287,10 +1492,10 @@ impl App {
         let seconds = self.menu_started.elapsed().as_secs_f64();
         if drawn > 0 {
             self.menu_drawn = true;
-            println!("Chromium drew the main menu in {seconds:.1} s");
+            say!("Chromium drew the main menu in {seconds:.1} s");
         } else if seconds > 10.0 && !self.menu_late {
             self.menu_late = true;
-            println!(
+            say!(
                 "Chromium has not drawn the main menu in 10 s ({pages} pages, {} frames drawn); \
                  its log is in ~/.opengmod/logs/chromium.log. opengmod --no-html goes without it.",
                 self.frames_drawn
@@ -1318,6 +1523,47 @@ impl App {
         {
             menu.runtime().addons_changed(menu::addons(&install, &self.setup.disabled, self.setup.subscribed.as_ref()));
         }
+        self.sync_addons();
+    }
+
+    /// The addons switched on, off, subscribed to or downloaded are mounted or taken out at
+    /// once, in the menu and in the game running, as GMod does: their content is there from
+    /// now on (their Lua runs from the next map on).
+    fn sync_addons(&mut self) {
+        let Ok(install) = Install::locate(self.setup.gmod.as_deref()) else { return };
+        let options = self.setup.mount_options();
+        let mut systems: Vec<Arc<Vfs>> = Vec::new();
+        for vfs in self.menu.as_ref().map(menu::Menu::vfs).into_iter().chain(self.models.as_ref().map(Models::vfs)) {
+            if !systems.iter().any(|known| Arc::ptr_eq(known, &vfs)) {
+                systems.push(vfs);
+            }
+        }
+        let mut changed = false;
+        for vfs in &systems {
+            let changes = gmod_fs::mount::sync_addons(vfs, &install, &options);
+            changed |= !changes.mounted.is_empty() || changes.unmounted > 0;
+            for title in &changes.mounted {
+                say!("Mounted {title}");
+            }
+            for warning in &changes.warnings {
+                say_error!("{warning}");
+            }
+        }
+        if !changed {
+            return;
+        }
+        if let Some(menu) = &self.menu {
+            menu.runtime().content_changed();
+        }
+        if let Some(models) = &mut self.models {
+            models.forget_missing();
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.forget_missing();
+        }
+        if let Some(game) = &self.game {
+            game.content_changed();
+        }
     }
 
     /// A frame of the main menu: Chromium's work, the menu's Lua when it shows, and what it
@@ -1325,6 +1571,18 @@ impl App {
     fn menu_frame(&mut self, seconds: f32) {
         self.report_menu();
         let Some(menu) = &self.menu else { return };
+        // the console window: what was said since, and what was typed into it
+        for (text, color) in console::since(&mut self.console_seen) {
+            menu.runtime().console_print(&text, color);
+        }
+        for line in menu.runtime().take_console_commands() {
+            console::type_line(line);
+        }
+        if let Some(line) = menu.runtime().take_console_complete() {
+            let mut list = self.game.as_ref().map(|game| game.completions(&line)).unwrap_or_default();
+            list.extend(menu.runtime().completions(&line));
+            menu.runtime().console_completions(&line, console::completions(&line, list));
+        }
         if self.menu_shown()
             && let Some(gpu) = &self.gpu
         {
@@ -1336,14 +1594,16 @@ impl App {
                 menu.console(&line);
             }
         }
-        if let Some(addons) = menu.runtime().take_addon_changes() {
+        let addons_changed = menu.runtime().take_addon_changes();
+        let setting_changes = menu.runtime().take_setting_changes();
+        if let Some(addons) = &addons_changed {
             self.setup.disabled = addons.iter().filter(|a| !a.mounted).map(menu::addon_key).collect();
             let on = addons.iter().filter(|a| a.mounted).count();
-            println!("Addons: {on} on, {} off - from the next game on", addons.len() - on);
+            say!("Addons: {on} on, {} off", addons.len() - on);
             if let Some(file) = menu::disabled_file()
                 && let Err(e) = gmod_fs::workshop::write_disabled(&file, &self.setup.disabled)
             {
-                eprintln!("{}: {e}", file.display());
+                say_error!("{}: {e}", file.display());
             }
         }
         for line in menu.take_commands() {
@@ -1373,13 +1633,17 @@ impl App {
                 ["progress_enable" | "sv_cheats" | "hostname" | "p2p_enabled" | "p2p_friendsonly" | "sv_lan" | "commentary", ..] => {}
                 _ => match &self.game {
                     Some(game) => game.command(&line),
-                    None => println!("Unknown command \"{line}\""),
+                    None => say!("Unknown command \"{line}\""),
                 },
             }
             if self.menu.is_none() {
                 break;
             }
         }
+        if addons_changed.is_some() {
+            self.sync_addons();
+        }
+        self.apply_setting_changes(setting_changes);
     }
 
     /// The game's menus show the cursor or hide it again: the mouse is let go and taken back.
@@ -1403,6 +1667,64 @@ impl App {
         }
     }
 
+    /// What the program does itself of a line typed - into the terminal, the console window;
+    /// the rest is for the player's console, given back.
+    fn typed_line(&mut self, line: String) -> Option<String> {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            ["connect", address] => self.pending_connect = Some(address.to_string()),
+            ["disconnect"] => self.leave_map(),
+            ["quit" | "exit"] => self.quit = true,
+            ["screenshot" | "jpeg"] => self.screenshot = true,
+            ["toggleconsole"] => self.toggle_console(),
+            // the menu over the game, as Escape shows and hides it
+            ["gameui_activate"] => {
+                if !self.menu_open {
+                    self.toggle_menu();
+                }
+            }
+            ["gameui_hide"] => {
+                if self.menu_open {
+                    self.toggle_menu();
+                }
+            }
+            ["showconsole"] => {
+                if !self.menu.as_ref().is_some_and(|menu| menu.runtime().console_shown()) {
+                    self.toggle_console();
+                }
+            }
+            ["lua_run_menu", ..] => {
+                if let Some(menu) = &self.menu {
+                    menu.console(&line);
+                }
+            }
+            // Lua for the player's own client, typed here only - where the server allows it
+            ["lua_run_cl", ..] => {
+                if let (Some(game), Some(code)) = (&self.game, line.trim_start().get("lua_run_cl ".len()..)) {
+                    if game.own_lua_allowed() {
+                        let _ = game.client().run_string(code, "lua_run_cl");
+                    } else {
+                        say!("lua_run_cl: the server does not let players run Lua of their own (sv_allowcslua 0)");
+                    }
+                }
+            }
+            _ => return Some(line),
+        }
+        None
+    }
+
+    /// The lines typed while the menu shows over a game that waits: they run at once, as the
+    /// engine's console runs them over a paused game.
+    fn typed_while_paused(&mut self) {
+        for line in game::typed_lines() {
+            if let Some(line) = self.typed_line(line)
+                && let Some(game) = &self.game
+            {
+                game.command(&line);
+            }
+        }
+    }
+
     /// A frame of the game: the player's command, the ticks, and the eyes to see from.
     fn play(&mut self, seconds: f32) {
         // under the menu nothing is pressed
@@ -1414,38 +1736,18 @@ impl App {
         // what the program does itself of the lines typed; the rest is the player's console
         let mut lines = Vec::new();
         for line in game::typed_lines() {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            match words.as_slice() {
-                ["connect", address] => self.pending_connect = Some(address.to_string()),
-                ["disconnect"] => {
-                    self.leave_map();
-                    return;
-                }
-                ["quit" | "exit"] => self.quit = true,
-                ["screenshot" | "jpeg"] => self.screenshot = true,
-                ["lua_run_menu", ..] => {
-                    if let Some(menu) = &self.menu {
-                        menu.console(&line);
-                    }
-                }
-                // Lua for the player's own client, typed here only - where the server allows it
-                ["lua_run_cl", ..] => {
-                    if let (Some(game), Some(code)) = (&self.game, line.trim_start().get("lua_run_cl ".len()..)) {
-                        if game.own_lua_allowed() {
-                            let _ = game.client().run_string(code, "lua_run_cl");
-                        } else {
-                            println!("lua_run_cl: the server does not let players run Lua of their own (sv_allowcslua 0)");
-                        }
-                    }
-                }
-                _ => lines.push(line),
+            if let Some(line) = self.typed_line(line) {
+                lines.push(line);
+            }
+            if self.game.is_none() {
+                return;
             }
         }
         let Some(game) = &mut self.game else { return };
         game.type_lines(lines);
         let shown = game.frame(&keys, &buttons, self.camera.pitch, self.camera.yaw, f64::from(seconds));
         if let Some(reason) = game.closed() {
-            println!("Disconnected: {reason}");
+            say!("Disconnected: {reason}");
             self.leave_map();
             return;
         }
@@ -1453,6 +1755,7 @@ impl App {
         self.holding = shown.view.holding;
         self.camera.eye = shown.eye;
         self.look = shown.look;
+        self.camera.fov = shown.fov;
         if let Some((pitch, yaw)) = shown.turned {
             (self.camera.pitch, self.camera.yaw) = (pitch, yaw);
         }
@@ -1489,15 +1792,19 @@ impl App {
 
     /// A key pressed while the game runs: what the game binds to it. Whether it was one.
     fn game_key(&mut self, key: KeyCode) -> bool {
+        let Some(command) = key_name(key).and_then(|name| self.config.command(name)).map(str::to_lowercase) else { return false };
         let Some(game) = &mut self.game else { return false };
-        let slot = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6]
-            .iter()
-            .position(|&k| k == key);
-        match (key, slot) {
-            (_, Some(slot)) => game.choose_weapon(Choose::Slot(slot as i64)),
-            (KeyCode::KeyV, _) => game.command("noclip"),
-            (KeyCode::KeyZ, _) => game.command("gmod_undo"),
-            (KeyCode::KeyF, _) => game.flashlight(),
+        let words: Vec<&str> = command.split_whitespace().collect();
+        match words.as_slice() {
+            // slot1 the first, slot0 the tenth
+            [slot] if slot.starts_with("slot") && slot[4..].parse::<i64>().is_ok() => {
+                let n: i64 = slot[4..].parse().unwrap_or(1);
+                game.choose_weapon(Choose::Slot(if n == 0 { 9 } else { n - 1 }));
+            }
+            ["invnext"] => game.choose_weapon(Choose::Next),
+            ["invprev"] => game.choose_weapon(Choose::Previous),
+            ["impulse", "100"] => game.flashlight(),
+            ["noclip" | "gmod_undo" | "lastinv" | "kill" | "undo"] => game.command(&command),
             _ => return false,
         }
         true
@@ -1505,7 +1812,7 @@ impl App {
 
     /// Flies the camera by the keys held, through walls.
     fn fly(&mut self, seconds: f32) {
-        let held = |key: KeyCode| self.keys.contains(&key);
+        let keys = self.movement_keys();
         let forward = self.camera.forward();
         let right = self.camera.right();
         let mut step = [0.0f32; 3];
@@ -1514,10 +1821,10 @@ impl App {
                 *s += d * amount;
             }
         };
-        push(forward, f32::from(held(KeyCode::KeyW)) - f32::from(held(KeyCode::KeyS)));
-        push(right, f32::from(held(KeyCode::KeyD)) - f32::from(held(KeyCode::KeyA)));
-        push([0.0, 0.0, 1.0], f32::from(held(KeyCode::Space)) - f32::from(held(KeyCode::ControlLeft) || held(KeyCode::ControlRight)));
-        let fast = if held(KeyCode::ShiftLeft) || held(KeyCode::ShiftRight) { 4.0 } else { 1.0 };
+        push(forward, f32::from(keys.forward) - f32::from(keys.back));
+        push(right, f32::from(keys.right) - f32::from(keys.left));
+        push([0.0, 0.0, 1.0], f32::from(keys.jump) - f32::from(keys.duck));
+        let fast = if keys.run { 4.0 } else { 1.0 };
         for (eye, s) in self.camera.eye.iter_mut().zip(step) {
             *eye += s * SPEED * fast * seconds;
         }
@@ -1538,9 +1845,35 @@ impl App {
         let mut view_models = models.place(&held, |model| renderer.add_model(&gpu.device, &gpu.queue, model));
         // what the game drew in the world by itself this frame: beams, sprites, quads
         let primitives = game.client().take_primitives();
-        let batches = effects::batches(&primitives, &camera, &mut models.materials, |texture| {
-            renderer.add_effect_texture(&gpu.device, &gpu.queue, texture)
-        });
+        // the pictures drawn in the world, given the renderer the first time
+        for name in primitives.iter().map(|p| &p.material.name) {
+            let Some(id) = name.strip_prefix(gmod_lua::render3d::IMAGES).and_then(|id| id.parse().ok()) else { continue };
+            if renderer.has_texture(name) {
+                continue;
+            }
+            let limit = gpu.device.limits().max_texture_dimension_2d;
+            // one that could not be read is plain
+            let (width, height, pixels) = match game.client().image(id).and_then(|(_, pixels)| pixels) {
+                Some(p) if p.width > 0 && p.height > 0 && p.width <= limit && p.height <= limit => (p.width, p.height, p.pixels),
+                _ => (1, 1, vec![255; 4]),
+            };
+            renderer.set_effect_pixels(&gpu.device, &gpu.queue, name, width, height, pixels);
+        }
+        // the pages of glyphs and the pictures the renderer has, which text and pictures in
+        // the world are cut from
+        let pages: HashSet<String> = primitives
+            .iter()
+            .map(|p| &p.material.name)
+            .filter(|name| effects::given(name) && renderer.has_texture(name))
+            .cloned()
+            .collect();
+        let batches = effects::batches(
+            &primitives,
+            &camera,
+            &mut models.materials,
+            |texture| renderer.add_effect_texture(&gpu.device, &gpu.queue, texture),
+            |name| pages.contains(name),
+        );
         renderer.set_effects(batches);
         let (Some(light), Some(collision)) = (&self.light, &self.collision) else { return };
         for p in placed.iter_mut().chain(&mut view_models) {
@@ -1579,8 +1912,27 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        match Gpu::new(event_loop, &format!("openGMOD - {}", self.name)) {
+        let (vsync, fullscreen) = (self.config.number("mat_vsync", 1.0) != 0.0, self.config.number("opengmod_fullscreen", 0.0) != 0.0);
+        let size = (self.config.number("opengmod_width", 1280.0) as u32, self.config.number("opengmod_height", 720.0) as u32);
+        let renderer = self.config.value("opengmod_renderer").to_string();
+        match Gpu::new(event_loop, &format!("openGMOD - {}", self.name), vsync, fullscreen, size, &renderer) {
             Ok(mut gpu) => {
+                // what draws, for the advanced video options
+                if let Some(menu) = &self.menu {
+                    let available = gpu.backends.iter().map(|&b| renderer_name(b).to_string()).collect();
+                    menu.runtime().set_renderer(renderer_name(gpu.backend), &gpu.adapter_name, available);
+                }
+                // the screen's sizes, for the video options
+                if let (Some(menu), Some(monitor)) = (&self.menu, gpu.window.current_monitor()) {
+                    let mut modes: Vec<(u32, u32)> = monitor
+                        .video_modes()
+                        .map(|mode| (mode.size().width, mode.size().height))
+                        .filter(|&(w, h)| w >= 640 && h >= 480)
+                        .collect();
+                    modes.sort_unstable();
+                    modes.dedup();
+                    menu.runtime().set_video_modes(modes, (monitor.size().width, monitor.size().height));
+                }
                 if let Some(world) = self.world.take() {
                     gpu.set_world(Some(&world));
                 }
@@ -1608,7 +1960,27 @@ impl ApplicationHandler for App {
                 if !focused {
                     self.keys.clear();
                     self.capture(false);
+                    // what was held goes up: its going up comes to another window
+                    self.release_keys(|_| true);
                 }
+            }
+            // the modifiers as the system has them: one it says is up is up, though its going
+            // up never came (Alt+Shift changing the keyboard's language takes it)
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let state = modifiers.state();
+                let (shift, control, alt) = (state.shift_key(), state.control_key(), state.alt_key());
+                self.keys.retain(|key| match key {
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => shift,
+                    KeyCode::AltLeft | KeyCode::AltRight => alt,
+                    KeyCode::ControlLeft | KeyCode::ControlRight => control,
+                    _ => true,
+                });
+                self.release_keys(|code| match code {
+                    79 | 80 => !shift,
+                    81 | 82 => !alt,
+                    83 | 84 => !control,
+                    _ => false,
+                });
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(menu) = self.menu.as_ref().filter(|_| self.menu_shown()) {
@@ -1693,6 +2065,16 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
+                // `: the console window, over the main menu as GMod opens it, and away again
+                if (key == KeyCode::Backquote || self.key_does(key, "toggleconsole"))
+                    && self.menu.is_some()
+                    && !self.game.as_ref().is_some_and(Game::chat_open)
+                {
+                    if pressed && !repeat {
+                        self.toggle_console();
+                    }
+                    return;
+                }
                 // Esc: the main menu over the game, and back
                 if key == KeyCode::Escape && self.menu.is_some() && self.collision.is_some() {
                     if pressed && !repeat {
@@ -1728,12 +2110,18 @@ impl ApplicationHandler for App {
                     match key {
                         KeyCode::Escape => self.capture(false),
                         _ if !repeat && self.game_key(key) => {}
-                        KeyCode::KeyV if !repeat => self.toggle_noclip(),
+                        _ if !repeat && self.key_does(key, "noclip") => self.toggle_noclip(),
+                        _ if !repeat && (self.key_does(key, "jpeg") || self.key_does(key, "screenshot")) => self.screenshot = true,
                         KeyCode::F12 if !repeat => self.screenshot = true,
                         KeyCode::F11 if !repeat => {
                             if let Some(gpu) = &self.gpu {
                                 let full = gpu.window.fullscreen().is_some();
                                 gpu.window.set_fullscreen(if full { None } else { Some(Fullscreen::Borderless(None)) });
+                                self.config.set("opengmod_fullscreen", if full { "0" } else { "1" });
+                                self.config.save();
+                                if let Some(menu) = &self.menu {
+                                    menu.runtime().set_settings(self.config.values(), self.config.binds().to_vec());
+                                }
                             }
                         }
                         _ => {}
@@ -1751,6 +2139,15 @@ impl ApplicationHandler for App {
                     self.begin_loading(Loadable::Server(address));
                 }
                 self.poll_loading();
+                // fps_max: no more frames a second than the player wants
+                let fps_max = self.config.number("fps_max", 0.0);
+                if fps_max >= 10.0 {
+                    let frame = Duration::from_secs_f32(1.0 / fps_max);
+                    let spent = self.last_frame.elapsed();
+                    if spent < frame {
+                        std::thread::sleep(frame - spent);
+                    }
+                }
                 let now = Instant::now();
                 let seconds = (now - self.last_frame).as_secs_f32().min(0.25);
                 self.last_frame = now;
@@ -1758,6 +2155,8 @@ impl ApplicationHandler for App {
                 // goes on
                 if !self.menu_shown() || self.game.as_ref().is_some_and(Game::multiplayer) {
                     self.advance(seconds);
+                } else if self.game.is_some() {
+                    self.typed_while_paused();
                 }
                 self.show_entities();
                 self.make_icons();
@@ -1778,8 +2177,8 @@ impl ApplicationHandler for App {
                     }
                     if std::mem::take(&mut self.screenshot) {
                         match gpu.screenshot(&camera, client, menu, &self.name) {
-                            Ok(file) => println!("Screenshot: {}", file.display()),
-                            Err(e) => println!("No screenshot: {e}"),
+                            Ok(file) => say!("Screenshot: {}", file.display()),
+                            Err(e) => say!("No screenshot: {e}"),
                         }
                     }
                     gpu.window.request_redraw();
@@ -1799,9 +2198,12 @@ impl ApplicationHandler for App {
         {
             self.mouse_moved = [self.mouse_moved[0] + dx, self.mouse_moved[1] + dy];
             // E with the physics gun holding something: the mouse turns that, not the view
-            if !(self.holding && self.keys.contains(&KeyCode::KeyE)) {
-                self.camera.yaw -= dx as f32 * MOUSE_DEGREES;
-                self.camera.pitch = (self.camera.pitch + dy as f32 * MOUSE_DEGREES).clamp(-89.0, 89.0);
+            if !(self.holding && self.bound("+use")) {
+                // degrees a count, as the engine has them: sensitivity by m_yaw and m_pitch
+                let sensitivity = self.config.number("sensitivity", 3.0);
+                let (yaw, pitch) = (sensitivity * self.config.number("m_yaw", 0.022), sensitivity * self.config.number("m_pitch", 0.022));
+                self.camera.yaw -= dx as f32 * yaw;
+                self.camera.pitch = (self.camera.pitch + dy as f32 * pitch).clamp(-89.0, 89.0);
             }
         }
     }
@@ -1837,6 +2239,11 @@ fn mouse_code(button: MouseButton) -> Option<i32> {
         MouseButton::Forward => MOUSE_LEFT + 4,
         MouseButton::Other(_) => return None,
     })
+}
+
+/// The engine's name of a key of the keyboard (`w`, `SPACE`), as binds name it.
+fn key_name(key: KeyCode) -> Option<&'static str> {
+    gmod_key(key).and_then(gmod_lua::client::key_name)
 }
 
 /// The game's number of a key (`KEY_*`), by where it is on the keyboard.
@@ -1911,9 +2318,13 @@ fn started_from_explorer() -> bool {
 }
 
 fn fail(message: &str) -> ExitCode {
-    eprintln!("{message}");
+    if !terminal::has_output() {
+        terminal::message("openGMOD", message);
+        return ExitCode::FAILURE;
+    }
+    say_error!("{message}");
     if started_from_explorer() {
-        eprintln!("\nPress Enter to close.");
+        say_error!("\nPress Enter to close.");
         let _ = std::io::stdin().read_line(&mut String::new());
     }
     ExitCode::FAILURE
@@ -1927,12 +2338,24 @@ fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(Some(args)) => args,
         Ok(None) => {
-            println!("{USAGE}");
+            terminal::open();
+            say!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Err(e) => return fail(&format!("{e}\n\n{USAGE}")),
+        Err(e) => {
+            terminal::open();
+            return fail(&format!("{e}\n\n{USAGE}"));
+        }
     };
-    println!("openGMOD {}", env!("CARGO_PKG_VERSION"));
+    // what has no window says what it does in a terminal
+    if args.dedicated || args.master {
+        terminal::open();
+    }
+    say!("openGMOD {}", env!("CARGO_PKG_VERSION"));
+    if let Some(rate) = args.tick_rate {
+        gmod_lua::timer::set_tick_rate(rate);
+        say!("Tick rate: {rate} ({:.4} s a tick)", gmod_lua::timer::tick_interval());
+    }
     if args.master {
         return match master(args.port.unwrap_or(gmod_net::MASTER_PORT)) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1950,7 +2373,7 @@ fn main() -> ExitCode {
         };
         match gmod_steam::Steam::start(&install.root) {
             Ok(steam) => {
-                println!("Steam: {} ({})", steam.name(), steam.steam_id());
+                say!("Steam: {} ({})", steam.name(), steam.steam_id());
                 Some(Rc::new(steam))
             }
             Err(e) => return fail(&format!("openGMOD plays with a licensed Garry's Mod, through Steam: {e}.")),
@@ -1984,7 +2407,7 @@ fn main() -> ExitCode {
     let (mut web, mut main_menu) = (None, None);
     match Install::locate(setup.gmod.as_deref()) {
         Ok(install) if args.html && args.lua => {
-            println!("Garry's Mod: {}", install.root.display());
+            say!("Garry's Mod: {}", install.root.display());
             let vfs = Arc::new(setup.mount(&install));
             match menu::start_web(vfs.clone()) {
                 Ok(started) => {
@@ -2002,11 +2425,11 @@ fn main() -> ExitCode {
                             menu.runtime().set_steam(steam.clone());
                             main_menu = Some(menu);
                         }
-                        Err(e) => println!("No main menu: {e}"),
+                        Err(e) => say!("No main menu: {e}"),
                     }
                     web = Some(started);
                 }
-                Err(e) => println!("No Chromium, so no main menu and no HTML: {e}"),
+                Err(e) => say!("No Chromium, so no main menu and no HTML: {e}"),
             }
         }
         _ => {}
@@ -2025,7 +2448,13 @@ fn main() -> ExitCode {
     // draw as fast as the screen takes it
     event_loop.set_control_flow(ControlFlow::Poll);
     let now = Instant::now();
+    let config = settings::Config::load(Install::locate(setup.gmod.as_deref()).ok().map(|install| install.game_dir()).as_deref());
+    if let Some(menu) = &main_menu {
+        menu.runtime().set_settings(config.values(), config.binds().to_vec());
+        menu.runtime().set_convar("gmod_language", config.value("gmod_language"));
+    }
     let mut app = App {
+        config,
         world: None,
         collision: None,
         models: None,
@@ -2060,6 +2489,8 @@ fn main() -> ExitCode {
         setup,
         menu: main_menu,
         menu_open: false,
+        console_menu: false,
+        console_seen: 0,
         web: web.take(),
         pending_map: None,
         pending_connect: None,
@@ -2111,6 +2542,8 @@ mod tests {
         assert_eq!((args.map.as_deref(), args.addons, args.lua, args.html), (None, true, true, true));
         assert!(!parse(&["--no-lua"]).unwrap().unwrap().lua);
         assert!(!parse(&["--no-html"]).unwrap().unwrap().html);
+        assert_eq!(parse(&["-tickrate", "33"]).unwrap().unwrap().tick_rate, Some(33.0));
+        assert!(parse(&["--tickrate", "5"]).is_err());
         let args = parse(&["gm_flatgrass", "--gmod", "D:/GarrysMod", "--no-addons"]).unwrap().unwrap();
         assert_eq!(
             (args.map.as_deref(), args.gmod.as_deref(), args.addons),
@@ -2150,7 +2583,7 @@ mod tests {
             (DeviceType::IntegratedGpu, Backend::Dx12),
             (DeviceType::DiscreteGpu, Backend::Dx12),
         ];
-        adapters.sort_by_key(|&(kind, backend)| adapter_rank(kind, backend));
+        adapters.sort_by_key(|&(kind, backend)| adapter_rank(kind, backend, None));
         assert_eq!(
             adapters,
             [
@@ -2161,5 +2594,18 @@ mod tests {
                 (DeviceType::Cpu, Backend::Dx12),
             ]
         );
+    }
+
+    #[test]
+    fn the_chosen_api_first_on_any_gpu() {
+        use wgpu::{Backend, DeviceType};
+        let mut adapters = [
+            (DeviceType::DiscreteGpu, Backend::Dx12),
+            (DeviceType::IntegratedGpu, Backend::Vulkan),
+            (DeviceType::DiscreteGpu, Backend::Vulkan),
+        ];
+        adapters.sort_by_key(|&(kind, backend)| adapter_rank(kind, backend, Some(Backend::Vulkan)));
+        assert_eq!(adapters[0], (DeviceType::DiscreteGpu, Backend::Vulkan));
+        assert_eq!(adapters[2], (DeviceType::DiscreteGpu, Backend::Dx12), "and the others after, should it not be there");
     }
 }

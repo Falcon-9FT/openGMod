@@ -48,6 +48,10 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
 /// The game being played: map, gamemode, players.
 #[derive(Default)]
 pub(crate) struct Game {
+    /// Where the map's sun is (`env_sun`, `light_environment`), towards it.
+    pub sun: std::cell::Cell<Option<crate::vector::Vector>>,
+    /// When `util.TimerCycle` was last called.
+    pub timer_cycle: std::cell::Cell<f64>,
     pub map: RefCell<String>,
     pub gamemode_name: RefCell<String>,
     /// The table of the active gamemode (`GAMEMODE`).
@@ -140,7 +144,7 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     })?;
     def(lua, &engine, "GetAddons", |a| Ok(Value::Table(a.lua.create_table()?)))?;
     def(lua, &engine, "GetGames", |a| Ok(Value::Table(a.lua.create_table()?)))?;
-    def(lua, &engine, "TickInterval", |_| Ok(Value::Number(timer::TICK_INTERVAL)))?;
+    def(lua, &engine, "TickInterval", |_| Ok(Value::Number(timer::tick_interval())))?;
     def(lua, &engine, "TickCount", |a| Ok(Value::Integer(host(a.lua).clock.ticks.get() as i64)))?;
     def(lua, &engine, "AbsoluteFrameTime", |a| Ok(Value::Number(host(a.lua).clock.frame_time.get())))?;
     def(lua, &engine, "ServerFrameTime", |a| Ok(Value::Number(host(a.lua).clock.frame_time.get())))?;
@@ -165,6 +169,40 @@ fn install_libraries(lua: &Lua, globals: &Table) -> mlua::Result<()> {
     def(lua, &system, "HasFocus", |_| Ok(Value::Boolean(true)))?;
     // 255: no battery
     def(lua, &system, "BatteryPower", |_| Ok(Value::Integer(255)))?;
+    // the country Steam would say the player is in: the one of the game's language
+    def(lua, &system, "GetCountry", |a| {
+        let language = crate::convar::value(a.lua, "gmod_language").unwrap_or_default().to_ascii_lowercase();
+        let country = match language.as_str() {
+            "ru" => "RU",
+            "uk" => "UA",
+            "de" => "DE",
+            "fr" => "FR",
+            "es-es" => "ES",
+            "pt-br" => "BR",
+            "pt-pt" => "PT",
+            "pl" => "PL",
+            "it" => "IT",
+            "ja" => "JP",
+            "ko" => "KR",
+            "zh-cn" => "CN",
+            "zh-tw" => "TW",
+            "tr" => "TR",
+            "cs" => "CZ",
+            "nl" => "NL",
+            "sv-se" => "SE",
+            "fi" => "FI",
+            "da" => "DK",
+            "no" => "NO",
+            "hu" => "HU",
+            "bg" => "BG",
+            "el" => "GR",
+            "th" => "TH",
+            "vi" => "VN",
+            "en-pt" | "en" | "" => "US",
+            other => return Ok(Value::String(a.lua.create_string(other.split('-').next_back().unwrap_or("US").to_ascii_uppercase())?)),
+        };
+        Ok(Value::String(a.lua.create_string(country)?))
+    })?;
     globals.raw_set("system", system)?;
     Ok(())
 }

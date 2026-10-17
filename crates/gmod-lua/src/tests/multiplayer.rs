@@ -37,7 +37,7 @@ fn players_take_the_slots_the_server_has() {
     assert!(g.eval::<bool>(
         "local all = player.GetAll()
          return #all == 3 and all[2]:Nick() == 'Bob' and Entity(1):IsListenServerHost() and not Entity(2):IsListenServerHost()
-             and Entity(1):UniqueID() ~= 1"
+             and Entity(1):UniqueID() ~= '1'"
     ));
     // one leaves: the next to come takes the slot
     g.runtime.leave(players[1]);
@@ -163,6 +163,17 @@ fn between_two_snapshots_things_move_smoothly() {
     // the short way round: from 170 through 180
     assert!((prop.ent.local_angles.y - 175.0).abs() < 0.01, "{:?}", prop.ent.local_angles);
     assert!((mid.time - (a.time + 0.025)).abs() < 1e-9);
+    // what played to its end stays at its end; what went round goes on from where it was
+    let cycle_between = |from: f32, to: f32, t: f32| {
+        let (mut a, mut b) = (a.clone(), b.clone());
+        for (s, cycle) in [(&mut a, from), (&mut b, to)] {
+            s.entities.iter_mut().filter(|e| e.ent.class == "prop_physics").for_each(|e| e.ent.anim.cycle = cycle);
+        }
+        Snapshot::between(&a, &b, t).entities.iter().find(|e| e.ent.class == "prop_physics").unwrap().ent.anim.cycle
+    };
+    assert_eq!(cycle_between(1.0, 1.0, 0.5), 1.0);
+    assert!((cycle_between(0.9, 0.1, 0.25) - 0.95).abs() < 1e-5);
+    assert!((cycle_between(0.9, 0.1, 0.75) - 0.05).abs() < 1e-5);
     // a jump is not drawn out
     g.runtime.run_string("P:SetPos(Vector(5000, 0, 0))", "teleport").unwrap();
     let c = g.runtime.snapshot();
@@ -184,7 +195,7 @@ fn the_server_asks_things_of_clients() {
         )
         .unwrap();
     assert_eq!(
-        g.runtime.take_to_clients(),
+        asked_of(&g),
         [
             (alice, ToClient::Lua("X = 1".into())),
             (alice, ToClient::Lua("Y = 2".into())),
@@ -261,7 +272,7 @@ fn a_client_moves_its_player_as_the_server_will() {
     );
     client.runtime.init();
     client.runtime.spawn_map(&player_map());
-    let tick = crate::timer::TICK_INTERVAL;
+    let tick = crate::timer::tick_interval();
     // what the server does in a while, and how many of its ticks that was
     let run = |cmd: UserCmd, seconds: f64| -> u32 {
         let before = (server.runtime.cur_time() / tick).floor();
@@ -322,7 +333,7 @@ fn a_client_fires_its_weapon_as_the_server_will() {
     client.runtime.init();
     client.runtime.run_string(TESTER_LUA, "tester").unwrap();
     client.runtime.spawn_map(&player_map());
-    let tick = crate::timer::TICK_INTERVAL;
+    let tick = crate::timer::tick_interval();
     let attack = UserCmd { buttons: crate::player::key::ATTACK, ..UserCmd::default() };
     let clip = |runtime: &Runtime| runtime.view(alice).and_then(|v| v.weapon).map(|w| (w.class, w.clip));
     use crate::sound::{SoundEvent, SoundPlay};

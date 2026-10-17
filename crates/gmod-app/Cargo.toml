@@ -18,6 +18,7 @@ gmod-lua.workspace = true
 gmod-material.workspace = true
 gmod-movement.workspace = true
 gmod-render.workspace = true
+gmod-ui.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 gmod-audio.workspace = true

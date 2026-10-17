@@ -467,6 +467,7 @@ fn walking_map() -> Map {
         collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
         textures: bsp.texinfo.iter().map(texture).collect(),
         visibility: gmod_bsp::Visibility::new(&bsp).map(Arc::new),
+        surfaces: Default::default(),
     }
 }
 

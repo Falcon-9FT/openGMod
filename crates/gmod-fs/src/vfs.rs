@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::dir::DirMount;
 use crate::gma::GmaArchive;
@@ -161,10 +161,21 @@ pub struct Found {
     pub dirs: Vec<String>,
 }
 
-/// The stack of mounts.
-#[derive(Debug, Default)]
+/// The stack of mounts. Addons go on and off it while the game runs
+/// ([`Vfs::mount_addon`], [`Vfs::unmount`]): a lookup sees the stack as it was when it began.
+#[derive(Default)]
 pub struct Vfs {
-    mounts: Vec<Mount>,
+    mounts: RwLock<Arc<Vec<Arc<Mount>>>>,
+    /// Where addons go in the search order: in front of the game's own content.
+    addon_slot: RwLock<Option<usize>>,
+    /// What the addons hide ([`Vfs::hide_in_addons`]), those mounted later too.
+    addon_hide: RwLock<Option<Hide>>,
+}
+
+impl fmt::Debug for Vfs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Vfs").field("mounts", &self.mounts()).finish()
+    }
 }
 
 fn not_found(path: &str, path_id: &str) -> io::Error {
@@ -176,39 +187,85 @@ impl Vfs {
         Vfs::default()
     }
 
+    /// Changes the stack: a new one in its place, which lookups begun before do not see.
+    fn change<R>(&self, f: impl FnOnce(&mut Vec<Arc<Mount>>) -> R) -> R {
+        let mut mounts = self.mounts.write().unwrap_or_else(PoisonError::into_inner);
+        f(Arc::make_mut(&mut mounts))
+    }
+
     /// Adds a mount behind all others.
     pub fn push(&mut self, mount: Mount) {
-        self.mounts.push(mount);
+        self.change(|mounts| mounts.push(Arc::new(mount)));
     }
 
     /// Adds a mount at `index` of the search order (0: before all others).
     pub fn insert(&mut self, index: usize, mount: Mount) {
-        self.mounts.insert(index.min(self.mounts.len()), mount);
+        self.change(|mounts| mounts.insert(index.min(mounts.len()), Arc::new(mount)));
     }
 
     /// Takes the mount at `index` out of the search order: the pakfile of a map that is left.
-    pub fn remove(&mut self, index: usize) -> Option<Mount> {
-        (index < self.mounts.len()).then(|| self.mounts.remove(index))
+    pub fn remove(&mut self, index: usize) -> Option<Arc<Mount>> {
+        self.change(|mounts| (index < mounts.len()).then(|| mounts.remove(index)))
     }
 
-    /// The mounts in search order.
-    pub fn mounts(&self) -> &[Mount] {
-        &self.mounts
+    /// The mounts in search order, as they are now.
+    pub fn mounts(&self) -> Arc<Vec<Arc<Mount>>> {
+        self.mounts.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Where addons go in the search order (what [`crate::mount::mount_install`] found):
+    /// [`Vfs::mount_addon`] puts them there.
+    pub fn set_addon_slot(&mut self, slot: usize) {
+        *self.addon_slot.write().unwrap_or_else(PoisonError::into_inner) = Some(slot);
     }
 
     /// Hides files of the addons' mounts: what `hide` says (`None`: shows them all again).
+    /// Addons mounted later hide them too.
     pub fn hide_in_addons(&mut self, hide: Option<Hide>) {
-        for mount in self.mounts.iter_mut().filter(|m| m.addon) {
-            mount.hide(hide.clone());
-        }
+        *self.addon_hide.write().unwrap_or_else(PoisonError::into_inner) = hide.clone();
+        self.change(|mounts| {
+            // the stack is being built: no lookup holds a mount of it
+            for mount in mounts.iter_mut().filter(|m| m.addon).filter_map(Arc::get_mut) {
+                mount.hide(hide.clone());
+            }
+        });
     }
 
-    fn search<'a>(&'a self, path_id: &str) -> impl Iterator<Item = &'a Mount> {
-        self.mounts.iter().filter(move |m| m.has_id(path_id))
+    /// Mounts an addon while the game runs - one switched on, one downloaded - in front of the
+    /// addons there are, as GMod does: what it has is there from now on.
+    pub fn mount_addon(&self, mount: Mount) {
+        let mut mount = mount.of_addon();
+        mount.hide(self.addon_hide.read().unwrap_or_else(PoisonError::into_inner).clone());
+        let slot = *self.addon_slot.read().unwrap_or_else(PoisonError::into_inner);
+        self.change(|mounts| {
+            let index = slot.unwrap_or(0).min(mounts.len());
+            mounts.insert(index, Arc::new(mount));
+        });
+    }
+
+    /// Takes the mounts of a folder or archive out while the game runs: an addon switched off.
+    /// Whether there was one.
+    pub fn unmount(&self, origin: &Path) -> bool {
+        self.change(|mounts| {
+            let before = mounts.len();
+            mounts.retain(|m| m.origin() != origin);
+            mounts.len() != before
+        })
+    }
+
+    /// Whether a folder or archive is mounted.
+    pub fn is_mounted(&self, origin: &Path) -> bool {
+        self.mounts().iter().any(|m| m.origin() == origin)
+    }
+
+    fn search(&self, path_id: &str) -> impl Iterator<Item = Arc<Mount>> {
+        let mounts = self.mounts();
+        let path_id = path_id.to_string();
+        (0..mounts.len()).map(move |i| mounts[i].clone()).filter(move |m| m.has_id(&path_id))
     }
 
     /// The mount a file is read from: the first, in search order, that has it.
-    pub fn locate(&self, path: &str, path_id: &str) -> Option<&Mount> {
+    pub fn locate(&self, path: &str, path_id: &str) -> Option<Arc<Mount>> {
         let path = normalize(path)?;
         self.search(path_id).find(|m| m.contains(&path) == Some(false))
     }
@@ -261,7 +318,7 @@ impl Vfs {
     pub fn files(&self, path_id: &str) -> Vec<(String, usize)> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for (index, mount) in self.mounts.iter().enumerate() {
+        for (index, mount) in self.mounts().iter().enumerate() {
             if !mount.has_id(path_id) {
                 continue;
             }

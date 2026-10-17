@@ -18,8 +18,8 @@ use crate::sky::Fog;
 use crate::{Look, Piece, SUN, Surface, Vec3, World, add, axes, dot, normalize, scale, sub};
 
 /// Bytes of one vertex: position (3 `f32`), normal (3), texture coordinates (2), light map
-/// coordinates (2), blend alpha (1) and vertex light (3).
-pub const VERTEX_SIZE: usize = 56;
+/// coordinates (2), blend alpha (1), vertex light (3) and tangent (4).
+pub const VERTEX_SIZE: usize = 72;
 
 /// Bytes of the bones of one vertex of a model: three bone numbers and a byte of nothing, then
 /// their three weights (`f32`).
@@ -89,6 +89,10 @@ pub fn geometry(pieces: &[Piece]) -> Geometry {
                 v.light[0],
                 v.light[1],
                 v.light[2],
+                v.tangent[0],
+                v.tangent[1],
+                v.tangent[2],
+                v.tangent[3],
             ];
             out.vertices.extend(values.iter().flat_map(|x| x.to_le_bytes()));
         }
@@ -151,6 +155,8 @@ pub struct TextureData {
     pub levels: Vec<Vec<u8>>,
     pub clamp_s: bool,
     pub clamp_t: bool,
+    /// Its texels are taken as they are, not as sRGB ([`crate::Texture::normal`]).
+    pub linear: bool,
 }
 
 /// The most frames of an animated texture uploaded: the layers a GPU surely has.
@@ -189,6 +195,7 @@ pub fn texture_data(vtf: &Vtf, compressed: bool, max_size: u32) -> Option<Textur
         levels: levels?,
         clamp_s: vtf.flags & flags::CLAMP_S != 0,
         clamp_t: vtf.flags & flags::CLAMP_T != 0,
+        linear: false,
     })
 }
 
@@ -207,13 +214,26 @@ pub fn missing_texture() -> TextureData {
                 .collect()
         })
         .collect();
-    TextureData { width: 64, height: 64, format: PixelFormat::Rgba8, frames: 1, levels, clamp_s: false, clamp_t: false }
+    TextureData { width: 64, height: 64, format: PixelFormat::Rgba8, frames: 1, levels, clamp_s: false, clamp_t: false, linear: false }
 }
 
 /// A light map as RGBA half floats.
 pub fn lightmap_data(lightmap: &Lightmap) -> Vec<u8> {
-    lightmap.texels.iter().flat_map(|&[r, g, b]| [r, g, b, 1.0]).flat_map(|v| to_half(v).to_le_bytes()).collect()
+    let texels = lightmap.texels.iter().chain(&lightmap.bumped);
+    texels.flat_map(|&[r, g, b]| [r, g, b, 1.0]).flat_map(|v| to_half(v).to_le_bytes()).collect()
 }
+
+/// How many lightmaps [`lightmap_data`] holds, one after another: 4 when some face is bump
+/// mapped, 1 otherwise.
+pub fn lightmap_layers(lightmap: &Lightmap) -> u32 {
+    if lightmap.bumped.is_empty() { 1 } else { 4 }
+}
+
+/// How a surface's bump map is taken, for the shader: not at all, as directions, or as the
+/// light along each of the bumped lightmaps' (`$ssbump`).
+pub const BUMP_NONE: f32 = 0.0;
+pub const BUMP_NORMAL: f32 = 1.0;
+pub const BUMP_SELF_SHADOWED: f32 = 2.0;
 
 /// How a surface is lit, for the shader.
 pub const LIGHT_NONE: f32 = 0.0;
@@ -227,7 +247,7 @@ pub const FOG_DARK: f32 = 1.0;
 pub const FOG_NONE: f32 = 2.0;
 
 /// How many floats a shader gets for a surface.
-pub const SURFACE_PARAMS: usize = 20;
+pub const SURFACE_PARAMS: usize = 52;
 
 /// The floats a shader gets for a surface as it `look`s at the moment: tint and alpha; water
 /// colour and whether it is water; alpha test reference (0 for none), how it is lit, whether
@@ -243,6 +263,18 @@ pub fn surface_params(surface: &Surface, look: &Look, frames: u32, has_lightmap:
     let [r, g, b] = look.tint;
     let water = surface.water.unwrap_or([0.0; 3]);
     let [u, v] = look.transform;
+    let bump_transform = look.bump_transform.or(surface.bump.map(|b| b.transform)).unwrap_or(crate::IDENTITY);
+    let refraction = surface.refraction;
+    let refract = refraction.unwrap_or(crate::Refraction {
+        water: false,
+        amount: 0.0,
+        tint: [1.0; 3],
+        tint_texture: None,
+        fog: [0.0; 2],
+        reflection: [0.0; 3],
+        scroll: [[0.0; 2]; 2],
+    });
+    let [[s1x, s1y], [s2x, s2y]] = refract.scroll.map(|s| s.map(|v| v * look.time));
     [
         r,
         g,
@@ -268,8 +300,62 @@ pub fn surface_params(surface: &Surface, look: &Look, frames: u32, has_lightmap:
         v[1],
         v[2],
         if surface.modulate { 1.0 } else { 0.0 },
+        // the detail: how much finer, how much of it, how it mixes in, and 1 when there is one
+        surface.detail.map_or(1.0, |d| d.scale),
+        surface.detail.map_or(0.0, |d| d.blend),
+        surface.detail.map_or(0.0, |d| d.mode as f32),
+        if surface.detail.is_some() { 1.0 } else { 0.0 },
+        // the bump map: how it is taken, 1 when a second one blends in
+        match surface.bump {
+            None => BUMP_NONE,
+            Some(b) if b.self_shadowed => BUMP_SELF_SHADOWED,
+            Some(_) => BUMP_NORMAL,
+        },
+        if surface.bump.is_some_and(|b| b.second.is_some()) && refraction.is_none() { 1.0 } else { 0.0 },
+        0.0,
+        0.0,
+        // and its transform, a row for u and one for v
+        bump_transform[0][0],
+        bump_transform[0][1],
+        bump_transform[0][2],
+        0.0,
+        bump_transform[1][0],
+        bump_transform[1][1],
+        bump_transform[1][2],
+        0.0,
+        // what shows what is behind it: how (none, glass, water), how far it is bent, 1 with a
+        // tint texture
+        match refraction {
+            None => REFRACT_NONE,
+            Some(r) if r.water => REFRACT_WATER,
+            Some(_) => REFRACT_GLASS,
+        },
+        refract.amount,
+        if refract.tint_texture.is_some() { 1.0 } else { 0.0 },
+        0.0,
+        // its tint, and where water's fog starts
+        refract.tint[0],
+        refract.tint[1],
+        refract.tint[2],
+        refract.fog[0],
+        // what water reflects, and where its fog is thickest
+        refract.reflection[0],
+        refract.reflection[1],
+        refract.reflection[2],
+        refract.fog[1],
+        // how far its normal map's two layers scrolled
+        s1x,
+        s1y,
+        s2x,
+        s2y,
     ]
 }
+
+/// How a surface shows what is behind it, for the shader: not at all, as `Refract` glass, as
+/// water.
+pub const REFRACT_NONE: f32 = 0.0;
+pub const REFRACT_GLASS: f32 = 1.0;
+pub const REFRACT_WATER: f32 = 2.0;
 
 /// The 8 floats a shader gets for fog: its colour and how thick it gets at most; where it
 /// starts, one over how far it thickens, and 1 when there is fog (all 0 when there is none).
@@ -487,13 +573,38 @@ mod tests {
         s.no_fog = true;
         assert_eq!(params(&s, true)[11], FOG_NONE);
         // no transform: the identity, frame 0, not modulating
-        assert_eq!(params(&s, true)[12..], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(params(&s, true)[12..20], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // no detail
+        assert_eq!(params(&s, true)[20..28], [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         // the look of the moment: its tint, alpha, transform and frame, wrapped to the frames
-        let look = Look { frame: 7, transform: [[2.0, 0.0, 0.5], [0.0, 2.0, 0.25]], tint: [0.5; 3], alpha: 0.5 };
+        let look =
+            Look { frame: 7, transform: [[2.0, 0.0, 0.5], [0.0, 2.0, 0.25]], tint: [0.5; 3], alpha: 0.5, bump_transform: None, time: 2.0 };
         s.modulate = true;
         let p = surface_params(&s, &look, 4, true);
         assert_eq!((p[0], p[3]), (0.5, 0.5));
-        assert_eq!(p[12..], [2.0, 0.0, 0.5, 3.0, 0.0, 2.0, 0.25, 1.0]);
+        assert_eq!(p[12..20], [2.0, 0.0, 0.5, 3.0, 0.0, 2.0, 0.25, 1.0]);
+        // a detail: how fine, how much, its mode, there
+        s.detail = Some(crate::Detail { texture: 0, scale: 8.0, blend: 0.5, mode: 1 });
+        assert_eq!(surface_params(&s, &look, 4, true)[20..24], [8.0, 0.5, 1.0, 1.0]);
+        // a bump map, self-shadowed, with a second one
+        s.bump = Some(crate::Bump { texture: 0, second: Some(1), self_shadowed: true, transform: [[2.0, 0.0, 0.5], [0.0, 3.0, 0.0]] });
+        let p = surface_params(&s, &look, 4, true);
+        assert_eq!(p[24..26], [BUMP_SELF_SHADOWED, 1.0]);
+        assert_eq!(p[28..36], [2.0, 0.0, 0.5, 0.0, 0.0, 3.0, 0.0, 0.0]);
+        assert_eq!(p[36], REFRACT_NONE);
+        // water: how it bends, tints, fogs, reflects, and its layers scrolled 2 s
+        s.refraction = Some(crate::Refraction {
+            water: true,
+            amount: 1.5,
+            tint: [0.5, 0.6, 0.7],
+            tint_texture: None,
+            fog: [10.0, 500.0],
+            reflection: [0.2, 0.3, 0.4],
+            scroll: [[0.01, 0.02], [-0.5, 1.0]],
+        });
+        let p = surface_params(&s, &look, 4, true);
+        assert_eq!(p[36..], [REFRACT_WATER, 1.5, 0.0, 0.0, 0.5, 0.6, 0.7, 10.0, 0.2, 0.3, 0.4, 500.0, 0.02, 0.04, -1.0, 2.0]);
+        assert_eq!(p[25], 0.0, "water's layers are not blended by the vertices");
     }
 
     fn transform(m: &[f32; 16], p: Vec3) -> [f32; 4] {
@@ -573,7 +684,10 @@ mod tests {
         assert_eq!(PixelFormat::Bc1.layout(2, 2), (8, 1));
         assert_eq!(PixelFormat::Bc3.layout(16, 8), (64, 2));
         assert_eq!(PixelFormat::Rgba8.layout(3, 2), (12, 2));
-        let lightmap = Lightmap { width: 1, height: 1, texels: vec![[1.0, 2.0, 0.5]] };
+        let lightmap = Lightmap { width: 1, height: 1, texels: vec![[1.0, 2.0, 0.5]], bumped: Vec::new() };
         assert_eq!(lightmap_data(&lightmap), [0x3C00u16, 0x4000, 0x3800, 0x3C00].iter().flat_map(|h| h.to_le_bytes()).collect::<Vec<u8>>());
+        assert_eq!(lightmap_layers(&lightmap), 1);
+        let bumped = Lightmap { bumped: vec![[1.0; 3]; 3], ..lightmap };
+        assert_eq!((lightmap_data(&bumped).len(), lightmap_layers(&bumped)), (4 * 8, 4));
     }
 }

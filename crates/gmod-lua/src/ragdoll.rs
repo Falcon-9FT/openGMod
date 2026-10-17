@@ -31,6 +31,10 @@ use crate::matrix::Matrix;
 use crate::physics::{angle, array, turn, vector};
 use crate::vector::{Angle, Vector};
 
+/// How slowly a ragdoll's parts move, in units a second at their farthest points, to fall
+/// asleep: lying on its joints' limits, a ragdoll stirs just under this.
+const RAGDOLL_SLEEP_SPEED: f32 = 6.0;
+
 /// The parts of a ragdoll.
 #[derive(Debug, Clone)]
 pub(crate) struct Ragdoll {
@@ -178,6 +182,7 @@ pub(crate) fn init(lua: &Lua, handle: EntityHandle, velocity: Vector) -> bool {
             }
             return false;
         };
+        host(lua).physics.physics.borrow_mut().set_sleep_speed(id, RAGDOLL_SLEEP_SPEED);
         crate::physics::keep(lua, id, handle, first, &shape, solid.surface_prop().unwrap_or("default"));
         made.insert(first, id);
     }
@@ -456,4 +461,15 @@ pub(crate) fn trace(lua: &Lua, handle: EntityHandle, start: Vector, end: Vector)
         }
     }
     best
+}
+
+/// A ragdoll of the client's (a corpse): it lies on the world, and goes through everything
+/// else.
+pub(crate) fn world_only(lua: &Lua, handle: EntityHandle) {
+    let bodies = bodies(lua, handle).unwrap_or_default();
+    let host = host(lua);
+    let mut physics = host.physics.physics.borrow_mut();
+    for id in bodies {
+        physics.set_collision_group(id, gmod_physics::WORLD_ONLY);
+    }
 }

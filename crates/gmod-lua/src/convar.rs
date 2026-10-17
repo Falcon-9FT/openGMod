@@ -20,6 +20,7 @@ use crate::{ScriptError, files, host};
 const ENGINE_CONVARS: &[(&str, &str, &str)] = &[
     ("sv_cheats", "0", "Allow cheats on server"),
     ("sv_gravity", "600", "World gravity."),
+    ("sv_defaultdeployspeed", "4", "Default weapon deploy speed"),
     ("sv_friction", "8", "World friction."),
     ("sv_stopspeed", "10", "Minimum stopping speed when on ground."),
     ("sv_accelerate", "10", "Linear acceleration amount (old value is 5.6)"),
@@ -149,7 +150,10 @@ impl UserData for ConVarHandle {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "ConVar", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "ConVar", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "ConVar", ud, key, value)
+        });
         methods.add_meta_function("__tostring", |lua, ud: AnyUserData| {
             let handle = *ud.borrow::<ConVarHandle>()?;
             Ok(format!("ConVar [{}]", host(lua).console.convars.borrow()[handle.0].name))
@@ -234,6 +238,19 @@ fn set(lua: &Lua, handle: ConVarHandle, value: &str) {
         if user_info {
             send_user_info(lua, &name, &new);
         }
+        // another language: its phrases from now on; the menu keeps it as the player's and
+        // tells its page (`LanguageChanged`), as the engine does
+        if name.eq_ignore_ascii_case("gmod_language") && host(lua).realm != crate::Realm::Server {
+            crate::client::load_phrases(lua);
+            if host(lua).realm == crate::Realm::Menu {
+                host(lua).menu.setting_changes.borrow_mut().push(crate::menu::SettingChange::Value("gmod_language".into(), new.clone()));
+                if let (Ok(Some(changed)), Ok(language)) =
+                    (lua.globals().get::<Option<mlua::Function>>("LanguageChanged"), lua.create_string(&new))
+                {
+                    let _ = files::call_reporting(lua, changed, mlua::MultiValue::from_iter([mlua::Value::String(language)]));
+                }
+            }
+        }
         let callback = || -> mlua::Result<Option<mlua::Function>> {
             let Some(cvars) = lua.globals().get::<Option<Table>>("cvars")? else { return Ok(None) };
             cvars.get::<Option<mlua::Function>>("OnConVarChanged")
@@ -254,6 +271,50 @@ pub(crate) fn set_value(lua: &Lua, name: &str, value: &str) {
     }
 }
 
+/// The engine's commands for players, which are no ConVars and no commands of Lua.
+const ENGINE_COMMANDS: &[&str] = &[
+    "noclip", "kill", "explode", "give", "use", "lastinv", "ent_fire", "invnext", "invprev", "slot1", "slot2", "slot3", "slot4", "slot5",
+    "slot6", "lua_run", "echo",
+];
+
+/// What the console offers for `line` typed so far: the ConVars (`name value`) and commands
+/// whose names start with it, by name; once the line has a command and a space, what the
+/// command's own completion (`concommand.Add`'s) gives.
+pub(crate) fn completions(lua: &Lua, line: &str) -> Vec<String> {
+    let line = line.trim_start();
+    if let Some((command, _)) = line.split_once(' ') {
+        let complete = || -> Option<Vec<String>> {
+            let concommand: Table = lua.globals().get("concommand").ok()?;
+            let auto: mlua::Function = concommand.get("AutoComplete").ok()?;
+            let arguments = &line[command.len()..];
+            let list: Table = files::call_reporting(lua, auto, mlua::IntoLuaMulti::into_lua_multi((command, arguments), lua).ok()?)
+                .ok()?
+                .into_iter()
+                .next()
+                .and_then(|v| v.as_table().cloned())?;
+            Some(list.sequence_values::<String>().flatten().collect())
+        };
+        return complete().unwrap_or_default();
+    }
+    let prefix = line.to_ascii_lowercase();
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let console = &host(lua).console;
+    let mut out: Vec<String> = console
+        .convars
+        .borrow()
+        .iter()
+        .filter(|c| c.name.to_ascii_lowercase().starts_with(&prefix))
+        .map(|c| format!("{} {}", c.name, c.value))
+        .collect();
+    out.extend(console.commands.borrow().keys().filter(|name| name.starts_with(&prefix)).cloned());
+    out.extend(ENGINE_COMMANDS.iter().filter(|name| name.starts_with(&prefix)).map(|name| name.to_string()));
+    out.sort_by_key(|entry| entry.split(' ').next().unwrap_or("").to_ascii_lowercase());
+    out.dedup_by_key(|entry| entry.split(' ').next().unwrap_or("").to_ascii_lowercase());
+    out
+}
+
 /// The value of a ConVar, if there is one of that name.
 pub(crate) fn value(lua: &Lua, name: &str) -> Option<String> {
     find(lua, name).map(|handle| with(lua, handle, |c| c.value.clone()))
@@ -263,11 +324,12 @@ fn with<R>(lua: &Lua, handle: ConVarHandle, f: impl FnOnce(&ConVar) -> R) -> R {
     f(&host(lua).console.convars.borrow()[handle.0])
 }
 
-/// FCVAR flags: a number, or a table of numbers to combine; a boolean, which some addons give,
-/// is none, as GMod takes it.
+/// FCVAR flags: a number, or a table of numbers to combine; a boolean, or a string that is no
+/// number (`"FCVAR_NOTIFY"`), which some addons give, is none, as GMod takes it.
 fn flags_arg(args: &Args, position: usize) -> mlua::Result<i64> {
     match args.get(position) {
         Some(Value::Boolean(_)) => Ok(0),
+        Some(Value::String(s)) => Ok(s.to_str().ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0) as i64),
         Some(Value::Table(t)) => {
             let mut flags = 0i64;
             for flag in t.sequence_values::<f64>() {
@@ -337,9 +399,11 @@ pub(crate) fn is_known(lua: &Lua, name: &str) -> bool {
         || crate::chat::is_command(lua, name)
 }
 
-/// Runs one command now: sets a ConVar, or calls a command of Lua.
+/// Runs one command now: sets a ConVar, or calls a command of Lua - typed into the server's
+/// console, or a client's, whose commands get its own player.
 pub(crate) fn execute(lua: &Lua, words: &[String]) {
-    execute_as(lua, words, EntityHandle::NULL);
+    let player = if host(lua).realm == crate::Realm::Client { host(lua).client.local_player.get() } else { EntityHandle::NULL };
+    execute_as(lua, words, player);
 }
 
 /// Runs a command typed by `player` (`NULL`: the server's console), whom the commands of
@@ -358,6 +422,11 @@ pub(crate) fn execute_as(lua: &Lua, words: &[String], player: EntityHandle) {
         return;
     }
     let known = host(lua).console.commands.borrow().contains_key(&name.to_ascii_lowercase());
+    // the engine's `echo`: what follows, back into the console
+    if !known && name.eq_ignore_ascii_case("echo") {
+        host(lua).print(&format!("{}\n", arguments.join(" ")));
+        return;
+    }
     if !known && crate::chat::command(lua, player, words) {
         return;
     }

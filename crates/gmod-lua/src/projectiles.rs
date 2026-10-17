@@ -153,7 +153,7 @@ pub(crate) fn think(lua: &Lua) {
 
 /// One tick of a projectile: where it is still, or none once it is gone.
 fn step(lua: &Lua, mut f: Flying) -> Option<Flying> {
-    let dt = crate::timer::TICK_INTERVAL as f32;
+    let dt = crate::timer::tick_interval() as f32;
     let (pos, _) = host(lua).entities.transform(f.entity)?;
     if now(lua) >= f.ends {
         match f.kind {

@@ -19,6 +19,7 @@ gmod-ui.workspace = true
 gmod-audio.workspace = true
 gmod-steam.workspace = true
 mlua.workspace = true
+ring.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 ureq.workspace = true

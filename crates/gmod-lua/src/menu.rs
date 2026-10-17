@@ -40,6 +40,18 @@ impl Addon {
     }
 }
 
+/// The screen's sizes, and its own.
+pub(crate) type VideoModes = (Vec<(u32, u32)>, (u32, u32));
+
+/// What the options window changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingChange {
+    /// A setting (`sensitivity`) and its value.
+    Value(String, String),
+    /// A key (its engine name, lower case) and the command it does from now on; none: nothing.
+    Bind(String, Option<String>),
+}
+
 /// A game whose content can be mounted, as `engine.GetGames` lists it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MountableGame {
@@ -56,6 +68,20 @@ pub(crate) struct Menu {
     pub addons: RefCell<Vec<Addon>>,
     /// `steamworks.ApplyAddons` was called since the program last looked.
     pub applied: Cell<bool>,
+    /// The lines typed into the console window, for the program to run.
+    pub console_typed: RefCell<Vec<String>>,
+    /// A line being typed there, whose completions the program is to give.
+    pub console_complete: RefCell<Option<String>>,
+    /// The player's settings as the program has them, for the options window; and what the
+    /// window changed, for the program.
+    pub settings: RefCell<std::collections::BTreeMap<String, String>>,
+    pub binds: RefCell<Vec<(String, String)>>,
+    pub setting_changes: RefCell<Vec<SettingChange>>,
+    /// The screen's sizes the video options offer, and the screen's own.
+    pub video_modes: RefCell<VideoModes>,
+    /// The graphics API it draws with (`dx12`, `vulkan`), the GPU's name, and the APIs the
+    /// player may choose.
+    pub renderer: RefCell<(String, String, Vec<String>)>,
     pub games: RefCell<Vec<MountableGame>>,
     pub in_game: Cell<bool>,
     /// Addons were not mounted at all (`-noaddons`), workshop ones were not (`-noworkshop`).
@@ -75,6 +101,31 @@ fn call_back(lua: &Lua, f: mlua::Function, args: impl mlua::IntoLuaMulti) {
     if let Ok(args) = args.into_lua_multi(lua) {
         let _ = crate::files::call_reporting(lua, f, args);
     }
+}
+
+/// The words of a list of the engine's (`scripts/kb_act.lst`): quoted or not, `//` ending a
+/// line; two to a pair.
+fn list_pairs(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() || rest.starts_with("//") {
+                break;
+            }
+            if let Some(quoted) = rest.strip_prefix('"') {
+                let end = quoted.find('"').unwrap_or(quoted.len());
+                words.push(quoted[..end].to_string());
+                rest = quoted.get(end + 1..).unwrap_or("");
+            } else {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                words.push(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+        }
+    }
+    words
 }
 
 fn nothing(_: &Args) -> mlua::Result<Value> {
@@ -201,6 +252,178 @@ function steamworks.RequestPlayerInfo( steamid, callback )
 	queue[ #queue + 1 ] = steamid
 	if ( !busy ) then AskNextName( 0 ) end
 end
+
+-- what servers were let do (`connect` elsewhere): for this run of the program, those given
+-- for good too; by the address of the server played on
+local granted = { temporary = {}, permanent = {} }
+local function ServerAddress()
+	local address = engine.CurrentServerAddress and engine.CurrentServerAddress() or ""
+	return address != "" and address or "loopback"
+end
+local function Changed()
+	if ( hook ) then hook.Run( "OnPermissionsChanged" ) end
+end
+permissions = {}
+function permissions.GetAll()
+	local all = { temporary = {}, permanent = {} }
+	for kind, servers in pairs( granted ) do
+		for address, perms in pairs( servers ) do
+			local names = {}
+			for name in pairs( perms ) do names[ #names + 1 ] = name end
+			table.sort( names )
+			if ( #names > 0 ) then all[ kind ][ address ] = table.concat( names, "," ) end
+		end
+	end
+	return all
+end
+function permissions.IsGranted( perm )
+	local address = ServerAddress()
+	for _, servers in pairs( granted ) do
+		if ( servers[ address ] and servers[ address ][ perm ] ) then return true end
+	end
+	return false
+end
+function permissions.Grant( perm, temporary )
+	local servers = granted[ temporary and "temporary" or "permanent" ]
+	local address = ServerAddress()
+	servers[ address ] = servers[ address ] or {}
+	servers[ address ][ perm ] = true
+	Changed()
+end
+function permissions.Revoke( perm, address )
+	for _, servers in pairs( granted ) do
+		if ( servers[ address ] ) then servers[ address ][ perm ] = nil end
+	end
+	Changed()
+end
+function permissions.Connect( address )
+	RunConsoleCommand( "connect", address )
+end
+function permissions.AskToConnect( address )
+	if ( RequestConnectToServer ) then RequestConnectToServer( address ) end
+end
+
+-- the console (`): what the game, its Lua and the program said, and a line to type commands
+-- into, as the engine's own window; made the first time it opens, what came before kept
+OpenGMODConsole = OpenGMODConsole or { pending = {} }
+local Console = OpenGMODConsole
+
+local function MakeConsole()
+	surface.CreateFont( "OpenGMODConsole", { font = "Lucida Console", size = 13, weight = 400, antialias = true } )
+	local frame = vgui.Create( "DFrame" )
+	frame:SetTitle( "Console" )
+	frame:SetSize( math.min( ScrW() - 40, 900 ), math.min( ScrH() - 40, 560 ) )
+	frame:Center()
+	frame:SetSizable( true )
+	frame:SetScreenLock( true )
+	frame:SetDeleteOnClose( false )
+	frame:SetMinWidth( 300 )
+	frame:SetMinHeight( 160 )
+	frame.btnMaxim:SetVisible( false )
+	frame.btnMinim:SetVisible( false )
+	-- the main menu comes up with it, over the game: the console stays in front of it
+	local base = vgui.GetControlTable( "DFrame" )
+	frame.Think = function( self )
+		if ( base and base.Think ) then base.Think( self ) end
+		if ( ( self.Fronts or 0 ) > 0 ) then
+			self.Fronts = self.Fronts - 1
+			self:MoveToFront()
+		end
+	end
+
+	local bottom = frame:Add( "Panel" )
+	bottom:Dock( BOTTOM )
+	bottom:SetTall( 22 )
+	bottom:DockMargin( 0, 4, 0, 0 )
+	local submit = bottom:Add( "DButton" )
+	submit:Dock( RIGHT )
+	submit:SetWide( 80 )
+	submit:SetText( "Submit" )
+	local entry = bottom:Add( "DTextEntry" )
+	entry:Dock( FILL )
+	entry:DockMargin( 0, 0, 4, 0 )
+	entry:SetHistoryEnabled( true )
+	-- what the line could go on as, as the program says a frame later: under the line, as
+	-- DTextEntry shows its own; up, down and Tab go through them
+	entry.GetAutoComplete = function( self, text )
+		if ( string.Trim( text ) != "" ) then OpenGMOD.ConsoleComplete( text ) end
+	end
+
+	local back = frame:Add( "DPanel" )
+	back:Dock( FILL )
+	back.Paint = function( self, w, h )
+		surface.SetDrawColor( 24, 24, 24, 240 )
+		surface.DrawRect( 0, 0, w, h )
+	end
+	local log = back:Add( "RichText" )
+	log:Dock( FILL )
+	log:DockMargin( 4, 2, 2, 2 )
+	log.PerformLayout = function( self ) self:SetFontInternal( "OpenGMODConsole" ) end
+
+	local function Run()
+		if ( IsValid( entry.Menu ) ) then entry.Menu:Remove() end
+		local line = entry:GetText()
+		entry:SetText( "" )
+		entry:RequestFocus()
+		if ( string.Trim( line ) == "" ) then return end
+		entry:AddHistory( line )
+		Console.Print( "] " .. line .. "\n", 220, 220, 220 )
+		OpenGMOD.ConsoleCommand( line )
+	end
+	entry.OnEnter = Run
+	submit.DoClick = Run
+
+	frame.Log, frame.Entry = log, entry
+	Console.Frame = frame
+	for _, chunk in ipairs( Console.pending ) do
+		log:InsertColorChange( chunk[ 2 ], chunk[ 3 ], chunk[ 4 ], 255 )
+		log:AppendText( chunk[ 1 ] )
+	end
+	Console.pending = {}
+	return frame
+end
+
+function Console.Print( text, r, g, b )
+	text = string.Replace( text, "\t", "    " )
+	local frame = Console.Frame
+	if ( IsValid( frame ) ) then
+		frame.Log:InsertColorChange( r, g, b, 255 )
+		frame.Log:AppendText( text )
+		return
+	end
+	local pending = Console.pending
+	pending[ #pending + 1 ] = { text, r, g, b }
+	if ( #pending > 2000 ) then table.remove( pending, 1 ) end
+end
+
+function Console.Toggle()
+	local frame = Console.Frame
+	if ( !IsValid( frame ) ) then
+		frame = MakeConsole()
+	elseif ( frame:IsVisible() ) then
+		frame:Close()
+		return false
+	end
+	frame:SetVisible( true )
+	frame:MakePopup()
+	frame.Fronts = 5
+	frame.Entry:RequestFocus()
+	return true
+end
+
+function Console.Completions( line, list )
+	local frame = Console.Frame
+	if ( !IsValid( frame ) or !frame:IsVisible() ) then return end
+	local entry = frame.Entry
+	if ( entry:GetText() != line ) then return end
+	if ( IsValid( entry.Menu ) ) then entry.Menu:Remove() end
+	if ( #list == 0 ) then return end
+	entry:OpenAutoComplete( list )
+end
+
+function Console.IsOpen()
+	return IsValid( Console.Frame ) and Console.Frame:IsVisible()
+end
 "#;
 
 /// Where the previews of workshop items are kept, in openGMOD's folder: the menu's page
@@ -303,6 +526,15 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
             "quit" | "quitnoconfirm" => "quit",
             "disconnect" | "engine disconnect" => "disconnect",
             "resumegame" => "resume",
+            // the options window, the menu's own
+            "openoptionsdialog" => {
+                if let Ok(options) = a.lua.globals().raw_get::<Table>("OpenGMODOptions")
+                    && let Ok(open) = options.raw_get::<mlua::Function>("Open")
+                {
+                    let _ = crate::files::call_reporting(a.lua, open, MultiValue::new());
+                }
+                return Ok(Value::Nil);
+            }
             _ => {
                 host(a.lua).print(&format!("{command} is not in openGMOD yet\n"));
                 return Ok(Value::Nil);
@@ -327,6 +559,127 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
         }
         Ok(Value::Nil)
     })?;
+    // the console window's side of the program: what is typed into it goes to the program
+    let opengmod = library(lua, "OpenGMOD")?;
+    // the options window is laid out as the engine's: its pages' `.res` files, with what does
+    // not hold on this computer left out; and the lists of keys (`scripts/kb_act.lst`)
+    def(lua, &opengmod, "ReadResource", |a| {
+        let path = a.string(1)?;
+        let Some(text) = host(a.lua).vfs.read(&path, "GAME").ok() else { return Ok(Value::Nil) };
+        let (mut document, _) = gmod_kv::parse_lenient(&gmod_kv::decode_text(&text), gmod_kv::Options::default());
+        document.root.apply_conditions(&gmod_kv::pc_symbol);
+        let controls = a.lua.create_table()?;
+        let Some(top) = document.root.pairs.first().and_then(|p| p.value.as_block()) else { return Ok(Value::Table(controls)) };
+        for pair in top.iter() {
+            let Some(block) = pair.value.as_block() else { continue };
+            let control = a.lua.create_table()?;
+            control.raw_set("name", pair.key.as_str())?;
+            for field in block.iter() {
+                let key = field.key.to_ascii_lowercase();
+                // the first of a key, as the engine reads it
+                if let Some(value) = field.value.as_str()
+                    && control.raw_get::<Value>(key.as_str())?.is_nil()
+                {
+                    control.raw_set(key, value)?;
+                }
+            }
+            controls.raw_push(control)?;
+        }
+        Ok(Value::Table(controls))
+    })?;
+    def(lua, &opengmod, "ReadPairs", |a| {
+        let path = a.string(1)?;
+        let Some(text) = host(a.lua).vfs.read(&path, "GAME").ok() else { return Ok(Value::Nil) };
+        let pairs = a.lua.create_table()?;
+        for [key, value] in list_pairs(&gmod_kv::decode_text(&text)).as_chunks::<2>().0 {
+            pairs.raw_push(a.lua.create_sequence_from([key.as_str(), value.as_str()])?)?;
+        }
+        Ok(Value::Table(pairs))
+    })?;
+    def(lua, &opengmod, "VideoModes", |a| {
+        let (modes, native) = host(a.lua).menu.video_modes.borrow().clone();
+        let list = a.lua.create_table()?;
+        for (w, h) in modes {
+            list.raw_push(a.lua.create_sequence_from([w, h])?)?;
+        }
+        list.raw_set("native", a.lua.create_sequence_from([native.0, native.1])?)?;
+        Ok(Value::Table(list))
+    })?;
+    // what draws: `{ api = "dx12", gpu = "...", available = { "dx12", "vulkan" } }`
+    def(lua, &opengmod, "Renderer", |a| {
+        let (api, gpu, available) = host(a.lua).menu.renderer.borrow().clone();
+        let out = a.lua.create_table()?;
+        out.raw_set("api", api)?;
+        out.raw_set("gpu", gpu)?;
+        out.raw_set("available", a.lua.create_sequence_from(available)?)?;
+        Ok(Value::Table(out))
+    })?;
+    // the options window's: the player's settings and key bindings
+    def(lua, &opengmod, "GetSetting", |a| {
+        let name = a.string(1)?.to_ascii_lowercase();
+        let value = host(a.lua).menu.settings.borrow().get(&name).cloned();
+        Ok(match value {
+            Some(value) => Value::String(a.lua.create_string(value)?),
+            None => Value::Nil,
+        })
+    })?;
+    def(lua, &opengmod, "SetSetting", |a| {
+        let name = a.string(1)?.to_ascii_lowercase();
+        let value = match a.get(2) {
+            Some(Value::Boolean(b)) => if *b { "1" } else { "0" }.to_string(),
+            Some(Value::Number(n)) if n.fract() == 0.0 && n.abs() < 1e15 => (*n as i64).to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::Integer(n)) => n.to_string(),
+            _ => a.string(2)?,
+        };
+        let menu = &host(a.lua).menu;
+        menu.settings.borrow_mut().insert(name.clone(), value.clone());
+        menu.setting_changes.borrow_mut().push(SettingChange::Value(name, value));
+        Ok(Value::Nil)
+    })?;
+    // every key bound, and what it does
+    def(lua, &opengmod, "GetBinds", |a| {
+        let list = a.lua.create_table()?;
+        for (key, command) in host(a.lua).menu.binds.borrow().iter() {
+            list.raw_push(a.lua.create_sequence_from([key.as_str(), command.as_str()])?)?;
+        }
+        Ok(Value::Table(list))
+    })?;
+    // the keys that do a command, in the order they were bound
+    def(lua, &opengmod, "GetBindKeys", |a| {
+        let command = a.string(1)?;
+        let keys: Vec<String> =
+            host(a.lua).menu.binds.borrow().iter().filter(|(_, c)| c.eq_ignore_ascii_case(&command)).map(|(k, _)| k.clone()).collect();
+        Ok(Value::Table(a.lua.create_sequence_from(keys)?))
+    })?;
+    // a key does a command from now on (nil: nothing)
+    def(lua, &opengmod, "BindKey", |a| {
+        let key = a.string(1)?.to_lowercase();
+        let command = a.opt_string(2)?.filter(|c| !c.is_empty());
+        let menu = &host(a.lua).menu;
+        {
+            let mut binds = menu.binds.borrow_mut();
+            binds.retain(|(k, _)| *k != key);
+            if let Some(command) = &command {
+                binds.push((key.clone(), command.clone()));
+            }
+        }
+        menu.setting_changes.borrow_mut().push(SettingChange::Bind(key, command));
+        Ok(Value::Nil)
+    })?;
+    def(lua, &opengmod, "ConsoleCommand", |a| {
+        let line = a.string(1)?;
+        host(a.lua).menu.console_typed.borrow_mut().push(line);
+        Ok(Value::Nil)
+    })?;
+    // what a line typed so far could go on as: `OpenGMODConsole.Completions(line, list)` comes
+    // with the answer
+    def(lua, &opengmod, "ConsoleComplete", |a| {
+        let line = a.string(1)?;
+        *host(a.lua).menu.console_complete.borrow_mut() = Some(line);
+        Ok(Value::Nil)
+    })?;
+
     let gui = library(lua, "gui")?;
     def(lua, &gui, "ShowConsole", nothing)?;
 
@@ -403,7 +756,9 @@ pub(crate) fn install(lua: &Lua, realm: Realm) -> mlua::Result<()> {
     crate::serverlist::install(lua, &serverlist)?;
 
     let chunk = lua.load(MENU_LUA).set_name("=[openGMOD menu]");
-    chunk.call((previews(lua)?, crate::steam::natives(lua)?))
+    chunk.call::<()>((previews(lua)?, crate::steam::natives(lua)?))?;
+    // the options dialog, as the engine's GameUI makes it
+    lua.load(include_str!("menu_options.lua")).set_name("=[openGMOD options]").exec()
 }
 
 /// The program's side of the menu.
@@ -425,6 +780,70 @@ impl crate::Runtime {
     pub fn take_addon_changes(&self) -> Option<Vec<Addon>> {
         let menu = &host(&self.lua).menu;
         menu.applied.replace(false).then(|| menu.addons.borrow().clone())
+    }
+
+    /// What the game said, for the console window (`): text, line breaks included, in a
+    /// colour; kept until the window is first opened.
+    pub fn console_print(&self, text: &str, color: [u8; 3]) {
+        let _ = self.console_call("Print", (text, color[0], color[1], color[2]));
+    }
+
+    /// Opens the console window, or closes it: whether it shows now.
+    pub fn toggle_console(&self) -> bool {
+        self.console_call("Toggle", ()).and_then(|v| v.into_iter().next()).is_some_and(|v| matches!(v, Value::Boolean(true)))
+    }
+
+    /// Whether the console window shows.
+    pub fn console_shown(&self) -> bool {
+        self.console_call("IsOpen", ()).and_then(|v| v.into_iter().next()).is_some_and(|v| matches!(v, Value::Boolean(true)))
+    }
+
+    /// The player's settings and key bindings, for the options window.
+    pub fn set_settings(&self, values: std::collections::BTreeMap<String, String>, binds: Vec<(String, String)>) {
+        let menu = &host(&self.lua).menu;
+        *menu.settings.borrow_mut() = values;
+        *menu.binds.borrow_mut() = binds;
+    }
+
+    /// The screen's sizes the video options offer, and the screen's own.
+    pub fn set_video_modes(&self, modes: Vec<(u32, u32)>, native: (u32, u32)) {
+        *host(&self.lua).menu.video_modes.borrow_mut() = (modes, native);
+    }
+
+    /// What draws: the graphics API (`dx12`, `vulkan`), the GPU's name, and the APIs it could
+    /// draw with, for the advanced video options.
+    pub fn set_renderer(&self, api: &str, gpu: &str, available: Vec<String>) {
+        *host(&self.lua).menu.renderer.borrow_mut() = (api.to_string(), gpu.to_string(), available);
+    }
+
+    /// What the options window changed since the last call, in order.
+    pub fn take_setting_changes(&self) -> Vec<SettingChange> {
+        std::mem::take(&mut *host(&self.lua).menu.setting_changes.borrow_mut())
+    }
+
+    /// The line typed into the console window whose completions it asked for since the last
+    /// call, if it did.
+    pub fn take_console_complete(&self) -> Option<String> {
+        host(&self.lua).menu.console_complete.borrow_mut().take()
+    }
+
+    /// The completions of a line typed into the console window: shown under it while it still
+    /// says that.
+    pub fn console_completions(&self, line: &str, list: Vec<String>) {
+        if let Ok(list) = self.lua.create_sequence_from(list) {
+            self.console_call("Completions", (line.to_string(), list));
+        }
+    }
+
+    /// The lines typed into the console window since the last call, oldest first.
+    pub fn take_console_commands(&self) -> Vec<String> {
+        std::mem::take(&mut *host(&self.lua).menu.console_typed.borrow_mut())
+    }
+
+    fn console_call(&self, name: &str, args: impl mlua::IntoLuaMulti) -> Option<MultiValue> {
+        let console: Table = self.lua.globals().raw_get("OpenGMODConsole").ok()?;
+        let f: mlua::Function = console.raw_get(name).ok()?;
+        crate::files::call_reporting(&self.lua, f, args.into_lua_multi(&self.lua).ok()?).ok()
     }
 
     /// No addons were mounted at all (`--no-addons`).

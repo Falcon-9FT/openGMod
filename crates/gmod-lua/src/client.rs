@@ -45,18 +45,24 @@ struct Keys {
 
 pub(crate) struct Client {
     pub local_player: Cell<EntityHandle>,
+    /// The map is loaded and its entities have not come yet: `InitPostEntity` waits for them.
+    pub awaiting_entities: Cell<bool>,
     pub view: Cell<View>,
     keys: RefCell<Keys>,
     pub cursor: Cell<(i32, i32)>,
     /// `gui.EnableScreenClicker`: the cursor is free over the game.
     pub screen_clicker: Cell<bool>,
     /// Key name (lower case) to command, as `cfg/config_default.cfg` binds them.
-    binds: RefCell<Vec<(String, String)>>,
+    pub(crate) binds: RefCell<Vec<(String, String)>>,
     phrases: RefCell<HashMap<String, String>>,
     /// Console lines for the server.
     pub to_server: RefCell<Vec<String>>,
     /// User info (ConVars with `FCVAR_USERINFO`) the server has not been told of.
     pub user_info: RefCell<Vec<(String, String)>>,
+    /// Keys and buttons of the game's that went down (true) or up since the server was told,
+    /// for its `PlayerButtonDown` and `PlayerButtonUp`; and those down, as it was told.
+    pub(crate) buttons: RefCell<Vec<(i32, bool)>>,
+    buttons_down: RefCell<HashSet<i32>>,
     pub frame: Cell<u64>,
     pub real_frame_time: Cell<f64>,
     /// The view is from outside the local player, who is drawn then (`CalcView`'s
@@ -68,6 +74,7 @@ impl Default for Client {
     fn default() -> Client {
         Client {
             local_player: Cell::new(EntityHandle::NULL),
+            awaiting_entities: Cell::new(false),
             view: Cell::new(View::default()),
             keys: RefCell::new(Keys::default()),
             cursor: Cell::new((0, 0)),
@@ -76,6 +83,8 @@ impl Default for Client {
             phrases: RefCell::new(HashMap::new()),
             to_server: RefCell::new(Vec::new()),
             user_info: RefCell::new(Vec::new()),
+            buttons: RefCell::new(Vec::new()),
+            buttons_down: RefCell::new(HashSet::new()),
             frame: Cell::new(0),
             draw_viewer: Cell::new(false),
             real_frame_time: Cell::new(0.0),
@@ -306,21 +315,69 @@ pub(crate) fn load(lua: &Lua) {
             }
         }
     }
+    drop(host);
+    load_phrases(lua);
+}
+
+/// The engine's name of a language GMod names by its code (`ru`: `russian`), as its token
+/// files (`gameui_russian.txt`) are named.
+fn engine_language(code: &str) -> &'static str {
+    match code.to_ascii_lowercase().as_str() {
+        "bg" => "bulgarian",
+        "cs" => "czech",
+        "da" => "danish",
+        "de" => "german",
+        "el" => "greek",
+        "es-es" | "es" => "spanish",
+        "fi" => "finnish",
+        "fr" => "french",
+        "hu" => "hungarian",
+        "it" => "italian",
+        "ja" => "japanese",
+        "ko" => "koreana",
+        "nl" => "dutch",
+        "no" => "norwegian",
+        "pl" => "polish",
+        "pt-br" => "brazilian",
+        "pt-pt" => "portuguese",
+        "ro" => "romanian",
+        "ru" => "russian",
+        "sv-se" | "sv" => "swedish",
+        "th" => "thai",
+        "tr" => "turkish",
+        "uk" => "ukrainian",
+        "zh-cn" => "schinese",
+        "zh-tw" => "tchinese",
+        _ => "english",
+    }
+}
+
+/// The phrases of the language (`gmod_language`): the engine's token files and GMod's, English
+/// first and the language over it.
+pub(crate) fn load_phrases(lua: &Lua) {
+    let host = host(lua);
+    let vfs = host.vfs.clone();
+    let language = crate::convar::value(lua, "gmod_language").filter(|l| !l.is_empty()).unwrap_or_else(|| "en".to_string());
     let mut phrases = host.client.phrases.borrow_mut();
-    // the engine's token files, then GMod's: English first, the language over it
-    for folder in ["resource", "resource/language"] {
-        for file in vfs.find(&format!("{folder}/*_english.txt"), "GAME").files {
-            let Ok(data) = vfs.read(&format!("{folder}/{file}"), "GAME") else { continue };
-            let (document, _) = gmod_kv::parse_lenient(&gmod_kv::decode_text(&data), gmod_kv::Options { escapes: true });
-            let Some(tokens) = document.root.iter().find_map(|p| p.value.as_block()).and_then(|b| b.block("Tokens")) else { continue };
-            for pair in tokens {
-                if let Some(value) = pair.value.as_str() {
-                    phrases.insert(pair.key.to_lowercase(), value.to_string());
+    phrases.clear();
+    let mut names = vec!["english"];
+    if engine_language(&language) != "english" {
+        names.push(engine_language(&language));
+    }
+    for name in names {
+        for folder in ["resource", "resource/language"] {
+            for file in vfs.find(&format!("{folder}/*_{name}.txt"), "GAME").files {
+                let Ok(data) = vfs.read(&format!("{folder}/{file}"), "GAME") else { continue };
+                let (document, _) = gmod_kv::parse_lenient(&gmod_kv::decode_text(&data), gmod_kv::Options { escapes: true });
+                let Some(tokens) = document.root.iter().find_map(|p| p.value.as_block()).and_then(|b| b.block("Tokens")) else { continue };
+                for pair in tokens {
+                    if let Some(value) = pair.value.as_str() {
+                        phrases.insert(pair.key.to_lowercase(), value.to_string());
+                    }
                 }
             }
         }
     }
-    let language = crate::convar::value(lua, "gmod_language").filter(|l| !l.is_empty()).unwrap_or_else(|| "en".to_string());
     let mut languages = vec!["en".to_string()];
     if language != "en" {
         languages.push(language);
@@ -329,33 +386,67 @@ pub(crate) fn load(lua: &Lua) {
         let folder = format!("resource/localization/{language}");
         for file in vfs.find(&format!("{folder}/*.properties"), "GAME").files {
             let Ok(data) = vfs.read(&format!("{folder}/{file}"), "GAME") else { continue };
-            for line in String::from_utf8_lossy(&data).lines() {
-                let line = line.trim_start_matches('\u{feff}').trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((key, value)) = line.split_once('=') {
-                    phrases.insert(key.trim().to_lowercase(), unescape(value.trim()));
-                }
+            for (key, value) in properties(&String::from_utf8_lossy(&data)) {
+                phrases.insert(key.to_lowercase(), value);
             }
         }
     }
 }
 
-/// A value of a `.properties` file: `\:` is `:`, `\n` a line break.
+/// The pairs of a `.properties` file: `key=value` a line, `#` lines left out; a line ending in
+/// `\` goes on in the next, whose leading blanks are left out.
+pub(crate) fn properties(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut logical = String::new();
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}');
+        let line = if logical.is_empty() { line.trim() } else { line.trim_start() };
+        if logical.is_empty() && (line.is_empty() || line.starts_with('#')) {
+            continue;
+        }
+        // an odd number of backslashes at the end: it goes on
+        let trailing = line.len() - line.trim_end_matches('\\').len();
+        if trailing % 2 == 1 {
+            logical.push_str(&line[..line.len() - 1]);
+            continue;
+        }
+        logical.push_str(line);
+        if let Some((key, value)) = logical.split_once('=') {
+            out.push((key.trim().to_string(), unescape(value.trim())));
+        }
+        logical.clear();
+    }
+    out
+}
+
+/// A value of a `.properties` file: `\uXXXX` is that character (two of them a pair of
+/// surrogates), `\n` a line break, `\t` a tab, a backslash before anything else that thing.
 fn unescape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
+    let mut chars = value.chars().peekable();
+    let mut high: Option<u32> = None;
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => {}
-            }
-        } else {
+        if c != '\\' {
             out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = std::iter::from_fn(|| chars.next_if(char::is_ascii_hexdigit)).take(4).collect();
+                let Ok(unit) = u32::from_str_radix(&hex, 16) else {
+                    out.push('u');
+                    continue;
+                };
+                match (high.take(), unit) {
+                    (_, 0xD800..=0xDBFF) => high = Some(unit),
+                    (Some(h), 0xDC00..=0xDFFF) => out.extend(char::from_u32(0x10000 + ((h - 0xD800) << 10) + (unit - 0xDC00))),
+                    (_, unit) => out.push(char::from_u32(unit).unwrap_or('\u{fffd}')),
+                }
+            }
+            Some(other) => out.push(other),
+            None => {}
         }
     }
     out
@@ -596,6 +687,9 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     def(lua, &globals, "EyePos", |a| userdata(a.lua, host(a.lua).client.view.get().origin))?;
     def(lua, &globals, "EyeAngles", |a| userdata(a.lua, host(a.lua).client.view.get().angles))?;
     def(lua, &globals, "EyeVector", |a| userdata(a.lua, host(a.lua).client.view.get().angles.vectors().0))?;
+    // the main view's: the same here, which draws no other views (`render.RenderView`) yet
+    def(lua, &globals, "MainEyePos", |a| userdata(a.lua, host(a.lua).client.view.get().origin))?;
+    def(lua, &globals, "MainEyeAngles", |a| userdata(a.lua, host(a.lua).client.view.get().angles))?;
     def(lua, &globals, "RenderAngles", |a| userdata(a.lua, host(a.lua).client.view.get().angles))?;
     def(lua, &globals, "RealFrameTime", |a| Ok(Value::Number(host(a.lua).client.real_frame_time.get())))?;
     def(lua, &globals, "FrameNumber", |a| Ok(Value::Integer(host(a.lua).client.frame.get() as i64)))?;
@@ -751,9 +845,12 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     globals.raw_set("gui", gui)?;
 
     let language = lua.create_table()?;
+    // without the text (as M9K's C4 calls it) nothing is added, as in GMod
     def(lua, &language, "Add", |a| {
-        let (key, value) = (a.string(1)?, a.string(2)?);
-        host(a.lua).client.phrases.borrow_mut().insert(key.trim_start_matches('#').to_lowercase(), value);
+        let key = a.string(1)?;
+        if let Some(value) = a.opt_string(2)? {
+            host(a.lua).client.phrases.borrow_mut().insert(key.trim_start_matches('#').to_lowercase(), value);
+        }
         Ok(Value::Nil)
     })?;
     def(lua, &language, "GetPhrase", |a| {
@@ -1050,6 +1147,16 @@ impl crate::Runtime {
         host.panels.cursor_visible(host.client.screen_clicker.get()) || crate::chat::is_open(&self.lua)
     }
 
+    /// The keys and buttons held down that `which` names go up: the program no longer has
+    /// them - its window lost the keyboard, the system took their going up (Alt+Shift changing
+    /// the keyboard's language), another menu has the keys now.
+    pub fn release_keys(&self, which: impl Fn(i32) -> bool) {
+        let down: Vec<i32> = host(&self.lua).client.keys.borrow().down.iter().copied().filter(|&code| which(code)).collect();
+        for code in down {
+            self.button(code, false);
+        }
+    }
+
     /// A key or mouse button (`KEY_*`, `MOUSE_*`) went down or up. The open chat box has the
     /// keys going down first ([`crate::chat`]), then the panels; then `PlayerBindPress` hears
     /// of the command bound to it, and a command of the client's own runs (`+menu` with the
@@ -1057,9 +1164,17 @@ impl crate::Runtime {
     /// has the rest (`+attack`, `noclip` ...).
     pub fn button(&self, code: i32, down: bool) -> bool {
         let lua = &self.lua;
+        // a key that is not down does not go up (it went up already: [`Runtime::release_keys`])
+        if !down && !host(lua).client.is_down(code) {
+            return false;
+        }
         // a key held down repeats: for the text entries, not the binds
         let repeat = down && host(lua).client.is_down(code);
         host(lua).client.set_key(code, down);
+        // a key the game had going down goes up for it whoever takes it now
+        if !down && host(lua).client.buttons_down.borrow_mut().remove(&code) {
+            self.player_button(code, false);
+        }
         if down {
             crate::chat::key_down(lua);
             if let Some(taken) = crate::chat::key(lua, code) {
@@ -1078,6 +1193,9 @@ impl crate::Runtime {
         }
         if repeat {
             return false;
+        }
+        if down && host(lua).client.buttons_down.borrow_mut().insert(code) {
+            self.player_button(code, true);
         }
         let Some(command) = host(lua).client.binding(code) else { return false };
         if down {
@@ -1204,6 +1322,13 @@ impl crate::Runtime {
         std::mem::take(&mut *host(&self.lua).client.to_server.borrow_mut())
     }
 
+    /// The keys and buttons of the game's (`KEY_*`, `MOUSE_*`) that went down (true) or up
+    /// since the last time, in order: the server's `PlayerButtonDown` and `PlayerButtonUp`
+    /// ([`player_button`](Self::player_button)).
+    pub fn take_buttons(&self) -> Vec<(i32, bool)> {
+        std::mem::take(&mut *host(&self.lua).client.buttons.borrow_mut())
+    }
+
     /// The user info the client tells the server (`gmod_toolmode`, `cl_playermodel`): all of
     /// it the first time, then what changed.
     pub fn take_user_info(&self) -> Vec<(String, String)> {
@@ -1214,6 +1339,8 @@ impl crate::Runtime {
 /// `CalcView(ply, origin, angles, fov, znear, zfar)`: the view Lua gives back in its table -
 /// `origin`, `angles`, `fov`, `drawviewer` - each where it says, else as it was.
 fn calc_view(lua: &Lua, player: EntityHandle, view: View) -> View {
+    // the view shakes before Lua sees it, as in Source
+    let view = crate::shake::apply(lua, view);
     let client = &host(lua).client;
     client.draw_viewer.set(false);
     let args = (|| -> mlua::Result<MultiValue> {

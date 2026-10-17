@@ -23,6 +23,9 @@ pub struct StaticMesh {
     pub batches: Vec<Batch>,
     /// Linear light per vertex, when baked light was given and fits ([`Vhv`]).
     pub light: Option<Vec<[f32; 3]>>,
+    /// The tangent of each vertex (x y z, and w: the side of the bitangent); none (all 0) when
+    /// the `.vvd` has none.
+    pub tangents: Vec<[f32; 4]>,
 }
 
 /// Builds the triangles of a model for body group number `body` and skin `skin`, lit by the
@@ -55,6 +58,10 @@ pub fn build(mdl: &Mdl, vvd: &Vvd, vtx: &Vtx, body: usize, skin: usize, baked: O
             }
             let base = out.vertices.len() as u32;
             out.vertices.extend_from_slice(vertices);
+            match vvd.tangents.get(first..first + mesh.vertex_count) {
+                Some(tangents) => out.tangents.extend_from_slice(tangents),
+                None => out.tangents.resize(out.vertices.len(), [0.0; 4]),
+            }
             // light comes per hardware vertex: give it to the mesh vertex behind each
             let mut colors = vec![[0.0f32; 3]; mesh.vertex_count];
             if let Some(baked) = mesh_light.and_then(|m| m.get(k)) {

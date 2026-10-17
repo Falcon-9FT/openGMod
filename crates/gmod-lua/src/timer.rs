@@ -5,6 +5,7 @@
 //! late fires once and is scheduled from the current time, not caught up.
 
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlua::{Function, Lua, MultiValue, Table, Value};
 
@@ -12,7 +13,31 @@ use crate::args::Args;
 use crate::{files, host};
 
 /// GMod's default tick: 66 ticks a second.
-pub const TICK_INTERVAL: f64 = 0.015;
+pub const DEFAULT_TICK_INTERVAL: f64 = 0.015;
+
+/// The seconds of a tick of every game in this program, as bits.
+static TICK_INTERVAL: AtomicU64 = AtomicU64::new(DEFAULT_TICK_INTERVAL.to_bits());
+
+/// The seconds of a tick (`engine.TickInterval`): 0.015 unless the game was started with
+/// another tick rate ([`set_tick_rate`]), or joined a server that has one.
+pub fn tick_interval() -> f64 {
+    f64::from_bits(TICK_INTERVAL.load(Ordering::Relaxed))
+}
+
+/// The ticks a second from now on (`-tickrate`), as the engine takes them: a tick of 1 / rate
+/// seconds, from 0.001 to 0.1.
+pub fn set_tick_rate(rate: f64) {
+    if rate.is_finite() && rate > 0.0 {
+        set_tick_interval(1.0 / rate);
+    }
+}
+
+/// The seconds of a tick from now on: a server's, joined.
+pub fn set_tick_interval(seconds: f64) {
+    if seconds.is_finite() && seconds > 0.0 {
+        TICK_INTERVAL.store(seconds.clamp(0.001, 0.1).to_bits(), Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Id {
@@ -49,6 +74,11 @@ pub(crate) struct Clock {
     /// prediction has gone: a tick ending there or before has been predicted.
     pub predicted_until: Cell<f64>,
     pub ticks: Cell<u64>,
+    /// A client was given the server's time since its last frame ([`crate::Runtime::apply_snapshot`]):
+    /// its frame ends there rather than a frame's time later.
+    pub given: Cell<bool>,
+    /// Where a client's last frame ended.
+    pub thought: Cell<f64>,
     timers: RefCell<Vec<Timer>>,
     next_simple: Cell<u64>,
 }
@@ -154,6 +184,10 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             }
         })?;
         Ok(MultiValue::from_iter([Value::Boolean(found.is_some())]))
+    })?;
+    def(&timer, "IsPaused", |a| {
+        let paused = with_timer(a, |t, _| t.paused.is_some())?;
+        Ok(MultiValue::from_iter([paused.map_or(Value::Nil, Value::Boolean)]))
     })?;
     def(&timer, "Toggle", |a| {
         let state = with_timer(a, |t, now| match t.paused.take() {

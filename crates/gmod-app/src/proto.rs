@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The version of these messages: a client and a server of different ones do not play.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 4;
 
 /// The port servers listen on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 27015;
@@ -65,6 +65,8 @@ pub struct Welcome {
     pub allow_cs_lua: bool,
     /// `sv_loadingurl`: the page its players see while they load.
     pub loading_url: String,
+    /// The seconds of its tick (`-tickrate`): its players' clients tick as it does.
+    pub tick_interval: f64,
 }
 
 /// What a server says of itself to those who ask ([`gmod_net::Query`]): a line of the menu's
@@ -126,6 +128,8 @@ pub enum ToServer {
     UserInfo(String, String),
     /// A `net` message.
     Net { name: String, data: Bits },
+    /// A key or button of the game's went down (true) or up (`PlayerButtonDown`).
+    Button(i32, bool),
 }
 
 /// What a server sends a client.

@@ -11,8 +11,10 @@ use mlua::Value;
 
 use super::*;
 
+mod api;
 mod bullets;
 mod chat;
+mod effects;
 mod items;
 mod mapio;
 mod movers;
@@ -62,6 +64,12 @@ impl Game {
     fn messages(&self) -> Vec<String> {
         self.runtime.errors().into_iter().map(|e| e.message).collect()
     }
+}
+
+/// What the server asked of its players' clients, but the engine's events they hear.
+fn asked_of(g: &Game) -> Vec<(EntityHandle, crate::player::ToClient)> {
+    let all = g.runtime.take_to_clients();
+    all.into_iter().filter(|(_, what)| !matches!(what, crate::player::ToClient::GameEvent(..))).collect()
 }
 
 /// A runtime of `realm` on a game folder with these files.
@@ -1110,6 +1118,7 @@ fn player_map() -> Map {
         collision: Some(Arc::new(gmod_bsp::Collision::new(&bsp))),
         textures: bsp.texinfo.iter().map(texture).collect(),
         visibility: gmod_bsp::Visibility::new(&bsp).map(Arc::new),
+        surfaces: crate::surfaceinfo::of_bsp(&bsp),
     }
 }
 
@@ -1602,10 +1611,13 @@ fn props_fall_and_come_to_rest() {
     // a third of a second in it falls as gravity says, v = g t; it then lies on the floor
     g.runtime.think(1.0 / 3.0);
     assert!(g.eval::<bool>("return math.abs(CRATE:GetVelocity().z + 200) < 15 and CRATE:GetPos().z < 100"));
+    // it bounced, and turned and went aside a little (GMod's crates dropped so: up to 16° and
+    // 20 units)
     g.runtime.think(4.0);
     assert!(g.eval::<bool>(
-        "local phys = CRATE:GetPhysicsObject()
-         return math.abs(CRATE:GetPos().z) < 0.5 and CRATE:GetAngles():IsEqualTol(Angle(0, 0, 0), 0.5) and phys:IsAsleep()"
+        "local phys = CRATE:GetPhysicsObject() local a = CRATE:GetAngles()
+         return math.abs(CRATE:GetPos().z) < 0.5 and math.abs(a.p) < 0.5 and math.abs(a.r) < 0.5 and math.abs(a.y) < 20
+             and CRATE:GetPos():Distance(Vector(-200, 0, 0)) < 20 and phys:IsAsleep()"
     ));
     // the server's gravity
     assert!(g.eval::<bool>(
@@ -1613,6 +1625,48 @@ fn props_fall_and_come_to_rest() {
     ));
     g.runtime.think(1.0);
     assert!(g.eval::<bool>("return math.abs(CRATE:GetPos().z - 100) < 0.01"));
+    assert!(g.messages().is_empty(), "{:?}", g.messages());
+}
+
+#[test]
+fn the_physics_surroundings_are_as_gmod_has_them() {
+    let g = physics_game(&[]);
+    // as GMod gives them at first (measured)
+    assert!(g.eval::<bool>(
+        "local p = physenv.GetPerformanceSettings()
+         return physenv.GetGravity() == Vector(0, 0, -600) and physenv.GetAirDensity() == 2 and physenv.GetTimeScale() == 1
+             and not physenv.GetPhysicsPaused() and p.MaxVelocity == 4000 and math.abs(p.MaxAngularVelocity - 7272.728) < 0.01
+             and p.MinFrictionMass == 10 and p.MaxFrictionMass == 2500"
+    ));
+    // gravity set holds until sv_gravity changes
+    g.runtime
+        .run_string(
+            "physenv.SetGravity(Vector(0, 0, 0))
+             CRATE = ents.Create('prop_physics') CRATE:SetModel('models/crate.mdl') CRATE:SetPos(Vector(-200, 0, 100)) CRATE:Spawn()",
+            "gravity",
+        )
+        .unwrap();
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>("return math.abs(CRATE:GetPos().z - 100) < 0.01 and physenv.GetGravity() == Vector(0, 0, 0)"));
+    g.runtime.run_string("RunConsoleCommand('sv_gravity', '300')", "sv_gravity").unwrap();
+    g.runtime.think(0.5);
+    assert!(g.eval::<bool>("return physenv.GetGravity() == Vector(0, 0, -300) and CRATE:GetPos().z < 100"));
+    // paused, nothing moves; nothing faster than the limits
+    g.runtime.run_string("physenv.SetPhysicsPaused(true) Z = CRATE:GetPos().z", "pause").unwrap();
+    g.runtime.think(0.3);
+    assert!(g.eval::<bool>("return CRATE:GetPos().z == Z"));
+    g.runtime
+        .run_string(
+            "physenv.SetPhysicsPaused(false) physenv.SetPerformanceSettings({ MaxVelocity = 100 })
+             CRATE:GetPhysicsObject():SetVelocity(Vector(5000, 0, 0))",
+            "limit",
+        )
+        .unwrap();
+    g.runtime.think(0.05);
+    assert!(g.eval::<bool>("return CRATE:GetVelocity().x <= 100.5 and physenv.GetPerformanceSettings().MaxVelocity == 100"));
+    // surfaces added
+    g.runtime.run_string("physenv.AddSurfaceData('\"opengmod_test\" { \"friction\" \"0.1\" }')", "surface").unwrap();
+    assert!(g.eval::<bool>("return util.GetSurfaceIndex('opengmod_test') >= 0"));
     assert!(g.messages().is_empty(), "{:?}", g.messages());
 }
 
@@ -1638,11 +1692,12 @@ fn physics_objects() {
     // frozen, it stays; a push of 2500 kg·units/s gives its 25 kg 100 units/s
     assert!(g.eval::<bool>(
         "local stayed = CRATE:GetPos() == Vector(-300, 0, 150)
-         PHYS:EnableMotion(true) PHYS:EnableGravity(false) PHYS:Wake()
+         PHYS:EnableMotion(true) PHYS:EnableGravity(false) PHYS:EnableDrag(false) PHYS:Wake()
          PHYS:ApplyForceCenter(Vector(0, 0, 2500))
          local pushed = PHYS:GetVelocity():IsEqualTol(Vector(0, 0, 100), 0.01)
          PHYS:SetVelocity(Vector(10, 0, 0)) PHYS:SetAngleVelocity(Vector(0, 0, 90))
-         return stayed and pushed and not PHYS:IsGravityEnabled() and PHYS:GetVelocity():IsEqualTol(Vector(10, 0, 0), 0.01)
+         return stayed and pushed and not PHYS:IsGravityEnabled() and not PHYS:IsDragEnabled()
+             and PHYS:GetVelocity():IsEqualTol(Vector(10, 0, 0), 0.01)
              and PHYS:GetAngleVelocity():IsEqualTol(Vector(0, 0, 90), 0.01)"
     ));
     g.runtime.think(1.0);
@@ -1707,7 +1762,7 @@ fn props_of_the_map() {
         "local frozen, asleep, falls = ents.FindByName('frozen')[1], ents.FindByName('asleep')[1], ents.FindByName('falls')[1]
          return frozen:GetPos() == Vector(-200, 0, 100) and not frozen:GetPhysicsObject():IsMotionEnabled()
              and asleep:GetPos() == Vector(-300, 0, 100) and asleep:GetPhysicsObject():IsAsleep()
-             and math.abs(falls:GetPos().z) < 0.5 and math.abs(falls:GetAngles().y - 45) < 0.5"
+             and math.abs(falls:GetPos().z) < 0.5 and math.abs(falls:GetAngles().y - 45) < 20"
     ));
     // woken, it falls too
     g.runtime.run_string("ents.FindByName('asleep')[1]:GetPhysicsObject():Wake()", "wake").unwrap();
@@ -1929,7 +1984,7 @@ fn what_a_players_client_would_say() {
     g.runtime.run_player_command(alice, "gmod_toolmode weld; weld_forcelimit 1000; gmod_toolmode");
     g.runtime.run_string("Entity(1):ConCommand('cl_playerskin 3; finger_0 1 2')", "concommand").unwrap();
     // the client runs it, and sends the server what it does not know
-    let asked = g.runtime.take_to_clients();
+    let asked = asked_of(&g);
     assert_eq!(asked, [(alice, ToClient::Command("cl_playerskin 3; finger_0 1 2".into()))]);
     g.runtime.run_player_command(alice, "cl_playerskin 3; finger_0 1 2");
     assert!(g.eval::<bool>(
@@ -2063,6 +2118,14 @@ fn panels_are_laid_out_painted_and_clicked() {
          L:Remove() W:Remove()
          return lw > 60 and ww <= 60 and wh >= 3 * lh"
     ));
+
+    // Shift held, its going up taken by the system: the program lets it go, and a click on an
+    // icon is no longer the start of a box of selection (the spawn menu would not spawn)
+    g.runtime.button(79, true);
+    assert!(g.eval::<bool>("return input.IsShiftDown() and input.IsKeyDown(KEY_LSHIFT)"));
+    g.runtime.release_keys(|code| code == 79);
+    assert!(g.eval::<bool>("return not input.IsShiftDown() and not input.IsKeyDown(KEY_LSHIFT) and input.WasKeyReleased(KEY_LSHIFT)"));
+    assert!(!g.runtime.button(79, false));
 
     // a click on the button, one beside the panels, which goes to the world
     g.runtime.set_cursor(50, 50);
@@ -2270,6 +2333,44 @@ fn sounds_are_what_lua_asks_for() {
     let id = patch.patch.expect("a patch");
     assert_eq!(&events[5..], [SoundEvent::ChangePatch { patch: id, volume: 1.0, pitch: 1.5 }, SoundEvent::StopPatch(id)]);
     assert!(g.runtime.take_sounds().is_empty());
+}
+
+#[test]
+fn a_client_traces_a_model_by_its_collision_model() {
+    use gmod_model::testmodel::{self, TestConvex};
+    // a shed: a floor and a roof, nothing between
+    let mdl = testmodel::mdl(1, ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]));
+    let floor = TestConvex::cuboid([-50.0, -50.0, 0.0], [50.0, 50.0, 10.0]);
+    let roof = TestConvex::cuboid([-50.0, -50.0, 90.0], [50.0, 50.0, 100.0]);
+    let phy = testmodel::phy(1, &[vec![floor, roof]], false, "solid { \"index\" \"0\" \"mass\" \"100\" }");
+    let client_init = format!(
+        "{ENTITY_LUA}
+{CLIENT_LUA}"
+    );
+    let server =
+        game_with(Realm::Server, &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/shed.mdl", &mdl), ("models/shed.phy", &phy)]);
+    server.runtime.init();
+    server
+        .runtime
+        .run_string(
+            "SHED = ents.Create('prop_physics') SHED:SetModel('models/shed.mdl') SHED:Spawn()
+             SHED:GetPhysicsObject():EnableMotion(false)",
+            "shed",
+        )
+        .unwrap();
+    server.runtime.think(0.02);
+    let inside = "return util.TraceLine({ start = Vector(0, 0, 50), endpos = Vector(0, 0, 50) }).Hit";
+    let up = "return util.TraceLine({ start = Vector(0, 0, 50), endpos = Vector(0, 0, 200) }).HitPos.z";
+    assert!(!server.eval::<bool>(inside));
+    // the client has no body of it, but traces it as the server does: not by the box around it
+    let client = game_with(
+        Realm::Client,
+        &[("lua/includes/init.lua", client_init.as_bytes()), ("models/shed.mdl", &mdl), ("models/shed.phy", &phy)],
+    );
+    client.runtime.init();
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    assert!(!client.eval::<bool>(inside));
+    assert!((client.eval::<f64>(up) - 90.0).abs() < 1.0, "{}", client.eval::<f64>(up));
 }
 
 #[test]
@@ -2750,8 +2851,15 @@ fn the_view_model_plays_the_weapon_in_hand() {
              and CHANGED[1] == 'models/weapons/v_test.mdl' and Entity(1):GetActiveWeapon():GetActivity() == ACT_VM_DRAW
              and vm:ViewModelIndex() == 0"
     ));
-    g.runtime.think(0.2);
-    assert!(g.eval::<bool>("return VM:GetSequence() == 0 and VM:GetCycle() > 0.4"), "still drawing");
+    // four times as fast as it was made, as GMod draws every weapon (`sv_defaultdeployspeed`)
+    g.runtime.think(0.05);
+    assert!(
+        g.eval::<bool>(
+            "return VM:GetSequence() == 0 and VM:GetCycle() > 0.3 and VM:GetPlaybackRate() == 4
+                 and Entity(1):GetActiveWeapon():GetDeploySpeed() == 4"
+        ),
+        "still drawing"
+    );
     g.runtime.think(0.3);
     assert!(g.eval::<bool>("return VM:GetSequence() == 1 and Entity(1):GetActiveWeapon():GetActivity() == ACT_VM_IDLE"), "idle");
 
@@ -2943,6 +3051,29 @@ fn weapons_translate_the_activities_of_their_holders() {
     // nothing in hand: as it was
     g.runtime.run_string("Entity(1):StripWeapons()", "strip").unwrap();
     assert!(g.eval::<bool>("return Entity(1):TranslateWeaponActivity(ACT_MP_RUN) == ACT_MP_RUN"));
+}
+
+#[test]
+fn the_menu_keeps_what_servers_were_let_do() {
+    let menu = game(Realm::Menu, &[]);
+    menu.runtime
+        .run_string(
+            "BEFORE = permissions.IsGranted('connect')
+             permissions.Grant('connect', true)
+             permissions.Grant('openurl')
+             permissions.Grant('connect')
+             local all = permissions.GetAll()
+             GOT = all.temporary.loopback .. ' / ' .. all.permanent.loopback
+             AFTER = permissions.IsGranted('connect')
+             permissions.Revoke('connect', 'loopback')
+             GONE = permissions.IsGranted('connect') or permissions.GetAll().permanent.loopback",
+            "permissions",
+        )
+        .unwrap();
+    assert!(!menu.eval::<bool>("return BEFORE"));
+    assert_eq!(menu.eval::<String>("return GOT"), "connect / connect,openurl");
+    assert!(menu.eval::<bool>("return AFTER"));
+    assert_eq!(menu.eval::<String>("return GONE"), "openurl");
 }
 
 #[test]
@@ -3396,6 +3527,28 @@ fn the_sender_of_messages_is_the_same_key_every_time() {
 }
 
 #[test]
+fn compressed_strings_come_back() {
+    let g = game(Realm::Server, &[]);
+    assert!(g.eval::<bool>(
+        "local text = string.rep('trolleybus informator \\0\\255 ', 200)
+         local packed = util.Compress(text)
+         return #packed < #text / 4 and util.Decompress(packed) == text and util.Decompress('not lzma') == nil
+             and util.Decompress(packed, 100) == nil and util.Compress('') == nil"
+    ));
+}
+
+#[test]
+fn custom_collision_checks_are_kept() {
+    let g = player_game();
+    assert!(g.eval::<bool>(
+        "local e = ents.Create('prop_physics') e:SetModel('models/box.mdl') e:Spawn()
+         local before = e:GetCustomCollisionCheck()
+         e:SetCustomCollisionCheck(true) e:CollisionRulesChanged()
+         return before == false and e:GetCustomCollisionCheck() == true"
+    ));
+}
+
+#[test]
 fn distance_to_line() {
     let g = game(Realm::Server, &[]);
     assert!(g.eval::<bool>(
@@ -3511,6 +3664,56 @@ fn players_sit_in_vehicles_and_get_out() {
 }
 
 #[test]
+fn what_null_is_can_be_asked() {
+    let g = game(Realm::Server, &[]);
+    // as GMod answers, measured in it: no error for these
+    let answer = g.eval::<String>(
+        "local t = {} for _, k in ipairs({ 'IsPlayer', 'IsNPC', 'IsNextBot', 'IsRagdoll', 'IsVehicle', 'IsWeapon', 'IsWorld', 'IsValid' }) do
+             t[#t + 1] = tostring(NULL[k](NULL))
+         end
+         return table.concat(t, ' ') .. ' ' .. NULL:EntIndex()",
+    );
+    assert_eq!(answer, "false false false false false false false false 0");
+    assert!(g.runtime.lua().load("NULL:GetPos()").exec().is_err());
+}
+
+#[test]
+fn the_keys_of_the_game_go_to_the_server() {
+    const KEY_V: i32 = 32;
+    let server = player_game();
+    let alice = server.runtime.join(alice()).unwrap();
+    server.runtime.think(0.02);
+    server
+        .runtime
+        .run_string(
+            "GOT = {}
+             HOOKS.PlayerButtonDown = function(ply, key) table.insert(GOT, ply:Nick() .. ' down ' .. key) end
+             HOOKS.PlayerButtonUp = function(ply, key) table.insert(GOT, ply:Nick() .. ' up ' .. key) end",
+            "keys",
+        )
+        .unwrap();
+    let client = client_game(&[]);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    client.runtime.set_local_player(alice);
+    client.runtime.run_string("DOWN = 0 HOOKS.PlayerButtonDown = function(ply, key) DOWN = key end", "keys").unwrap();
+    client.runtime.button(KEY_V, true);
+    // held, the key repeats: once down for the game
+    client.runtime.button(KEY_V, true);
+    client.runtime.button(KEY_V, false);
+    assert_eq!(client.eval::<i64>("return DOWN"), i64::from(KEY_V));
+    let keys = client.runtime.take_buttons();
+    assert_eq!(keys, [(KEY_V, true), (KEY_V, false)]);
+    for (code, down) in keys {
+        server.runtime.player_button_of(alice, code, down);
+    }
+    assert_eq!(server.eval::<String>("return table.concat(GOT, ', ')"), "Alice down 32, Alice up 32");
+    // a key the chat box takes is not the game's
+    client.runtime.run_string("chat.Open(1)", "chat").unwrap();
+    client.runtime.button(KEY_V, true);
+    assert!(client.runtime.take_buttons().is_empty());
+}
+
+#[test]
 fn weapons_are_chosen_in_the_row_of_slots() {
     use crate::weaponselect::Choose;
     let server = player_game();
@@ -3608,10 +3811,12 @@ fn the_gravity_gun_punts_takes_and_launches() {
     // what it does not hold, the first key punts: into the wall a little way off
     g.runtime.set_input(alice, UserCmd::default());
     g.runtime.think(1.5);
-    // back before the gun, upright (thrown, it turned over: its origin is at its bottom)
+    // back before the gun, upright (thrown, it turned over: its origin is at its bottom), and
+    // the player back where they were (it bounced off the wall into them)
     g.runtime
         .run_string(
-            "C:SetPos(P:EyePos() + Vector(80, 0, -8)) C:SetAngles(Angle(0, 0, 0)) C:GetPhysicsObject():SetVelocity(Vector(0, 0, 0))",
+            "P:SetPos(Vector(0, 0, 0)) C:SetPos(P:EyePos() + Vector(80, 0, -8)) C:SetAngles(Angle(0, 0, 0))
+             C:GetPhysicsObject():SetVelocity(Vector(0, 0, 0)) C:GetPhysicsObject():SetAngleVelocity(Vector(0, 0, 0))",
             "back",
         )
         .unwrap();
@@ -3718,4 +3923,187 @@ fn the_physics_guns_beam_shows_while_its_key_is_down() {
     client.runtime.apply_snapshot(&server.runtime.snapshot());
     client.runtime.drawn(alice);
     assert!(client.runtime.take_primitives().iter().all(|p| p.material.name != "sprites/physbeama"));
+}
+
+#[test]
+fn the_scissor_and_the_main_view() {
+    let g = client_game(&[]);
+    assert!(g.eval::<bool>(
+        "local on, l, t, r, b = surface.GetScissorRect()
+         -- nothing cuts: off, the whole screen
+         local off = on == false and l == 0 and t == 0 and r == 640 and b == 480
+         return off and MainEyePos() == EyePos() and MainEyeAngles() == EyeAngles()"
+    ));
+}
+
+#[test]
+fn the_gamemode_thinks_before_the_entities_and_what_was_removed_goes() {
+    let g = player_game();
+    g.runtime
+        .run_string(
+            "ORDER = {}
+             scripted_ents.Register({ Type = 'anim', Think = function(self)
+                 table.insert(ORDER, 'ent') self:NextThink(CurTime()) return true end }, 'sent_order')
+             S = ents.Create('sent_order') S:Spawn()",
+            "order",
+        )
+        .unwrap();
+    g.runtime.think(0.015);
+    g.runtime
+        .run_string(
+            "ORDER = {}
+             HOOKS.Think = function() table.insert(ORDER, 'Think') end
+             HOOKS.Tick = function() table.insert(ORDER, 'Tick') end",
+            "hooks",
+        )
+        .unwrap();
+    g.runtime.think(0.03);
+    // as measured in GMod: Think, Tick, then the entities, each tick
+    assert_eq!(g.eval::<String>("return table.concat(ORDER, ' ')"), "Think Tick ent Think Tick ent");
+    // removed in a tick: still valid in it, gone by the gamemode's Think of the next
+    g.runtime
+        .run_string(
+            "HOOKS.Think = function() SEEN = S:IsValid() end
+             S.Think = function(self) self:Remove() STILL = self:IsValid() end",
+            "remove",
+        )
+        .unwrap();
+    g.runtime.think(0.03);
+    assert_eq!(g.eval::<String>("return tostring(STILL) .. ' ' .. tostring(SEEN)"), "true false");
+}
+
+#[test]
+fn a_client_thinks_every_frame_whatever_the_server_ticks() {
+    const SENT: &str = "scripted_ents.Register({ Type = 'anim', Think = function(self) THINKS = (THINKS or 0) + 1 end }, 'sent_thinker')";
+    let server = player_game();
+    server.runtime.run_string(SENT, "sent").unwrap();
+    let alice = server.runtime.join(alice()).unwrap();
+    server.runtime.run_string("S = ents.Create('sent_thinker') S:Spawn()", "spawn").unwrap();
+    server.runtime.think(0.02);
+    let client = client_game(&[]);
+    client.runtime.run_string(SENT, "sent").unwrap();
+    client.runtime.set_local_player(alice);
+    // the server's own Think every 0.2 seconds; the client's every frame, as GMod's
+    for _ in 0..30 {
+        server.runtime.think(1.0 / 60.0);
+        client.runtime.apply_snapshot(&server.runtime.snapshot());
+        client.runtime.think(1.0 / 60.0);
+    }
+    let thinks = client.eval::<i64>("return THINKS or 0");
+    assert!(thinks >= 29, "{thinks} of 30 frames");
+    // and the bounds it is drawn in, the client's, stay
+    client
+        .runtime
+        .run_string("local e = ents.FindByClass('sent_thinker')[1] e:SetRenderBounds(Vector(-50, -50, -50), Vector(50, 50, 50))", "bounds")
+        .unwrap();
+    server.runtime.think(0.02);
+    client.runtime.apply_snapshot(&server.runtime.snapshot());
+    assert!(client.eval::<bool>("local lo = ents.FindByClass('sent_thinker')[1]:GetRenderBounds() return lo == Vector(-50, -50, -50)"));
+}
+
+#[test]
+fn a_still_model_is_drawn_where_its_bones_rest() {
+    use gmod_model::testmodel::{TestBone, TestRig};
+    // one bone, which rests turned a quarter about z from where the vertices were made with it
+    // (a root bone the model's compile turned), and one that rests where they were made
+    let rig = TestRig {
+        name: "still.mdl".into(),
+        bones: vec![TestBone { name: "root".into(), parent: -1, position: [0.0; 3], euler: [0.0; 3] }],
+        ..TestRig::default()
+    };
+    let (plain, _) = rig.files();
+    let mut turned = plain.clone();
+    let bone_at = i32::from_le_bytes(turned[160..164].try_into().unwrap()) as usize;
+    let q = gmod_model::anim::euler_quaternion([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
+    for (i, v) in q.iter().chain(&[0.0, 0.0, std::f32::consts::FRAC_PI_2]).enumerate() {
+        turned[bone_at + 44 + i * 4..bone_at + 48 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let g = game_with(
+        Realm::Server,
+        &[("lua/includes/init.lua", ENTITY_LUA.as_bytes()), ("models/turned.mdl", &turned), ("models/plain.mdl", &plain)],
+    );
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "for _, m in ipairs({ 'models/turned.mdl', 'models/plain.mdl' }) do
+                 local e = ents.Create('prop_dynamic') e:SetModel(m) e:Spawn()
+             end",
+            "props",
+        )
+        .unwrap();
+    let drawn = g.runtime.drawn(EntityHandle::NULL);
+    let bones = |model: &str| drawn.iter().find(|d| d.model == model).map(|d| d.bones.clone()).expect("drawn");
+    let turned = bones("models/turned.mdl");
+    assert_eq!(turned.len(), 1);
+    // x goes to y: a quarter turn about z
+    let m = turned[0];
+    assert!((m[0][0]).abs() < 1e-4 && (m[1][0] - 1.0).abs() < 1e-4 && (m[0][1] + 1.0).abs() < 1e-4, "{m:?}");
+    assert!(bones("models/plain.mdl").is_empty(), "drawn as it was made");
+}
+
+#[test]
+fn a_picture_drawn_on_a_plane_is_the_programs_image() {
+    use crate::render3d::{IMAGES, Shape};
+    let init = format!(
+        "{ENTITY_LUA}
+{CLIENT_LUA}"
+    );
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes()), ("materials/displays/screen.png", b"PNG")]);
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "local screen = Material('displays/screen.png')
+             HOOKS.PostDrawOpaqueRenderables = function()
+                 cam.Start3D2D(Vector(0, 0, 100), Angle(0, 0, 0), 0.01)
+                     surface.SetDrawColor(0, 0, 0) surface.DrawRect(0, 0, 600, 400)
+                     surface.SetDrawColor(255, 255, 255) surface.SetMaterial(screen) surface.DrawTexturedRect(0, 0, 600, 400)
+                 cam.End3D2D()
+             end",
+            "screen",
+        )
+        .unwrap();
+    g.runtime.drawn(EntityHandle::NULL);
+    let drawn = g.runtime.take_primitives();
+    // the black behind, then the picture over it: by the number of its image, 6 units across
+    assert_eq!(drawn.len(), 2, "{drawn:?}");
+    assert_eq!(drawn[0].material.name, "color");
+    let id: u32 = drawn[1].material.name.strip_prefix(IMAGES).and_then(|id| id.parse().ok()).expect("a picture");
+    assert!(g.runtime.image(id).is_some_and(|(image, _)| image.name.ends_with("screen.png")));
+    let Shape::Triangles(corners) = &drawn[1].shape else { panic!("{drawn:?}") };
+    assert!(corners.iter().all(|c| c.pos.z == 100.0) && corners.iter().any(|c| (c.pos.x - 6.0).abs() < 1e-3));
+}
+
+#[test]
+fn text_drawn_on_a_plane_is_cut_from_the_pages_of_glyphs() {
+    use crate::render3d::{GLYPHS, Shape};
+    let init = format!("{ENTITY_LUA}\n{CLIENT_LUA}");
+    let g = game_with(Realm::Client, &[("lua/includes/init.lua", init.as_bytes())]);
+    g.runtime.init();
+    g.runtime
+        .run_string(
+            "surface.CreateFont('Plate', { font = 'Tahoma', size = 20 })
+             HOOKS.PostDrawOpaqueRenderables = function()
+                 cam.Start3D2D(Vector(0, 0, 100), Angle(0, 0, 0), 0.25)
+                     surface.SetFont('Plate') surface.SetTextColor(255, 200, 0, 255) surface.SetTextPos(0, 0)
+                     surface.DrawText('42')
+                 cam.End3D2D()
+             end",
+            "plate",
+        )
+        .unwrap();
+    g.runtime.drawn(EntityHandle::NULL);
+    let drawn = g.runtime.take_primitives();
+    // where the machine has a font at all, its glyphs: triangles of a page, in the text's colour
+    let has_font = g.runtime.with_canvas(|_, fonts| {
+        let font = fonts.font(&gmod_ui::FontSpec { family: "Tahoma".into(), size: 20, ..gmod_ui::FontSpec::default() });
+        fonts.face_name(font).is_some()
+    });
+    let text: Vec<_> = drawn.iter().filter(|p| p.material.name.starts_with(GLYPHS)).collect();
+    assert_eq!(!text.is_empty(), has_font, "{drawn:?}");
+    if let Some(Shape::Triangles(corners)) = text.first().map(|p| &p.shape) {
+        assert!(corners.iter().all(|c| c.pos.z == 100.0 && (c.color[1] - 200.0 / 255.0).abs() < 1e-3));
+        // two glyphs, two quads at least, a quarter of a unit a pixel: well under 20 units across
+        let xs: Vec<f32> = corners.iter().map(|c| c.pos.x).collect();
+        assert!(corners.len() >= 12 && xs.iter().cloned().fold(f32::MIN, f32::max) < 20.0, "{corners:?}");
+    }
 }

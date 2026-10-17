@@ -230,7 +230,10 @@ impl UserData for Matrix {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function("__index", |lua, (_, key): (AnyUserData, Value)| meta::lookup(lua, "VMatrix", key));
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "VMatrix", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "VMatrix", ud, key, value)
+        });
         methods.add_meta_function("__mul", |lua, (a, b): (Value, Value)| match (matrix_of(&a), matrix_of(&b), vector_of(&b)) {
             (Some(x), Some(y), _) => Ok(Value::UserData(lua.create_userdata(x * y)?)),
             (Some(x), None, Some(v)) => Ok(Value::UserData(lua.create_userdata(x.transform(v))?)),

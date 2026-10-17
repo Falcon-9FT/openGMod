@@ -134,7 +134,8 @@ fn compact_surface(convexes: &[TestConvex]) -> Vec<u8> {
     let size = nodes_at + 28 * nodes.len();
 
     let mut out = Vec::with_capacity(size);
-    for v in [0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0] {
+    // no mass centre and no inertia, as a reader takes it: they are worked out of the shape
+    for v in [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] {
         out.extend(v.to_le_bytes());
     }
     put(&mut out, &[(size as i32) << 8, nodes_at as i32, 0, 0]);

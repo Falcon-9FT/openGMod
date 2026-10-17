@@ -69,16 +69,20 @@ pub mod breakable;
 pub mod bullets;
 pub mod chat;
 pub mod client;
+mod clipboard;
 pub mod console;
 pub mod constraint;
 pub mod convar;
 pub mod damage;
 pub mod effect;
 pub mod engine;
+mod engine_effects;
 pub mod entity;
 pub mod ents;
 pub mod files;
 pub mod filesystem;
+pub mod fire;
+pub mod gameevent;
 pub mod hitbox;
 pub mod hl2weapons;
 pub mod html;
@@ -93,13 +97,18 @@ pub mod material;
 pub mod matrix;
 pub mod menu;
 pub mod meta;
+mod misc;
+mod models;
 pub mod movedata;
 pub mod movers;
 pub mod nav;
 pub mod net;
 pub mod npc;
 pub mod outputs;
+mod particle_systems;
+mod particles;
 pub mod physcannon;
+mod physenv;
 pub mod physgun;
 pub mod physics;
 pub mod pickup;
@@ -112,16 +121,19 @@ pub mod render3d;
 pub mod resource;
 pub mod sandbox;
 pub mod serverlist;
+mod shake;
 pub mod snapshot;
 pub mod sound;
 pub mod sql;
 mod startup;
 pub mod steam;
 pub mod surface;
+pub mod surfaceinfo;
 mod surfaceprops;
 pub mod timer;
 pub mod trace;
 pub mod triggers;
+pub mod usermessage;
 pub mod util;
 pub mod vector;
 pub mod vehicle;
@@ -137,7 +149,7 @@ pub use chat::ChatMessage;
 pub use entity::EntityHandle;
 pub use ents::{Drawn, Map};
 pub use html::{WebButton, WebEvent, WebPage, WebPages};
-pub use menu::{Addon, MountableGame};
+pub use menu::{Addon, MountableGame, SettingChange};
 pub use mlua;
 pub use movedata::UserCmd;
 pub use player::{PlayerInfo, PlayerView, ToClient, WeaponView};
@@ -311,6 +323,16 @@ pub(crate) struct Host {
     pub channels: bass::Channels,
     /// What the client's Lua draws in the world this frame.
     pub render3d: render3d::Frame,
+    /// The client's particle emitters (`ParticleEmitter`).
+    pub(crate) particles: particles::Particles,
+    /// The client's effects of Lua (`util.Effect`).
+    pub(crate) effects: effect::Effects,
+    /// The engine's events Lua listens to (`gameevent.Listen`).
+    pub(crate) game_events: gameevent::Listening,
+    /// The user message the server's Lua is writing (`umsg`).
+    pub(crate) user_messages: usermessage::Writing,
+    /// How the client's view shakes (`util.ScreenShake`).
+    pub(crate) shakes: shake::Shakes,
     /// The engine's HUD: where its elements go, its colours.
     pub hud: RefCell<hud::Hud>,
     /// The row of weapon slots the HUD chooses a weapon in.
@@ -423,6 +445,11 @@ impl Runtime {
             menu: menu::Menu::default(),
             channels: bass::Channels::default(),
             render3d: render3d::Frame::default(),
+            particles: particles::Particles::default(),
+            effects: effect::Effects::default(),
+            game_events: gameevent::Listening::default(),
+            user_messages: usermessage::Writing::default(),
+            shakes: shake::Shakes::default(),
             hud: RefCell::new(hud::Hud::default()),
             selection: weaponselect::Selection::default(),
             sounds: sound::Sounds::new(realm),
@@ -452,8 +479,12 @@ impl Runtime {
         entity::install(&lua, realm)?;
         util::install(&lua)?;
         anim::install_util(&lua)?;
+        models::install(&lua)?;
         trace::install(&lua)?;
         effect::install(&lua)?;
+        gameevent::install(&lua)?;
+        surfaceinfo::install(&lua)?;
+        fire::install(&lua)?;
         constraint::install(&lua)?;
         sound::install(&lua)?;
         if realm != Realm::Server {
@@ -470,6 +501,7 @@ impl Runtime {
         net::install(&lua, realm)?;
         if realm == Realm::Server {
             recipients::install(&lua)?;
+            usermessage::install_server(&lua)?;
             resource::install(&lua)?;
             pvs::install(&lua)?;
         }
@@ -480,11 +512,16 @@ impl Runtime {
         if realm != Realm::Server {
             surface::install(&lua)?;
             client::install(&lua)?;
+            particles::install(&lua)?;
+            usermessage::install_client(&lua)?;
             vgui::install(&lua)?;
             surface::load_fonts(&lua);
             client::load(&lua);
             hud::load(&lua);
         }
+        misc::install(&lua)?;
+        shake::install(&lua)?;
+        particle_systems::install(&lua)?;
         menu::install(&lua, realm)?;
         Ok(Runtime { lua })
     }
@@ -561,51 +598,71 @@ impl Runtime {
     }
 
     /// Moves game time on by `seconds` - one frame - and runs what happens in it: the
-    /// answers to `HTTP` requests that came in, the timers that are due, for every tick that
-    /// passed the players' commands and movement, the bodies of physics, the inputs fired, the
-    /// scripted entities that think and the `Tick` hook, each at its own `CurTime`; the `Think` hook; then the
-    /// entities removed in the frame go.
+    /// answers to `HTTP` requests that came in, the timers that are due (a client's each frame,
+    /// a server's each tick), for every tick that passed the players' commands and movement,
+    /// the `Tick` and `Think` hooks (the server's frame is a tick: the gamemode thinks at its
+    /// start, as in Source), the bodies of physics,
+    /// the inputs fired, the scripted entities that think, each at its own `CurTime`; the
+    /// entities removed go when the players' commands have run and at the end of the tick (a
+    /// client's at the end of its frame).
     pub fn think(&self, seconds: f64) {
         let (before, end, ticks) = {
             let clock = &host(&self.lua).clock;
-            let before = (clock.cur_time.get() / timer::TICK_INTERVAL).floor();
-            let end = clock.cur_time.get() + seconds;
+            // a client given the server's time this frame is at it, from where its last frame
+            // ended: the server's frames are not quite its own
+            let given = self.realm() != Realm::Server && clock.given.replace(false);
+            let (now, last) = (clock.cur_time.get(), clock.thought.get());
+            // the first frame, or one long after the last: from the server's time
+            let start = if given && last > 0.0 && (now - last).abs() < 1.0 { last } else { now };
+            let before = (start / timer::tick_interval()).floor();
+            let end = if given { now.max(start) } else { now + seconds };
+            clock.thought.set(end);
             clock.cur_time.set(end);
             // a server's frame is a tick, as in GMod; a client's is what was drawn
-            clock.frame_time.set(if self.realm() == Realm::Server { timer::TICK_INTERVAL } else { seconds });
-            let ticks = ((end / timer::TICK_INTERVAL).floor() - before).max(0.0) as u64;
+            clock.frame_time.set(if self.realm() == Realm::Server { timer::tick_interval() } else { seconds });
+            let ticks = ((end / timer::tick_interval()).floor() - before).max(0.0) as u64;
             clock.ticks.set(clock.ticks.get() + ticks);
             (before, end, ticks)
         };
         convar::run_buffer(&self.lua);
         http::deliver(&self.lua);
         bass::deliver(&self.lua);
-        timer::run_timers(&self.lua);
         // a client does not simulate: what moves comes from the server
         let server = self.realm() == Realm::Server;
+        // a client's timers go by its frames; a server's by its ticks
+        if !server {
+            timer::run_timers(&self.lua);
+        }
         for tick in 1..=ticks {
-            host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::TICK_INTERVAL).min(end));
+            host(&self.lua).clock.cur_time.set(((before + tick as f64) * timer::tick_interval()).min(end));
             if server {
                 player::tick_all(&self.lua);
+                // what the players' commands removed goes before the frame, as in Source
+                ents::collect(&self.lua);
+            }
+            // the gamemode thinks first in a frame of the server's, before the entities do:
+            // `Think`, the timers that are due, then `Tick` (as measured in GMod)
+            if server {
+                self.call_hook("Think", mlua::MultiValue::new());
+                timer::run_timers(&self.lua);
+            }
+            self.call_hook("Tick", mlua::MultiValue::new());
+            if server {
                 physgun::think(&self.lua);
                 pickup::think(&self.lua);
                 physics::simulate(&self.lua);
                 projectiles::think(&self.lua);
+                fire::tick(&self.lua);
                 triggers::tick(&self.lua);
                 inputs::service(&self.lua);
                 logic::tick(&self.lua);
                 movers::tick(&self.lua);
                 npc::tick(&self.lua);
-            }
-            if server {
                 ents::think(&self.lua);
                 anim::advance(&self.lua);
                 lagcomp::record(&self.lua);
-            }
-            self.call_hook("Tick", mlua::MultiValue::new());
-            // the server's frame is the tick: its `Think` runs with each
-            if server {
-                self.call_hook("Think", mlua::MultiValue::new());
+                // the server's frame ends: what was removed in it is gone before the next
+                ents::collect(&self.lua);
             }
         }
         host(&self.lua).clock.cur_time.set(end);
@@ -613,6 +670,9 @@ impl Runtime {
         if !server {
             ents::think(&self.lua);
             self.call_hook("Think", mlua::MultiValue::new());
+            effect::think(&self.lua);
+            fire::flames(&self.lua, seconds as f32);
+            particles::simulate(&self.lua, seconds as f32);
         }
         ents::collect(&self.lua);
     }
@@ -635,6 +695,12 @@ impl Runtime {
     /// How many players the server takes (`game.MaxPlayers`, 1 to [`player::MAX_PLAYERS`]):
     /// entity indices 1 to this are theirs. Given before the map spawns; 1 is a single-player
     /// game.
+    /// The map the game is played on (`game.GetMap`), known to its Lua from the start, as in
+    /// GMod: before [`spawn_map`](Self::spawn_map) loads its entities.
+    pub fn set_map_name(&self, name: &str) {
+        *host(&self.lua).game.map.borrow_mut() = name.to_string();
+    }
+
     pub fn set_max_players(&self, count: u32) {
         host(&self.lua).game.max_players.set(count.clamp(1, player::MAX_PLAYERS));
     }
@@ -654,6 +720,41 @@ impl Runtime {
     /// player slot is taken ([`set_max_players`](Self::set_max_players)).
     pub fn join(&self, info: PlayerInfo) -> Option<EntityHandle> {
         player::join(&self.lua, info)
+    }
+
+    /// A key or button of a player's (`KEY_*`, `MOUSE_*`) went down or up, one the game had
+    /// rather than a menu or the chat: `PlayerButtonDown` or `PlayerButtonUp`, with the
+    /// player. On a client, the local player's, and the server is told
+    /// ([`take_buttons`](Self::take_buttons)).
+    pub fn player_button(&self, code: i32, down: bool) {
+        let player = host(&self.lua).client.local_player.get();
+        if self.realm() != Realm::Server {
+            host(&self.lua).client.buttons.borrow_mut().push((code, down));
+        }
+        self.player_button_of(player, code, down);
+    }
+
+    /// [`player_button`](Self::player_button) on the server: the player whose it was.
+    pub fn player_button_of(&self, player: EntityHandle, code: i32, down: bool) {
+        if !host(&self.lua).entities.is_valid(player) {
+            return;
+        }
+        let Ok(ply) = entity::push(&self.lua, player) else { return };
+        let hook = if down { "PlayerButtonDown" } else { "PlayerButtonUp" };
+        self.call_hook(hook, mlua::MultiValue::from_iter([ply, mlua::Value::Integer(code.into())]));
+    }
+
+    /// The game's files changed while it runs - an addon was mounted or taken out: what was
+    /// not there before is looked for again, and Lua hears of it (`GameContentChanged`).
+    pub fn content_changed(&self) {
+        let host = host(&self.lua);
+        host.anims.rigs.borrow_mut().retain(|_, rig| rig.is_some());
+        host.models.studio.borrow_mut().retain(|_, model| model.is_some());
+        host.screen.pixels.borrow_mut().retain(|_, pixels| pixels.is_some());
+        host.weapons.scripts.borrow_mut().retain(|_, script| script.is_some());
+        drop(host);
+        physics::forget_missing(&self.lua);
+        self.call_hook("GameContentChanged", mlua::MultiValue::new());
     }
 
     /// Runs console commands typed by a player, as a client's console sends them: the
@@ -688,6 +789,11 @@ impl Runtime {
             }
             player::ToClient::Command(line) => self.run_command(line),
             player::ToClient::Print(text) => host(&self.lua).print(&format!("{text}\n")),
+            player::ToClient::Effect(name, data) => effect::make(&self.lua, name, *data),
+            player::ToClient::GameEvent(name, fields) => gameevent::heard(&self.lua, name, fields),
+            player::ToClient::UserMessage(name, parts) => usermessage::receive(&self.lua, name, parts),
+            player::ToClient::Shake(amplitude, frequency, duration) => shake::start(&self.lua, *amplitude, *frequency, *duration),
+            player::ToClient::ParticleSystem(name, data) => particle_systems::show(&self.lua, name, *data),
         }
     }
 
@@ -702,9 +808,26 @@ impl Runtime {
         player::view(&self.lua, player)
     }
 
+    /// What the console offers for a line typed so far: ConVars (`name value`) and commands
+    /// whose names start with it; after a command and a space, what its own completion gives.
+    pub fn completions(&self, line: &str) -> Vec<String> {
+        convar::completions(&self.lua, line)
+    }
+
     /// A console variable's value, if there is one of that name.
     pub fn convar(&self, name: &str) -> Option<String> {
         convar::value(&self.lua, name)
+    }
+
+    /// Sets a console variable, as the player's settings say (`fov_desired`, `cl_drawhud`).
+    pub fn set_convar(&self, name: &str, value: &str) {
+        convar::set_value(&self.lua, name, value);
+    }
+
+    /// The player's key bindings from now on, key name (lower case) to command, in place of
+    /// the game's defaults.
+    pub fn set_binds(&self, binds: Vec<(String, String)>) {
+        *host(&self.lua).client.binds.borrow_mut() = binds;
     }
 
     /// The players who hear a sound, by the map's PAS; `None` for everyone.
@@ -745,7 +868,7 @@ impl Runtime {
     /// How far game time is into the next tick, 0 to 1: where to draw between where things
     /// were at the last two ticks.
     pub fn tick_fraction(&self) -> f32 {
-        let ticks = host(&self.lua).clock.cur_time.get() / timer::TICK_INTERVAL;
+        let ticks = host(&self.lua).clock.cur_time.get() / timer::tick_interval();
         (ticks - ticks.floor()) as f32
     }
 

@@ -17,7 +17,7 @@
 //!   (spawn flag 2), it does not get shorter either.
 //! - `phys_spring`: a spring from where it is to `springaxis`, `length` long (0: as far as
 //!   they are), `constant` stiff and `damping` damped. It pulls them together and pushes them
-//!   apart: "stretch only" (spawn flag 1) is not kept yet.
+//!   apart; "stretch only" (spawn flag 1, constraint.Elastic's `stretchonly`) only pulls.
 //! - `phys_ragdollconstraint`: a ball and socket whose second body turns from how it is no
 //!   farther than `xmin`..`xmax`, `ymin`..`ymax` and `zmin`..`zmax` degrees about the axes of
 //!   the constraint's angles, as a ragdoll's joints do ([`gmod_physics::Joint::Ragdoll`]).
@@ -72,6 +72,8 @@ const CONSTRAINTS: &[&str] = &[
 const SF_NO_COLLISION: i64 = 1;
 /// A rope that does not get shorter.
 const SF_RIGID: i64 = 2;
+/// `phys_spring`: it only pulls, never pushes.
+const SF_STRETCH_ONLY: i64 = 1;
 /// A ragdoll constraint that holds only how the two turn ("free movement").
 const SF_FREE: i64 = 2;
 /// Not held until `TurnOn`.
@@ -160,7 +162,15 @@ fn make(lua: &Lua, handle: EntityHandle) {
                     _ => (Vector::new(end[0], end[1], end[2]) - pos).length(),
                 };
                 collide = true;
-                Joint::Spring { start: at, end, length, stiffness: number("constant"), damping: number("damping") }
+                Joint::Spring {
+                    start: at,
+                    end,
+                    length,
+                    stiffness: number("constant"),
+                    damping: number("damping"),
+                    relative_damping: number("relativedamping"),
+                    stretch_only: ent.spawn_flags & SF_STRETCH_ONLY != 0,
+                }
             }
             COLLISION_PAIR => {
                 collide = false;

@@ -156,9 +156,50 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(Value::UserData(lua.create_userdata(origin + direction * t)?))
         })?,
     )?;
+    // LZMA, as GMod's: the "alone" container, its size in its header
+    util.raw_set(
+        "Compress",
+        lua.create_function(|lua, data: mlua::LuaString| {
+            let data = data.as_bytes();
+            if data.is_empty() {
+                return Ok(Value::Nil);
+            }
+            Ok(Value::String(lua.create_string(gmod_fs::lzma::compress_alone(&data))?))
+        })?,
+    )?;
+    util.raw_set(
+        "Decompress",
+        lua.create_function(|lua, (data, most): (mlua::LuaString, Option<f64>)| {
+            let limit = most.filter(|m| *m > 0.0).map_or(1 << 28, |m| m as u64);
+            match gmod_fs::lzma::decompress_alone(&data.as_bytes(), limit) {
+                Ok(out) => Ok(Value::String(lua.create_string(out)?)),
+                Err(_) => Ok(Value::Nil),
+            }
+        })?,
+    )?;
     crate::surfaceprops::install(lua, &util)?;
     lua.globals().raw_set("util", util)?;
     lua.globals().raw_set("PrecacheParticleSystem", lua.create_function(|_, _: MultiValue| Ok(()))?)?;
+    // `debugoverlay`: what it draws GMod shows only with `developer 1`, and this game not at all
+    let debugoverlay = lua.create_table()?;
+    let nothing = lua.create_function(|_, _: MultiValue| Ok(()))?;
+    for name in [
+        "Axis",
+        "Box",
+        "BoxAngles",
+        "Cross",
+        "EntityTextAtPosition",
+        "Grid",
+        "Line",
+        "ScreenText",
+        "Sphere",
+        "SweptBox",
+        "Text",
+        "Triangle",
+    ] {
+        debugoverlay.raw_set(name, &nothing)?;
+    }
+    lua.globals().raw_set("debugoverlay", debugoverlay)?;
     let globals = lua.globals();
     let def = |name: &'static str, f: fn(&Args) -> mlua::Result<MultiValue>| -> mlua::Result<()> {
         globals.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)

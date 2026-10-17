@@ -236,7 +236,8 @@ fn players_push_props_and_ride_what_moves() {
         g.runtime.set_input(alice, UserCmd::default());
         g.runtime.think(0.5);
     };
-    // walking into crates: a light one goes along, a heavy one hardly
+    // walking into crates: a light one goes along (as GMod's player pushes one, at 87
+    // units/s), a heavy one hardly
     g.runtime
         .run_string(
             "LIGHT = ents.Create('prop_physics') LIGHT:SetModel('models/light.mdl') LIGHT:SetPos(Vector(110, -300, 0)) LIGHT:Spawn()
@@ -249,7 +250,7 @@ fn players_push_props_and_ride_what_moves() {
     walk(300.0, 1.0);
     let light = g.eval::<f32>("return LIGHT:GetPos().x - 110");
     let heavy = g.eval::<f32>("return HEAVY:GetPos().x - 110");
-    assert!(light > 60.0 && heavy < light / 4.0, "pushed: light {light}, heavy {heavy}");
+    assert!(light > 40.0 && heavy < light / 4.0, "pushed: light {light}, heavy {heavy}");
 
     // standing on the top of the door when it rises: lifted with it
     g.runtime.run_string("Entity(1):SetPos(Vector(204, 0, 129))", "on").unwrap();
@@ -342,7 +343,8 @@ fn the_use_key_carries_light_props() {
     // the attack key throws it the way the player looks
     press(side, 1);
     assert!(g.printed().contains("dropped\tmodels/light.mdl\ttrue"));
-    assert!(g.eval::<bool>("return not LIGHT:IsPlayerHolding() and LIGHT:GetPos().y > 150"));
+    // (the air holding it back a little)
+    assert!(g.eval::<bool>("return not LIGHT:IsPlayerHolding() and LIGHT:GetPos().y > 120"));
     // the heavy crate is too heavy, unless Lua says to take it
     let at_heavy = Angle::new(25.0, 0.0, 0.0);
     g.runtime.run_string("Entity(1):SetPos(Vector(40, -200, 0)) Entity(1):SetEyeAngles(Angle(25, 0, 0))", "look").unwrap();

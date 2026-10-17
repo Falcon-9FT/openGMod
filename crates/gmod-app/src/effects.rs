@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gmod_fs::Vfs;
-use gmod_lua::render3d::{Material3d, Primitive, Shape};
+use gmod_lua::render3d::{GLYPHS, IMAGES, Material3d, Primitive, Shape};
 use gmod_lua::vector::Vector;
 use gmod_render::{EffectBatch, EffectVertex};
 use gmod_world::gpu::Camera;
@@ -28,9 +28,18 @@ impl Materials {
         Materials { vfs, looks: HashMap::new() }
     }
 
+    /// The game's files changed (an addon came or went): materials are read again.
+    pub fn forget(&mut self) {
+        self.looks.clear();
+    }
+
     /// The texture a material shows (none for a plain colour, or one that is not there) and
     /// whether it adds to what is behind it.
     fn look(&mut self, material: &Material3d) -> Look {
+        // text, a picture: pixels the program hands the renderer itself
+        if given(&material.name) {
+            return (None, material.additive.unwrap_or(false));
+        }
         let key = (material.name.to_ascii_lowercase(), material.texture.clone(), material.additive);
         if let Some(known) = self.looks.get(&key) {
             return known.clone();
@@ -42,12 +51,17 @@ impl Materials {
         let additive = material.additive.unwrap_or_else(|| vmt.as_ref().is_some_and(|m| m.flag("$additive")));
         let texture = texture_name.and_then(|name| {
             let vtf = gmod_material::load_texture(&self.vfs, &name).ok()?;
-            Some(gmod_world::Texture { name, vtf: Arc::new(vtf) })
+            Some(gmod_world::Texture { name, vtf: Arc::new(vtf), normal: false })
         });
         let look = (texture, additive);
         self.looks.insert(key, look.clone());
         look
     }
+}
+
+/// A texture the program makes from pixels of its own: a page of the fonts' glyphs, a picture.
+pub fn given(name: &str) -> bool {
+    name.starts_with(GLYPHS) || name.starts_with(IMAGES)
 }
 
 fn v3(v: Vector) -> [f32; 3] {
@@ -79,23 +93,29 @@ fn quad(out: &mut Vec<EffectVertex>, corners: [[f32; 3]; 4], uvs: [[f32; 2]; 4],
 }
 
 /// The triangles of the primitives, as seen from `camera`, in batches of one texture each, in
-/// the order they were drawn; the textures they need are handed to `upload` once.
+/// the order they were drawn; the textures they need are handed to `upload` once. Text and
+/// pictures whose pixels the renderer does not have yet (`has`) are left out.
 pub fn batches(
     primitives: &[Primitive],
     camera: &Camera,
     materials: &mut Materials,
     mut upload: impl FnMut(&gmod_world::Texture),
+    has: impl Fn(&str) -> bool,
 ) -> Vec<EffectBatch> {
     let eye = camera.eye;
     let (forward, right) = (camera.forward(), camera.right());
     let up = cross(right, forward);
     let mut out: Vec<EffectBatch> = Vec::new();
     for primitive in primitives {
+        let glyphs = given(&primitive.material.name);
+        if glyphs && !has(&primitive.material.name) {
+            continue;
+        }
         let (texture, additive) = materials.look(&primitive.material);
         if let Some(texture) = &texture {
             upload(texture);
         }
-        let name = texture.map(|t| t.name);
+        let name = if glyphs { Some(primitive.material.name.clone()) } else { texture.map(|t| t.name) };
         if out.last().is_none_or(|b| b.texture != name || b.additive != additive) {
             out.push(EffectBatch { texture: name, additive, vertices: Vec::new() });
         }
@@ -160,7 +180,7 @@ mod tests {
         let sprite = Shape::Sprite { pos: Vector::new(100.0, 0.0, 0.0), width: 4.0, height: 4.0, color };
         let plain = Material3d { name: "color".into(), texture: None, additive: Some(true) };
         let primitives = [Primitive { material: plain.clone(), shape: beam }, Primitive { material: plain, shape: sprite }];
-        let batches = batches(&primitives, &camera, &mut materials, |_| {});
+        let batches = batches(&primitives, &camera, &mut materials, |_| {}, |_| true);
         // one batch: the same material, plain white, added
         assert_eq!(batches.len(), 1);
         assert!(batches[0].additive && batches[0].texture.is_none());

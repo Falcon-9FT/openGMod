@@ -184,3 +184,29 @@ pub(crate) fn lookup(lua: &Lua, name: &str, key: Value) -> mlua::Result<Value> {
         None => Ok(Value::Nil),
     }
 }
+
+/// `__index` of the engine's userdata: what the named metatable's own `__index` says - a
+/// function a script put there (`meta.__index = function(self, key) ... end`), or a table -
+/// as in GMod, where that table is the userdata's metatable.
+pub(crate) fn index(lua: &Lua, name: &str, ud: AnyUserData, key: Value) -> mlua::Result<Value> {
+    let Some(table) = registry(lua)?.raw_get::<Option<Table>>(name)? else { return Ok(Value::Nil) };
+    match table.raw_get::<Value>("__index")? {
+        Value::Function(f) => f.call((ud, key)),
+        Value::Table(t) => t.get(key),
+        _ => table.get(key),
+    }
+}
+
+/// `__newindex` of the engine's userdata: the named metatable's own, if a script gave it one;
+/// otherwise a value has no fields to set, as in Lua.
+pub(crate) fn new_index(lua: &Lua, name: &str, ud: AnyUserData, key: Value, value: Value) -> mlua::Result<()> {
+    let handler = match registry(lua)?.raw_get::<Option<Table>>(name)? {
+        Some(table) => table.raw_get::<Value>("__newindex")?,
+        None => Value::Nil,
+    };
+    match handler {
+        Value::Function(f) => f.call((ud, key, value)),
+        Value::Table(t) => t.set(key, value),
+        _ => Err(crate::args::error(lua, format!("attempt to index a {name} value"))),
+    }
+}

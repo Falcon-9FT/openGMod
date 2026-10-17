@@ -8,11 +8,13 @@
 //! over the world, after what is seen through.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
-use mlua::{IntoLuaMulti, Lua, MultiValue, Table, Value};
+use mlua::{AnyUserData, IntoLuaMulti, Lua, MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value};
 
 use crate::args::Args;
 use crate::host;
+use crate::meta::{self, type_id};
 use crate::vector::{Angle, Vector};
 
 /// What a primitive is drawn with: a material of the game, or one Lua made with its own base
@@ -77,6 +79,8 @@ pub(crate) struct Frame {
     /// A mesh being made (`mesh.Begin`): its kind of primitive, the corners made, and the one
     /// being made.
     mesh: RefCell<Option<(i64, Vec<MeshVertex>, MeshVertex)>>,
+    /// The `IMesh` the mesh being made goes into (`mesh.Begin(imesh, ...)`), instead of the frame.
+    mesh_target: RefCell<Option<Rc<RefCell<Vec<Shape>>>>>,
     /// The planes 2D drawing goes on now (`cam.Start3D2D`), innermost last: each with the
     /// screen's drawing it took the place of.
     planes: RefCell<Vec<(Plane, gmod_ui::Canvas)>>,
@@ -90,6 +94,14 @@ struct Plane {
     x: Vector,
     y: Vector,
 }
+
+/// The material of text drawn in the world: this, and the number of the page of the fonts'
+/// glyphs ([`gmod_ui::Fonts::pages`]) it is cut from, which the program gives the renderer.
+pub const GLYPHS: &str = "!glyphs/";
+
+/// The material of a picture (`Material("x.png")`) drawn in the world: this, and the number of
+/// its image ([`crate::Runtime::image`]), whose pixels the program gives the renderer.
+pub const IMAGES: &str = "!image/";
 
 // The canvas drawn on a plane: so big, and `(0, 0)` so far in, that nothing drawn is cut off at
 // its edges, as drawing on a plane may go any way from its origin.
@@ -105,6 +117,7 @@ pub(crate) fn begin(lua: &Lua) {
     frame.blend.set(1.0);
     *frame.beam.borrow_mut() = None;
     *frame.mesh.borrow_mut() = None;
+    *frame.mesh_target.borrow_mut() = None;
 }
 
 /// The frame's Lua is done: planes it left open (an error between `cam.Start3D2D` and
@@ -129,7 +142,8 @@ fn start_3d2d(lua: &Lua, pos: Vector, angles: Angle, scale: f32) {
 }
 
 /// `cam.End3D2D`: what was drawn on the plane put in the world, as triangles of the materials
-/// it was drawn with; the screen is drawn on again. Text is not put there yet.
+/// it was drawn with - text of the page of the fonts' glyphs it was cut from
+/// ([`GLYPHS`]) - and the screen is drawn on again.
 fn end_3d2d(lua: &Lua) {
     let Some((plane, taken)) = host(lua).render3d.planes.borrow_mut().pop() else { return };
     let screen = &host(lua).screen;
@@ -152,9 +166,15 @@ fn plane_triangles(
             gmod_ui::Texture::White => Material3d { name: "color".into(), texture: None, additive: Some(batch.additive) },
             gmod_ui::Texture::Image(id) => {
                 let Some(found) = image(id) else { continue };
-                Material3d { name: found.name, texture: None, additive: Some(batch.additive || found.additive) }
+                let additive = Some(batch.additive || found.additive);
+                // a picture (`Material("x.png")`) is no material of the game's: the program has
+                // its pixels by its number
+                let lower = found.name.to_ascii_lowercase();
+                let picture = [".png", ".jpg", ".jpeg"].iter().any(|e| lower.ends_with(e));
+                let name = if picture { format!("{IMAGES}{id}") } else { found.name };
+                Material3d { name, texture: None, additive }
             }
-            gmod_ui::Texture::Glyphs(_) => continue,
+            gmod_ui::Texture::Glyphs(page) => Material3d { name: format!("{GLYPHS}{page}"), texture: None, additive: Some(batch.additive) },
         };
         let range = batch.start as usize..(batch.start + batch.count) as usize;
         let triangles = vertices[range]
@@ -238,13 +258,18 @@ fn install_mesh(lua: &Lua) -> mlua::Result<()> {
     let def = |name: &'static str, f: fn(&Args) -> mlua::Result<Value>| -> mlua::Result<()> {
         mesh.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
     };
-    // `Begin(kind, count)`; one made into an `IMesh` (`Begin(mesh, kind, count)`) is not kept
+    // `Begin(kind, count)`, or into an `IMesh`: `Begin(mesh, kind, count)`
     def("Begin", |a| {
-        let kind = match a.get(1) {
+        let (target, at) = match a.get(1) {
+            Some(Value::UserData(ud)) => (Some(ud.borrow::<LuaMesh>().map_err(|_| a.bad(1, "IMesh"))?.shapes.clone()), 2),
+            _ => (None, 1),
+        };
+        let kind = match a.get(at) {
             Some(Value::Integer(n)) => Some(*n),
             Some(Value::Number(n)) => Some(*n as i64),
             _ => None,
         };
+        *host(a.lua).render3d.mesh_target.borrow_mut() = target;
         *host(a.lua).render3d.mesh.borrow_mut() = kind.map(|k| (k, Vec::new(), MeshVertex { color: [1.0; 4], ..MeshVertex::default() }));
         Ok(Value::Nil)
     })?;
@@ -283,9 +308,12 @@ fn install_mesh(lua: &Lua) -> mlua::Result<()> {
     })?;
     def("End", |a| {
         let made = host(a.lua).render3d.mesh.borrow_mut().take();
+        let target = host(a.lua).render3d.mesh_target.borrow_mut().take();
         if let Some((kind, list, _)) = made {
-            for shape in mesh_shapes(kind, &list) {
-                push(a.lua, shape);
+            let shapes = mesh_shapes(kind, &list);
+            match target {
+                Some(target) => *target.borrow_mut() = shapes,
+                None => shapes.into_iter().for_each(|shape| push(a.lua, shape)),
             }
         }
         Ok(Value::Nil)
@@ -311,7 +339,90 @@ fn install_mesh(lua: &Lua) -> mlua::Result<()> {
         push(a.lua, Shape::Quad { corners: [pos - r + u, pos + r + u, pos + r - u, pos - r - u], color: color(a, 5) });
         Ok(Value::Nil)
     })?;
-    lua.globals().raw_set("mesh", mesh)
+    lua.globals().raw_set("mesh", mesh)?;
+    install_imesh(lua)
+}
+
+/// `IMesh`: triangles made once (`Mesh`, then `BuildFromTriangles` or `mesh.Begin(imesh, ...)`)
+/// and drawn as often as Lua wants, with the material set.
+pub(crate) struct LuaMesh {
+    shapes: Rc<RefCell<Vec<Shape>>>,
+    destroyed: Cell<bool>,
+}
+
+impl UserData for LuaMesh {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_meta_field("MetaName", "IMesh");
+        fields.add_meta_field("MetaID", type_id::IMESH);
+    }
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_function("__index", |lua, (ud, key): (AnyUserData, Value)| meta::index(lua, "IMesh", ud, key));
+        methods.add_meta_function("__newindex", |lua, (ud, key, value): (AnyUserData, Value, Value)| {
+            meta::new_index(lua, "IMesh", ud, key, value)
+        });
+        methods.add_meta_method("__tostring", |_, m, ()| Ok(format!("IMesh [{:p}]", Rc::as_ptr(&m.shapes))));
+    }
+}
+
+fn with_mesh<R>(a: &Args, f: impl FnOnce(&LuaMesh) -> R) -> mlua::Result<R> {
+    match a.get(1) {
+        Some(Value::UserData(ud)) => Ok(f(&*ud.borrow::<LuaMesh>().map_err(|_| a.bad(1, "IMesh"))?)),
+        _ => Err(a.bad(1, "IMesh")),
+    }
+}
+
+/// A corner of `BuildFromTriangles`: `pos`, `u`, `v`, `color`.
+fn table_vertex(t: &Table) -> mlua::Result<MeshVertex> {
+    let pos = match t.get::<Value>("pos")? {
+        Value::UserData(ud) => ud.borrow::<Vector>().map(|v| *v).unwrap_or_default(),
+        _ => Vector::default(),
+    };
+    let (u, v) = (t.get::<Option<f64>>("u")?.unwrap_or(0.0) as f32, t.get::<Option<f64>>("v")?.unwrap_or(0.0) as f32);
+    let color = match t.get::<Value>("color")? {
+        Value::Table(c) => {
+            let channel = |k: &str| c.get::<Option<f64>>(k).ok().flatten().map_or(1.0, |n| n as f32 / 255.0);
+            [channel("r"), channel("g"), channel("b"), channel("a")]
+        }
+        _ => [1.0; 4],
+    };
+    Ok(MeshVertex { pos, uv: [u, v], color })
+}
+
+fn install_imesh(lua: &Lua) -> mlua::Result<()> {
+    lua.globals().raw_set(
+        "Mesh",
+        lua.create_function(|lua, _: MultiValue| lua.create_userdata(LuaMesh { shapes: Rc::default(), destroyed: Cell::new(false) }))?,
+    )?;
+    let t = meta::meta_table(lua, "IMesh", type_id::IMESH)?;
+    let def = |name: &'static str, f: fn(&Args) -> mlua::Result<Value>| -> mlua::Result<()> {
+        t.raw_set(name, lua.create_function(move |lua, values: MultiValue| f(&Args::new(lua, values, name)))?)
+    };
+    def("BuildFromTriangles", |a| {
+        let list = a.table(2)?;
+        let corners = list.sequence_values::<Table>().map(|t| table_vertex(&t?)).collect::<mlua::Result<Vec<_>>>()?;
+        let shapes = mesh_shapes(TRIANGLES, &corners);
+        with_mesh(a, |m| *m.shapes.borrow_mut() = shapes)?;
+        Ok(Value::Nil)
+    })?;
+    let draw = |a: &Args| {
+        let shapes = with_mesh(a, |m| if m.destroyed.get() { Vec::new() } else { m.shapes.borrow().clone() })?;
+        for shape in shapes {
+            push(a.lua, shape);
+        }
+        Ok(Value::Nil)
+    };
+    def("Draw", draw)?;
+    def("DrawSkinned", draw)?;
+    def("Destroy", |a| {
+        with_mesh(a, |m| {
+            m.destroyed.set(true);
+            m.shapes.borrow_mut().clear();
+        })?;
+        Ok(Value::Nil)
+    })?;
+    def("IsValid", |a| Ok(Value::Boolean(!with_mesh(a, |m| m.destroyed.get())?)))?;
+    Ok(())
 }
 
 /// `util.GetPixelVisibleHandle` and `util.PixelVisible`: whether a point can be seen now - in
@@ -335,6 +446,23 @@ fn install_visibility(lua: &Lua) -> mlua::Result<()> {
             let hit = crate::trace::trace(lua, &sweep);
             let length = to.length().max(1e-3);
             Ok(if hit.fraction >= 1.0 || (1.0 - hit.fraction) * length <= radius.max(1.0) { 1.0 } else { 0.0 })
+        })?,
+    )?;
+    // where the map's sun is from here, and whether the world is between it and the eyes
+    util.raw_set(
+        "GetSunInfo",
+        lua.create_function(|lua, ()| {
+            let Some(direction) = host(lua).game.sun.get() else { return Ok(Value::Nil) };
+            let view = host(lua).client.view.get();
+            let player = host(lua).client.local_player.get();
+            let sweep =
+                crate::trace::Sweep::line(view.origin, view.origin + direction * 32768.0, crate::trace::Filter::Entities(vec![player]));
+            let hit = crate::trace::trace(lua, &sweep);
+            let open = hit.fraction >= 1.0 || hit.surface_flags & gmod_bsp::surf::SKY != 0;
+            let info = lua.create_table()?;
+            info.raw_set("direction", crate::entity::vector(lua, direction)?)?;
+            info.raw_set("obstruction", if open { 0.0 } else { 1.0 })?;
+            Ok(Value::Table(info))
         })?,
     )
 }

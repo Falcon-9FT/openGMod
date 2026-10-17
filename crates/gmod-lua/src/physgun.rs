@@ -33,6 +33,11 @@ pub(crate) const CONVARS: &[(&str, &str, &str)] = &[
     ("physgun_timeToArrive", "0.05", ""),
     ("physgun_maxSpeed", "5000", ""),
     ("physgun_maxAngular", "5000", ""),
+    ("physgun_maxSpeedDamping", "10000", ""),
+    ("physgun_maxAngularDamping", "10000", ""),
+    ("physgun_DampingFactor", "0.8", ""),
+    ("physgun_teleportDistance", "0", ""),
+    ("physgun_timeToArriveRagdoll", "0.1", ""),
 ];
 
 const IN_ATTACK: u32 = 1;
@@ -121,11 +126,13 @@ pub(crate) fn command(lua: &Lua, player: EntityHandle, weapon: EntityHandle, cmd
     if !is_gun {
         return;
     }
-    // the claws open while it holds something, and close again
-    let open = if held(lua, player).is_some() { 1.0 } else { 0.0 };
-    crate::anim::approach_view_model_pose(lua, player, "active", open, 4.0);
     if cmd.buttons & IN_ATTACK == 0 {
         host(lua).physgun.waiting.borrow_mut().retain(|&p| p != player);
+    }
+    // as GMod's: the key going down plays its firing once, which stays at its end, held or let
+    // go - it has no idle, and its claws do not open (measured)
+    if pressed & IN_ATTACK != 0 {
+        crate::anim::send_weapon_anim(lua, weapon, crate::anim::ACT_VM_PRIMARYATTACK);
     }
     match held(lua, player) {
         Some(_) if cmd.buttons & IN_ATTACK == 0 => drop(lua, player),
@@ -247,15 +254,24 @@ pub(crate) fn think(lua: &Lua) {
         let yaw = player::eye_angles(lua, player).map_or(held.yaw, |a| a.y);
         let angles = held.angles.rotated_about(Vector::new(0.0, 0.0, 1.0), yaw - held.yaw);
         let origin = eye + aim * held.distance - held.point.rotated(angles);
-        let seconds = number(lua, "physgun_timeToArrive", 0.05).max(timer::TICK_INTERVAL as f32);
-        let (speed, turn) = (number(lua, "physgun_maxSpeed", 5000.0), number(lua, "physgun_maxAngular", 5000.0));
-        host(lua).physics.physics.borrow_mut().steer(
-            body,
-            [origin.x, origin.y, origin.z],
-            [angles.p, angles.y, angles.r],
-            seconds,
-            speed,
-            turn,
-        );
+        // as GMod's: Source's shadow control with the gun's console variables, a ragdoll a little
+        // slower to arrive
+        let arrive = if crate::ragdoll::is_ragdoll(lua, held.entity) {
+            number(lua, "physgun_timeToArriveRagdoll", 0.1)
+        } else {
+            number(lua, "physgun_timeToArrive", 0.05)
+        };
+        let shadow = gmod_physics::Shadow {
+            origin: [origin.x, origin.y, origin.z],
+            angles: [angles.p, angles.y, angles.r],
+            seconds: arrive,
+            max_speed: number(lua, "physgun_maxSpeed", 5000.0),
+            max_damp_speed: number(lua, "physgun_maxSpeedDamping", 10000.0),
+            max_angular: number(lua, "physgun_maxAngular", 5000.0),
+            max_damp_angular: number(lua, "physgun_maxAngularDamping", 10000.0),
+            damp_factor: number(lua, "physgun_DampingFactor", 0.8),
+            teleport_distance: number(lua, "physgun_teleportDistance", 0.0),
+        };
+        host(lua).physics.physics.borrow_mut().shadow(body, &shadow, timer::tick_interval() as f32);
     }
 }

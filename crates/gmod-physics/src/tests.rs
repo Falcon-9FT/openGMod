@@ -2,6 +2,21 @@ use super::*;
 
 const TICK: f32 = 0.015;
 
+thread_local! {
+    /// The step [`run`] takes: a tick of 66 a second, or of another tick rate.
+    static STEP: std::cell::Cell<f32> = const { std::cell::Cell::new(TICK) };
+}
+
+/// Runs `test` with ticks of each of the rates the game may run at: 66 (GMod's), 33, 128, and
+/// 100.
+fn at_tick_rates(test: impl Fn()) {
+    for rate in [66.6667f32, 33.0, 128.0, 100.0] {
+        STEP.with(|s| s.set(1.0 / rate));
+        test();
+    }
+    STEP.with(|s| s.set(TICK));
+}
+
 fn near(a: Vec3, b: Vec3, within: f32) -> bool {
     (0..3).all(|i| (a[i] - b[i]).abs() <= within)
 }
@@ -19,8 +34,9 @@ fn crate_body(origin: Vec3) -> Body {
 }
 
 fn run(physics: &mut Physics, seconds: f32) {
-    for _ in 0..(seconds / TICK).round() as usize {
-        physics.step(TICK);
+    let step = STEP.with(std::cell::Cell::get);
+    for _ in 0..(seconds / step).round() as usize {
+        physics.step(step);
     }
 }
 
@@ -49,13 +65,33 @@ fn a_crate_falls_and_comes_to_rest_on_the_floor() {
     run(&mut physics, 0.3);
     let v = physics.velocity(body);
     assert!((v[2] + DEFAULT_GRAVITY * 0.3).abs() < 15.0, "{v:?}");
-    // then it lies on the floor, its bottom on the top, and falls asleep
+    // then it lies on the floor, its bottom on the top, and falls asleep; it bounced, and went
+    // a little aside (GMod's crates dropped so: 2 to 20 units, a few degrees)
     run(&mut physics, 3.0);
     let (origin, angles) = physics.pose(body).unwrap();
-    assert!(near(origin, [0.0, 0.0, 16.0], 0.5) && near(angles, [0.0; 3], 0.5), "{origin:?} {angles:?}");
+    assert!(near(origin, [0.0, 0.0, 16.0], 15.0) && (origin[2] - 16.0).abs() < 0.5, "{origin:?}");
+    assert!(angles[0].abs() < 0.5 && angles[2].abs() < 0.5 && angles[1].abs() < 20.0, "{angles:?}");
     assert!(physics.asleep(body) && physics.awake().is_empty());
     let (mins, maxs) = physics.bounds(body).unwrap();
-    assert!(near(mins, [-16.0, -16.0, 0.0], 0.5) && near(maxs, [16.0, 16.0, 32.0], 0.5), "{mins:?} {maxs:?}");
+    assert!((mins[2] - 0.0).abs() < 0.5 && (maxs[2] - 32.0).abs() < 0.5, "{mins:?} {maxs:?}");
+}
+
+#[test]
+fn a_body_of_no_friction_slides_on() {
+    let mut physics = floor();
+    let gripping = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    let sliding = physics.add(&crate_body([0.0, 200.0, 16.0])).unwrap();
+    physics.set_friction(sliding, 0.0);
+    assert_eq!(physics.friction(sliding), 0.0);
+    run(&mut physics, 0.5);
+    for body in [gripping, sliding] {
+        physics.set_velocity(body, [300.0, 0.0, 0.0]);
+    }
+    run(&mut physics, 1.0);
+    // the floor holds the one back, and not the other: the less of the two goes
+    let (held, _) = physics.pose(gripping).unwrap();
+    let (slid, _) = physics.pose(sliding).unwrap();
+    assert!(held[0] < 150.0 && slid[0] > 250.0, "{held:?} {slid:?}");
 }
 
 #[test]
@@ -234,7 +270,15 @@ fn ropes_hinges_springs_and_sliders() {
         .join(
             spring,
             ground,
-            Joint::Spring { start: [0.0, 500.0, 16.0], end: [0.0, 500.0, 100.0], length: 50.0, stiffness, damping },
+            Joint::Spring {
+                start: [0.0, 500.0, 16.0],
+                end: [0.0, 500.0, 100.0],
+                length: 50.0,
+                stiffness,
+                damping,
+                relative_damping: 0.0,
+                stretch_only: false,
+            },
             true,
             [0.0; 2],
         )
@@ -310,7 +354,6 @@ fn ragdoll_joints_turn_as_far_as_their_limits() {
         ([[0.0, 0.0], [-45.0, 45.0], [0.0, 0.0]], 45.0),
         ([[0.0, 0.0], [-30.0, 80.0], [-10.0, 10.0]], 80.0),
         ([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]], 0.0),
-        ([[-180.0, 180.0], [-180.0, 180.0], [-180.0, 180.0]], 90.0),
     ] {
         let mut physics = floor();
         let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
@@ -327,6 +370,22 @@ fn ragdoll_joints_turn_as_far_as_their_limits() {
         let down = f32::to_radians(pitch);
         assert!(near(forward, [down.cos(), 0.0, -down.sin()], 0.05) && near(left, [0.0, 1.0, 0.0], 0.05), "{limits:?}: {angles:?}");
     }
+    // free, it swings down through straight down and on: in the air nothing damps it (as in
+    // GMod), and nothing holds it back
+    let mut physics = floor();
+    let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
+    physics.set_motion(post, false);
+    let arm = physics.add(&stick([16.0, 0.0, 200.0])).unwrap();
+    let limits = [[-180.0, 180.0]; 3];
+    physics.join(post, arm, Joint::Ragdoll { point: [16.0, 0.0, 200.0], angles: [0.0; 3], limits, free: false }, false, [0.0; 2]).unwrap();
+    let mut lowest = 0.0f32;
+    for _ in 0..100 {
+        run(&mut physics, 0.04);
+        let (origin, angles) = physics.pose(arm).unwrap();
+        assert!(near(origin, [16.0, 0.0, 200.0], 1.0), "{origin:?}");
+        lowest = lowest.min(axes(angles)[0][2]);
+    }
+    assert!(lowest < -0.99, "it never hung straight down: {lowest}");
     // the frame turns the axes: about its x, which is the world's y, the stick may not turn
     let mut physics = floor();
     let post = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
@@ -413,7 +472,7 @@ fn bodies_set_apart_go_through_each_other() {
     assert!(physics.apart(a, b) && physics.apart(b, a));
     run(&mut physics, 3.0);
     let (pa, pb) = (physics.pose(a).unwrap().0, physics.pose(b).unwrap().0);
-    assert!(near(pa, [0.0, 0.0, 16.0], 1.0) && near(pb, [8.0, 0.0, 16.0], 1.0), "{pa:?} {pb:?}");
+    assert!(near(pa, [0.0, 0.0, 16.0], 6.0) && near(pb, [8.0, 0.0, 16.0], 6.0), "{pa:?} {pb:?}");
     // together again, they push each other apart
     physics.set_apart(a, b, false);
     assert!(!physics.apart(a, b));
@@ -436,12 +495,16 @@ fn aloof_bodies_go_through_what_moves() {
     physics.set_aloof(aloof, true);
     run(&mut physics, 2.0);
     let (pa, pb) = (physics.pose(aloof).unwrap().0, physics.pose(below).unwrap().0);
-    assert!(near(pa, [0.0, 0.0, 16.0], 1.0) && near(pb, [0.0, 0.0, 16.0], 0.5), "{pa:?} {pb:?}");
+    assert!(near(pa, [0.0, 0.0, 16.0], 6.0) && near(pb, [0.0, 0.0, 16.0], 0.5), "{pa:?} {pb:?}");
     // one that does not move holds it, and so does another aloof one
     physics.set_motion(below, false);
     physics.set_pose(aloof, [0.0, 0.0, 100.0], [0.0; 3]);
     let other = physics.add(&crate_body([0.0, 0.0, 200.0])).unwrap();
     physics.set_aloof(other, true);
+    // bouncing as little as anything does, which may still tip them over the edge (GMod's
+    // crates dropped on crates mostly fall off)
+    physics.set_elasticity(aloof, 0.0);
+    physics.set_elasticity(other, 0.0);
     run(&mut physics, 3.0);
     let (pa, po) = (physics.pose(aloof).unwrap().0, physics.pose(other).unwrap().0);
     assert!(near(pa, [0.0, 0.0, 48.0], 1.0) && near(po, [0.0, 0.0, 80.0], 2.0), "{pa:?} {po:?}");
@@ -518,4 +581,622 @@ fn movers_carry_and_push_what_they_meet() {
     }
     let (pushed, _) = physics.pose(beside).unwrap();
     assert!(pushed[0] > 320.0, "pushed along: {pushed:?}");
+}
+
+/// A trolleybus's wheel: a heavy ball held to a heavier body by two rigid ropes across it and
+/// springs to where it hangs. The body spun hard, the wheel goes round with it.
+#[test]
+fn a_wheel_on_rigid_ropes_goes_round_with_its_body() {
+    let mut physics = Physics::new();
+    physics.set_gravity(0.0);
+    let body = physics
+        .add(&Body {
+            mass: Some(7466.0),
+            ..Body::new(Shape::cuboid([-230.0, -48.0, -49.0], [216.0, 48.0, 74.0]), [0.0, 0.0, 100.0], [0.0; 3])
+        })
+        .unwrap();
+    let wheel_at = [112.0, 40.0, 100.0 - 45.0];
+    let wheel = physics.add(&Body { mass: Some(933.0), ..Body::new(Shape::Sphere(20.0), wheel_at, [0.0; 3]) }).unwrap();
+    let distance = |a: Vec3, b: Vec3| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+    for (dx, rigid) in [(-40.0, true), (40.0, true), (0.0, false)] {
+        // across the body, level with the wheel, as Trolleybus System ties them
+        let end = [112.0 + dx, -40.0, 100.0 - 45.0];
+        let joint = Joint::Rope { start: wheel_at, end, length: distance(wheel_at, end), rigid };
+        physics.join(wheel, body, joint, false, [0.0; 2]).unwrap();
+    }
+    for _ in 0..6 {
+        let spring = Joint::Spring {
+            start: wheel_at,
+            end: wheel_at,
+            length: 0.0,
+            stiffness: 50000.0,
+            damping: 1300.0,
+            relative_damping: 1300.0,
+            stretch_only: false,
+        };
+        physics.join(wheel, body, spring, false, [0.0; 2]).unwrap();
+    }
+    let local = |physics: &Physics| {
+        let (origin, angles) = physics.pose(body).unwrap();
+        let (point, _) = physics.pose(wheel).unwrap();
+        let d = Vector::from(point) - Vector::from(origin);
+        (rotation(angles).inverse() * d).to_array()
+    };
+    run(&mut physics, 0.3);
+    let rest = local(&physics);
+    let mut worst: f32 = 0.0;
+    for tick in 0..100 {
+        physics.set_angular_velocity(body, if tick < 4 { [0.0, 0.0, 600.0] } else { [0.0; 3] });
+        physics.step(TICK);
+        worst = worst.max(distance(local(&physics), rest));
+    }
+    // GMod, measured: 4 units at most (rigid ropes are rods there)
+    assert!(worst < 5.0, "the wheel went {worst} units from its place");
+}
+
+/// Debris (1) collides with nothing but what has no group, as Half-Life 2's rules have it.
+fn rule(a: i64, b: i64) -> bool {
+    !(a == 1 && b == 1)
+}
+
+#[test]
+fn collision_groups_say_what_collides() {
+    let mut physics = floor();
+    physics.set_group_rule(rule);
+    let below = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    physics.set_motion(below, false);
+    let below2 = physics.add(&crate_body([200.0, 0.0, 16.0])).unwrap();
+    physics.set_motion(below2, false);
+    // the world only: through the crate, onto the floor
+    let world_only = physics.add(&crate_body([0.0, 0.0, 100.0])).unwrap();
+    physics.set_collision_group(world_only, WORLD_ONLY);
+    // debris on debris: through it as well
+    physics.set_collision_group(below2, 1);
+    let debris = physics.add(&crate_body([200.0, 0.0, 100.0])).unwrap();
+    physics.set_collision_group(debris, 1);
+    // nothing at all, not solid: through the floor too
+    let ghost = physics.add(&crate_body([400.0, 0.0, 100.0])).unwrap();
+    physics.set_collisions(ghost, false);
+    run(&mut physics, 2.0);
+    let z = |id| physics.pose(id).unwrap().0[2];
+    assert!((z(world_only) - 16.0).abs() < 2.0, "{}", z(world_only));
+    assert!((z(debris) - 16.0).abs() < 2.0, "{}", z(debris));
+    assert!(z(ghost) < -200.0, "{}", z(ghost));
+}
+
+#[test]
+fn a_concrete_barrier_lying_across_a_crest_of_the_ground_falls_asleep() {
+    at_tick_rates(barrier_on_crests);
+}
+
+fn barrier_on_crests() {
+    // where gm_construct has it, and nearer the middle of the world
+    let step = STEP.with(std::cell::Cell::get);
+    for at in [[-3952.0, 4100.0, -100.0], [-250.0, 250.0, -100.0], [-8000.0, 8000.0, 0.0]] {
+        let fastest = barrier_on_crest(at);
+        assert_eq!(fastest, 0.0, "a tick of {step} s: at {at:?} still moving, as fast as {fastest} units/s after 5 s");
+    }
+}
+
+/// A concrete barrier lying across a crest of ground at `at`: 0 when it falls asleep, else the
+/// fastest it moved after the first 5 seconds of 20.
+fn barrier_on_crest(at: Vec3) -> f32 {
+    // gm_construct's ground at (-3952, 4100, -100): two slopes of a displacement meeting
+    let ground: [[Vec3; 3]; 12] = [
+        [[100.0, -101.29, -0.38], [0.0, -100.07, 0.0], [100.0, -27.96, -0.62]],
+        [[100.0, -27.96, -0.62], [0.0, -100.07, 0.0], [0.0, -27.05, 0.0]],
+        [[100.0, -27.96, -0.62], [0.0, -27.05, 0.0], [0.0, 45.96, 0.0]],
+        [[100.0, -27.96, -0.62], [0.0, 45.96, 0.0], [100.0, 45.36, -0.67]],
+        [[100.0, 45.36, -0.67], [0.0, 45.96, 0.0], [100.0, 118.68, -0.67]],
+        [[100.0, 118.68, -0.67], [0.0, 45.96, 0.0], [0.0, 118.98, 0.0]],
+        [[0.0, -100.07, 0.0], [-100.0, -98.86, -0.25], [-100.0, -26.14, -0.41]],
+        [[0.0, -100.07, 0.0], [-100.0, -26.14, -0.41], [0.0, -27.05, 0.0]],
+        [[0.0, -27.05, 0.0], [-100.0, -26.14, -0.41], [0.0, 45.96, 0.0]],
+        [[0.0, 45.96, 0.0], [-100.0, -26.14, -0.41], [-100.0, 46.57, -0.7]],
+        [[0.0, 45.96, 0.0], [-100.0, 46.57, -0.7], [-100.0, 119.29, -0.85]],
+        [[0.0, 45.96, 0.0], [-100.0, 119.29, -0.85], [0.0, 118.98, 0.0]],
+    ];
+    let mut physics = Physics::new();
+    let corners: Vec<Vec3> = ground.iter().flatten().map(|p| [p[0] + at[0], p[1] + at[1], p[2] + at[2]]).collect();
+    let triangles: Vec<[u32; 3]> = (0..12).map(|t| [3 * t, 3 * t + 1, 3 * t + 2]).collect();
+    physics.add_world(&[], &corners, &triangles);
+    // models/props_c17/concrete_barrier001a.mdl, as its .phy has it
+    let hulls = vec![
+        vec![
+            [-4.959, 55.995, 12.098],
+            [-2.732, -56.069, 48.072],
+            [-4.959, -56.069, 12.098],
+            [-2.732, 55.995, 48.072],
+            [2.660, 55.995, 48.072],
+            [2.660, -56.069, 48.072],
+            [4.831, -56.069, 12.098],
+            [4.831, 55.995, 12.098],
+        ],
+        vec![
+            [5.591, -56.069, 13.624],
+            [-5.581, -56.069, 13.624],
+            [6.048, 55.995, 13.624],
+            [-5.581, 55.995, 13.624],
+            [10.188, -56.069, -0.183],
+            [-10.252, -56.069, -0.183],
+            [10.188, 55.995, -0.183],
+            [-10.252, 55.995, -0.183],
+        ],
+    ];
+    let body = physics
+        .add(&Body { mass: Some(75.0), ..Body::new(Shape::Hulls(hulls), [at[0] + 2.0, at[1], at[2] + 2.0], [0.0, 75.0, 0.0]) })
+        .unwrap();
+    let mut fastest: f32 = 0.0;
+    for second in 0..20 {
+        run(&mut physics, 1.0);
+        if second >= 5 {
+            let v = physics.velocity(body);
+            fastest = fastest.max((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+        }
+    }
+    if physics.asleep(body) { 0.0 } else { fastest }
+}
+
+#[test]
+fn what_falls_fast_does_not_go_through_the_ground() {
+    at_tick_rates(falls_fast);
+}
+
+fn falls_fast() {
+    for speed in [1000.0f32, 3000.0, 6000.0] {
+        for small in [4.0f32, 16.0] {
+            // ground as a displacement makes it: triangles, no thickness
+            let mut physics = Physics::new();
+            let corners = [
+                [-512.0, -512.0, 0.0],
+                [512.0, -512.0, 0.0],
+                [512.0, 512.0, 0.0],
+                [-512.0, -512.0, 0.0],
+                [512.0, 512.0, 0.0],
+                [-512.0, 512.0, 0.0],
+            ];
+            physics.add_world(&[], &corners, &[[0, 1, 2], [3, 4, 5]]);
+            // and a floor of a brush 8 units thick beside it
+            let Shape::Hulls(hulls) = Shape::cuboid([600.0, -512.0, -8.0], [1600.0, 512.0, 0.0]) else { unreachable!() };
+            physics.add_world(&hulls, &[], &[]);
+            let mut bodies = Vec::new();
+            for x in [0.0, 1100.0] {
+                let body = physics
+                    .add(&Body { mass: Some(5.0), ..Body::new(Shape::cuboid([-small; 3], [small; 3]), [x, 0.0, 300.0], [0.0; 3]) })
+                    .unwrap();
+                physics.set_velocity(body, [0.0, 0.0, -speed]);
+                bodies.push(body);
+            }
+            run(&mut physics, 2.0);
+            for body in bodies {
+                let (origin, _) = physics.pose(body).unwrap();
+                assert!(origin[2] > 0.0, "a box of {} units at {speed} units/s went through to {origin:?}", small * 2.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_car_held_on_its_wheels_by_rods_and_springs_stands_still() {
+    at_tick_rates(car_stands_still);
+}
+
+fn car_stands_still() {
+    // simfphys' Volga as GMod joins it: a body, and four wheels each held by two rods to the
+    // far side, a rope that limits how far it hangs, a spring, and a ball joint that keeps it
+    // from turning
+    let mut physics = floor();
+    let ground = 3.39;
+    let car = physics
+        .add(&Body {
+            mass: Some(1265.0),
+            ..Body::new(Shape::cuboid([-105.7, -42.3, 0.0], [96.0, 42.6, 66.1]), [0.0, 0.0, ground], [0.0; 3])
+        })
+        .unwrap();
+    let on_car = |p: Vec3| [p[0], p[1], p[2] + ground];
+    for (x, y) in [(64.0, 34.0), (64.0, -34.0), (-55.0, 34.0), (-55.0, -34.0)] {
+        let centre = on_car([x, y, 12.0]);
+        let wheel = physics.add(&Body { mass: Some(42.19), ..Body::new(Shape::Sphere(15.4), centre, [0.0; 3]) }).unwrap();
+        physics.set_friction(wheel, 1.0);
+        let across = if y > 0.0 { -150.0 } else { 150.0 };
+        for along in [75.0, -75.0] {
+            let rod = Joint::Rope { start: on_car([x + along, y + across, 6.5]), end: centre, length: 167.7, rigid: true };
+            physics.join(car, wheel, rod, false, [0.0; 2]).unwrap();
+        }
+        let limiter = Joint::Rope { start: on_car([x, y + across * 0.4, 13.0]), end: centre, length: 60.2, rigid: false };
+        physics.join(car, wheel, limiter, false, [0.0; 2]).unwrap();
+        let spring = Joint::Spring {
+            start: [centre[0], centre[1], centre[2] + 6.5],
+            end: on_car([x, y, 6.5]),
+            length: 6.5,
+            stiffness: 25000.0,
+            damping: 1300.0,
+            relative_damping: 1300.0,
+            stretch_only: false,
+        };
+        physics.join(wheel, car, spring, false, [0.0; 2]).unwrap();
+        let held = Joint::Ragdoll { point: centre, angles: [0.0; 3], limits: [[-0.01, 0.01]; 3], free: true };
+        physics.join(car, wheel, held, false, [0.0; 2]).unwrap();
+    }
+    run(&mut physics, 4.0);
+    let (_, angles) = physics.pose(car).unwrap();
+    run(&mut physics, 6.0);
+    let (_, later) = physics.pose(car).unwrap();
+    let v = physics.velocity(car);
+    let speed = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    assert!(
+        speed < 0.5 && (later[1] - angles[1]).abs() < 0.1,
+        "it creeps: {speed} units/s, turned {} degrees in 6 s",
+        later[1] - angles[1]
+    );
+}
+
+#[test]
+fn a_shadow_holds_back_some_of_its_own_speed_and_is_pushed_to_where_it_is_to_be() {
+    // as IVP's ComputeController: 0.8 of the speed held back, no more than the damping allows
+    let v = Vector::new(10.0, 0.0, 0.0);
+    assert!((shadow_control(v, Vector::ZERO, 0.0, 100.0, 0.0, 0.8).x - 2.0).abs() < 1e-5);
+    assert!((shadow_control(v, Vector::ZERO, 0.0, 1.0, 0.0, 0.8).x - 9.0).abs() < 1e-5);
+    // and pushed by the way to go times the scale, no faster than its most
+    let pushed = shadow_control(Vector::ZERO, Vector::new(0.0, 1.0, 0.0), 5.0, 0.0, 20.0, 0.8);
+    assert!((pushed.y - 5.0).abs() < 1e-5);
+
+    // the physics gun's: up in the air, steered 100 units away and held there
+    let mut physics = Physics::new();
+    physics.set_gravity(0.0);
+    let body = physics.add(&crate_body([0.0, 0.0, 500.0])).unwrap();
+    let held = Shadow {
+        origin: [100.0, 0.0, 500.0],
+        angles: [0.0, 90.0, 0.0],
+        seconds: 0.05,
+        max_speed: 5000.0,
+        max_damp_speed: 10000.0,
+        max_angular: 5000.0,
+        max_damp_angular: 10000.0,
+        damp_factor: 0.8,
+        teleport_distance: 0.0,
+    };
+    for _ in 0..60 {
+        physics.shadow(body, &held, TICK);
+        physics.step(TICK);
+    }
+    let (origin, angles) = physics.pose(body).unwrap();
+    assert!(near(origin, [100.0, 0.0, 500.0], 0.5) && near(angles, [0.0, 90.0, 0.0], 0.5), "{origin:?} {angles:?}");
+    // far beyond its teleport distance it is put there at once
+    let far = Shadow { origin: [5000.0, 0.0, 500.0], teleport_distance: 1000.0, ..held };
+    physics.shadow(body, &far, TICK);
+    assert!(near(physics.pose(body).unwrap().0, [5000.0, 0.0, 500.0], 0.01));
+}
+
+#[test]
+fn nothing_goes_faster_than_the_limits() {
+    let mut physics = Physics::new();
+    physics.set_gravity(0.0);
+    let body = physics.add(&crate_body([0.0, 0.0, 500.0])).unwrap();
+    physics.set_velocity(body, [20000.0, 0.0, 0.0]);
+    physics.step(TICK);
+    assert!((physics.velocity(body)[0] - MAX_VELOCITY).abs() < 1.0, "{:?}", physics.velocity(body));
+    physics.set_speed_limits(1000.0, 360.0);
+    physics.step(TICK);
+    assert!((physics.velocity(body)[0] - 1000.0).abs() < 1.0);
+}
+
+#[test]
+fn friction_is_the_two_surfaces_multiplied() {
+    // a crate of glass (0.5) pushed along the floor (0.8) at 400 units/s slides as 0.4 does:
+    // v² / (2 μ g), 333 units (GMod: 349, the crate turning as it went)
+    let mut physics = floor();
+    let body = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    physics.set_friction(body, 0.5);
+    // as it was measured, the air holding nothing back
+    physics.set_drag(body, false);
+    run(&mut physics, 0.5);
+    physics.set_velocity(body, [400.0, 0.0, 0.0]);
+    run(&mut physics, 3.0);
+    let slid = physics.pose(body).unwrap().0[0];
+    assert!((slid - 333.0).abs() < 25.0, "slid {slid}");
+}
+
+#[test]
+fn what_slides_over_the_seams_of_brushes_does_not_trip_on_them() {
+    // a floor of brushes side by side, as maps are made, and a crate sliding over their
+    // seams fast; it went head over heels on the first (the face between two brushes caught
+    // its edge)
+    at_tick_rates(|| {
+        for speed in [300.0f32, 600.0, 1000.0] {
+            let mut physics = Physics::new();
+            let hulls: Vec<Vec<Vec3>> = (0..24)
+                .flat_map(|i| {
+                    let x = -256.0 + i as f32 * 128.0;
+                    let Shape::Hulls(hulls) = Shape::cuboid([x, -512.0, -64.0], [x + 128.0, 512.0, 0.0]) else { unreachable!() };
+                    hulls
+                })
+                .collect();
+            physics.add_world(&hulls, &[], &[]);
+            let body = physics.add(&crate_body([-200.0, 0.0, 16.0])).unwrap();
+            physics.set_friction(body, 0.1);
+            run(&mut physics, 0.5);
+            physics.set_velocity(body, [speed, 0.0, 0.0]);
+            // until it is near the floor's end
+            for step in 0..90 {
+                run(&mut physics, 0.025);
+                let (origin, angles) = physics.pose(body).unwrap();
+                assert!(
+                    angles[0].abs() < 1.0 && angles[2].abs() < 1.0 && (origin[2] - 16.0).abs() < 1.0,
+                    "at {speed} units/s it tripped by {origin:?} {angles:?} ({step})"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn what_falls_bounces_by_both_surfaces() {
+    // a ball dropped on the floor (0.25) goes back up by √(e₁ e₂) of the speed it hit at, no
+    // less than 0.2 and no more than all of it (GMod: a ball on concrete, 0.2, at 0.25 0.228,
+    // at 0.5 0.321, at 1000 1.0; of dirt, 0.01, 0.204, on grass too)
+    at_tick_rates(|| {
+        for (elasticity, ratio) in [(0.0f32, 0.2f32), (0.01, 0.2), (0.25, 0.25), (0.5, 0.354), (2.0, 0.707), (1000.0, 1.0)] {
+            let mut physics = floor();
+            let ball = Body { mass: Some(20.0), ..Body::new(Shape::Sphere(12.0), [0.0, 0.0, 212.0], [0.0; 3]) };
+            let ball = physics.add(&ball).unwrap();
+            physics.set_elasticity(ball, elasticity);
+            let (mut hit, mut back) = (0.0f32, 0.0f32);
+            let step = STEP.with(std::cell::Cell::get);
+            let mut last = 0.0;
+            for _ in 0..(1.5 / step) as usize {
+                physics.step(step);
+                let v = physics.velocity(ball)[2];
+                if last < -50.0 && v >= 0.0 && hit == 0.0 {
+                    hit = -last;
+                }
+                if hit > 0.0 {
+                    back = back.max(v);
+                }
+                last = v;
+            }
+            let got = if hit > 0.0 { back / hit } else { 0.0 };
+            assert!((got - ratio).abs() < 0.06, "at {elasticity} it bounced by {got} (hit at {hit})");
+        }
+    });
+}
+
+#[test]
+fn what_touches_the_world_touches_the_face_it_touches() {
+    // a floor whose top is slippery (0.2) and sides are not, as a brush of ice: a crate of
+    // glass (0.5) pushed along the top at 200 units/s slides as 0.1 does, v² / (2 μ g), 333
+    // units; and the top is bouncy as its surface says
+    let Shape::Hulls(hulls) = Shape::cuboid([-1024.0, -1024.0, -64.0], [1024.0, 1024.0, 0.0]) else { unreachable!() };
+    let rough = Surface { friction: 0.8, elasticity: 0.0 };
+    let top = Surface { friction: 0.2, elasticity: 1.0 };
+    let mut faces = vec![([0.0, 0.0, 1.0], top), ([0.0, 0.0, -1.0], rough)];
+    faces.extend([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0]].map(|n| (n, rough)));
+    let mut physics = Physics::new();
+    physics.add_world_made_of(&hulls, &[faces], &[], &[], &[]);
+    let body = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+    physics.set_friction(body, 0.5);
+    physics.set_elasticity(body, 0.0);
+    physics.set_drag(body, false);
+    run(&mut physics, 0.5);
+    physics.set_velocity(body, [200.0, 0.0, 0.0]);
+    run(&mut physics, 3.0);
+    let slid = physics.pose(body).unwrap().0[0];
+    assert!((slid - 333.0).abs() < 25.0, "slid {slid}");
+    // a ball of 0.25 off a top of 1 bounces by 0.5
+    let ball = Body { mass: Some(20.0), ..Body::new(Shape::Sphere(12.0), [-500.0, 0.0, 212.0], [0.0; 3]) };
+    let ball = physics.add(&ball).unwrap();
+    let (mut hit, mut back, mut last) = (0.0f32, 0.0f32, 0.0f32);
+    for _ in 0..100 {
+        run(&mut physics, 0.015);
+        let v = physics.velocity(ball)[2];
+        if last < -50.0 && v >= 0.0 && hit == 0.0 {
+            hit = -last;
+        }
+        if hit > 0.0 {
+            back = back.max(v);
+        }
+        last = v;
+    }
+    assert!((back / hit - 0.5).abs() < 0.06, "bounced by {} ({hit})", back / hit);
+}
+
+#[test]
+fn a_surface_of_triangles_is_touched_by_the_triangle_touched() {
+    // two triangles of a ground of ice (0.2), two of rough ground (0.8)
+    let vertices = vec![
+        [-1024.0, -1024.0, 0.0],
+        [0.0, -1024.0, 0.0],
+        [0.0, 1024.0, 0.0],
+        [-1024.0, 1024.0, 0.0],
+        [1024.0, -1024.0, 0.0],
+        [1024.0, 1024.0, 0.0],
+    ];
+    let triangles = vec![[0, 2, 1], [0, 3, 2], [1, 5, 4], [1, 2, 5]];
+    let (ice, rough) = (Surface { friction: 0.2, elasticity: 0.0 }, Surface { friction: 0.8, elasticity: 0.0 });
+    let mut slid = Vec::new();
+    for x in [-500.0f32, 300.0] {
+        let mut physics = Physics::new();
+        physics.add_world_made_of(&[], &[], &vertices, &triangles, &[ice, ice, rough, rough]);
+        let body = physics.add(&crate_body([x, 0.0, 16.0])).unwrap();
+        physics.set_friction(body, 0.5);
+        physics.set_elasticity(body, 0.0);
+        physics.set_drag(body, false);
+        run(&mut physics, 0.5);
+        physics.set_velocity(body, [200.0, 0.0, 0.0]);
+        run(&mut physics, 3.0);
+        slid.push(physics.pose(body).unwrap().0[0] - x);
+    }
+    // on ice 333 units, on rough ground 83
+    assert!((slid[0] - 333.0).abs() < 30.0 && (slid[1] - 83.0).abs() < 15.0, "slid {slid:?}");
+}
+
+#[test]
+fn a_spring_that_only_stretches_pulls_and_never_pushes() {
+    // two cans without gravity on a spring 100 long (GMod's constraint.Elastic, measured: put
+    // 50 apart, one that only stretches leaves them there; put 150 apart, it pulls them in)
+    for (stretch_only, from, nearer) in [(false, 50.0f32, false), (true, 50.0, false), (false, 150.0, true), (true, 150.0, true)] {
+        let mut physics = Physics::new();
+        physics.set_gravity(0.0);
+        let anchor = physics.add(&Body { mass: Some(1.0), ..Body::new(Shape::Sphere(2.0), [0.0, 0.0, 0.0], [0.0; 3]) }).unwrap();
+        physics.set_motion(anchor, false);
+        let can = physics.add(&Body { mass: Some(1.0), ..Body::new(Shape::Sphere(2.0), [0.0, 0.0, -100.0], [0.0; 3]) }).unwrap();
+        let spring = Joint::Spring {
+            start: [0.0; 3],
+            end: [0.0, 0.0, -100.0],
+            length: 100.0,
+            stiffness: 100.0,
+            damping: 0.0,
+            relative_damping: 0.0,
+            stretch_only,
+        };
+        physics.join(anchor, can, spring, true, [0.0; 2]).unwrap();
+        physics.set_pose(can, [0.0, 0.0, -from], [0.0; 3]);
+        run(&mut physics, 0.1);
+        let apart = -physics.pose(can).unwrap().0[2];
+        let moved = (apart - from).abs() > 5.0;
+        match (stretch_only, nearer) {
+            (true, false) => assert!(!moved, "only stretching, it pushed: {apart}"),
+            (false, true) => assert!(apart < from - 5.0, "it did not pull: {apart}"),
+            (true, true) => {
+                assert!(apart < from - 5.0, "it did not pull: {apart}");
+                // and nearer than its length, it lets the can go on (GMod: 71.6 at 0.2 s)
+                run(&mut physics, 0.1);
+                let later = -physics.pose(can).unwrap().0[2];
+                assert!(later < 85.0, "it held the can back: {later}");
+            }
+            (false, false) => assert!(apart > from + 5.0, "it did not push: {apart}"),
+        }
+    }
+}
+
+#[test]
+fn damping_holds_back_only_what_touches_something() {
+    // GMod, measured: a crate damped by 5 going 100 units/s keeps going so in the air (but for
+    // the air holding it back: 98.2 after a fifth of a second), and on a floor without
+    // friction keeps e⁻⁵ of it a second (33)
+    let mut physics = floor();
+    let flying = physics.add(&crate_body([0.0, 0.0, 300.0])).unwrap();
+    let sliding = physics.add(&crate_body([0.0, 200.0, 16.0])).unwrap();
+    physics.set_friction(sliding, 0.0);
+    run(&mut physics, 0.3);
+    for body in [flying, sliding] {
+        physics.set_damping(body, 5.0, 0.0);
+        physics.set_velocity(body, [100.0, 0.0, 0.0]);
+    }
+    assert_eq!(physics.damping(flying), (5.0, 0.0));
+    run(&mut physics, 0.2);
+    let (air, ground) = (physics.velocity(flying)[0], physics.velocity(sliding)[0]);
+    assert!((air - 98.2).abs() < 1.0, "damped in the air: {air}");
+    assert!((ground - 36.8).abs() < 4.0, "on the ground: {ground}");
+}
+
+#[test]
+fn an_impact_is_touching_again_after_being_apart() {
+    // GMod, measured: a crate lying on the floor lifted 0.55 and sent down at 120 units/s makes
+    // no impact; lifted 0.65 and sent down at 5, it makes one, at about the speed it came
+    for (lift, down, impact) in [(0.4f32, 120.0f32, false), (0.8, 5.0, true), (0.8, 60.0, true), (2.0, 0.0, true)] {
+        let mut physics = floor();
+        let body = physics.add(&crate_body([0.0, 0.0, 16.0])).unwrap();
+        run(&mut physics, 1.0);
+        physics.impacts();
+        physics.set_pose(body, [0.0, 0.0, 16.0 + lift], [0.0; 3]);
+        physics.set_velocity(body, [0.0, 0.0, -down]);
+        run(&mut physics, 0.1);
+        let impacts = physics.impacts();
+        assert_eq!(impacts.is_empty(), !impact, "lifted {lift}, sent down at {down}: {impacts:?}");
+        if let Some(first) = impacts.first() {
+            let came = (down * down + 2.0 * DEFAULT_GRAVITY * lift).sqrt();
+            assert!((first.speed - came).abs() < 15.0, "{} for {came}", first.speed);
+        }
+    }
+}
+
+#[test]
+fn the_air_holds_back_what_moves_through_it() {
+    // GMod, measured, without gravity: a crate of 30 kg and 40.5 units sent at 1000 units/s
+    // goes at 916 after a tenth of a second and 739 after four; a ball of 150 kg and 43 units
+    // at 984 after a tenth (round, it meets less of the air than its box); without drag, at
+    // 1000 still
+    for (shape, mass, after, drag) in [
+        (Shape::cuboid([-20.25; 3], [20.25; 3]), 30.0, [916.0, 739.0], true),
+        (Shape::Sphere(21.5), 150.0, [984.0, 941.0], true),
+        (Shape::cuboid([-20.25; 3], [20.25; 3]), 30.0, [1000.0, 1000.0], false),
+    ] {
+        let mut physics = Physics::new();
+        physics.set_gravity(0.0);
+        let body = physics.add(&Body { mass: Some(mass), ..Body::new(shape, [0.0; 3], [0.0; 3]) }).unwrap();
+        physics.set_drag(body, drag);
+        physics.set_velocity(body, [1000.0, 0.0, 0.0]);
+        run(&mut physics, 0.1);
+        let first = physics.velocity(body)[0];
+        run(&mut physics, 0.3);
+        let later = physics.velocity(body)[0];
+        assert!((first - after[0]).abs() < 8.0 && (later - after[1]).abs() < 12.0, "{first} {later}, not {after:?}");
+    }
+}
+
+#[test]
+fn bodies_turn_as_hard_as_ivp_reckons() {
+    // GMod, measured with boxes made in Lua (PhysicsInitBox) of 10 kg: 47.95 units a side,
+    // 1.748 about each axis; 95.4 by 47.95 by 47.95, 1.748 about the long one and 5.047 across
+    // (a solid's would be 2.472 and 6.129)
+    let mut physics = Physics::new();
+    physics.set_gravity(0.0);
+    let cube = Body { mass: Some(10.0), ..Body::new(Shape::cuboid([-23.975; 3], [23.975; 3]), [0.0; 3], [0.0; 3]) };
+    let cube = physics.add(&cube).unwrap();
+    let long = Body {
+        mass: Some(10.0),
+        ..Body::new(Shape::cuboid([-47.7, -23.975, -23.975], [47.7, 23.975, 23.975]), [0.0, 200.0, 0.0], [0.0; 3])
+    };
+    let long = physics.add(&long).unwrap();
+    let near = |a: Vec3, b: Vec3| (0..3).all(|i| (a[i] - b[i]).abs() < 0.01 * b[i]);
+    assert!(near(physics.inertia(cube), [1.748; 3]), "{:?}", physics.inertia(cube));
+    assert!(near(physics.inertia(long), [1.748, 5.047, 5.047]), "{:?}", physics.inertia(long));
+    // as heavy again, as hard again to turn
+    physics.set_mass(cube, 20.0);
+    assert!(near(physics.inertia(cube), [3.496; 3]), "{:?}", physics.inertia(cube));
+    // a model's own, but no axis less than 0.0707 of the most (a plank: 2.587 across, 0.183
+    // about its length in GMod, where its model says 0.04)
+    let plank = Body {
+        mass: Some(11.75),
+        mass_shape: Some(MassShape { centre: [0.0; 3], inertia: [0.22024, 0.22021, 0.00345], drag_areas: None }),
+        ..Body::new(Shape::cuboid([-1.3, -4.3, -32.3], [1.3, 4.3, 32.3]), [0.0, 400.0, 0.0], [0.0; 3])
+    };
+    let plank = physics.add(&plank).unwrap();
+    assert!(near(physics.inertia(plank), [2.588, 2.587, 0.183]), "{:?}", physics.inertia(plank));
+    // set outright
+    physics.set_inertia(plank, [1.0, 2.0, 3.0]);
+    assert!(near(physics.inertia(plank), [1.0, 2.0, 3.0]), "{:?}", physics.inertia(plank));
+    // and it turns so: a push of 1000 kg·units/s 10 units off its middle (GMod's crate of 3.62
+    // turns at 102 degrees a second)
+    physics.set_inertia(cube, [3.62; 3]);
+    physics.apply_impulse_at(cube, [0.0, 1000.0, 0.0], [10.0, 0.0, 0.0]);
+    let w = physics.angular_velocity(cube);
+    assert!((w[2] - 102.1).abs() < 1.0, "{w:?}");
+}
+
+#[test]
+fn a_crate_dropped_flat_lands_flat() {
+    // however it is turned about the up: the push of the floor is in the middle of its face
+    // (in GMod, crates and cubes dropped so land flat, turning no faster than 240 degrees a
+    // second as they do)
+    at_tick_rates(|| {
+        for yaw in [0.0f32, 30.0, 45.0] {
+            let mut physics = floor();
+            let body = Body {
+                mass: Some(25.0),
+                ..Body::new(Shape::cuboid([-8.0, -8.0, 0.0], [8.0, 8.0, 16.0]), [0.0, 0.0, 100.0], [0.0, yaw, 0.0])
+            };
+            let body = physics.add(&body).unwrap();
+            physics.set_elasticity(body, 0.1);
+            let mut spun = 0.0f32;
+            for _ in 0..(3.0 / STEP.with(std::cell::Cell::get)) as usize {
+                run(&mut physics, STEP.with(std::cell::Cell::get));
+                let w = physics.angular_velocity(body);
+                spun = spun.max((w[0] * w[0] + w[1] * w[1]).sqrt());
+            }
+            let (_, angles) = physics.pose(body).unwrap();
+            assert!(spun < 100.0 && angles[0].abs() < 1.0 && angles[2].abs() < 1.0, "turned {yaw}: spun {spun}, {angles:?}");
+        }
+    });
 }

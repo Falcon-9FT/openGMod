@@ -18,6 +18,7 @@ use std::sync::{Mutex, OnceLock};
 
 use gmod_fs::Vfs;
 use gmod_lua::player::{IMPULSE_FLASHLIGHT, key};
+use gmod_lua::snapshot::Snapshot;
 use gmod_lua::vector::{Angle, Vector};
 use gmod_lua::{Drawn, EntityHandle, Map, PlayerView, Realm, Runtime, UserCmd};
 use gmod_movement::FULL_MOVE;
@@ -74,6 +75,31 @@ pub fn command(keys: &Keys, buttons: &Buttons, pitch: f32, yaw: f32) -> UserCmd 
     }
 }
 
+/// A console command that holds a key: `+attack` (down) or `-attack` (up), and the key.
+fn console_key(line: &str) -> Option<(u32, bool)> {
+    let (down, name) = match line.as_bytes().first()? {
+        b'+' => (true, &line[1..]),
+        b'-' => (false, &line[1..]),
+        _ => return None,
+    };
+    let bit = match name.to_ascii_lowercase().as_str() {
+        "attack" => key::ATTACK,
+        "attack2" => key::ATTACK2,
+        "use" => key::USE,
+        "reload" => key::RELOAD,
+        "jump" => key::JUMP,
+        "duck" => key::DUCK,
+        "forward" => key::FORWARD,
+        "back" => key::BACK,
+        "moveleft" => key::MOVELEFT,
+        "moveright" => key::MOVERIGHT,
+        "speed" => key::SPEED,
+        "walk" => key::WALK,
+        _ => return None,
+    };
+    Some((bit, down))
+}
+
 /// What a frame shows.
 pub struct Shown {
     /// Where to see from: between where the eyes were at the last two ticks.
@@ -84,6 +110,8 @@ pub struct Shown {
     /// The client's Lua looks elsewhere than the player does (`CalcView`): the pitch and yaw
     /// to draw with, this frame only.
     pub look: Option<(f32, f32)>,
+    /// The field of view to draw with: the player's, as the client's Lua makes the view.
+    pub fov: f32,
     pub view: PlayerView,
 }
 
@@ -104,10 +132,17 @@ pub struct Game {
     impulse: u8,
     /// The turns of the player by the game the camera has taken ([`PlayerView::turned`]).
     turned: Option<u32>,
+    /// In this program: the angles of the latest commands, newest last - what the player's
+    /// angles are as the ticks take them, unless something else turned them.
+    sent: std::collections::VecDeque<(f32, f32)>,
     /// The server's sounds for the client since the last frame.
     sounds: Vec<gmod_lua::sound::SoundEvent>,
     /// Console lines typed for the next frame.
     typed: Vec<String>,
+    /// The keys held by the console (`+attack` until `-attack`), as by the keyboard.
+    console_keys: u32,
+    /// A game here: the server's last two ticks, which the client is shown between.
+    ticks: Option<(Snapshot, Snapshot)>,
 }
 
 /// The player's client, on the game's files with the map, for `max_players`.
@@ -117,6 +152,7 @@ fn client(vfs: Arc<Vfs>, map: &Map, gamemode: &str, max_players: u32, pages: Opt
         client.set_web_pages(pages);
     }
     client.set_max_players(max_players);
+    client.set_map_name(&map.name);
     client.start(gamemode);
     client.spawn_map(map);
     Ok(client)
@@ -138,23 +174,37 @@ impl Game {
         if let Some(addr) = listen {
             match server.listen(addr, crate::keys::server_identity()) {
                 Ok(at) => {
-                    println!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port());
+                    say!("Others join at {at} (opengmod --connect <this computer's address>:{})", at.port());
                     server.set_masters(crate::browser::masters(&[]));
                 }
-                Err(e) => println!("Others cannot join: {addr}: {e}"),
+                Err(e) => say!("Others cannot join: {addr}: {e}"),
             }
         }
         let player = server.join_host(name, Some(key)).ok_or("no player could join the game")?;
         let client = client(vfs, map, gamemode, max_players, pages)?;
         client.set_local_player(player);
+        // what the server sent as the player joined comes before the entities, as in GMod
+        let mut sounds = Vec::new();
+        deliver(&client, server.flush(), &mut sounds);
         client.apply_snapshot(&server.runtime().snapshot());
         let errors = server.runtime().errors().len() + client.errors().len();
-        println!(
-            "Lua: {} files, {errors} errors; type commands here (give weapon_crowbar, gm_spawn <model>)",
+        say!(
+            "Lua: {} files, {errors} errors; commands go in the console, ` (give weapon_crowbar, gm_spawn <model>)",
             server.runtime().files_loaded() + client.files_loaded()
         );
-        let mut game =
-            Game { link: Link::Local(Box::new(server)), client, player, impulse: 0, turned: None, sounds: Vec::new(), typed: Vec::new() };
+        let mut game = Game {
+            link: Link::Local(Box::new(server)),
+            client,
+            player,
+            impulse: 0,
+            turned: None,
+            sent: std::collections::VecDeque::new(),
+            sounds: Vec::new(),
+            typed: Vec::new(),
+            console_keys: 0,
+            ticks: None,
+        };
+        game.sounds = sounds;
         game.send_client_commands();
         Ok(game)
     }
@@ -166,15 +216,18 @@ impl Game {
         let client = client(vfs, map, &welcome.gamemode, welcome.max_players, pages)?;
         let player = connection.join()?;
         client.set_local_player(player);
-        println!("Lua: {} files, {} errors", client.files_loaded(), client.errors().len());
+        say!("Lua: {} files, {} errors", client.files_loaded(), client.errors().len());
         let mut game = Game {
             link: Link::Remote(Box::new(connection)),
             client,
             player,
             impulse: 0,
             turned: None,
+            sent: std::collections::VecDeque::new(),
             sounds: Vec::new(),
             typed: Vec::new(),
+            console_keys: 0,
+            ticks: None,
         };
         game.send_client_commands();
         Ok(game)
@@ -214,10 +267,11 @@ impl Game {
         }
     }
 
-    /// What the client asked of the server since the last time: its user info, its commands,
-    /// its `net` messages.
+    /// What the client asked of the server since the last time: its user info, its keys
+    /// that went down and up, its commands, its `net` messages.
     fn send_client_commands(&mut self) {
         let info = self.client.take_user_info();
+        let buttons = self.client.take_buttons();
         let commands = self.client.take_server_commands();
         let messages = self.client.take_net_messages();
         match &mut self.link {
@@ -225,6 +279,9 @@ impl Game {
                 let runtime = server.runtime();
                 for (name, value) in info {
                     runtime.set_user_info(self.player, &name, &value);
+                }
+                for (code, down) in buttons {
+                    runtime.player_button_of(self.player, code, down);
                 }
                 for line in commands {
                     runtime.run_player_command(self.player, &line);
@@ -236,6 +293,9 @@ impl Game {
             Link::Remote(connection) => {
                 for (name, value) in info {
                     connection.send(&ToServer::UserInfo(name, value), true);
+                }
+                for (code, down) in buttons {
+                    connection.send(&ToServer::Button(code, down), true);
                 }
                 for line in commands {
                     connection.send(&ToServer::Command(line), true);
@@ -251,6 +311,11 @@ impl Game {
     /// client took it - a menu, a text entry, a command of its own (`+menu`).
     pub fn button(&self, code: i32, down: bool) -> bool {
         self.client.button(code, down)
+    }
+
+    /// The keys held down that `which` names go up ([`gmod_lua::Runtime::release_keys`]).
+    pub fn release_keys(&self, which: impl Fn(i32) -> bool) {
+        self.client.release_keys(which);
     }
 
     /// Text typed, for the chat box or the text entry that has the keyboard: whether one took it.
@@ -302,6 +367,16 @@ impl Game {
         &self.client
     }
 
+    /// What the console offers for a line typed so far, of the client's and - when the game
+    /// runs here - the server's ConVars and commands.
+    pub fn completions(&self, line: &str) -> Vec<String> {
+        let mut list = self.client.completions(line);
+        if let Link::Local(server) = &self.link {
+            list.extend(server.runtime().completions(line));
+        }
+        list
+    }
+
     /// Runs a console command as the player: on the server in this program, or through the
     /// client's console, which sends the server what it does not know itself.
     /// A key of choosing a weapon: the client's row of slots, or the key's command to the
@@ -341,9 +416,25 @@ impl Game {
     /// ticks of the game - here, or on the server, whose entities come as they come - and
     /// the client's frame.
     pub fn frame(&mut self, keys: &Keys, buttons: &Buttons, pitch: f32, yaw: f32, seconds: f64) -> Option<Shown> {
+        let mut lines = std::mem::take(&mut self.typed);
+        // `+attack` and the like hold a key until their `-` comes, as the engine's console does
+        lines.retain(|line| match console_key(line.trim()) {
+            Some((bit, down)) => {
+                self.console_keys = if down { self.console_keys | bit } else { self.console_keys & !bit };
+                false
+            }
+            None => true,
+        });
         let mut cmd = command(keys, buttons, pitch, yaw);
+        cmd.buttons |= self.console_keys;
+        let held = |bit: u32| self.console_keys & bit != 0;
+        if cmd.forward_move == 0.0 {
+            cmd.forward_move = (f32::from(held(key::FORWARD)) - f32::from(held(key::BACK))) * FULL_MOVE;
+        }
+        if cmd.side_move == 0.0 {
+            cmd.side_move = (f32::from(held(key::MOVERIGHT)) - f32::from(held(key::MOVELEFT))) * FULL_MOVE;
+        }
         cmd.impulse = std::mem::take(&mut self.impulse);
-        let lines = std::mem::take(&mut self.typed);
         match &mut self.link {
             Link::Local(server) => {
                 server.runtime().set_input(self.player, cmd);
@@ -357,9 +448,11 @@ impl Game {
         let eye = match &mut self.link {
             Link::Local(server) => {
                 let host = server.frame(seconds);
-                // the client has what the server has now - its entities, what is said to its
-                // player - and thinks
-                self.client.apply_snapshot(&server.runtime().snapshot());
+                // the client has what the server has - its entities, between its last two
+                // ticks as this frame falls, so that what moves moves smoothly; what is said to
+                // its player - and thinks
+                let shown = between_ticks(&mut self.ticks, server.runtime().snapshot(), server.runtime().tick_fraction(), self.player);
+                self.client.apply_snapshot(&shown);
                 deliver(&self.client, host, &mut self.sounds);
                 let view = self.client.view(self.player)?;
                 between(view.previous_eye, view.eye, server.runtime().tick_fraction())
@@ -396,11 +489,16 @@ impl Game {
         };
         let view = self.client.view(self.player)?;
         let local = matches!(self.link, Link::Local(_));
-        // over the network the player's angles come back late: the eyes look where the mouse
-        // says now
-        let angles = if local { view.angles } else { Angle::new(pitch, yaw, 0.0) };
+        // the player's angles change with the ticks, here too, and come back late over the
+        // network: the eyes look where the mouse says now
+        let angles = Angle::new(pitch, yaw, 0.0);
         // as the client's Lua makes the view of it (a vehicle's, from behind)
-        let eyes = gmod_lua::client::View { origin: Vector::new(eye[0], eye[1], eye[2]), angles, fov: view.fov };
+        // the player's own field of view (`fov_desired`) where the game leaves it as it is
+        let fov = match self.client.convar("fov_desired").and_then(|v| v.trim().parse::<f32>().ok()) {
+            Some(desired) if (view.fov - gmod_lua::player::DEFAULT_FOV).abs() < 0.01 => desired.clamp(20.0, 120.0),
+            _ => view.fov,
+        };
+        let eyes = gmod_lua::client::View { origin: Vector::new(eye[0], eye[1], eye[2]), angles, fov };
         let seen = self.client.calc_view(self.player, eyes);
         self.client.set_view(seen);
         let eye = [seen.origin.x, seen.origin.y, seen.origin.z];
@@ -410,14 +508,31 @@ impl Game {
         // this program also whatever else turned them, which comes at once
         let given = self.turned != Some(view.turned);
         self.turned = Some(view.turned);
-        let apart = local && (angle_apart(view.angles.p, pitch) || angle_apart(view.angles.y, yaw));
+        // here, what turned them is what makes them other than those of any command lately
+        // (the mouse since the tick, which the next one takes, is not)
+        if local {
+            self.sent.push_back((pitch, yaw));
+            if self.sent.len() > SENT_KEPT {
+                self.sent.pop_front();
+            }
+        }
+        let apart = local && !self.sent.iter().any(|&(p, y)| !angle_apart(view.angles.p, p) && !angle_apart(view.angles.y, y));
         let turned = (given || apart).then_some((view.angles.p, view.angles.y));
-        Some(Shown { eye, turned, look, view })
+        Some(Shown { eye, turned, look, fov: seen.fov, view })
     }
 
     /// The models of the entities the player sees.
     pub fn drawn(&self) -> Vec<Drawn> {
         self.client.drawn(self.player)
+    }
+
+    /// The game's files changed (an addon came or went): the server here and the client look
+    /// again for what was not there, and their Lua hears of it.
+    pub fn content_changed(&self) {
+        if let Link::Local(server) = &self.link {
+            server.runtime().content_changed();
+        }
+        self.client.content_changed();
     }
 
     /// What the player holds before their eyes - the weapon's view model and the hands - put
@@ -433,6 +548,30 @@ impl Game {
         }
         (models, fov)
     }
+}
+
+/// The entities as the client is shown them in a game here: between the server's last two
+/// ticks (`ticks`, moved on when `latest` is of a new one) by `fraction`, as a client over the
+/// network sees them; but the player as they are now, whose eyes go between the ticks of
+/// themselves, and whose angles are the mouse's.
+fn between_ticks(ticks: &mut Option<(Snapshot, Snapshot)>, latest: Snapshot, fraction: f32, player: EntityHandle) -> Snapshot {
+    // the server's time goes on between its ticks: what it has is of its last tick
+    let tick = |time: f64| (time / gmod_lua::timer::tick_interval() + 1e-6).floor();
+    let time = latest.time;
+    match ticks {
+        Some((_, now)) if tick(now.time) == tick(latest.time) => *now = latest,
+        Some((before, now)) => *before = std::mem::replace(now, latest),
+        None => *ticks = Some((latest.clone(), latest)),
+    }
+    let (before, now) = ticks.as_ref().expect("set above");
+    let mut shown = Snapshot::between(before, now, fraction);
+    // a tick ago, as what is shown is
+    shown.time = time - gmod_lua::timer::tick_interval();
+    let own = |e: &&gmod_lua::snapshot::EntityState| Some(e.index) == player.index && e.serial == player.serial;
+    if let (Some(state), Some(slot)) = (now.entities.iter().find(own), shown.entities.iter_mut().find(|e| own(&&**e))) {
+        *slot = state.clone();
+    }
+    shown
 }
 
 /// What the server's frame left for the host's client, handed to it.
@@ -473,6 +612,18 @@ impl Models {
         self
     }
 
+    /// The game's files these are read from.
+    pub fn vfs(&self) -> Arc<Vfs> {
+        self.vfs.clone()
+    }
+
+    /// The game's files changed (an addon came or went): the models and materials that were
+    /// not there are looked for again.
+    pub fn forget_missing(&mut self) {
+        self.loaded.retain(|_, model| model.is_some());
+        self.materials.forget();
+    }
+
     /// A model to picture alone (a spawn icon), as it is made - skin 0, its first body - read
     /// and handed to `upload` the first time; and its bounds, its vertices' box.
     pub fn icon_model(&mut self, name: &str, mut upload: impl FnMut(&World) -> ModelId) -> Option<(ModelId, [f32; 3], [f32; 3])> {
@@ -507,7 +658,7 @@ impl Models {
                     match gmod_world::model(&self.vfs, name, usize::try_from(*skin).unwrap_or(0), *body) {
                         Ok(model) => Some(upload(&model)),
                         Err(e) => {
-                            println!("{name}: {e}");
+                            say!("{name}: {e}");
                             None
                         }
                     }
@@ -532,12 +683,16 @@ fn between(from: Vector, to: Vector, t: f32) -> [f32; 3] {
 }
 
 /// Whether two angles in degrees differ, a turn apart counting as the same.
+/// How many commands' angles are kept to tell the player's own turning from the game's: more
+/// than the frames a tick takes at the slowest tick rate.
+const SENT_KEPT: usize = 64;
+
 fn angle_apart(a: f32, b: f32) -> bool {
     ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs() > 0.01
 }
 
 /// The lines typed into the terminal since the last call, read on a thread of their own
-/// (started by the first call).
+/// (started by the first call), and into the console window.
 pub fn typed_lines() -> Vec<String> {
     static CONSOLE: OnceLock<Mutex<Receiver<String>>> = OnceLock::new();
     let console = CONSOLE.get_or_init(|| {
@@ -553,7 +708,10 @@ pub fn typed_lines() -> Vec<String> {
         Mutex::new(receive)
     });
     let console = console.lock().unwrap_or_else(|e| e.into_inner());
-    std::iter::from_fn(|| console.try_recv().ok()).collect()
+    let mut lines: Vec<String> = std::iter::from_fn(|| console.try_recv().ok()).collect();
+    // and into the console window
+    lines.extend(crate::console::take_typed());
+    lines
 }
 
 /// The title of the window while the game runs: health and the weapon in hand.
@@ -625,6 +783,13 @@ mod tests {
             shown = game.frame(&forward, &still.1, 0.0, 90.0, 1.0 / 60.0).unwrap();
         }
         assert!(shown.eye[1] > 50.0 && shown.eye[0].abs() < 0.1 && shown.turned.is_none(), "{:?}", shown.eye);
+
+        // the mouse turns the camera between the ticks too, and the game leaves it where it is
+        for frame in 0..40 {
+            let yaw = 90.0 + frame as f32 * 0.7;
+            let shown = game.frame(&forward, &still.1, 0.0, yaw, 1.0 / 144.0).unwrap();
+            assert!(shown.turned.is_none(), "frame {frame}: the camera was put back to {:?}", shown.turned);
+        }
 
         // the console: the game's commands and those of Lua, as the player
         game.command("health 42; noclip");
@@ -927,6 +1092,30 @@ mod tests {
         assert_eq!((cmd.mouse_wheel, cmd.mouse_x, cmd.mouse_y), (-1, 3, -4));
         assert_eq!((cmd.forward_move, cmd.side_move), (FULL_MOVE, -FULL_MOVE));
         assert_eq!(cmd.buttons, key::FORWARD | key::MOVELEFT | key::SPEED | key::ATTACK | key::USE);
+    }
+
+    #[test]
+    fn a_game_here_is_shown_between_its_last_two_ticks() {
+        use gmod_lua::entity::{Ent, Kind};
+        use gmod_lua::snapshot::EntityState;
+        let at = |time: f64, x: f32| {
+            let state = |index: u32| {
+                let mut ent = Ent::new("prop_physics", Kind::Entity, index, 0.0);
+                ent.local_pos = Vector::new(x, 0.0, 0.0);
+                EntityState { index, serial: 1, ent, vars: Default::default() }
+            };
+            Snapshot { time, entities: vec![state(1), state(5)], dormant: Vec::new() }
+        };
+        let player = EntityHandle { index: Some(1), serial: 1, ..EntityHandle::NULL };
+        let mut ticks = None;
+        between_ticks(&mut ticks, at(1.0, 0.0), 0.5, player);
+        // a tick later, half way between the two: the prop half way, the player where they are
+        let shown = between_ticks(&mut ticks, at(1.015, 10.0), 0.5, player);
+        assert_eq!(shown.entities[1].ent.local_pos.x, 5.0);
+        assert_eq!(shown.entities[0].ent.local_pos.x, 10.0);
+        // the same tick again, later in it: further on, from the same two
+        let shown = between_ticks(&mut ticks, at(1.015, 10.0), 0.75, player);
+        assert_eq!(shown.entities[1].ent.local_pos.x, 7.5);
     }
 
     #[test]

@@ -181,8 +181,9 @@ impl Overlay {
     }
 
     /// Sends the pages of the font atlas that changed.
-    pub fn update_glyphs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, fonts: &mut Fonts) {
-        for page in fonts.take_changed() {
+    pub fn update_glyphs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, fonts: &mut Fonts) -> Vec<u32> {
+        let changed = fonts.take_changed();
+        for &page in &changed {
             let pixels = &fonts.pages()[page as usize].pixels;
             let side = gmod_ui::font::PAGE_SIZE;
             while self.pages.len() <= page as usize {
@@ -192,6 +193,7 @@ impl Overlay {
             }
             write(queue, &self.pages[page as usize].0, side, side, pixels);
         }
+        changed
     }
 
     /// The images the canvas draws that have not been given yet.
